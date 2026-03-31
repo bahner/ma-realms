@@ -1,0 +1,16 @@
+kind: world_root
+version: 1
+world_id: "did:ma:k51exampleworld#ma-world"
+refs:
+  actor_registry_cid: "bafybeihactorregistryexample"
+  room_index_cid: "bafybeihroomindexexample"
+  global_acl_cid: null
+  global_properties_cid: null
+entrypoints:
+  default_room_id: "did:ma:k51exampleworld#ma-world-lobby"
+  spawn_location_id: "did:ma:k51exampleworld#ma-world-lobby"
+  system_actor_id: "did:ma:k51exampleworld#system"
+meta:
+  created_at: "2026-03-23T12:00:00Z"
+  updated_at: "2026-03-23T12:00:00Z"
+  revision: 1

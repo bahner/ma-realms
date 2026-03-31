@@ -1,0 +1,7 @@
+[workspace]
+members = [
+  "core",
+  "actor",
+  "world",
+]
+resolver = "2"

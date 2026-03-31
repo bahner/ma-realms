@@ -1,0 +1,212 @@
+# ma-actor
+
+A WebAssembly home client built on top of `did-ma`.
+
+It creates/unlocks local encrypted identity bundles, publishes DID documents to IPNS via Kubo, and provides a command-driven browser UI.
+
+## Features
+
+- WASM exports for identity lifecycle
+  - create identity
+  - create identity bound to existing IPNS key
+  - unlock encrypted identity bundle
+- Passphrase-based local encryption (`argon2id` + `XChaCha20Poly1305`)
+- BIP39 recovery phrase generation/normalization
+- Browser UI with slash commands
+- Kubo API integration for key management and IPNS publish
+
+## Repository Layout
+
+- `src/lib.rs`: wasm-bindgen exports and crypto/identity logic
+- `www/index.html`: UI shell
+- `www/style.css`: UI styling
+- `www/app.js`: app logic and slash command handling
+- `www/pkg/`: generated wasm-pack output (ignored)
+
+## Prerequisites
+
+- Rust toolchain
+- `wasm-pack`
+- Python 3 (for local static server)
+- Kubo/IPFS API reachable at `http://127.0.0.1:5001`
+
+## Build and Run
+
+```bash
+make build
+make serve
+make publish
+make release
+```
+
+`make build` now also computes current IPFS CID for `www/` and writes it to:
+
+- `.cid` (in the `ma-actor` directory)
+
+This makes it easy to launch ma-world with the latest explicit actor-web CID:
+
+```bash
+cargo run --manifest-path ../ma-world/Cargo.toml -- run --world-slug <slug> --cid "$(cat .cid)"
+```
+
+The app is served on:
+
+- `http://127.0.0.1:8081`
+
+The build can be published to IPFS + IPNS with a stable URL:
+
+- `make publish` builds and publishes without `--release` (faster for active development)
+- `make release` builds with release profile before publish
+- Publishes `www/` to `/ipfs/<cid>`
+- Ensures key alias `ma-actor` exists (creates it if missing)
+- Publishes IPNS record `/ipns/<key-id>` to point to the new CID
+- Prints key alias, IPNS path, CID path, a local gateway view URL (`:8080`), and API/runtime URL (`:8081`)
+
+Important runtime note:
+
+- This app requires local Kubo API access at runtime (key lookup and DID publish).
+- Preferred runtime: install `ma-extension` and run from published IPNS/gateway URL.
+- Fallback runtime without extension: use `http://127.0.0.1:8081`.
+- `http://127.0.0.1:8080/ipns/<key>/` is the published gateway URL, but Kubo API calls from that origin can be blocked by Kubo security policy.
+- Public gateways (for example `ipfs.io`) are not suitable for this app's local-Kubo API workflow.
+
+## Optional Browser Extension (recommended)
+
+The `ma-extension` folder contains a local extension that proxies app Kubo API calls to `http://127.0.0.1:5001`.
+
+Install from filesystem (no store publishing required):
+
+- Chromium/Chrome/Brave/Edge: open `chrome://extensions`, enable Developer Mode, click Load unpacked, choose `ma-extension`.
+- Firefox: open `about:debugging#/runtime/this-firefox`, click Load Temporary Add-on, choose `ma-extension/manifest.json`.
+
+### CID consistency notes
+
+To maximize the chance that two developers get the same CID from the same commit:
+
+- use the same Rust and wasm-pack versions
+- run `make build` / `make release` on clean trees
+- keep generated output deterministic (`SOURCE_DATE_EPOCH`, remapped paths, release build)
+
+The Makefile already sets reproducibility-friendly build flags, but exact wasm bytes can still differ across toolchain versions.
+
+## Cleanup
+
+```bash
+make clean
+```
+
+For a full Rust clean as well, run `cargo clean` manually.
+
+## Command Surface
+
+All client commands use dot prefix (`.`). Bare text is gameplay sent to the world.
+
+### Dot Commands (local/client)
+
+- `.help`
+- `.identity`
+- `.alias <name> <address>`
+- `.set home [did:ma:<world>#<room>]` (without arg: use current position)
+- `.set lang <nb|en|se|da>` (set ma-actor UI language for quick debugging)
+- `.unalias <name>`
+- `.aliases`
+- `.inspect @here` (inspect room DID/content CID and exit CID references)
+- `.inspect @exit <name|alias>` (inspect one exit document by name)
+- `.locale <tag>` (also `.lang`, `.language`)
+- `.edit [@here|@me|did:ma:<world>#<room>]`
+- `.eval <cid|alias>`
+- `.refresh` (force immediate room/object/event refresh)
+- `.publish` (publishes DID document to IPNS)
+- `.block <did|alias|handle>`
+- `.unblock <did|alias|handle>`
+- `.blocks`
+- `.smoke [alias]` (diagnostic smoke test)
+- `.debug [on|off]`
+
+### Gameplay (bare, no prefix)
+
+- `go north` — navigate via server-resolved exits
+- `look` — describe current room
+- `attack goblin` — gameplay verb sent to world
+- `'Hello world` — shorthand for @me say Hello world
+
+### Actor Targeting
+
+- `@target command args` — send command to actor
+- `@target 'message` — whisper to actor (E2E encrypted)
+- `@@command` — world-admin command
+
+## Edit Modes
+
+- `.edit` opens local script mode
+- `.edit @here` edits current room YAML
+- `.edit @me` edits your avatar profile text
+- `.edit did:ma:<world>#<room>` edits a specific room by DID
+- Saving in local script mode publishes the script to IPFS and returns a CID
+- In local script mode, `Close and Eval` saves/publishes, closes editor, and runs `.eval` on the new CID
+- `.eval <cid|alias>` loads script text from IPFS and executes it line by line
+- In `.eval` scripts, use explicit actor targets (`@me`, `@here`) for references
+- Room editor sanitizes metadata before publish (`cid` and `did` are stripped from YAML)
+
+Unqualified `.edit` is intentionally local-only. Network-backed editing requires an explicit target (`@here`, `@me`, or `did:...`).
+
+Alias example:
+
+- `.alias oppsett bafyabcdefoppsettcid`
+- `.eval oppsett`
+
+Home target example:
+
+- `.set home did:ma:<world>#lobby`
+- `.set home` (sets `home` to your current room DID)
+- `go home`
+
+## World Connection Over Iroh
+
+Navigation is gameplay — the server resolves exits and directs the client to new endpoints:
+
+- `go north` may cross world boundaries (exits can point to any `did:ma:world#room`)
+- The client auto-follows server directives to connect/reconnect Iroh endpoints
+- The browser WASM client uses `iroh` directly
+- Room chatter is fanned out by `ma-world` and polled by each avatar
+
+## Identity and Publish Model
+
+- Encrypted bundle is local/private (browser storage + export file)
+- DID document is public and publishable
+- `.publish` uploads DID document JSON to IPFS and updates IPNS record
+- Browser storage is namespaced per alias, so one browser profile can keep multiple local homes
+- The currently active alias is remembered per browser tab, which allows concurrent homes in separate tabs/windows on the same origin
+- The actor locale is configurable per alias; localized `@` aliases are mapped to canonical protocol targets before sending
+- The published DID document carries the preferred locale in `ma:locale` using canonical locale tags such as `en` and `nb-NO`
+
+## Kubo CORS
+
+Browser calls require Kubo API CORS headers allowing your app origin (for example `http://127.0.0.1:8081`).
+
+## Protocol & Transport
+
+The WASM client uses ALPN constants and content types from `did-ma` directly
+(e.g. `CONTENT_TYPE_CHAT`, `CONTENT_TYPE_PRESENCE`, `CONTENT_TYPE_WHISPER`, `CONTENT_TYPE_BROADCAST`).
+Connection caches are maintained per transport kind (World, Cmd, Chat) so
+repeated interactions with the same world reuse the iroh connection.
+
+An inbox listener registers protocol handlers for the `ma/inbox/1`,
+`ma/whisper/1`, `ma/broadcast/1`, and `ma/presence/1` ALPN lanes so the
+browser can receive inbound signed messages (presence snapshots, whispers,
+broadcasts) from the world and other actors.
+
+If `/publish` or Kubo check fails in-browser, verify:
+
+1. Kubo daemon is running
+2. API endpoint is correct
+3. CORS origins include your host/port
+
+The setup screen also shows:
+
+- current published IPNS path
+- current published CID path
+- a Kubo install hint with a link to docs when Kubo is not reachable
+
+Local serving on `http://127.0.0.1:8081` remains the recommended runtime origin.
+Use `make publish` for fast iteration, and `make release` when you want an optimized published build.

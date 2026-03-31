@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>間</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.ico">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="bg-ornament"></div>
+
+  <main class="shell">
+    <header class="brand-row">
+      <h1 id="brand-proper-name">間</h1>
+      <p id="brand-subtitle">間 — identity, presence, and transport</p>
+    </header>
+
+    <div id="session-tools" class="session-tools hidden" aria-label="Session tools">
+      <button id="btn-export" type="button">Export Bundle</button>
+      <button id="btn-lock" type="button">Lock</button>
+    </div>
+
+    <section id="setup-view" class="card">
+      <h2>Create or provide identity</h2>
+      <p class="lead">Start with a username alias and passphrase. The alias is used as your Kubo key name.</p>
+      <p class="lead">Saved bundles are isolated per alias, and each browser tab remembers its active alias separately.</p>
+
+      <div class="grid-2">
+        <div>
+          <label for="kubo-api">Kubo API</label>
+          <input id="kubo-api" type="text" value="http://127.0.0.1:5001" autocomplete="off">
+        </div>
+        <div>
+          <label for="alias-name">Username Alias</label>
+          <input id="alias-name" type="text" placeholder="for example: bahner" autocomplete="off">
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div>
+          <label for="passphrase">Passphrase</label>
+          <input id="passphrase" type="password" placeholder="minimum 8 characters" autocomplete="off">
+        </div>
+        <div>
+          <label for="actor-language">Language</label>
+          <select id="actor-language">
+            <option value="en">English</option>
+            <option value="nb-NO">Norsk bokmål</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div>
+          <label for="recovery-phrase">Recovery Words (BIP39)</label>
+          <div class="row-tight">
+            <input id="recovery-phrase" type="text" placeholder="twelve words" autocomplete="off">
+            <button id="btn-new-phrase" type="button">New</button>
+          </div>
+        </div>
+        <div></div>
+      </div>
+
+      <label for="bundle-text">Encrypted Bundle (for recovery on this device)</label>
+      <textarea id="bundle-text" placeholder="Paste a saved encrypted bundle to unlock, or leave empty when creating."></textarea>
+
+      <div class="setup-actions">
+        <button id="btn-kubo-check" type="button">Check Kubo</button>
+        <button id="btn-create" class="primary" type="button">Create Identity</button>
+        <button id="btn-unlock" type="button">Unlock Provided Bundle</button>
+      </div>
+
+      <p id="kubo-status" class="status idle">kubo not checked</p>
+      <div id="kubo-install-note" class="kubo-install-note hidden"></div>
+      <section id="publish-info" class="publish-info" aria-live="polite">
+        <p class="publish-line">Current IPNS: <a id="current-ipns-link" href="#">(not published yet)</a></p>
+        <p class="publish-line">Current CID: <a id="current-cid-link" href="#">(not published yet)</a></p>
+      </section>
+      <p id="setup-status" class="setup-status"></p>
+    </section>
+
+    <section id="chat-view" class="chat hidden" aria-live="polite">
+      <div class="room-hero">
+        <h2 id="room-heading">Welcome</h2>
+        <p class="lead room-description" id="room-description"></p>
+      </div>
+
+      <div class="chat-body">
+        <div class="chat-main">
+          <div id="transcript" class="transcript"></div>
+          <form id="command-form" class="composer">
+            <input id="command-input" type="text" placeholder="go north / look / 'hello / @alice 'hi / .help" autocomplete="off">
+            <button type="submit" class="primary">Send</button>
+          </form>
+        </div>
+        <aside id="avatar-panel" class="avatar-panel">
+          <div class="avatar-panel-label">Here</div>
+          <ul id="avatar-list"></ul>
+        </aside>
+      </div>
+    </section>
+  </main>
+
+  <footer class="app-footer" aria-live="polite">
+    <span id="app-version" class="app-version">Version: loading...</span>
+  </footer>
+
+  <div id="lock-overlay" class="lock-overlay hidden" role="dialog" aria-modal="true" aria-hidden="true" tabindex="0" aria-label="Session lock overlay">
+    <div class="lock-card">
+      <div class="lock-banner">
+        <div>
+          <p class="lock-title">Pan-Galactic Pause</p>
+          <p class="lock-subtitle">Klikk hvor som helst for å lande tilbake i setup.</p>
+        </div>
+      </div>
+      <canvas id="lock-canvas" class="lock-canvas" aria-label="Don't panic canvas"></canvas>
+    </div>
+  </div>
+
+  <div id="yaml-editor-modal" class="yaml-editor-modal hidden" role="dialog" aria-modal="true" aria-hidden="true" aria-label="Local room YAML editor">
+    <div class="yaml-editor-card">
+      <header class="yaml-editor-head">
+        <div>
+          <h2>Local YAML Editor</h2>
+          <p id="yaml-editor-context" class="yaml-editor-context">No edit target loaded.</p>
+        </div>
+      </header>
+      <textarea id="yaml-editor-text" class="yaml-editor-text" spellcheck="false" placeholder="Edit content will appear here."></textarea>
+      <p id="yaml-editor-status" class="yaml-editor-status">Ready.</p>
+      <div class="yaml-editor-actions">
+        <button id="yaml-editor-reload" type="button">Reload Source</button>
+        <button id="yaml-editor-cancel" type="button">Close</button>
+        <button id="yaml-editor-close-eval" type="button" class="hidden">Close and Eval</button>
+        <button id="yaml-editor-save" class="primary" type="button">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
