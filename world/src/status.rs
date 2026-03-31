@@ -381,11 +381,24 @@ async fn update_world_owner(
     Form(form): Form<WorldOwnerForm>,
 ) -> Json<WorldOwnerResponse> {
     match state.world.set_owner_did(&form.owner_did).await {
-        Ok(owner_did) => Json(WorldOwnerResponse {
-            ok: true,
-            message: format!("world owner set to '{}'", owner_did),
-            owner_did: Some(owner_did),
-        }),
+        Ok(owner_did) => match state.world.save_encrypted_state().await {
+            Ok((state_cid, root_cid)) => Json(WorldOwnerResponse {
+                ok: true,
+                message: format!(
+                    "world owner set to '{}' and persisted (state_cid={}, root_cid={})",
+                    owner_did, state_cid, root_cid
+                ),
+                owner_did: Some(owner_did),
+            }),
+            Err(err) => Json(WorldOwnerResponse {
+                ok: false,
+                message: format!(
+                    "world owner set to '{}' in runtime but persist failed: {}",
+                    owner_did, err
+                ),
+                owner_did: Some(owner_did),
+            }),
+        },
         Err(err) => Json(WorldOwnerResponse {
             ok: false,
             message: format!("world owner update failed: {}", err),
@@ -901,21 +914,18 @@ fn render_unlocked_html(world: &WorldInfo, snapshot: &WorldSnapshot, runtime: &R
             const url = value && value.trim() ? value.trim() : '';
             if (kuboUrlMetric) kuboUrlMetric.textContent = url || '(none)';
             if (kuboUrlInput) kuboUrlInput.value = url;
-            localStorage.setItem('ma.status.kubo_url', url);
         }}
 
         function setOwnerDid(value) {{
             const did = value && value.trim() ? value.trim() : '(none)';
             if (ownerDidMetric) ownerDidMetric.textContent = did;
             if (ownerDidInput) ownerDidInput.value = did === '(none)' ? '' : did;
-            localStorage.setItem('ma.status.owner_did', did === '(none)' ? '' : did);
         }}
 
         function setStateCid(value) {{
             const cid = value && value.trim() ? value.trim() : '(none)';
             if (stateCidMetric) stateCidMetric.textContent = cid;
             if (stateCidInput && cid !== '(none)') stateCidInput.value = cid;
-            localStorage.setItem('ma.status.state_cid', cid === '(none)' ? '' : cid);
         }}
 
         function setRootCid(value) {{
@@ -926,7 +936,6 @@ fn render_unlocked_html(world: &WorldInfo, snapshot: &WorldSnapshot, runtime: &R
                 worldAliasMetric.textContent = slug + ' -> ' + cid;
             }}
             if (rootCidInput && cid !== '(none)') rootCidInput.value = cid;
-            localStorage.setItem('ma.status.root_cid', cid === '(none)' ? '' : cid);
         }}
 
         function drawLockCanvas(timeMs) {{
@@ -1101,22 +1110,6 @@ fn render_unlocked_html(world: &WorldInfo, snapshot: &WorldSnapshot, runtime: &R
             updateLockCountdown();
         }}
 
-        const savedSlug = localStorage.getItem('ma.status.slug');
-        const savedKubo = localStorage.getItem('ma.status.kubo_url');
-        const savedOwner = localStorage.getItem('ma.status.owner_did');
-        const savedState = localStorage.getItem('ma.status.state_cid');
-        const savedRoot = localStorage.getItem('ma.status.root_cid');
-        if (savedSlug && slugInput) slugInput.value = savedSlug;
-        if (savedKubo && kuboUrlInput) kuboUrlInput.value = savedKubo;
-        if (savedOwner && ownerDidInput) ownerDidInput.value = savedOwner;
-        if (savedState && stateCidInput) stateCidInput.value = savedState;
-        if (savedRoot && rootCidInput) rootCidInput.value = savedRoot;
-
-        [slugInput, kuboUrlInput, ownerDidInput, stateCidInput, rootCidInput].forEach((el) => {{
-            if (!el) return;
-            el.addEventListener('input', () => localStorage.setItem('ma.status.' + el.id.replace('-input', '').replace('-', '_'), el.value || ''));
-        }});
-
         if (lockOverlay) {{
             lockOverlay.addEventListener('click', hideScreenLock);
         }}
@@ -1153,7 +1146,6 @@ fn render_unlocked_html(world: &WorldInfo, snapshot: &WorldSnapshot, runtime: &R
                     const ok = Boolean(data.ok);
                     if (ok && data.slug && slugInput) {{
                         slugInput.value = data.slug;
-                        localStorage.setItem('ma.status.slug', data.slug);
                         if (worldAliasMetric) {{
                             const cid = worldAliasMetric.dataset.cid || '(none)';
                             worldAliasMetric.textContent = data.slug + ' -> ' + cid;

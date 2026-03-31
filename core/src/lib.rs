@@ -1,4 +1,5 @@
 pub mod addressing;
+pub mod capability_acl;
 pub mod domain;
 pub mod interfaces;
 pub mod locale;
@@ -12,6 +13,13 @@ pub use addressing::{
     normalize_endpoint_id, normalize_iroh_address, normalize_relay_url, resolve_alias_input,
     endpoint_id_from_address, endpoint_id_from_transport_value, resolve_inbox_endpoint_id,
 };
+pub use capability_acl::{
+    CapabilityAcl, CompiledCapabilityAcl, CompiledSubjectAcl,
+    capability_pattern_matches, compile_acl, compile_acl_from_text,
+    evaluate_compiled_acl, evaluate_compiled_acl_with_owner,
+    parse_capability_acl_text, parse_object_local_capability_acl,
+    subject_has_capability, subject_has_capability_with_owner, validate_capability_acl,
+};
 pub use domain::{ActorType, AvatarActor, ExitData, ObjectData, RoomActor, WorldActor};
 pub use interfaces::{AclRuntime, DidPublisher, IpfsPublisher};
 pub use locale::{LocaleLexicon, canonical_locale, localized_here_alias, localized_say_verb};
@@ -19,6 +27,7 @@ pub use object_runtime::{
     ObjectCommandOutput, ObjectCommandResult, ObjectDefinition, ObjectInboxMessage,
     ObjectMessageIntent, ObjectMessageKind, ObjectMessageRetention, ObjectMessageTarget, ObjectPersistencePolicy,
     ObjectProgramRef, ObjectReceiverListener, ObjectRuntimeState, PendingEphemeralRequest,
+    ObjectVerbDefinition, ObjectVerbEvaluator,
 };
 pub use parser::{
     ActorCommand, MessageEnvelope, normalize_spoken_text, parse_actor_command,

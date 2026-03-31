@@ -1,5 +1,7 @@
 //! Shared protocol types and constants used by both the world server and home client.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 // ─── ALPN Protocol Identifiers ──────────────────────────────────────────────
@@ -151,6 +153,8 @@ pub struct WorldResponse {
     pub room_did: String,
     #[serde(default)]
     pub avatars: Vec<PresenceAvatar>,
+    #[serde(default)]
+    pub room_object_dids: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_ack: Option<TransportAck>,
 }

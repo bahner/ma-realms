@@ -58,8 +58,31 @@ pub struct ObjectDefinition {
     pub tags: Vec<String>,
     #[serde(default)]
     pub aliases: Vec<String>,
+    #[serde(default)]
+    pub verbs: Vec<ObjectVerbDefinition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program: Option<ObjectProgramRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectVerbEvaluator {
+    #[serde(rename = "type")]
+    pub evaluator_type: String,
+    pub name: String,
+    #[serde(default)]
+    pub version: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectVerbDefinition {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    pub evaluator: ObjectVerbEvaluator,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,6 +200,8 @@ pub struct ObjectRuntimeState {
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition_cid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<ObjectDefinition>,
     pub room: String,
     #[serde(default)]
     pub aliases: Vec<String>,
@@ -229,6 +254,38 @@ impl ObjectRuntimeState {
             name: "mailbox".to_string(),
             kind: "receiver".to_string(),
             definition_cid: None,
+            definition: Some(ObjectDefinition {
+                id: "mailbox".to_string(),
+                name: "mailbox".to_string(),
+                descriptions: HashMap::new(),
+                tags: vec!["system".to_string(), "mailbox".to_string()],
+                aliases: vec!["mailbox".to_string(), "messaging-device".to_string()],
+                verbs: vec![
+                    ObjectVerbDefinition {
+                        name: "hjelp".to_string(),
+                        lang: Some("nb".to_string()),
+                        aliases: vec!["hjelp".to_string(), "help".to_string()],
+                        evaluator: ObjectVerbEvaluator {
+                            evaluator_type: "built-in".to_string(),
+                            name: "print".to_string(),
+                            version: 1,
+                        },
+                        content: Some("mailbox kommandoer:\n- show/status/look\n- take, drop\n- open, close\n- list, pop, pending\n- ask <target> <text>\n- retry <request_id>\n- reply <request_id> <text>\n- accept <id>, reject <id> [note]\n- invite <did> [note]".to_string()),
+                    },
+                    ObjectVerbDefinition {
+                        name: "help".to_string(),
+                        lang: Some("en".to_string()),
+                        aliases: vec!["help".to_string(), "hjelp".to_string()],
+                        evaluator: ObjectVerbEvaluator {
+                            evaluator_type: "built-in".to_string(),
+                            name: "print".to_string(),
+                            version: 1,
+                        },
+                        content: Some("mailbox commands:\n- show/status/look\n- take, drop\n- open, close\n- list, pop, pending\n- ask <target> <text>\n- retry <request_id>\n- reply <request_id> <text>\n- accept <id>, reject <id> [note]\n- invite <did> [note]".to_string()),
+                    },
+                ],
+                program: None,
+            }),
             room: room.to_string(),
             aliases: vec!["mailbox".to_string(), "messaging-device".to_string()],
             receivers: vec![ObjectReceiverListener {

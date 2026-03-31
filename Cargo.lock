@@ -2150,9 +2150,12 @@ dependencies = [
 name = "ma-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "did-ma",
  "fluent-bundle",
  "serde",
  "serde_json",
+ "serde_yaml",
  "unic-langid",
 ]
 

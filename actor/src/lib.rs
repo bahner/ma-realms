@@ -115,7 +115,19 @@ thread_local! {
     static WORLD_CONN_CACHE: RefCell<Option<WorldConnCache>> = RefCell::new(None);
     static CMD_CONN_CACHE: RefCell<Option<WorldConnCache>> = RefCell::new(None);
     static CHAT_CONN_CACHE: RefCell<Option<WorldConnCache>> = RefCell::new(None);
+    static ACL_COMPILED_CACHE: RefCell<HashMap<String, CompiledCapabilityAcl>> = RefCell::new(HashMap::new());
+    static ROOM_DID_CACHE: RefCell<HashMap<String, CachedDidEntry>> = RefCell::new(HashMap::new());
+    static ROOM_OBJECT_DID_CACHE: RefCell<HashMap<String, CachedDidEntry>> = RefCell::new(HashMap::new());
+    static ACTIVE_ROOM_CACHE: RefCell<Option<String>> = RefCell::new(None);
 }
+
+#[derive(Clone, Debug)]
+struct CachedDidEntry {
+    did: String,
+    expires_at_ms: f64,
+}
+
+const ROOM_DID_CACHE_TTL_MS: f64 = 5.0 * 60.0 * 1000.0;
 
 fn take_conn_cache(kind: WorldTransportKind) -> Option<WorldConnCache> {
     match kind {
@@ -404,9 +416,12 @@ async fn exchange_on_stream(cache: &mut WorldConnCache, request: &WorldRequest) 
 }
 use ma_core::{
     canonical_locale,
+    CompiledCapabilityAcl,
+    compile_acl,
     CONTENT_TYPE_BROADCAST, CONTENT_TYPE_CHAT, CONTENT_TYPE_CMD, CONTENT_TYPE_PRESENCE,
     CONTENT_TYPE_WORLD, CONTENT_TYPE_WHISPER,
     DEFAULT_WORLD_RELAY_URL,
+    evaluate_compiled_acl_with_owner,
     did_root as core_did_root,
     find_alias_for_address as core_find_alias_for_address,
     find_did_by_endpoint as core_find_did_by_endpoint,
@@ -414,6 +429,7 @@ use ma_core::{
     humanize_text as core_humanize_text,
     normalize_endpoint_id as core_normalize_endpoint_id,
     normalize_relay_url as core_normalize_relay_url,
+    parse_capability_acl_text,
     parse_message_with_locale,
     resolve_inbox_endpoint_id as core_resolve_inbox_endpoint_id,
     resolve_alias_input as core_resolve_alias_input,
@@ -534,10 +550,94 @@ struct IpnsPointer {
     sequence: u64,
 }
 
+#[derive(Serialize)]
+struct ActorDidCacheEntryDebug {
+    key: String,
+    did: String,
+    expires_at_ms: u64,
+    ttl_remaining_ms: u64,
+}
+
+#[derive(Serialize)]
+struct ActorDidCacheDebug {
+    now_ms: u64,
+    ttl_config_ms: u64,
+    active_room: Option<String>,
+    room_dids: Vec<ActorDidCacheEntryDebug>,
+    room_object_dids: Vec<ActorDidCacheEntryDebug>,
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 fn js_err(msg: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&msg.to_string())
+}
+
+fn compiled_acl_from_text_cached(source: &str, acl_text: &str) -> Result<CompiledCapabilityAcl, JsValue> {
+    let cache_key = format!("{}:{}", source, blake3::hash(acl_text.as_bytes()).to_hex());
+
+    if let Some(cached) = ACL_COMPILED_CACHE.with(|slot| slot.borrow().get(&cache_key).cloned()) {
+        return Ok(cached);
+    }
+
+    let acl = parse_capability_acl_text(acl_text, source).map_err(js_err)?;
+    let compiled = compile_acl(&acl, source).map_err(js_err)?;
+
+    ACL_COMPILED_CACHE.with(|slot| {
+        slot.borrow_mut().insert(cache_key, compiled.clone());
+    });
+
+    Ok(compiled)
+}
+
+#[wasm_bindgen]
+pub fn evaluate_capability_acl(
+    subject_did: &str,
+    capability: &str,
+    global_acl_text: &str,
+    local_acl_text: &str,
+    world_owner_did: &str,
+    local_owner_did: &str,
+) -> Result<bool, JsValue> {
+    let subject = subject_did.trim();
+    let cap = capability.trim();
+    if subject.is_empty() {
+        return Err(js_err("subject_did cannot be empty"));
+    }
+    if cap.is_empty() {
+        return Err(js_err("capability cannot be empty"));
+    }
+
+    let world_owner = if world_owner_did.trim().is_empty() {
+        None
+    } else {
+        Some(world_owner_did.trim())
+    };
+    let local_owner = if local_owner_did.trim().is_empty() {
+        None
+    } else {
+        Some(local_owner_did.trim())
+    };
+
+    let global_match = if global_acl_text.trim().is_empty() {
+        true
+    } else {
+        let compiled = compiled_acl_from_text_cached("actor-global-acl", global_acl_text)?;
+        evaluate_compiled_acl_with_owner(&compiled, subject, world_owner, cap)
+    };
+
+    if !global_match {
+        return Ok(false);
+    }
+
+    let local_match = if local_acl_text.trim().is_empty() {
+        true
+    } else {
+        let compiled = compiled_acl_from_text_cached("actor-local-acl", local_acl_text)?;
+        evaluate_compiled_acl_with_owner(&compiled, subject, local_owner, cap)
+    };
+
+    Ok(local_match)
 }
 
 fn random_bytes<const N: usize>() -> Result<[u8; N], String> {
@@ -558,6 +658,20 @@ fn now_unix_secs() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64
 }
 
+fn now_ms() -> f64 {
+    js_sys::Date::now()
+}
+
+fn clamp_ms_u64(value: f64) -> u64 {
+    if !value.is_finite() || value <= 0.0 {
+        0
+    } else if value >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        value as u64
+    }
+}
+
 fn normalize_phrase_text(input: &str) -> String {
     input
         .split_whitespace()
@@ -574,6 +688,168 @@ fn parse_string_map(map_json: &str) -> Result<HashMap<String, String>, JsValue> 
     }
     serde_json::from_str::<HashMap<String, String>>(trimmed)
         .map_err(|e| js_err(format!("invalid map JSON: {e}")))
+}
+
+fn room_object_cache_key(room: &str, object_token: &str) -> String {
+    let room_key = room.trim().to_ascii_lowercase();
+    let token_key = object_token
+        .trim()
+        .trim_start_matches('@')
+        .to_ascii_lowercase();
+    format!("{}\n{}", room_key, token_key)
+}
+
+fn clear_room_cache_for(room: &str) {
+    let room_key = room.trim().to_ascii_lowercase();
+    if room_key.is_empty() {
+        return;
+    }
+
+    ROOM_DID_CACHE.with(|slot| {
+        slot.borrow_mut().remove(&room_key);
+    });
+
+    let room_prefix = format!("{}\n", room_key);
+    ROOM_OBJECT_DID_CACHE.with(|slot| {
+        slot.borrow_mut().retain(|key, _| !key.starts_with(&room_prefix));
+    });
+}
+
+fn clear_all_room_did_caches() {
+    ROOM_DID_CACHE.with(|slot| slot.borrow_mut().clear());
+    ROOM_OBJECT_DID_CACHE.with(|slot| slot.borrow_mut().clear());
+    ACTIVE_ROOM_CACHE.with(|slot| *slot.borrow_mut() = None);
+}
+
+fn switch_active_room_cache(room: &str) {
+    let room_key = room.trim().to_ascii_lowercase();
+    if room_key.is_empty() {
+        return;
+    }
+    ACTIVE_ROOM_CACHE.with(|slot| {
+        let mut active = slot.borrow_mut();
+        if let Some(previous) = active.as_ref() {
+            if previous != &room_key {
+                clear_room_cache_for(previous);
+            }
+        }
+        *active = Some(room_key);
+    });
+}
+
+fn cache_room_did(room: &str, room_did: &str) {
+    let room = room.trim();
+    let room_did = room_did.trim();
+    if room.is_empty() || room_did.is_empty() {
+        return;
+    }
+    let expires_at_ms = now_ms() + ROOM_DID_CACHE_TTL_MS;
+    ROOM_DID_CACHE.with(|slot| {
+        slot.borrow_mut().insert(
+            room.to_ascii_lowercase(),
+            CachedDidEntry {
+                did: room_did.to_string(),
+                expires_at_ms,
+            },
+        );
+    });
+}
+
+fn cache_room_object_did(room: &str, object_token: &str, object_did: &str) {
+    let key = room_object_cache_key(room, object_token);
+    if key.trim().is_empty() || object_did.trim().is_empty() {
+        return;
+    }
+    let expires_at_ms = now_ms() + ROOM_DID_CACHE_TTL_MS;
+    ROOM_OBJECT_DID_CACHE.with(|slot| {
+        slot.borrow_mut().insert(
+            key,
+            CachedDidEntry {
+                did: object_did.trim().to_string(),
+                expires_at_ms,
+            },
+        );
+    });
+}
+
+fn lookup_room_object_did(room: &str, object_token: &str) -> Option<String> {
+    let key = room_object_cache_key(room, object_token);
+    let now = now_ms();
+    ROOM_OBJECT_DID_CACHE.with(|slot| {
+        let mut map = slot.borrow_mut();
+        let Some(entry) = map.get(&key).cloned() else {
+            return None;
+        };
+        if entry.expires_at_ms <= now {
+            map.remove(&key);
+            return None;
+        }
+        Some(entry.did)
+    })
+}
+
+fn update_room_did_cache_from_response(response: &WorldResponse) {
+    if response.room.is_empty() || response.room_did.is_empty() {
+        return;
+    }
+    switch_active_room_cache(&response.room);
+    if Did::validate(&response.room_did).is_ok() {
+        cache_room_did(&response.room, &response.room_did);
+    }
+    for (token, did_text) in &response.room_object_dids {
+        if let Ok(did) = Did::try_from(did_text.as_str()) {
+            if did.fragment.is_some() {
+                cache_room_object_did(&response.room, token, &did.id());
+            }
+        }
+    }
+}
+
+fn normalize_use_alias_command(room: &str, text: &str) -> String {
+    let trimmed = text.trim();
+    let (prefix, rest) = if let Some(rest) = trimmed.strip_prefix("use ") {
+        ("use ", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("/use ") {
+        ("/use ", rest)
+    } else {
+        return text.to_string();
+    };
+
+    let Some((target_raw, alias_raw)) = rest.split_once(" as ") else {
+        return text.to_string();
+    };
+    let target = target_raw.trim();
+    let alias = alias_raw.trim();
+    if target.is_empty() || !alias.starts_with('@') {
+        return text.to_string();
+    }
+
+    if let Ok(target_did) = Did::try_from(target) {
+        if let Some(object_id) = target_did.fragment.as_ref() {
+            cache_room_object_did(room, object_id, &target_did.id());
+        }
+        return text.to_string();
+    }
+
+    if let Some(cached_did) = lookup_room_object_did(room, target) {
+        return format!("{}{} as {}", prefix, cached_did, alias);
+    }
+
+    text.to_string()
+}
+
+fn cache_entry_debug(key: String, entry: &CachedDidEntry, now: f64) -> ActorDidCacheEntryDebug {
+    let remaining = if entry.expires_at_ms <= now {
+        0.0
+    } else {
+        entry.expires_at_ms - now
+    };
+    ActorDidCacheEntryDebug {
+        key,
+        did: entry.did.clone(),
+        expires_at_ms: clamp_ms_u64(entry.expires_at_ms),
+        ttl_remaining_ms: clamp_ms_u64(remaining),
+    }
 }
 
 // ── Crypto ─────────────────────────────────────────────────────────────────────
@@ -702,6 +978,8 @@ pub async fn disconnect_world() {
         let _ = listener.router.shutdown().await;
         listener.endpoint.close().await;
     }
+
+    clear_all_room_did_caches();
 }
 
 /// Ensure a direct inbox listener is running for this ma-actor session.
@@ -886,6 +1164,61 @@ pub fn alias_humanize_identifier(value: &str, alias_book_json: &str) -> Result<S
 pub fn alias_humanize_text(text: &str, alias_book_json: &str) -> Result<String, JsValue> {
     let alias_book = parse_string_map(alias_book_json)?;
     Ok(core_humanize_text(text, &alias_book))
+}
+
+#[wasm_bindgen]
+pub fn actor_cache_room_object_did(room: &str, object_token: &str, object_did: &str) -> Result<(), JsValue> {
+    let did = Did::try_from(object_did).map_err(js_err)?;
+    if did.fragment.is_none() {
+        return Err(js_err("object DID must include #fragment"));
+    }
+    cache_room_object_did(room, object_token, &did.id());
+    Ok(())
+}
+
+#[wasm_bindgen]
+pub fn actor_cache_room_did(room: &str, room_did: &str) -> Result<(), JsValue> {
+    Did::try_from(room_did).map_err(js_err)?;
+    cache_room_did(room, room_did);
+    Ok(())
+}
+
+#[wasm_bindgen]
+pub fn actor_debug_room_did_cache() -> Result<String, JsValue> {
+    let now = now_ms();
+
+    let room_dids = ROOM_DID_CACHE.with(|slot| {
+        let mut map = slot.borrow_mut();
+        map.retain(|_, entry| entry.expires_at_ms > now);
+        let mut rows = map
+            .iter()
+            .map(|(k, v)| cache_entry_debug(k.clone(), v, now))
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| a.key.cmp(&b.key));
+        rows
+    });
+
+    let room_object_dids = ROOM_OBJECT_DID_CACHE.with(|slot| {
+        let mut map = slot.borrow_mut();
+        map.retain(|_, entry| entry.expires_at_ms > now);
+        let mut rows = map
+            .iter()
+            .map(|(k, v)| cache_entry_debug(k.clone(), v, now))
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| a.key.cmp(&b.key));
+        rows
+    });
+
+    let active_room = ACTIVE_ROOM_CACHE.with(|slot| slot.borrow().clone());
+
+    serde_json::to_string_pretty(&ActorDidCacheDebug {
+        now_ms: clamp_ms_u64(now),
+        ttl_config_ms: clamp_ms_u64(ROOM_DID_CACHE_TTL_MS),
+        active_room,
+        room_dids,
+        room_object_dids,
+    })
+    .map_err(js_err)
 }
 
 fn build_signed_world_request(
@@ -1314,6 +1647,7 @@ pub async fn enter_world(
         timestamp_ms,
     )?;
     let response = send_world_request(endpoint_id, request).await?;
+    update_room_did_cache_from_response(&response);
 
     serde_json::to_string(&WorldActionResult {
         response,
@@ -1359,6 +1693,7 @@ pub async fn send_world_chat(
         message_cbor: message.to_cbor().map_err(js_err)?,
     };
     let response = send_world_chat_request(endpoint_id, request).await?;
+    update_room_did_cache_from_response(&response);
 
     serde_json::to_string(&WorldActionResult {
         response,
@@ -1420,6 +1755,7 @@ pub async fn send_world_whisper(
             room_title: String::new(),
             room_did: String::new(),
             avatars: Vec::new(),
+            room_object_dids: HashMap::new(),
             transport_ack: None,
         },
         pending_whispers: Vec::new(),
@@ -1496,6 +1832,7 @@ pub async fn send_world_message(
         timestamp_ms,
     )?;
     let response = send_world_request(endpoint_id, request).await?;
+    update_room_did_cache_from_response(&response);
 
     serde_json::to_string(&WorldActionResult {
         response,
@@ -1516,8 +1853,9 @@ pub async fn send_world_cmd(
     text: &str,
 ) -> Result<String, JsValue> {
     let timestamp_ms = js_sys::Date::now() as u64;
+    let rewritten_text = normalize_use_alias_command(room, text);
     let canonical = canonical_locale(locale);
-    let envelope = parse_message_with_locale(text, &canonical);
+    let envelope = parse_message_with_locale(&rewritten_text, &canonical);
     let is_admin_world_command =
         matches!(&envelope, ma_core::MessageEnvelope::ActorCommand { target, .. } if target.eq_ignore_ascii_case("world"));
     if is_admin_world_command {
@@ -1536,6 +1874,7 @@ pub async fn send_world_cmd(
         timestamp_ms,
     )?;
     let response = send_world_cmd_request(endpoint_id, request).await?;
+    update_room_did_cache_from_response(&response);
 
     serde_json::to_string(&WorldActionResult {
         response,
@@ -1567,6 +1906,7 @@ pub async fn poll_world_events(
         timestamp_ms,
     )?;
     let response = send_world_request(endpoint_id, request).await?;
+    update_room_did_cache_from_response(&response);
 
     serde_json::to_string(&WorldActionResult {
         response,

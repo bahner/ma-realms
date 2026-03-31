@@ -4,10 +4,10 @@ use std::collections::{HashMap, HashSet};
 
 /// Access control list for a room.
 /// Evaluation order: deny list → allow list (with * wildcard).
-/// The room owner always has access regardless of deny list.
+/// Owner access is enforced through ACL membership (allow/deny), not bypass rules.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RoomAcl {
-    /// Root DID of the room owner (always granted access).
+    /// Root DID of the room owner.
     pub owner: Option<String>,
     /// Public assertion key (multibase) of current owner at time of assignment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -33,10 +33,6 @@ impl RoomAcl {
 
     /// Returns `true` if `did_root` is allowed to enter this room.
     pub fn can_enter(&self, did_root: &str) -> bool {
-        // Owner is always allowed.
-        if self.owner.as_deref() == Some(did_root) {
-            return true;
-        }
         // Explicit deny takes priority.
         if self.deny.contains(did_root) {
             return false;

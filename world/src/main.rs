@@ -1,9 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
-    io::Cursor,
     net::{IpAddr, SocketAddr},
-    path::Path,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -12,34 +10,31 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 use anyhow::{Result, anyhow};
-use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
+use bootstrap::{
+    load_runtime_file_config, print_cli_help, resolve_actor_web_source_dir, runtime_config_path,
+    runtime_iroh_secret_default_path, xdg_data_home,
+};
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 use chrono::Utc;
-use did_ma::{
-    Did, Document,
-    EncryptionKey, Message, SigningKey, VerificationMethod,
-};
+use did_ma::{Did, Document, EncryptionKey, Message, SigningKey, VerificationMethod};
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayUrl,
-    SecretKey,
+    Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey,
     endpoint::Connection,
     endpoint::presets,
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use ma_core::{
-    CONTENT_TYPE_CHAT, CONTENT_TYPE_CMD, CONTENT_TYPE_PRESENCE, CONTENT_TYPE_WORLD,
-    DEFAULT_WORLD_RELAY_URL,
-    LaneCapability,
-    ActorCommand, ExitData, MessageEnvelope, RoomActorAction, RoomActorContext,
-    ObjectInboxMessage, ObjectMessageIntent, ObjectMessageKind, ObjectMessageRetention,
-    ObjectMessageTarget,
-    ObjectRuntimeState,
-    execute_room_actor_command, normalize_spoken_text,
-    PresenceAvatar, RoomEvent, TransportAck, TransportAckCode, WorldCommand, WorldLane,
-    WorldRequest, WorldResponse,
-    BROADCAST_ALPN, CHAT_ALPN, CMD_ALPN, PRESENCE_ALPN, WORLD_ALPN,
+    ActorCommand, BROADCAST_ALPN, CHAT_ALPN, CMD_ALPN, CONTENT_TYPE_CHAT, CONTENT_TYPE_CMD,
+    CONTENT_TYPE_PRESENCE, CONTENT_TYPE_WORLD, CompiledCapabilityAcl, DEFAULT_WORLD_RELAY_URL,
+    ExitData, LaneCapability, MessageEnvelope, ObjectDefinition, ObjectInboxMessage,
+    ObjectMessageIntent, ObjectMessageKind, ObjectMessageRetention, ObjectMessageTarget,
+    ObjectRuntimeState, PRESENCE_ALPN, PresenceAvatar, RoomActorAction, RoomActorContext,
+    RoomEvent, TransportAck, TransportAckCode, WORLD_ALPN, WorldCommand, WorldLane, WorldRequest,
+    WorldResponse, compile_acl, evaluate_compiled_acl_with_owner, execute_room_actor_command,
+    normalize_spoken_text, parse_capability_acl_text, parse_object_local_capability_acl,
 };
 use nanoid::nanoid;
 use rand::RngCore;
@@ -51,25 +46,26 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::prelude::*;
 
 mod actor;
+mod actor_web;
+mod bootstrap;
 mod kubo;
 mod room;
 mod schema;
 mod status;
 
 use actor::Avatar;
+use actor_web::{
+    materialize_actor_web_from_cid, publish_actor_web_from_dir, resolve_actor_web_cid_from_ipns_key,
+};
 use kubo::{
-    dag_get_dag_cbor, dag_put_dag_cbor, generate_kubo_key, ipfs_add, ipns_publish_with_retry, list_kubo_key_names,
-    list_kubo_keys,
-    name_resolve,
-    pin_add_named, pin_rm, pin_update, wait_for_kubo_api, IpnsPublishOptions,
+    IpnsPublishOptions, dag_get_dag_cbor, dag_put_dag_cbor, generate_kubo_key, ipfs_add,
+    ipns_publish_with_retry, list_kubo_key_names, list_kubo_keys, name_resolve, pin_add_named,
+    pin_rm, pin_update, wait_for_kubo_api,
 };
 use room::{Room, RoomAcl};
 use schema::{
-    default_world_dir, did_fragment, load_world_authoring,
-    normalize_world_key_name,
-    ActorSecretBundle,
-    unlock_actor_secret_bundles,
-    validate_world_authoring,
+    ActorSecretBundle, default_world_dir, did_fragment, load_world_authoring,
+    normalize_world_key_name, unlock_actor_secret_bundles, validate_world_authoring,
 };
 
 const DEFAULT_ROOM: &str = "lobby";
@@ -88,7 +84,9 @@ const DEFAULT_KUBO_API_URL: &str = "http://127.0.0.1:5001";
 
 fn extract_global_config_arg(raw_args: Vec<String>) -> Result<Vec<String>> {
     if raw_args.iter().any(|arg| arg == "--config") {
-        return Err(anyhow!("--config has been removed; pass runtime options directly via CLI/env"));
+        return Err(anyhow!(
+            "--config has been removed; pass runtime options directly via CLI/env"
+        ));
     }
     if raw_args.iter().any(|arg| arg == "--world-dir") {
         return Err(anyhow!("--world-dir has been removed"));
@@ -202,6 +200,7 @@ struct WorldProtocol {
 #[derive(Clone, Debug)]
 struct EntryAcl {
     allow_all: bool,
+    allow_owner: bool,
     allowed_dids: HashSet<String>,
     source: String,
 }
@@ -257,6 +256,12 @@ pub struct World {
     world_did: Arc<RwLock<Option<String>>>,
     /// Runtime state lock; when false, command lanes reject world interactions.
     unlocked: Arc<RwLock<bool>>,
+    /// Global capability ACL (typically loaded from world_root.refs.global_acl_cid).
+    global_capability_acl: Arc<RwLock<Option<CompiledCapabilityAcl>>>,
+    /// Source marker for currently loaded global capability ACL.
+    global_capability_acl_source: Arc<RwLock<Option<String>>>,
+    /// Compiled capability ACL cache keyed by ACL CID.
+    capability_acl_cache: Arc<RwLock<HashMap<String, CompiledCapabilityAcl>>>,
     /// Authored world directory used to unlock sealed actor bundles.
     unlock_world_dir: Arc<RwLock<Option<PathBuf>>>,
     /// Path to world master key file for encrypted state save/load.
@@ -466,6 +471,13 @@ struct PersistedWorldEnvelope {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct ObjectDefinitionDoc {
+    kind: String,
+    version: u32,
+    definition: ObjectDefinition,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct RoomAclDoc {
     kind: String,
     version: u32,
@@ -629,6 +641,9 @@ impl World {
             world_did_root: Arc::new(RwLock::new(None)),
             world_did: Arc::new(RwLock::new(None)),
             unlocked: Arc::new(RwLock::new(false)),
+            global_capability_acl: Arc::new(RwLock::new(None)),
+            global_capability_acl_source: Arc::new(RwLock::new(None)),
+            capability_acl_cache: Arc::new(RwLock::new(HashMap::new())),
             unlock_world_dir: Arc::new(RwLock::new(None)),
             world_master_key_path: Arc::new(RwLock::new(None)),
             unlocked_world_master_key: Arc::new(RwLock::new(None)),
@@ -688,6 +703,31 @@ impl World {
             return Vec::new();
         };
         room_map.values().map(|obj| obj.name.clone()).collect()
+    }
+
+    async fn room_object_did_map(&self, room_name: &str) -> HashMap<String, String> {
+        let world_root = self
+            .local_world_did_root()
+            .await
+            .unwrap_or_else(|| "did:ma:unconfigured".to_string());
+        let objects = self.room_objects.read().await;
+        let Some(room_map) = objects.get(room_name) else {
+            return HashMap::new();
+        };
+
+        let mut out = HashMap::new();
+        for object in room_map.values() {
+            let object_did = format!("{}#{}", world_root, object.id);
+            out.insert(object.id.to_ascii_lowercase(), object_did.clone());
+            out.insert(object.name.to_ascii_lowercase(), object_did.clone());
+            for alias in &object.aliases {
+                let token = alias.trim().trim_start_matches('@').to_ascii_lowercase();
+                if !token.is_empty() {
+                    out.insert(token, object_did.clone());
+                }
+            }
+        }
+        out
     }
 
     async fn resolve_room_object_id(&self, room_name: &str, target: &str) -> Option<String> {
@@ -792,6 +832,107 @@ impl World {
             .as_ref()
             .map(|owner| owner == caller_root_did)
             .unwrap_or(false)
+    }
+
+    async fn load_global_capability_acl_from_cid(&self, acl_cid: &str) -> Result<()> {
+        let compiled = self.load_compiled_acl_from_cid_cached(acl_cid).await?;
+        *self.global_capability_acl.write().await = Some(compiled);
+        *self.global_capability_acl_source.write().await = Some(acl_cid.to_string());
+        Ok(())
+    }
+
+    async fn load_compiled_acl_from_cid_cached(&self, acl_cid: &str) -> Result<CompiledCapabilityAcl> {
+        if let Some(cached) = self.capability_acl_cache.read().await.get(acl_cid).cloned() {
+            return Ok(cached);
+        }
+
+        let kubo_url = self.kubo_url().await;
+        let raw = kubo::cat_cid(&kubo_url, acl_cid)
+            .await
+            .map_err(|e| anyhow!("failed loading capability ACL {}: {}", acl_cid, e))?;
+        let acl = parse_capability_acl_text(&raw, acl_cid)?;
+        let compiled = compile_acl(&acl, acl_cid)?;
+
+        self.capability_acl_cache
+            .write()
+            .await
+            .insert(acl_cid.to_string(), compiled.clone());
+
+        Ok(compiled)
+    }
+
+    async fn object_capability_allowed(
+        &self,
+        room_name: &str,
+        object_id: &str,
+        caller_root_did: &str,
+        capability: &str,
+    ) -> Result<bool> {
+        let (object_owner, object_state) = {
+            let objects = self.room_objects.read().await;
+            let Some(room_map) = objects.get(room_name) else {
+                return Ok(false);
+            };
+            let Some(object) = room_map.get(object_id) else {
+                return Ok(false);
+            };
+            (object.owner_did.clone(), object.state.clone())
+        };
+
+        let world_owner = self.owner_did.read().await.clone();
+
+        let global_match = {
+            let global_acl = self.global_capability_acl.read().await;
+            match global_acl.as_ref() {
+                None => true,
+                Some(acl) => evaluate_compiled_acl_with_owner(
+                    acl,
+                    caller_root_did,
+                    world_owner.as_deref(),
+                    capability,
+                ),
+            }
+        };
+        if !global_match {
+            return Ok(false);
+        }
+
+        let local_acl_cid = object_state
+            .as_object()
+            .and_then(|obj| {
+                obj.get("acl_cid")
+                    .or_else(|| obj.get("capabilities_acl_cid"))
+            })
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|cid| !cid.is_empty())
+            .map(str::to_string);
+
+        let local_match = if let Some(acl_cid) = local_acl_cid {
+            let compiled_local = self.load_compiled_acl_from_cid_cached(&acl_cid).await?;
+            evaluate_compiled_acl_with_owner(
+                &compiled_local,
+                caller_root_did,
+                object_owner.as_deref(),
+                capability,
+            )
+        } else {
+            let local_acl = parse_object_local_capability_acl(&object_state)?;
+            match local_acl.as_ref() {
+                None => true,
+                Some(acl) => {
+                    let compiled_local = compile_acl(acl, "object-local-acl")?;
+                    evaluate_compiled_acl_with_owner(
+                        &compiled_local,
+                        caller_root_did,
+                        object_owner.as_deref(),
+                        capability,
+                    )
+                }
+            }
+        };
+
+        Ok(local_match)
     }
 
     pub async fn kubo_url(&self) -> String {
@@ -966,8 +1107,26 @@ impl World {
             .without_fragment()
             .id();
 
-        *self.world_did_root.write().await = Some(root);
+        *self.world_did_root.write().await = Some(root.clone());
         *self.world_did.write().await = Some(world_did.to_string());
+
+        // Keep runtime rooms aligned with the configured world DID root.
+        // This fixes stale values like did:ma:unconfigured#lobby created before DID bootstrap.
+        {
+            let mut rooms = self.rooms.write().await;
+            for (room_name, room) in rooms.iter_mut() {
+                room.did = format!("{}#{}", root, room_name);
+            }
+        }
+
+        // Bootstrap owner identity from the world DID root when owner has not
+        // been explicitly restored yet (e.g. first boot or missing runtime state).
+        // This keeps entry ACL policy-driven while avoiding owner lockout.
+        let owner_missing = self.owner_did.read().await.is_none();
+        if owner_missing {
+            *self.owner_did.write().await = Some(root.clone());
+            self.allow_entry_did(&root).await;
+        }
 
         Ok(())
     }
@@ -1121,19 +1280,39 @@ impl World {
     }
 
     pub async fn can_enter(&self, did: &Did) -> bool {
-        // World owner always has world-level access.
-        if self.is_world_owner(&did.without_fragment().id()).await {
-            return true;
-        }
+        let did_root = did.without_fragment().id();
+        // Entry decisions are ACL-driven only.
         let acl = self.entry_acl.read().await;
         if acl.allow_all {
             return true;
         }
-        acl.allowed_dids.contains(&did.without_fragment().id())
+        if acl.allow_owner
+            && self
+                .owner_did
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|owner| owner == &did_root)
+        {
+            return true;
+        }
+        acl.allowed_dids.contains(&did_root)
     }
 
     pub async fn entry_acl_source(&self) -> String {
         self.entry_acl.read().await.source.clone()
+    }
+
+    pub async fn entry_acl_debug(&self) -> (bool, bool, usize, Option<String>, String) {
+        let acl = self.entry_acl.read().await;
+        let owner = self.owner_did.read().await.clone();
+        (
+            acl.allow_all,
+            acl.allow_owner,
+            acl.allowed_dids.len(),
+            owner,
+            acl.source.clone(),
+        )
     }
 
     pub async fn is_private_world(&self) -> bool {
@@ -1143,6 +1322,7 @@ impl World {
     pub async fn set_private_world(&self, enabled: bool) {
         let mut acl = self.entry_acl.write().await;
         acl.allow_all = !enabled;
+        acl.allow_owner = true;
         if enabled {
             acl.source = "runtime:private".to_string();
         } else {
@@ -1170,6 +1350,152 @@ impl World {
         Did::try_from(target_did_raw)
             .map(|did| did.without_fragment().id())
             .map_err(|err| format!("invalid DID '{}': {}", target_did_raw, err))
+    }
+
+    fn lookup_object_print_verb(
+        object: &ObjectRuntimeState,
+        verb: &str,
+        sender_locale: &str,
+    ) -> Option<String> {
+        let verbs = object.definition.as_ref().map(|def| &def.verbs)?;
+
+        let needle = verb.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return None;
+        }
+
+        let sender = sender_locale.trim().to_ascii_lowercase();
+        let sender_base = sender
+            .split('-')
+            .next()
+            .unwrap_or(sender.as_str())
+            .to_string();
+
+        let mut best: Option<(u8, String)> = None;
+
+        for entry in verbs {
+            let name_matches = entry.name.trim().eq_ignore_ascii_case(needle.as_str());
+            let alias_matches = entry
+                .aliases
+                .iter()
+                .any(|value| value.trim().eq_ignore_ascii_case(needle.as_str()));
+
+            if !name_matches && !alias_matches {
+                continue;
+            }
+
+            let evaluator_name = entry.evaluator.name.trim().to_ascii_lowercase();
+            let evaluator_type = entry.evaluator.evaluator_type.trim().to_ascii_lowercase();
+            let evaluator_ok = (evaluator_type == "built-in" || evaluator_type == "builtin")
+                && matches!(evaluator_name.as_str(), "print" | "output" | "printf" | "format");
+
+            if !evaluator_ok {
+                continue;
+            }
+
+            let Some(content) = entry.content.clone() else {
+                continue;
+            };
+
+            let score = match entry.lang.as_deref() {
+                None => 1,
+                Some(lang_raw) => {
+                    let lang = lang_raw.trim().to_ascii_lowercase();
+                    let lang_base = lang.split('-').next().unwrap_or(lang.as_str()).to_string();
+                    if !sender.is_empty() && sender == lang {
+                        3
+                    } else if !sender.is_empty()
+                        && (sender.starts_with(&(lang.clone() + "-"))
+                            || lang.starts_with(&(sender_base.clone() + "-"))
+                            || sender_base == lang_base)
+                    {
+                        2
+                    } else {
+                        0
+                    }
+                }
+            };
+
+            if score == 0 {
+                continue;
+            }
+
+            match &best {
+                Some((best_score, _)) if *best_score >= score => {}
+                _ => best = Some((score, content)),
+            }
+        }
+
+        best.map(|(_, content)| content)
+    }
+
+    fn parse_object_definition_text(raw: &str, cid: &str) -> Result<ObjectDefinition> {
+        if let Ok(doc) = serde_yaml::from_str::<ObjectDefinitionDoc>(raw) {
+            if doc.kind == "ma_object_definition" && doc.version == 1 {
+                return Ok(doc.definition);
+            }
+        }
+        if let Ok(doc) = serde_json::from_str::<ObjectDefinitionDoc>(raw) {
+            if doc.kind == "ma_object_definition" && doc.version == 1 {
+                return Ok(doc.definition);
+            }
+        }
+        if let Ok(def) = serde_yaml::from_str::<ObjectDefinition>(raw) {
+            return Ok(def);
+        }
+        if let Ok(def) = serde_json::from_str::<ObjectDefinition>(raw) {
+            return Ok(def);
+        }
+        Err(anyhow!(
+            "unsupported object definition format at CID {}",
+            cid
+        ))
+    }
+
+    async fn load_object_definition_from_cid(&self, definition_cid: &str) -> Result<ObjectDefinition> {
+        let kubo_url = self.kubo_url().await;
+        let raw = kubo::cat_cid(&kubo_url, definition_cid).await
+            .map_err(|e| anyhow!("failed to load object definition {}: {}", definition_cid, e))?;
+        Self::parse_object_definition_text(&raw, definition_cid)
+    }
+
+    async fn hydrate_object_definition_by_cid(
+        &self,
+        room_name: &str,
+        object_id: &str,
+    ) -> Result<()> {
+        let cid_to_load = {
+            let objects = self.room_objects.read().await;
+            let Some(room_map) = objects.get(room_name) else {
+                return Ok(());
+            };
+            let Some(object) = room_map.get(object_id) else {
+                return Ok(());
+            };
+            if object.definition.is_some() {
+                return Ok(());
+            }
+            object.definition_cid.clone()
+        };
+
+        let Some(definition_cid) = cid_to_load else {
+            return Ok(());
+        };
+
+        let definition = self.load_object_definition_from_cid(&definition_cid).await?;
+
+        let mut objects = self.room_objects.write().await;
+        if let Some(room_map) = objects.get_mut(room_name) {
+            if let Some(object) = room_map.get_mut(object_id) {
+                if object.definition.is_none()
+                    && object.definition_cid.as_deref() == Some(definition_cid.as_str())
+                {
+                    object.definition = Some(definition);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn enqueue_knock(
@@ -1442,6 +1768,10 @@ impl World {
                         let mut loaded_acl = acl_doc.acl;
                         loaded_acl.owner = owner_doc.owner_did;
                         loaded_acl.owner_assertion_key = owner_doc.owner_assertion_key;
+                        if let Some(owner) = loaded_acl.owner.clone() {
+                            loaded_acl.allow.insert(owner.clone());
+                            loaded_acl.deny.remove(&owner);
+                        }
                         loaded_room.acl = loaded_acl;
                         {
                             let mut rooms = self.rooms.write().await;
@@ -2059,6 +2389,7 @@ impl World {
             .map_err(|e| anyhow!("invalid owner DID '{}': {}", did_raw, e))?;
         let root = parsed.without_fragment().id();
         *self.owner_did.write().await = Some(root.clone());
+        self.allow_entry_did(&root).await;
         info!("World owner set to {}", root);
         Ok(root)
     }
@@ -2340,6 +2671,10 @@ impl World {
                 .get(&room_id)
                 .cloned()
                 .unwrap_or_else(RoomAcl::open);
+            if let Some(owner) = room.acl.owner.clone() {
+                room.acl.allow.insert(owner.clone());
+                room.acl.deny.remove(&owner);
+            }
             room.descriptions = room_doc.descriptions;
 
             for avatar_doc in room_doc.avatars {
@@ -2370,6 +2705,24 @@ impl World {
             let mut entries = HashMap::new();
             for mut object in object_list {
                 object.clear_expired_lock(Utc::now().timestamp().max(0) as u64);
+                if object.definition.is_none() {
+                    if let Some(definition_cid) = object.definition_cid.as_deref() {
+                        match self.load_object_definition_from_cid(definition_cid).await {
+                            Ok(definition) => {
+                                object.definition = Some(definition);
+                            }
+                            Err(err) => {
+                                warn!(
+                                    "failed to hydrate object definition from CID {} for object '{}' in room '{}': {}",
+                                    definition_cid,
+                                    object.id,
+                                    room_id,
+                                    err
+                                );
+                            }
+                        }
+                    }
+                }
                 entries.insert(object.id.clone(), object);
             }
             next_room_objects.insert(room_id, entries);
@@ -2382,7 +2735,11 @@ impl World {
         *self.next_room_event_sequence.write().await = state.next_room_event_sequence;
         *self.handle_to_did.write().await = state.handle_to_did;
         *self.did_to_handle.write().await = state.did_to_handle;
-        *self.owner_did.write().await = state.owner_did;
+        let loaded_owner_did = state.owner_did;
+        *self.owner_did.write().await = loaded_owner_did.clone();
+        if let Some(owner) = loaded_owner_did {
+            self.allow_entry_did(&owner).await;
+        }
         *self.room_cids.write().await = state.room_cids;
         *self.state_cid.write().await = Some(state_cid.to_string());
 
@@ -2499,7 +2856,7 @@ impl World {
 
                 if let Some(resolved_target) = shortcut_target {
                     if let Some(result) = self
-                        .handle_room_object_command(room_name, from, from_did, &resolved_target, command.clone())
+                        .handle_object_method(room_name, from, from_did, sender_locale, &resolved_target, command.clone())
                         .await
                     {
                         return result;
@@ -2512,7 +2869,7 @@ impl World {
 
                 if !actor_exists {
                     if let Some(result) = self
-                        .handle_room_object_command(room_name, from, from_did, target, command.clone())
+                        .handle_object_method(room_name, from, from_did, sender_locale, target, command.clone())
                         .await
                     {
                         return result;
@@ -2534,11 +2891,12 @@ impl World {
         }
     }
 
-    async fn handle_room_object_command(
+    async fn handle_object_method(
         &self,
         room_name: &str,
         from: &str,
         from_did: &Did,
+        sender_locale: &str,
         target: &str,
         command: ActorCommand,
     ) -> Option<(String, String)> {
@@ -2567,6 +2925,18 @@ impl World {
             }
             object_id
         };
+
+        if let Err(err) = self
+            .hydrate_object_definition_by_cid(room_name, &object_id)
+            .await
+        {
+            warn!(
+                "failed to hydrate object definition for '{}' in room '{}': {}",
+                object_id,
+                room_name,
+                err
+            );
+        }
 
         let object_label = {
             let objects = self.room_objects.read().await;
@@ -2599,6 +2969,52 @@ impl World {
 
         let mut parts = trimmed.split_whitespace();
         let verb = parts.next().unwrap_or("help").to_ascii_lowercase();
+
+        let cap_verb = match verb.as_str() {
+            "pickup" | "hold" => "take",
+            "status" | "look" => "show",
+            other => other,
+        };
+        let required_capability = if matches!(cap_verb, "help" | "show") {
+            format!("object.{}.read", object_id)
+        } else {
+            format!("object.{}.method.{}.invoke", object_id, cap_verb)
+        };
+
+        match self
+            .object_capability_allowed(room_name, &object_id, &caller_root, &required_capability)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return Some((
+                    format!("access denied for capability '{}'", required_capability),
+                    room_name.to_string(),
+                ));
+            }
+            Err(err) => {
+                warn!(
+                    "object ACL evaluation failed for '{}' in room '{}': {}",
+                    object_id,
+                    room_name,
+                    err
+                );
+                return Some((
+                    "access denied (invalid ACL policy)".to_string(),
+                    room_name.to_string(),
+                ));
+            }
+        }
+
+        let declarative = {
+            let objects = self.room_objects.read().await;
+            let room_map = objects.get(room_name)?;
+            let object = room_map.get(&object_id)?;
+            Self::lookup_object_print_verb(object, &verb, sender_locale)
+        };
+        if let Some(output) = declarative {
+            return Some((output, room_name.to_string()));
+        }
 
         if verb == "help" || verb == "show" || verb == "status" || verb == "look" {
             let (device_name, device_kind, object_did, definition_cid, holder, opened_by, durable, persistence, durable_inbox_messages, ephemeral_inbox_messages, outbound_messages) = {
@@ -3011,14 +3427,14 @@ impl World {
                 let trimmed = command.trim();
 
                 if let Some(rest) = trimmed.strip_prefix("use ") {
-                    let Some((did_raw, alias_raw)) = rest.split_once(" as ") else {
+                    let Some((target_raw, alias_raw)) = rest.split_once(" as ") else {
                         return (
                             "usage: use <did:ma:...#object> as @alias".to_string(),
                             room_name.to_string(),
                         );
                     };
 
-                    let did_value = did_raw.trim();
+                    let target_value = target_raw.trim();
                     let alias = alias_raw.trim();
                     if !alias.starts_with('@') {
                         return (
@@ -3027,21 +3443,32 @@ impl World {
                         );
                     }
 
-                    let object_did = match Did::try_from(did_value) {
-                        Ok(value) => value,
+                    let object_did = match Did::try_from(target_value) {
+                        Ok(did) => did,
                         Err(err) => {
                             return (
-                                format!("invalid object DID '{}': {}", did_value, err),
+                                format!("invalid object DID '{}': {}", target_value, err),
                                 room_name.to_string(),
                             );
                         }
                     };
+
+                    let root = object_did.without_fragment().id();
+                    if !self.is_local_world_root(&root).await {
+                        return (
+                            format!("object DID '{}' is not in this world", object_did.id()),
+                            room_name.to_string(),
+                        );
+                    }
+
                     let Some(object_id) = object_did.fragment.clone() else {
                         return (
                             format!("object DID '{}' is missing #fragment", object_did.id()),
                             room_name.to_string(),
                         );
                     };
+
+                    let object_did_id = object_did.id();
 
                     let object_exists_here = {
                         let objects = self.room_objects.read().await;
@@ -3079,7 +3506,7 @@ impl World {
                         format!(
                             "bound {} -> {} (object_id={}) shortcuts=[{}]",
                             alias,
-                            object_did.id(),
+                            object_did_id,
                             object_id,
                             shortcuts_summary
                         ),
@@ -3761,6 +4188,9 @@ impl World {
                     let Some(room) = rooms.get_mut(&room_name_arg) else {
                         return format!("@world room '{}' not found", room_name_arg);
                     };
+                    if room.acl.owner.as_deref() == Some(target_root.as_str()) {
+                        return format!("@world room '{}' owner cannot be denied", room_name_arg);
+                    }
                     room.acl.deny.insert(target_root.clone());
                     room.acl.allow.remove(&target_root);
                     drop(rooms);
@@ -3880,10 +4310,14 @@ impl World {
             RoomActorAction::Deny { did } => {
                 let mut rooms = self.rooms.write().await;
                 if let Some(room) = rooms.get_mut(room_name) {
-                    room.acl.deny.insert(did.clone());
-                    room.acl.allow.remove(&did);
-                    room.avatars.retain(|_, av| av.agent_did.without_fragment().id() != did);
-                    changed_rooms.push(room_name.to_string());
+                    if room.acl.owner.as_deref() == Some(did.as_str()) {
+                        response = "@here owner cannot be denied".to_string();
+                    } else {
+                        room.acl.deny.insert(did.clone());
+                        room.acl.allow.remove(&did);
+                        room.avatars.retain(|_, av| av.agent_did.without_fragment().id() != did);
+                        changed_rooms.push(room_name.to_string());
+                    }
                 }
             }
             RoomActorAction::Kick { handle } => {
@@ -3904,7 +4338,9 @@ impl World {
                         };
                         let mut rooms = self.rooms.write().await;
                         if let Some(room) = rooms.get_mut(room_name) {
-                            room.acl.owner = Some(did);
+                            room.acl.owner = Some(did.clone());
+                            room.acl.allow.insert(did.clone());
+                            room.acl.deny.remove(&did);
                             changed_rooms.push(room_name.to_string());
                         }
                     }
@@ -4357,6 +4793,7 @@ impl WorldProtocol {
                     room_title: String::new(),
                     room_did: String::new(),
                     avatars: Vec::new(),
+                    room_object_dids: HashMap::new(),
                     transport_ack: Some(TransportAck {
                         lane: self.lane.label().to_string(),
                         code: ack_code,
@@ -4475,6 +4912,7 @@ impl WorldProtocol {
                     room_title: String::new(),
                     room_did: String::new(),
                     avatars: Vec::new(),
+                    room_object_dids: HashMap::new(),
                     transport_ack: None,
                 })
             }
@@ -4504,6 +4942,8 @@ impl WorldProtocol {
                 let room = room.unwrap_or_else(|| DEFAULT_ROOM.to_string());
                 let root_did = sender_did.without_fragment();
                 if !self.world.can_enter(&root_did).await {
+                    let (allow_all, allow_owner, allow_count, owner_did, acl_source) =
+                        self.world.entry_acl_debug().await;
                     let (knock_id, duplicate) = self
                         .world
                         .enqueue_knock(
@@ -4515,15 +4955,25 @@ impl WorldProtocol {
                         .await;
                     let detail = if duplicate {
                         format!(
-                            "entry denied by ACL for {}; existing knock request id={} is pending",
+                            "entry denied by ACL for {}; existing knock request id={} is pending (acl_source='{}' allow_all={} allow_owner={} allow_count={} owner_did={})",
                             root_did.id(),
-                            knock_id
+                            knock_id,
+                            acl_source,
+                            allow_all,
+                            allow_owner,
+                            allow_count,
+                            owner_did.unwrap_or_else(|| "(none)".to_string())
                         )
                     } else {
                         format!(
-                            "entry denied by ACL for {}; knock request queued with id={}",
+                            "entry denied by ACL for {}; knock request queued with id={} (acl_source='{}' allow_all={} allow_owner={} allow_count={} owner_did={})",
                             root_did.id(),
-                            knock_id
+                            knock_id,
+                            acl_source,
+                            allow_all,
+                            allow_owner,
+                            allow_count,
+                            owner_did.unwrap_or_else(|| "(none)".to_string())
                         )
                     };
                     return Ok(WorldResponse {
@@ -4539,6 +4989,7 @@ impl WorldProtocol {
                         room_title: String::new(),
                         room_did: String::new(),
                         avatars: Vec::new(),
+                        room_object_dids: HashMap::new(),
                         transport_ack: Some(TransportAck {
                             lane: self.lane.label().to_string(),
                             code: TransportAckCode::Rejected,
@@ -4568,6 +5019,7 @@ impl WorldProtocol {
                     room_title: self.world.room_title(&room).await,
                     room_did: self.world.room_did(&room).await,
                     avatars: self.world.room_avatars(&room).await,
+                    room_object_dids: self.world.room_object_did_map(&room).await,
                     transport_ack: None,
                 })
             }
@@ -4617,13 +5069,14 @@ impl WorldProtocol {
                     room_title: self.world.room_title(&effective_room).await,
                     room_did: self.world.room_did(&effective_room).await,
                     avatars: self.world.room_avatars(&effective_room).await,
-                    room: effective_room,
+                    room: effective_room.clone(),
                     message,
                     endpoint_id: self.endpoint_id.clone(),
                     latest_event_sequence,
                     broadcasted,
                     events: Vec::new(),
                     handle: String::new(),
+                    room_object_dids: self.world.room_object_did_map(&effective_room).await,
                     transport_ack: None,
                 })
             }
@@ -4645,6 +5098,7 @@ impl WorldProtocol {
                     room_title: self.world.room_title(&room).await,
                     room_did: self.world.room_did(&room).await,
                     avatars: self.world.room_avatars(&room).await,
+                    room_object_dids: self.world.room_object_did_map(&room).await,
                     transport_ack: None,
                 })
             }
@@ -4693,6 +5147,7 @@ impl ProtocolHandler for WorldProtocol {
                     room_title: String::new(),
                     room_did: String::new(),
                     avatars: Vec::new(),
+                    room_object_dids: HashMap::new(),
                     transport_ack: Some(TransportAck {
                         lane: self.lane.label().to_string(),
                         code: TransportAckCode::InvalidRequestJson,
@@ -4714,290 +5169,6 @@ impl ProtocolHandler for WorldProtocol {
     }
 }
 
-fn print_cli_help() {
-    println!("ma-world");
-    println!();
-    println!("Usage:");
-    println!("  ma-world [COMMAND] [OPTIONS]");
-    println!();
-    println!("Commands:");
-    println!("  run                 Start ma-world server (default when no command is provided)");
-    println!("  --gen-iroh-secret   Generate iroh secret file (32 random bytes) and exit");
-    println!("  validate-world      Validate authored world schema files");
-    println!("  check-kubo-keys     Verify required Kubo key names exist");
-    println!("  ensure-kubo-keys    Create missing required Kubo keys");
-    println!("  check-kubo-ipns     Preflight dag/put + IPNS name/publish health check");
-    println!("  publish-world       Publish authored world DAG and optional IPNS records");
-    println!();
-    println!("Global flags:");
-    println!("  -h, --help          Show this help text and exit");
-    println!("  --gen-iroh-secret [path]  Create iroh secret and exit");
-    println!("                           default path source: runtime config iroh_secret, else XDG data path");
-    println!("                           supports: --world-slug <slug>");
-    println!();
-    println!("publish-world options:");
-    println!("  --skip-ipns");
-    println!("  --allow-partial-ipns");
-    println!("  --ipns-timeout-ms <ms>");
-    println!("  --ipns-retries <n>");
-    println!("  --ipns-backoff-ms <ms>");
-    println!();
-    println!("run options (server mode):");
-    println!("  --world-slug <slug>    Required world slug (e.g. panteia)");
-    println!("  --listen <ip:port>");
-    println!("  --kubo-url <url>");
-    println!("  --cid <cid>            Override actor web CID for this run");
-    println!("  --log-level <level>    Log level: trace, debug, info (default), warn, error");
-    println!("  --log-file <path>      Write logs to file (appends to existing file)");
-    println!("  runtime config file:   $XDG_CONFIG_HOME/ma/<slug>.yaml (or ~/.config/ma/<slug>.yaml)");
-    println!("  iroh secret default:   $XDG_DATA_HOME/ma/iroh_<slug>_secret.bin");
-    println!();
-    println!("Environment variables:");
-    println!("  MA_KUBO_API_URL               Kubo API URL");
-    println!("  MA_LISTEN                     HTTP status listen socket");
-    println!("  MA_LOG_LEVEL                  Log level for 'run' command");
-    println!("  MA_LOG_FILE                   Log file path for 'run' command");
-    println!();
-    println!("Precedence (highest to lowest): CLI args > runtime config file > env vars > defaults");
-}
-
-#[derive(Clone, Debug, Deserialize, Default)]
-struct RuntimeFileConfig {
-    #[serde(default)]
-    kubo_api_url: Option<String>,
-    #[serde(default)]
-    listen: Option<String>,
-    #[serde(default)]
-    iroh_secret: Option<String>,
-    #[serde(default)]
-    log_level: Option<String>,
-    #[serde(default)]
-    log_file: Option<String>,
-    #[serde(default)]
-    actor_web_version: Option<String>,
-    #[serde(default)]
-    actor_web_cid: Option<String>,
-    #[serde(default)]
-    actor_web_dir: Option<String>,
-    #[serde(default)]
-    actor_web_listen: Option<String>,
-    #[serde(default)]
-    actor_web_cache_dir: Option<String>,
-    #[serde(default)]
-    actor_web_ipns_key: Option<String>,
-    #[serde(default)]
-    actor_web_auto_build: Option<bool>,
-    #[serde(default)]
-    actor_web_auto_publish_ipns: Option<bool>,
-}
-
-fn xdg_config_home() -> PathBuf {
-    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
-        return PathBuf::from(path);
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".config");
-    }
-    PathBuf::from(".config")
-}
-
-fn xdg_data_home() -> PathBuf {
-    if let Some(path) = std::env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(path);
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".local").join("share");
-    }
-    PathBuf::from(".local").join("share")
-}
-
-fn runtime_config_path(world_slug: &str) -> PathBuf {
-    xdg_config_home()
-        .join("ma")
-        .join(format!("{}.yaml", world_slug))
-}
-
-fn runtime_iroh_secret_default_path(world_slug: &str) -> PathBuf {
-    xdg_data_home()
-        .join("ma")
-        .join(format!("iroh_{}_secret.bin", world_slug))
-}
-
-fn default_workspace_actor_web_dir() -> Option<PathBuf> {
-    let candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(|p| p.join("ma-actor").join("www"));
-    candidate.filter(|dir| dir.exists() && dir.is_dir())
-}
-
-fn resolve_actor_web_source_dir(runtime_cfg: &RuntimeFileConfig) -> Option<PathBuf> {
-    if let Some(dir) = runtime_cfg
-        .actor_web_dir
-        .clone()
-        .map(PathBuf::from)
-        .filter(|dir| dir.exists() && dir.is_dir())
-    {
-        return Some(dir);
-    }
-    default_workspace_actor_web_dir()
-}
-
-fn package_actor_web_directory(source_dir: &Path) -> Result<Vec<u8>> {
-    let index = source_dir.join("index.html");
-    if !index.exists() {
-        return Err(anyhow!(
-            "actor web source dir {} is missing index.html",
-            source_dir.display()
-        ));
-    }
-
-    let mut cursor = Cursor::new(Vec::new());
-    {
-        let mut tar_builder = tar::Builder::new(&mut cursor);
-        tar_builder
-            .append_dir_all(".", source_dir)
-            .map_err(|e| anyhow!("failed creating actor web archive from {}: {}", source_dir.display(), e))?;
-        tar_builder
-            .finish()
-            .map_err(|e| anyhow!("failed finalizing actor web archive from {}: {}", source_dir.display(), e))?;
-    }
-    Ok(cursor.into_inner())
-}
-
-async fn ensure_kubo_key_exists(kubo_url: &str, key_name: &str) -> Result<()> {
-    let key_names = list_kubo_key_names(kubo_url).await?;
-    if key_names.iter().any(|name| name == key_name) {
-        return Ok(());
-    }
-    generate_kubo_key(kubo_url, key_name).await
-}
-
-async fn publish_actor_web_from_dir(
-    kubo_url: &str,
-    source_dir: &Path,
-    ipns_key_name: Option<&str>,
-) -> Result<String> {
-    let archive = package_actor_web_directory(source_dir)?;
-    let cid = ipfs_add(kubo_url, archive).await?;
-
-    if let Some(key_name) = ipns_key_name {
-        ensure_kubo_key_exists(kubo_url, key_name).await?;
-        let options = IpnsPublishOptions::default();
-        ipns_publish_with_retry(
-            kubo_url,
-            key_name,
-            &cid,
-            &options,
-            3,
-            Duration::from_millis(500),
-        )
-        .await?;
-    }
-
-    Ok(cid)
-}
-
-async fn materialize_actor_web_from_cid(kubo_url: &str, cid: &str, cache_root: &Path) -> Result<PathBuf> {
-    fs::create_dir_all(cache_root).map_err(|e| {
-        anyhow!(
-            "failed creating actor web cache root {}: {}",
-            cache_root.display(),
-            e
-        )
-    })?;
-
-    let cid_clean = cid.trim();
-    if cid_clean.is_empty() {
-        return Err(anyhow!("actor web cid is empty"));
-    }
-
-    let stage_dir = cache_root.join(format!(".stage-{}-{}", cid_clean, nanoid!(8)));
-    let target_dir = cache_root.join(cid_clean);
-    fs::create_dir_all(&stage_dir)
-        .map_err(|e| anyhow!("failed creating actor web stage dir {}: {}", stage_dir.display(), e))?;
-
-    let base = kubo_url.trim_end_matches('/');
-    let url = format!(
-        "{}/api/v0/get?arg={}&archive=true&compress=false",
-        base, cid_clean
-    );
-    let response = reqwest::Client::new()
-        .post(&url)
-        .send()
-        .await
-        .map_err(|e| anyhow!("failed downloading actor web cid {}: {}", cid_clean, e))?
-        .error_for_status()
-        .map_err(|e| anyhow!("failed downloading actor web cid {}: {}", cid_clean, e))?;
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| anyhow!("failed reading actor web archive for {}: {}", cid_clean, e))?;
-
-    let mut archive = tar::Archive::new(Cursor::new(bytes));
-    archive
-        .unpack(&stage_dir)
-        .map_err(|e| anyhow!("failed unpacking actor web archive for {}: {}", cid_clean, e))?;
-
-    let extracted_root = find_index_html_root(&stage_dir)
-        .ok_or_else(|| anyhow!("actor web archive for {} does not contain index.html", cid_clean))?;
-
-    if target_dir.exists() {
-        fs::remove_dir_all(&target_dir)
-            .map_err(|e| anyhow!("failed clearing actor web cache {}: {}", target_dir.display(), e))?;
-    }
-
-    if extracted_root == stage_dir {
-        fs::rename(&stage_dir, &target_dir).map_err(|e| {
-            anyhow!(
-                "failed moving actor web stage {} -> {}: {}",
-                stage_dir.display(),
-                target_dir.display(),
-                e
-            )
-        })?;
-    } else {
-        fs::rename(&extracted_root, &target_dir).map_err(|e| {
-            anyhow!(
-                "failed moving actor web dir {} -> {}: {}",
-                extracted_root.display(),
-                target_dir.display(),
-                e
-            )
-        })?;
-        let _ = fs::remove_dir_all(&stage_dir);
-    }
-
-    Ok(target_dir)
-}
-
-fn find_index_html_root(dir: &Path) -> Option<PathBuf> {
-    let candidate = dir.join("index.html");
-    if candidate.exists() {
-        return Some(dir.to_path_buf());
-    }
-
-    let entries = fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if let Some(found) = find_index_html_root(&path) {
-                return Some(found);
-            }
-        }
-    }
-
-    None
-}
-
-fn load_runtime_file_config(path: &Path) -> Result<RuntimeFileConfig> {
-    if !path.exists() {
-        return Ok(RuntimeFileConfig::default());
-    }
-    let raw = fs::read_to_string(path)
-        .map_err(|e| anyhow!("failed reading runtime config {}: {}", path.display(), e))?;
-    serde_yaml::from_str::<RuntimeFileConfig>(&raw)
-        .map_err(|e| anyhow!("invalid runtime config {}: {}", path.display(), e))
-}
 
 fn derive_world_master_key(secret_key: &SecretKey, world_slug: &str) -> [u8; 32] {
     // Deterministic per-world key derived from machine-local iroh identity.
@@ -5124,42 +5295,6 @@ async fn resolve_world_root_cid_from_did_inline(kubo_url: &str, world_did: &str)
         return Ok(None);
     }
     Ok(Some(value.to_string()))
-}
-
-async fn resolve_key_id_by_name(kubo_url: &str, key_name: &str) -> Result<String> {
-    let key_name = key_name.trim();
-    if key_name.is_empty() {
-        return Err(anyhow!("kubo key name must not be empty"));
-    }
-
-    let keys = list_kubo_keys(kubo_url).await?;
-    keys.into_iter()
-        .find(|key| key.name == key_name)
-        .map(|key| key.id)
-        .filter(|id| !id.trim().is_empty())
-        .ok_or_else(|| anyhow!("kubo key '{}' exists but has no usable id", key_name))
-}
-
-async fn resolve_actor_web_cid_from_ipns_key(kubo_url: &str, key_name: &str) -> Result<Option<String>> {
-    let key_name = key_name.trim();
-    if key_name.is_empty() {
-        return Ok(None);
-    }
-
-    let key_id = match resolve_key_id_by_name(kubo_url, key_name).await {
-        Ok(id) => id,
-        Err(_) => return Ok(None),
-    };
-    let resolved = name_resolve(kubo_url, &format!("/ipns/{}", key_id), true).await?;
-    let Some(rest) = resolved.strip_prefix("/ipfs/") else {
-        return Ok(None);
-    };
-    let cid = rest.split('/').next().unwrap_or_default().trim();
-    if cid.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(cid.to_string()))
-    }
 }
 
 async fn publish_world_did_runtime_ma(
@@ -6167,8 +6302,12 @@ async fn main() -> Result<()> {
     let runtime_cfg_path = runtime_config_path(&world_slug);
     let runtime_cfg = load_runtime_file_config(&runtime_cfg_path)?;
     let authored_world_dir = default_world_dir(&world_slug);
-    let authored_actor_web = load_world_authoring(&authored_world_dir)
-        .ok()
+    let authored_world = load_world_authoring(&authored_world_dir).ok();
+    let authored_global_acl_cid = authored_world
+        .as_ref()
+        .and_then(|loaded| loaded.world_root.refs.global_acl_cid.clone())
+        .filter(|cid| !cid.trim().is_empty());
+    let authored_actor_web = authored_world
         .and_then(|loaded| loaded.world_manifest.actor_web)
         .and_then(|registry| {
             registry
@@ -6247,6 +6386,17 @@ async fn main() -> Result<()> {
 
     // Ensure Kubo API is online before DID/IPNS bootstrap.
     wait_for_kubo_api(&kubo_url, 8, Duration::from_millis(1000)).await?;
+
+    if let Some(global_acl_cid) = authored_global_acl_cid.as_deref() {
+        match world.load_global_capability_acl_from_cid(global_acl_cid).await {
+            Ok(()) => info!("Loaded global capability ACL from CID {}", global_acl_cid),
+            Err(err) => warn!(
+                "Failed loading global capability ACL from CID {}: {}",
+                global_acl_cid,
+                err
+            ),
+        }
+    }
 
     if actor_web_cid.is_none() && actor_web_auto_build {
         if let Some(source_dir) = actor_web_source_dir.as_deref() {
@@ -6351,6 +6501,19 @@ async fn main() -> Result<()> {
                     "Failed restoring world from DID ma runtime fields {}: {}",
                     root_cid, err
                 ),
+            }
+
+            if let Some(state_cid) = world.state_cid().await {
+                match world.load_encrypted_state(&state_cid).await {
+                    Ok(new_root_cid) => info!(
+                        "Restored encrypted runtime state: state_cid={} root_cid={}",
+                        state_cid, new_root_cid
+                    ),
+                    Err(err) => warn!(
+                        "Failed restoring encrypted runtime state {}: {}",
+                        state_cid, err
+                    ),
+                }
             }
         }
 
@@ -6629,9 +6792,14 @@ fn parse_entry_acl(raw: &str) -> Result<EntryAcl> {
 
     let mut allow_all = false;
     let mut allowed_dids = HashSet::new();
+    let mut owner_token_present = false;
     for token in tokens {
         if token == "*" {
             allow_all = true;
+            continue;
+        }
+        if token.eq_ignore_ascii_case("owner") {
+            owner_token_present = true;
             continue;
         }
 
@@ -6639,15 +6807,16 @@ fn parse_entry_acl(raw: &str) -> Result<EntryAcl> {
         allowed_dids.insert(did.without_fragment().id());
     }
 
-    if !allow_all && allowed_dids.is_empty() {
+    if !allow_all && allowed_dids.is_empty() && !owner_token_present {
         return Err(anyhow!(
-            "{} must contain '*' or at least one valid DID",
+            "{} must contain '*', 'owner', or at least one valid DID",
             WORLD_ENTRY_ACL_ENV
         ));
     }
 
     Ok(EntryAcl {
         allow_all,
+        allow_owner: owner_token_present,
         allowed_dids,
         source: raw.trim().to_string(),
     })
