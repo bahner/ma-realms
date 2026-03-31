@@ -14,11 +14,11 @@ help:
 
 build: $(STAMP)
 
-$(STAMP): Cargo.toml src/*.rs ../ma/src/*.rs
+$(STAMP): Cargo.toml src/*.rs ../../ma/src/*.rs ../core/src/*.rs
 	cargo build
 	@touch $(STAMP)
 
-release: Cargo.toml src/*.rs ../ma/src/*.rs
+release: Cargo.toml src/*.rs ../../ma/src/*.rs ../core/src/*.rs
 	cargo build --release
 	@echo "🏗️  Release binary at $(RELEASE_BINARY)"
 

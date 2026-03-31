@@ -58,13 +58,17 @@ jobs:
           & $binPath --help | Out-Null
 
       - name: Import macOS signing certificate (optional)
-        if: runner.os == 'macOS' && secrets.MA_WORLD_MACOS_CERT_P12_BASE64 != ''
+        if: runner.os == 'macOS'
         shell: bash
         env:
           MACOS_CERT_P12_BASE64: ${{ secrets.MA_WORLD_MACOS_CERT_P12_BASE64 }}
           MACOS_CERT_PASSWORD: ${{ secrets.MA_WORLD_MACOS_CERT_PASSWORD }}
         run: |
           set -euo pipefail
+          if [ -z "${MACOS_CERT_P12_BASE64:-}" ] || [ -z "${MACOS_CERT_PASSWORD:-}" ]; then
+            echo "Skipping macOS certificate import (secrets missing)."
+            exit 0
+          fi
           CERT_PATH="$RUNNER_TEMP/ma-world-signing.p12"
           KEYCHAIN_PATH="$RUNNER_TEMP/ma-world-signing.keychain-db"
           echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$CERT_PATH"
@@ -75,31 +79,43 @@ jobs:
           security list-keychains -d user -s "$KEYCHAIN_PATH"
 
       - name: Sign macOS binary (optional)
-        if: runner.os == 'macOS' && secrets.MA_WORLD_MACOS_CODESIGN_IDENTITY != ''
+        if: runner.os == 'macOS'
         shell: bash
         env:
           MACOS_CODESIGN_IDENTITY: ${{ secrets.MA_WORLD_MACOS_CODESIGN_IDENTITY }}
         run: |
           set -euo pipefail
+          if [ -z "${MACOS_CODESIGN_IDENTITY:-}" ]; then
+            echo "Skipping macOS code signing (identity secret missing)."
+            exit 0
+          fi
           BIN_PATH="target/${{ matrix.target }}/release/ma-world${{ matrix.binary_ext }}"
           codesign --force --options runtime --timestamp --sign "$MACOS_CODESIGN_IDENTITY" "$BIN_PATH"
 
       - name: Decode Windows signing certificate (optional)
-        if: runner.os == 'Windows' && secrets.MA_WORLD_WINDOWS_CERT_PFX_BASE64 != ''
+        if: runner.os == 'Windows'
         shell: pwsh
         env:
           WINDOWS_CERT_PFX_BASE64: ${{ secrets.MA_WORLD_WINDOWS_CERT_PFX_BASE64 }}
         run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERT_PFX_BASE64)) {
+            Write-Host "Skipping Windows cert decode (secret missing)."
+            exit 0
+          }
           $pfxPath = "$env:RUNNER_TEMP\ma-world-signing.pfx"
           [System.IO.File]::WriteAllBytes($pfxPath, [System.Convert]::FromBase64String($env:WINDOWS_CERT_PFX_BASE64))
           "WINDOWS_SIGNING_PFX_PATH=$pfxPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Sign Windows binary (optional)
-        if: runner.os == 'Windows' && secrets.MA_WORLD_WINDOWS_CERT_PFX_BASE64 != '' && secrets.MA_WORLD_WINDOWS_CERT_PASSWORD != ''
+        if: runner.os == 'Windows'
         shell: pwsh
         env:
           WINDOWS_CERT_PASSWORD: ${{ secrets.MA_WORLD_WINDOWS_CERT_PASSWORD }}
         run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_PFX_PATH) -or [string]::IsNullOrWhiteSpace($env:WINDOWS_CERT_PASSWORD)) {
+            Write-Host "Skipping Windows signing (signing secrets missing)."
+            exit 0
+          }
           $binPath = "target/${{ matrix.target }}/release/ma-world${{ matrix.binary_ext }}"
           signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f "$env:WINDOWS_SIGNING_PFX_PATH" /p "$env:WINDOWS_CERT_PASSWORD" "$binPath"
 
@@ -130,7 +146,7 @@ jobs:
           shasum -a 256 "dist/${ASSET_BASENAME}.${{ matrix.archive_ext }}" > "dist/${ASSET_BASENAME}.${{ matrix.archive_ext }}.sha256"
 
       - name: Notarize macOS archive (optional)
-        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/') && secrets.MA_WORLD_APPLE_ID != '' && secrets.MA_WORLD_APPLE_TEAM_ID != '' && secrets.MA_WORLD_APPLE_APP_PASSWORD != ''
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/')
         shell: bash
         env:
           APPLE_ID: ${{ secrets.MA_WORLD_APPLE_ID }}
@@ -138,6 +154,10 @@ jobs:
           APPLE_APP_PASSWORD: ${{ secrets.MA_WORLD_APPLE_APP_PASSWORD }}
         run: |
           set -euo pipefail
+          if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_TEAM_ID:-}" ] || [ -z "${APPLE_APP_PASSWORD:-}" ]; then
+            echo "Skipping macOS notarization (Apple secrets missing)."
+            exit 0
+          fi
           VERSION="${GITHUB_REF_NAME:-manual}"
           ASSET_BASENAME="ma-world-${VERSION}-${{ matrix.target }}"
           ARCHIVE_PATH="dist/${ASSET_BASENAME}.${{ matrix.archive_ext }}"

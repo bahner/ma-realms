@@ -1,9 +1,9 @@
-.PHONY: build build-dev build-release cid show-cid serve publish release clean
+.PHONY: build build-dev build-release cid show-cid serve publish release clean distclean
 
 HOME_RS := $(shell find src -type f -name '*.rs')
-DID_MA_RS := $(shell find ../ma/src -type f -name '*.rs')
-MA_CORE_RS := $(shell find ../ma-core/src -type f -name '*.rs')
-BUILD_INPUTS := Makefile Cargo.toml Cargo.lock ../ma/Cargo.toml ../ma/Cargo.lock ../ma-core/Cargo.toml $(HOME_RS) $(DID_MA_RS) $(MA_CORE_RS)
+DID_MA_RS := $(shell find ../../ma/src -type f -name '*.rs')
+MA_CORE_RS := $(shell find ../core/src -type f -name '*.rs')
+BUILD_INPUTS := Makefile Cargo.toml Cargo.lock ../../ma/Cargo.toml ../../ma/Cargo.lock ../core/Cargo.toml $(HOME_RS) $(DID_MA_RS) $(MA_CORE_RS)
 
 PKG_STAMP := .build/pkg.stamp
 PKG_DEV_STAMP := .build/pkg-dev.stamp
@@ -98,3 +98,7 @@ clean:
 	rm -rf www/pkg
 	rm -rf pkg
 	rm -rf .build
+
+distclean: clean
+	cargo clean
+	rm -f $(CID_FILE)
