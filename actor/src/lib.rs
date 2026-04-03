@@ -415,7 +415,6 @@ async fn exchange_on_stream(cache: &mut WorldConnCache, request: &WorldRequest) 
     serde_json::from_slice(&response_bytes).map_err(js_err)
 }
 use ma_core::{
-    canonical_locale,
     CompiledCapabilityAcl,
     compile_acl,
     CONTENT_TYPE_BROADCAST, CONTENT_TYPE_CHAT, CONTENT_TYPE_CMD, CONTENT_TYPE_PRESENCE,
@@ -430,7 +429,7 @@ use ma_core::{
     normalize_endpoint_id as core_normalize_endpoint_id,
     normalize_relay_url as core_normalize_relay_url,
     parse_capability_acl_text,
-    parse_message_with_locale,
+    parse_message,
     resolve_inbox_endpoint_id as core_resolve_inbox_endpoint_id,
     resolve_alias_input as core_resolve_alias_input,
     RoomEvent, WorldCommand, WorldRequest, WorldResponse,
@@ -1530,17 +1529,18 @@ pub fn set_bundle_presence_hint(
     })
 }
 
-/// Update the optional `ma:locale` field in the DID document and re-sign it.
+/// Update optional `ma:lang` and `ma:language` fields in the DID document and re-sign it.
 /// Returns JSON: `{ encrypted_bundle, did, ipns, document_json }`
 #[wasm_bindgen]
-pub fn set_bundle_locale(
+pub fn set_bundle_language_preferences(
     passphrase: &str,
     encrypted_bundle_json: &str,
-    locale: &str,
+    lang: &str,
+    language: &str,
 ) -> Result<String, JsValue> {
     update_bundle_document(passphrase, encrypted_bundle_json, |document| {
-        let canonical = canonical_locale(locale);
-        document.set_locale(&canonical).map_err(js_err)
+        document.set_lang(lang).map_err(js_err)?;
+        document.set_language(language).map_err(js_err)
     })
 }
 
@@ -1579,15 +1579,16 @@ pub fn set_bundle_transports(
     })
 }
 
-/// Remove the optional `ma:locale` field from the DID document and re-sign it.
+/// Remove optional `ma:lang` and `ma:language` fields from the DID document and re-sign it.
 /// Returns JSON: `{ encrypted_bundle, did, ipns, document_json }`
 #[wasm_bindgen]
-pub fn clear_bundle_locale(
+pub fn clear_bundle_language_preferences(
     passphrase: &str,
     encrypted_bundle_json: &str,
 ) -> Result<String, JsValue> {
     update_bundle_document(passphrase, encrypted_bundle_json, |document| {
-        document.clear_locale();
+        document.clear_lang();
+        document.clear_language();
         Ok(())
     })
 }
@@ -1809,12 +1810,11 @@ pub async fn send_world_message(
     encrypted_bundle_json: &str,
     actor_name: &str,
     room: &str,
-    locale: &str,
+    _language: &str,
     text: &str,
 ) -> Result<String, JsValue> {
     let timestamp_ms = js_sys::Date::now() as u64;
-    let canonical = canonical_locale(locale);
-    let envelope = parse_message_with_locale(text, &canonical);
+    let envelope = parse_message(text);
     let is_admin_world_command =
         matches!(&envelope, ma_core::MessageEnvelope::ActorCommand { target, .. } if target.eq_ignore_ascii_case("world"));
     if !is_admin_world_command {
@@ -1849,13 +1849,12 @@ pub async fn send_world_cmd(
     encrypted_bundle_json: &str,
     actor_name: &str,
     room: &str,
-    locale: &str,
+    _language: &str,
     text: &str,
 ) -> Result<String, JsValue> {
     let timestamp_ms = js_sys::Date::now() as u64;
     let rewritten_text = normalize_use_alias_command(room, text);
-    let canonical = canonical_locale(locale);
-    let envelope = parse_message_with_locale(&rewritten_text, &canonical);
+    let envelope = parse_message(&rewritten_text);
     let is_admin_world_command =
         matches!(&envelope, ma_core::MessageEnvelope::ActorCommand { target, .. } if target.eq_ignore_ascii_case("world"));
     if is_admin_world_command {

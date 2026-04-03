@@ -115,14 +115,14 @@ impl Avatar {
         rows.join(", ")
     }
 
-    pub fn set_description(&mut self, locale: &str, value: String) {
-        self.descriptions.insert(locale.to_string(), value);
+    pub fn set_description(&mut self, language: &str, value: String) {
+        self.descriptions.insert(language.to_string(), value);
     }
 
-    pub fn description_or_default(&self, locale: &str) -> String {
+    pub fn description_or_default(&self, language: &str) -> String {
         self.descriptions
-            .get(locale)
-            .or_else(|| self.descriptions.get("en"))
+            .get(language)
+            .or_else(|| self.descriptions.get("und"))
             .cloned()
             .unwrap_or_else(|| "(unset)".to_string())
     }

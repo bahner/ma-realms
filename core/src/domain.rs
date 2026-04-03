@@ -72,9 +72,7 @@ impl ExitData {
         let canonical_name = name.into();
         let mut names = HashMap::new();
         if !canonical_name.trim().is_empty() {
-            // Seed common locales so exits are never locale-empty out of the box.
-            names.insert("en".to_string(), canonical_name.clone());
-            names.insert("nb".to_string(), canonical_name.clone());
+            names.insert("und".to_string(), canonical_name.clone());
         }
 
         Self {
@@ -99,9 +97,12 @@ impl ExitData {
             || self.names.values().any(|n| n == input)
     }
 
-    pub fn name_for_locale(&self, locale: &str) -> String {
-        let normalized = locale.trim().to_ascii_lowercase();
-        if !normalized.is_empty() {
+    pub fn name_for_language_preferences(&self, preferences: &[String]) -> String {
+        for candidate in preferences {
+            let normalized = candidate.trim().replace('-', "_");
+            if normalized.is_empty() {
+                continue;
+            }
             if let Some(value) = self.names.get(&normalized) {
                 return value.clone();
             }
@@ -110,16 +111,25 @@ impl ExitData {
                     return value.clone();
                 }
             }
+            if let Some((primary, _)) = normalized.split_once('_') {
+                if let Some(value) = self.names.get(primary) {
+                    return value.clone();
+                }
+            }
         }
 
-        if let Some(value) = self.names.get("en") {
+        if let Some(value) = self.names.get("und") {
+            return value.clone();
+        }
+
+        if let Some(value) = self.names.values().next() {
             return value.clone();
         }
 
         self.name.clone()
     }
 
-    pub fn matches_for_locale(&self, input: &str, locale: &str) -> bool {
+    pub fn matches_for_language_preferences(&self, input: &str, preferences: &[String]) -> bool {
         let token = input.trim();
         if token.is_empty() {
             return false;
@@ -127,7 +137,7 @@ impl ExitData {
         if self.matches(token) {
             return true;
         }
-        if self.name_for_locale(locale) == token {
+        if self.name_for_language_preferences(preferences) == token {
             return true;
         }
 
@@ -158,21 +168,27 @@ impl ExitData {
         self.acl.can_use(did_root)
     }
 
-    pub fn travel_text_for_locale(&self, locale: &str) -> Option<String> {
-        let normalized = locale.trim().to_ascii_lowercase();
-        if normalized.is_empty() {
-            return self.travel_texts.get("en").cloned();
-        }
-        if let Some(value) = self.travel_texts.get(&normalized) {
-            return Some(value.clone());
-        }
-        if let Some((primary, _)) = normalized.split_once('-') {
-            if let Some(value) = self.travel_texts.get(primary) {
+    pub fn travel_text_for_language_preferences(&self, preferences: &[String]) -> Option<String> {
+        for candidate in preferences {
+            let normalized = candidate.trim().replace('-', "_");
+            if normalized.is_empty() {
+                continue;
+            }
+            if let Some(value) = self.travel_texts.get(&normalized) {
                 return Some(value.clone());
             }
+            if let Some((primary, _)) = normalized.split_once('_') {
+                if let Some(value) = self.travel_texts.get(primary) {
+                    return Some(value.clone());
+                }
+            }
         }
-        self.travel_texts.get("en").cloned()
+        self.travel_texts
+            .get("und")
+            .cloned()
+            .or_else(|| self.travel_texts.values().next().cloned())
     }
+
 }
 
 /// A generic room-local object (item, prop, container, etc.).

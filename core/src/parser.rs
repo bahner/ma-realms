@@ -1,18 +1,15 @@
-use crate::locale::LocaleLexicon;
 use serde::{Deserialize, Serialize};
 
-fn canonical_target(target: &str, lexicon: &LocaleLexicon) -> String {
+fn canonical_target(target: &str) -> String {
     let normalized = target.trim().to_ascii_lowercase();
-    if lexicon.here_aliases.iter().any(|alias| alias == &normalized) {
-        return "here".to_string();
+    match normalized.as_str() {
+        "here" | "room" | "world" => "here".to_string(),
+        "avatar" | "me" | "self" => "avatar".to_string(),
+        _ => target.trim().to_string(),
     }
-    if lexicon.avatar_aliases.iter().any(|alias| alias == &normalized) {
-        return "avatar".to_string();
-    }
-    target.trim().to_string()
 }
 
-fn canonical_room_command(command: &str, lexicon: &LocaleLexicon) -> String {
+fn canonical_room_command(command: &str) -> String {
     let trimmed = command.trim();
     if trimmed.is_empty() {
         return String::new();
@@ -21,11 +18,10 @@ fn canonical_room_command(command: &str, lexicon: &LocaleLexicon) -> String {
     let mut parts = trimmed.splitn(2, char::is_whitespace);
     let head = parts.next().unwrap_or_default();
     let tail = parts.next().unwrap_or_default().trim();
-    let canonical_head = lexicon
-        .room_command_aliases
-        .get(&head.to_ascii_lowercase())
-        .cloned()
-        .unwrap_or_else(|| head.to_string());
+    let canonical_head = match head.to_ascii_lowercase().as_str() {
+        "actors" => "who".to_string(),
+        _ => head.to_string(),
+    };
 
     if tail.is_empty() {
         canonical_head
@@ -50,18 +46,9 @@ pub enum ActorCommand {
 }
 
 pub fn parse_message(input: &str) -> MessageEnvelope {
-    let lexicon = LocaleLexicon::for_locale("en");
-    parse_message_with_lexicon(input, &lexicon)
-}
-
-pub fn parse_message_with_locale(input: &str, locale: &str) -> MessageEnvelope {
-    let lexicon = LocaleLexicon::for_locale(locale);
-    parse_message_with_lexicon(input, &lexicon)
-}
-
-pub fn parse_message_with_lexicon(input: &str, lexicon: &LocaleLexicon) -> MessageEnvelope {
     let trimmed = input.trim();
-    // @@ is shorthand for @world — world-admin commands.
+
+    // @@ is shorthand for @world world-admin commands.
     if let Some(after_at2) = trimmed.strip_prefix("@@") {
         let cmd = after_at2.trim().to_string();
         return MessageEnvelope::ActorCommand {
@@ -88,23 +75,23 @@ pub fn parse_message_with_lexicon(input: &str, lexicon: &LocaleLexicon) -> Messa
             return MessageEnvelope::RoomCommand { command };
         }
 
-        let target = canonical_target(target, lexicon);
+        let target = canonical_target(target);
         if target == "here" {
             return MessageEnvelope::ActorCommand {
                 target,
                 command: ActorCommand::Raw {
-                    command: canonical_room_command(&command, lexicon),
+                    command: canonical_room_command(&command),
                 },
             };
         }
 
         return MessageEnvelope::ActorCommand {
             target,
-            command: parse_actor_command_with_lexicon(&command, lexicon),
+            command: parse_actor_command(&command),
         };
     }
 
-    // A leading single-quote is shorthand for `say`: 'Hello → @avatar say Hello
+    // A leading single-quote is shorthand for `say`.
     if let Some(speech) = trimmed.strip_prefix('\'') {
         return MessageEnvelope::ActorCommand {
             target: "avatar".to_string(),
@@ -114,33 +101,20 @@ pub fn parse_message_with_lexicon(input: &str, lexicon: &LocaleLexicon) -> Messa
         };
     }
 
-    // Bare input (no @ or ') is a command to the caller's own avatar,
-    // parsed through the full lexicon so `say foo` → Say, not Raw.
+    // Bare input is interpreted as command to caller avatar.
     MessageEnvelope::ActorCommand {
         target: "avatar".to_string(),
-        command: parse_actor_command_with_lexicon(trimmed, lexicon),
+        command: parse_actor_command(trimmed),
     }
 }
 
 pub fn parse_actor_command(command: &str) -> ActorCommand {
-    let lexicon = LocaleLexicon::for_locale("en");
-    parse_actor_command_with_lexicon(command, &lexicon)
-}
-
-pub fn parse_actor_command_with_locale(command: &str, locale: &str) -> ActorCommand {
-    let lexicon = LocaleLexicon::for_locale(locale);
-    parse_actor_command_with_lexicon(command, &lexicon)
-}
-
-pub fn parse_actor_command_with_lexicon(command: &str, lexicon: &LocaleLexicon) -> ActorCommand {
     let trimmed = command.trim();
-    for verb in &lexicon.say_verbs {
-        if let Some(rest) = trimmed.strip_prefix(verb.as_str()) {
-            if rest.starts_with(char::is_whitespace) {
-                return ActorCommand::Say {
-                    payload: rest.trim().to_string(),
-                };
-            }
+    if let Some(rest) = trimmed.strip_prefix("say") {
+        if rest.starts_with(char::is_whitespace) {
+            return ActorCommand::Say {
+                payload: rest.trim().to_string(),
+            };
         }
     }
 

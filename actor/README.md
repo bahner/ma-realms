@@ -112,7 +112,8 @@ All client commands use dot prefix (`.`). Bare text is gameplay sent to the worl
 - `.aliases`
 - `.inspect @here` (inspect room DID/content CID and exit CID references)
 - `.inspect @exit <name|alias>` (inspect one exit document by name)
-- `.locale <tag>` (also `.lang`, `.language`)
+- `.lang <tag>` (set primary language tag, for example `nb`)
+- `.language <tag:tag:tag>` (set preference order, for example `nb_NO:nn_NO:en_UK`)
 - `.edit [@here|@me|did:ma:<world>#<room>]`
 - `.eval <cid|alias>`
 - `.refresh` (force immediate room/object/event refresh)
@@ -177,8 +178,8 @@ Navigation is gameplay — the server resolves exits and directs the client to n
 - `.publish` uploads DID document JSON to IPFS and updates IPNS record
 - Browser storage is namespaced per alias, so one browser profile can keep multiple local homes
 - The currently active alias is remembered per browser tab, which allows concurrent homes in separate tabs/windows on the same origin
-- The actor locale is configurable per alias; localized `@` aliases are mapped to canonical protocol targets before sending
-- The published DID document carries the preferred locale in `ma:locale` using canonical locale tags such as `en` and `nb-NO`
+- The actor language metadata is configurable per alias using `ma:lang` and `ma:language`
+- Object and room texts are language-keyed generically (no hardcoded language pairs)
 
 ## Kubo CORS
 

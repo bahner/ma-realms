@@ -10,7 +10,7 @@ pub enum RoomActorAction {
     Dig { exit_name: String, destination: Option<String> },
     /// Set room attribute using a key/value pair.
     /// Supported keys: owner, title, description, cid.
-    SetAttribute { key: String, value: String, locale: Option<String> },
+    SetAttribute { key: String, value: String, language: Option<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,7 +197,7 @@ fn cmd_set(arg: &str, ctx: &RoomActorContext<'_>) -> RoomActorResult {
     let mut kv = arg.splitn(2, char::is_whitespace);
     let key = kv.next().unwrap_or_default().trim().to_ascii_lowercase();
     let mut value_raw = kv.next().unwrap_or_default().trim().to_string();
-    let mut locale: Option<String> = None;
+    let mut language: Option<String> = None;
 
     if let Some(rest) = value_raw.strip_prefix("to ") {
         value_raw = rest.trim().to_string();
@@ -207,12 +207,12 @@ fn cmd_set(arg: &str, ctx: &RoomActorContext<'_>) -> RoomActorResult {
         if let Some(close_idx) = rest.find(']') {
             let tag = rest[..close_idx].trim();
             if !is_valid_lang_tag(tag) {
-                return none_result(format!("@here invalid locale tag '{}'", tag));
+                return none_result(format!("@here invalid language tag '{}'", tag));
             }
-            locale = Some(tag.to_string());
+            language = Some(tag.to_string());
             value_raw = rest[close_idx + 1..].trim().to_string();
         } else {
-            return none_result("@here invalid locale qualifier: expected [lang]".to_string());
+            return none_result("@here invalid language qualifier: expected [lang]".to_string());
         }
     }
 
@@ -229,7 +229,7 @@ fn cmd_set(arg: &str, ctx: &RoomActorContext<'_>) -> RoomActorResult {
             }
             RoomActorResult {
                 response: format!("@here '{}' is now owned by {}", ctx.room_name, value),
-                action: RoomActorAction::SetAttribute { key, value, locale: None },
+                action: RoomActorAction::SetAttribute { key, value, language: None },
             }
         }
         "title" | "description" => {
@@ -238,7 +238,7 @@ fn cmd_set(arg: &str, ctx: &RoomActorContext<'_>) -> RoomActorResult {
             }
             RoomActorResult {
                 response: format!("@here {} for '{}' updated", key, ctx.room_name),
-                action: RoomActorAction::SetAttribute { key, value, locale },
+                action: RoomActorAction::SetAttribute { key, value, language },
             }
         }
         "cid" => {
@@ -247,7 +247,7 @@ fn cmd_set(arg: &str, ctx: &RoomActorContext<'_>) -> RoomActorResult {
             }
             RoomActorResult {
                 response: format!("@here loading room '{}' from {}", ctx.room_name, value),
-                action: RoomActorAction::SetAttribute { key, value, locale: None },
+                action: RoomActorAction::SetAttribute { key, value, language: None },
             }
         }
         _ => none_result(format!("@here unknown set attribute '{}'. Supported: owner, title, description, cid", key)),

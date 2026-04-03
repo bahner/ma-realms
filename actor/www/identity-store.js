@@ -2,7 +2,8 @@ export function createIdentityStore({
   storagePrefix,
   legacy,
   isValidAliasName,
-  normalizeLocale
+  normalizeLanguageTag,
+  normalizeLanguagePreferences
 }) {
   const IDENTITY_PREFIX = `${storagePrefix}.identity.`;
 
@@ -37,7 +38,7 @@ export function createIdentityStore({
     }
   }
 
-  function saveIdentityRecord(aliasName, encryptedBundle, locale) {
+  function saveIdentityRecord(aliasName, encryptedBundle, lang, language) {
     if (!isValidAliasName(aliasName)) {
       return;
     }
@@ -47,7 +48,8 @@ export function createIdentityStore({
       JSON.stringify({
         aliasName,
         encryptedBundle,
-        locale: normalizeLocale(locale)
+        lang: normalizeLanguageTag(lang),
+        language: normalizeLanguagePreferences(language || lang)
       })
     );
   }
@@ -65,7 +67,8 @@ export function createIdentityStore({
     return {
       aliasName: typeof parsed.aliasName === 'string' ? parsed.aliasName : aliasName,
       encryptedBundle: typeof parsed.encryptedBundle === 'string' ? parsed.encryptedBundle : '',
-      locale: normalizeLocale(parsed.locale)
+      lang: normalizeLanguageTag(parsed.lang || parsed.locale),
+      language: normalizeLanguagePreferences(parsed.language || parsed.lang || parsed.locale)
     };
   }
 
@@ -78,7 +81,8 @@ export function createIdentityStore({
     return {
       aliasName,
       encryptedBundle: localStorage.getItem(legacy.bundleKey) || '',
-      locale: legacy.defaultLocale
+      lang: legacy.defaultLang,
+      language: legacy.defaultLanguage
     };
   }
 

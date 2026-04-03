@@ -1,6 +1,6 @@
 # ma-core
 
-Shared actor library for the ma stack — message parsing, protocol types, room command engine, domain model, addressing, i18n, and trait interfaces.
+Shared actor library for the ma stack — message parsing, protocol types, room command engine, domain model, addressing, and trait interfaces.
 
 ## What It Provides
 
@@ -8,7 +8,7 @@ Shared actor library for the ma stack — message parsing, protocol types, room 
 
 - `MessageEnvelope`: normalized representation of user input (verb, target, body, raw text)
 - `parse_message()`: top-level parser that classifies input as room commands, actor messages, or spoken text
-- Locale-aware lexicons for translating `@` aliases (e.g., Norwegian `@her hvem` → canonical `@here /who`)
+- Canonical command parsing without hardcoded per-language alias tables
 
 ### Protocol Types (`protocol`)
 
@@ -51,24 +51,15 @@ Abstract traits for pluggable backends:
 - `IpfsPublisher`: put JSON to IPFS and publish IPNS names
 - `AclRuntime`: room ACL queries (can_enter, summary)
 
-### Internationalization (`locale`)
-
-- Fluent-based i18n with locale negotiation
-- Bundled locales: `en`, `nb-NO`
-- Locale-aware command aliases resolved before dispatching
-
 ## Project Layout
 
 - `src/addressing.rs`: address normalization and alias resolution
 - `src/domain.rs`: core domain model types (ActorType, ExitData, actors)
 - `src/interfaces.rs`: abstract trait interfaces
 - `src/lib.rs`: module declarations, public re-exports, unit tests
-- `src/locale.rs`: i18n support via Fluent bundles
 - `src/parser.rs`: message parsing and envelope construction
 - `src/protocol.rs`: shared protocol types and ALPN constants
 - `src/room_actor.rs`: built-in room command engine
-- `locales/en/core.ftl`: English locale strings
-- `locales/nb-NO/core.ftl`: Norwegian Bokmål locale strings
 
 ## Build and Cleanup
 
@@ -92,4 +83,4 @@ cargo test
 
 - This is a library crate shared by `ma-actor` (WASM client) and `ma-world` (server).
 - Protocol types in `protocol.rs` are the single source of truth — do not duplicate in consumer crates.
-- The crate uses `serde` for serialization and `fluent-bundle` for i18n.
+- The crate uses `serde` for serialization.

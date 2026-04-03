@@ -537,23 +537,24 @@ struct RuntimeStateDoc {
     room_objects: HashMap<String, Vec<ObjectRuntimeState>>,
 }
 
-fn normalize_locale_tag(value: &str) -> String {
+fn normalize_language_tag(value: &str) -> String {
     let raw = value.trim();
     if raw.is_empty() {
-        return "en".to_string();
+        return "und".to_string();
     }
-    let lowered = raw.to_ascii_lowercase();
-    if lowered == "nb" || lowered == "nb-no" || lowered == "no" {
-        "nb".to_string()
-    } else if lowered == "en" || lowered == "en-us" || lowered == "en-gb" {
-        "en".to_string()
+    let cleaned = raw.replace('-', "_");
+    if cleaned
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ':')
+    {
+        cleaned
     } else {
-        lowered
+        "und".to_string()
     }
 }
 
-fn exit_for_locale(id: String, name: String, to: String, locale: &str) -> ExitData {
-    let normalized = normalize_locale_tag(locale);
+fn exit_for_language(id: String, name: String, to: String, language: &str) -> ExitData {
+    let normalized = normalize_language_tag(language);
     let mut exit = ExitData::new(id, name.clone(), to);
     exit.names.clear();
     if !name.trim().is_empty() {
@@ -562,13 +563,19 @@ fn exit_for_locale(id: String, name: String, to: String, locale: &str) -> ExitDa
     exit
 }
 
-fn sender_locale_from_document(document: &Document) -> String {
+fn sender_language_from_document(document: &Document) -> String {
     if let Some(ma) = document.ma.as_ref() {
-        if let Some(locale) = ma.locale.as_deref() {
-            return normalize_locale_tag(locale);
+        if let Some(language) = ma.language.as_deref() {
+            let first = language.split(':').find(|entry| !entry.trim().is_empty());
+            if let Some(primary) = first {
+                return normalize_language_tag(primary);
+            }
+        }
+        if let Some(lang) = ma.lang.as_deref() {
+            return normalize_language_tag(lang);
         }
     }
-    "en".to_string()
+    "und".to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1213,8 +1220,7 @@ impl World {
 
         let title_value = legacy.title.trim().to_string();
         if !title_value.is_empty() {
-            room.set_title("en", title_value.clone());
-            room.set_title("nb", title_value);
+            room.set_title("und", title_value);
         }
 
         // ACL/owner are runtime metadata and are not loaded from room CID definitions.
@@ -1355,7 +1361,7 @@ impl World {
     fn lookup_object_print_verb(
         object: &ObjectRuntimeState,
         verb: &str,
-        sender_locale: &str,
+        sender_language: &str,
     ) -> Option<String> {
         let verbs = object.definition.as_ref().map(|def| &def.verbs)?;
 
@@ -1364,7 +1370,7 @@ impl World {
             return None;
         }
 
-        let sender = sender_locale.trim().to_ascii_lowercase();
+        let sender = sender_language.trim().to_ascii_lowercase();
         let sender_base = sender
             .split('-')
             .next()
@@ -1975,29 +1981,15 @@ impl World {
                 id: room.name.clone(),
                 titles: {
                     let mut titles = room.titles.clone();
-                    if !titles.contains_key("en") {
-                        titles.insert("en".to_string(), room.title_or_default("en"));
-                    }
-                    if !titles.contains_key("nb") {
-                        let fallback = titles
-                            .get("en")
-                            .cloned()
-                            .unwrap_or_else(|| room.title_or_default("en"));
-                        titles.insert("nb".to_string(), fallback);
+                    if !titles.contains_key("und") {
+                        titles.insert("und".to_string(), room.title_or_default("und"));
                     }
                     titles
                 },
                 descriptions: {
                     let mut descriptions = room.descriptions.clone();
-                    if !descriptions.contains_key("en") {
-                        descriptions.insert("en".to_string(), room.description_or_default("en"));
-                    }
-                    if !descriptions.contains_key("nb") {
-                        let fallback = descriptions
-                            .get("en")
-                            .cloned()
-                            .unwrap_or_else(|| room.description_or_default("en"));
-                        descriptions.insert("nb".to_string(), fallback);
+                    if !descriptions.contains_key("und") {
+                        descriptions.insert("und".to_string(), room.description_or_default("und"));
                     }
                     descriptions
                 },
@@ -2248,7 +2240,7 @@ impl World {
         room_name: &str,
         from: &str,
         from_did: &Did,
-        sender_locale: &str,
+        sender_language: &str,
         envelope: MessageEnvelope,
     ) -> Result<(String, bool, String)> {
         {
@@ -2282,7 +2274,7 @@ impl World {
             MessageEnvelope::RoomCommand { command } => {
                 let caller_root_did = from_did.without_fragment().id();
                 let response = self
-                    .room_command(room_name, &command, from, sender_locale, Some(caller_root_did.as_str()))
+                    .room_command(room_name, &command, from, sender_language, Some(caller_root_did.as_str()))
                     .await;
                 info!("[{}] {} -> @here: {} -> {}", room_name, from, command, response);
                 self.record_event(format!("[{room_name}] {from} -> @here: {command} => {}", response))
@@ -2296,7 +2288,7 @@ impl World {
                     ActorCommand::Raw { .. } => None,
                 };
                 let (response, effective_room) = self
-                    .handle_actor_command(room_name, from, from_did, sender_locale, &target, command)
+                    .handle_actor_command(room_name, from, from_did, sender_language, &target, command)
                     .await;
                 info!("[{}] {} -> @{} -> {}", room_name, from, target, response);
                 self.record_event(format!(
@@ -2349,14 +2341,14 @@ impl World {
     async fn room_description(&self, room_name: &str) -> String {
         let rooms = self.rooms.read().await;
         rooms.get(room_name)
-            .map(|r| r.description_or_default("en"))
+            .map(|r| r.description_or_default("und"))
             .unwrap_or_default()
     }
 
     async fn room_title(&self, room_name: &str) -> String {
         let rooms = self.rooms.read().await;
         rooms.get(room_name)
-            .map(|r| r.title_or_default("en"))
+            .map(|r| r.title_or_default("und"))
             .unwrap_or_default()
     }
 
@@ -2762,7 +2754,7 @@ impl World {
                         agent_did: avatar.agent_did.id(),
                         agent_endpoint: avatar.agent_endpoint.clone(),
                         owner: avatar.owner.clone(),
-                        description: avatar.description_or_default("en"),
+                        description: avatar.description_or_default("und"),
                         acl: avatar.acl.summary(),
                         joined_at: format_system_time(avatar.joined_at),
                     })
@@ -2791,7 +2783,7 @@ impl World {
         room_name: &str,
         from: &str,
         from_did: &Did,
-        sender_locale: &str,
+        sender_language: &str,
         target: &str,
         command: ActorCommand,
     ) -> (String, String) {
@@ -2808,7 +2800,7 @@ impl World {
                             room_name,
                             &room_cmd,
                             from,
-                            sender_locale,
+                            sender_language,
                             Some(caller_root_did.as_str()),
                         )
                         .await,
@@ -2822,13 +2814,13 @@ impl World {
                 };
                 (
                     self
-                        .handle_world_command(room_name, from, from_did, sender_locale, &cmd)
+                        .handle_world_command(room_name, from, from_did, sender_language, &cmd)
                         .await,
                     room_name.to_string(),
                 )
             }
             "avatar" => self
-                .handle_avatar_command(room_name, from, from_did, sender_locale, command)
+                .handle_avatar_command(room_name, from, from_did, sender_language, command)
                 .await,
             _ => {
                 let rooms = self.rooms.read().await;
@@ -2856,7 +2848,7 @@ impl World {
 
                 if let Some(resolved_target) = shortcut_target {
                     if let Some(result) = self
-                        .handle_object_method(room_name, from, from_did, sender_locale, &resolved_target, command.clone())
+                        .handle_object_method(room_name, from, from_did, sender_language, &resolved_target, command.clone())
                         .await
                     {
                         return result;
@@ -2869,7 +2861,7 @@ impl World {
 
                 if !actor_exists {
                     if let Some(result) = self
-                        .handle_object_method(room_name, from, from_did, sender_locale, target, command.clone())
+                        .handle_object_method(room_name, from, from_did, sender_language, target, command.clone())
                         .await
                     {
                         return result;
@@ -2896,7 +2888,7 @@ impl World {
         room_name: &str,
         from: &str,
         from_did: &Did,
-        sender_locale: &str,
+        sender_language: &str,
         target: &str,
         command: ActorCommand,
     ) -> Option<(String, String)> {
@@ -3010,7 +3002,7 @@ impl World {
             let objects = self.room_objects.read().await;
             let room_map = objects.get(room_name)?;
             let object = room_map.get(&object_id)?;
-            Self::lookup_object_print_verb(object, &verb, sender_locale)
+            Self::lookup_object_print_verb(object, &verb, sender_language)
         };
         if let Some(output) = declarative {
             return Some((output, room_name.to_string()));
@@ -3414,7 +3406,7 @@ impl World {
         room_name: &str,
         from: &str,
         from_did: &Did,
-        sender_locale: &str,
+        sender_language: &str,
         command: ActorCommand,
     ) -> (String, String) {
         match command {
@@ -3561,13 +3553,13 @@ impl World {
                     rooms.get(room_name).and_then(|room| {
                         room.exits
                             .iter()
-                            .find(|e| e.matches_for_locale(direction, sender_locale))
+                            .find(|e| e.matches_for_language_preferences(direction, &[sender_language.to_string()]))
                             .cloned()
                     })
                 };
 
                 if let Some(exit) = move_target {
-                    let exit_name = exit.name_for_locale(sender_locale);
+                    let exit_name = exit.name_for_language_preferences(&[sender_language.to_string()]);
                     if exit.locked {
                         return (format!("The way {} is locked.", exit_name), room_name.to_string());
                     }
@@ -3577,7 +3569,7 @@ impl World {
                     }
 
                     let destination = exit.to.clone();
-                    let travel_text = exit.travel_text_for_locale(sender_locale);
+                    let travel_text = exit.travel_text_for_language_preferences(&[sender_language.to_string()]);
 
                     // Exit destinations may be local room fragments or full room DIDs.
                     // If the DID root is not this world, we hand off via /enter.
@@ -3647,8 +3639,7 @@ impl World {
                         return (format!("@avatar '{}' not found", from), room_name.to_string());
                     };
 
-                    avatar.set_description("en", description.clone());
-                    avatar.set_description("nb", description.clone());
+                    avatar.set_description("und", description.clone());
                     return (format!("@avatar owner={} desc={}", avatar.owner, description), room_name.to_string());
                 }
 
@@ -3663,7 +3654,7 @@ impl World {
                     return (format!(
                         "@avatar owner={} desc={} acl={} shortcuts={}",
                         avatar.owner,
-                        avatar.description_or_default("en"),
+                        avatar.description_or_default("und"),
                         avatar.acl.summary(),
                         avatar.object_shortcuts_summary()
                     ), room_name.to_string());
@@ -3676,7 +3667,7 @@ impl World {
                             room_name,
                             trimmed,
                             from,
-                            sender_locale,
+                            sender_language,
                             Some(caller_root_did.as_str()),
                         )
                         .await,
@@ -3691,7 +3682,7 @@ impl World {
         room_name: &str,
         _from: &str,
         from_did: &Did,
-        sender_locale: &str,
+        sender_language: &str,
         command: &str,
     ) -> String {
         let normalized = command.trim();
@@ -3713,7 +3704,7 @@ impl World {
 
             let mut rows: Vec<(String, String)> = rooms
                 .iter()
-                .map(|(id, room)| (id.clone(), room.title_or_default("en")))
+                .map(|(id, room)| (id.clone(), room.title_or_default("und")))
                 .collect();
             rows.sort_by(|left, right| left.0.cmp(&right.0));
 
@@ -3821,7 +3812,7 @@ impl World {
             let Some(room) = rooms.get(&fragment) else {
                 return format!("@world room '{}' not found", fragment);
             };
-            return format!("@world {} — {}", room.name, room.description_or_default("en"));
+            return format!("@world {} — {}", room.name, room.description_or_default("und"));
         }
 
         if verb == "private" {
@@ -4088,11 +4079,11 @@ impl World {
             }
             if let Some(room) = rooms.get_mut(room_name) {
                 if !room.exits.iter().any(|e| e.matches(&exit_name)) {
-                    room.exits.push(exit_for_locale(
+                    room.exits.push(exit_for_language(
                         exit_id,
                         exit_name.clone(),
                         exit_target.clone(),
-                        sender_locale,
+                        sender_language,
                     ));
                 }
             }
@@ -4214,7 +4205,7 @@ impl World {
         room_name: &str,
         command: &str,
         from: &str,
-        sender_locale: &str,
+        sender_language: &str,
         caller_root_did: Option<&str>,
     ) -> String {
 
@@ -4226,7 +4217,7 @@ impl World {
                     room.avatars.keys().cloned().collect::<Vec<_>>(),
                     room.acl.owner.clone(),
                     room.acl.summary(),
-                    room.description_or_default("en"),
+                    room.description_or_default("und"),
                     Some(room.did.clone()),
                 )
             } else {
@@ -4326,7 +4317,7 @@ impl World {
                     room.avatars.remove(&handle);
                 }
             }
-            RoomActorAction::SetAttribute { key, value, locale } => {
+            RoomActorAction::SetAttribute { key, value, language } => {
                 match key.as_str() {
                     "owner" => {
                         let did = match Did::try_from(value.as_str()) {
@@ -4345,32 +4336,32 @@ impl World {
                         }
                     }
                     "title" => {
-                        let locale = locale
-                            .map(|v| normalize_locale_tag(&v))
-                            .unwrap_or_else(|| normalize_locale_tag(sender_locale));
+                        let language_tag = language
+                            .map(|v| normalize_language_tag(&v))
+                            .unwrap_or_else(|| normalize_language_tag(sender_language));
                         let title_value = value.clone();
                         let mut rooms = self.rooms.write().await;
                         if let Some(room) = rooms.get_mut(room_name) {
-                            room.set_title(&locale, title_value);
+                            room.set_title(&language_tag, title_value);
                             changed_rooms.push(room_name.to_string());
                             room_update_announcement = Some(format!(
                                 "room title updated ({}) by {}",
-                                locale, from
+                                language_tag, from
                             ));
                         }
                     }
                     "description" => {
-                        let locale = locale
-                            .map(|v| normalize_locale_tag(&v))
-                            .unwrap_or_else(|| normalize_locale_tag(sender_locale));
+                        let language_tag = language
+                            .map(|v| normalize_language_tag(&v))
+                            .unwrap_or_else(|| normalize_language_tag(sender_language));
                         let description_value = value.clone();
                         let mut rooms = self.rooms.write().await;
                         if let Some(room) = rooms.get_mut(room_name) {
-                            room.set_description(&locale, description_value);
+                            room.set_description(&language_tag, description_value);
                             changed_rooms.push(room_name.to_string());
                             room_update_announcement = Some(format!(
                                 "room description updated ({}) by {}",
-                                locale, from
+                                language_tag, from
                             ));
                         }
                     }
@@ -4467,11 +4458,11 @@ impl World {
                 if let Some(room) = rooms.get_mut(room_name) {
                     let already_exists = room.exits.iter().any(|e| e.matches(&exit_name));
                     if !already_exists {
-                        room.exits.push(exit_for_locale(
+                        room.exits.push(exit_for_language(
                             exit_id,
                             exit_name.clone(),
                             exit_target,
-                            sender_locale,
+                            sender_language,
                         ));
                     }
                 }
@@ -4602,8 +4593,8 @@ impl WorldProtocol {
 
         Ok((
             room.did.clone(),
-            room.title_or_default("en"),
-            room.description_or_default("en"),
+            room.title_or_default("und"),
+            room.description_or_default("und"),
             avatars,
             endpoints,
         ))
@@ -4932,7 +4923,7 @@ impl WorldProtocol {
         agent_endpoint: String,
         sender_root: &str,
     ) -> Result<WorldResponse> {
-        let sender_locale = sender_locale_from_document(&sender_document);
+        let sender_language = sender_language_from_document(&sender_document);
 
         match command {
             WorldCommand::Enter { room, preferred_handle } => {
@@ -5056,7 +5047,7 @@ impl WorldProtocol {
                 }
                 let (message, broadcasted, effective_room) = self
                     .world
-                    .send_message(&room, &actor_name, sender_did, &sender_locale, envelope)
+                    .send_message(&room, &actor_name, sender_did, &sender_language, envelope)
                     .await?;
                 if effective_room != room {
                     self.push_presence_snapshot(&room).await;

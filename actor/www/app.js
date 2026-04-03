@@ -2,7 +2,7 @@ import init, {
   create_identity_with_ipns,
   unlock_identity,
   ensure_bundle_iroh_secret,
-  set_bundle_locale,
+  set_bundle_language_preferences,
   set_bundle_world,
   set_bundle_transports,
   generate_bip39_phrase,
@@ -52,15 +52,12 @@ const LAST_PUBLISHED_CID_KEY = `${STORAGE_PREFIX}.lastPublishedCid`;
 const HOME_PUBLISH_KEY_ALIAS = 'ma-actor';
 const LEGACY_API_KEY = 'ma.identity.v2.kuboApi';
 const LEGACY_ALIAS_KEY = 'ma.identity.v2.alias';
-const DEFAULT_LOCALE = 'en';
+const DEFAULT_LANG = 'en';
+const DEFAULT_LANGUAGE_PREFERENCES = 'en_UK';
 const DEFAULT_UI_LANG = 'en';
 const LOCAL_EDIT_SCRIPT_KEY = `${STORAGE_PREFIX}.localEditScript`;
 const LOCAL_EDIT_SCRIPT_CID_KEY = `${STORAGE_PREFIX}.localEditScriptCid`;
 
-const LOCALE_LABELS = {
-  en: { label: 'English' },
-  'nb-NO': { label: 'Norsk bokmål' }
-};
 const ROOM_POLL_INTERVAL_MS = 1500;
 const DID_DOC_CACHE_TTL_MS = 60_000;
 const LOCK_OVERLAY_TARGET_FPS = 45;
@@ -224,7 +221,8 @@ const state = {
   identity: null,
   encryptedBundle: '',
   aliasName: '',
-  locale: DEFAULT_LOCALE,
+  lang: DEFAULT_LANG,
+  languagePreferences: DEFAULT_LANGUAGE_PREFERENCES,
   uiLang: DEFAULT_UI_LANG,
   debug: false,
   aliasBook: {},
@@ -1084,12 +1082,12 @@ function replaceExitCidInRoomYaml(roomYamlText, exitId, newCid) {
   return lines.join('\n');
 }
 
-function roomLocaleKey() {
-  const locale = normalizeLocale(state.locale).toLowerCase();
-  if (locale.startsWith('nb')) {
-    return 'nb';
+function roomLanguageKey() {
+  const primary = normalizeLanguageTag(state.lang).toLowerCase();
+  if (!primary) {
+    return 'und';
   }
-  return 'en';
+  return primary;
 }
 
 async function appendAmbientProseAfterSpeech() {
@@ -1098,7 +1096,7 @@ async function appendAmbientProseAfterSpeech() {
   }
 
   const info = await fetchCurrentRoomInspectData();
-  const localeKey = roomLocaleKey();
+  const languageKey = roomLanguageKey();
   const roomDescription = String(state.currentHome.roomDescription || '').trim() || uiText('(no description)', '(ingen beskrivelse)');
   const exits = Object.entries(info.exitCidMap);
   const labels = [];
@@ -1107,7 +1105,7 @@ async function appendAmbientProseAfterSpeech() {
     try {
       const exitYaml = await kuboPostText('/api/v0/cat', { arg: asIpfsCatArg(exitCid) });
       const summary = parseExitYamlSummary(exitYaml);
-      const localized = summary.names[localeKey] || summary.names.en || summary.name || exitId;
+      const localized = summary.names[languageKey] || summary.names.und || summary.name || exitId;
       labels.push(localized);
     } catch {
       labels.push(exitId);
@@ -1274,10 +1272,10 @@ async function inspectExitByQuery(queryText) {
     `  aliases: ${summary.aliases.length ? summary.aliases.join(', ') : '(none)'}`,
     `  aliaser: ${summary.aliases.length ? summary.aliases.join(', ') : '(ingen)'}`
   ));
-  const nameLocales = Object.keys(summary.names || {}).sort();
+  const nameLanguages = Object.keys(summary.names || {}).sort();
   appendMessage('system', uiText(
-    `  names: ${nameLocales.length ? nameLocales.map((key) => `${key}=${summary.names[key]}`).join(', ') : '(none)'}`,
-    `  navn: ${nameLocales.length ? nameLocales.map((key) => `${key}=${summary.names[key]}`).join(', ') : '(ingen)'}`
+    `  names: ${nameLanguages.length ? nameLanguages.map((key) => `${key}=${summary.names[key]}`).join(', ') : '(none)'}`,
+    `  navn: ${nameLanguages.length ? nameLanguages.map((key) => `${key}=${summary.names[key]}`).join(', ') : '(ingen)'}`
   ));
   appendMessage('system', `  flags: hidden=${summary.hidden} locked=${summary.locked} one_way=${summary.oneWay}`);
   appendMessage('system', uiText(
@@ -1504,7 +1502,7 @@ async function sendWorldCommandQuery(commandText) {
       state.encryptedBundle,
       state.aliasName,
       state.currentHome.room,
-      state.locale,
+      state.languagePreferences,
       commandText
     )
   );
@@ -2805,7 +2803,7 @@ async function runSmokeTest(targetAlias) {
         state.encryptedBundle,
         state.aliasName,
         state.currentHome.room,
-        state.locale,
+        state.languagePreferences,
         marker
       ),
       12000,
@@ -2876,12 +2874,26 @@ function isPrintableAliasLabel(label) {
   return value.length <= 64;
 }
 
-function normalizeLocale(value) {
-  const normalized = String(value || '').trim().replace(/_/g, '-').toLowerCase();
-  if (['nb', 'nb-no', 'nb-no.utf8', 'nb-no.utf-8'].includes(normalized)) {
-    return 'nb-NO';
+function normalizeLanguageTag(value) {
+  const normalized = String(value || '').trim().replace(/-/g, '_');
+  if (!normalized) {
+    return DEFAULT_LANG;
   }
-  return DEFAULT_LOCALE;
+  if (!/^[A-Za-z0-9_]+$/.test(normalized)) {
+    return DEFAULT_LANG;
+  }
+  return normalized;
+}
+
+function normalizeLanguagePreferences(value) {
+  const items = String(value || '')
+    .split(':')
+    .map((entry) => normalizeLanguageTag(entry))
+    .filter((entry, index, arr) => entry && arr.indexOf(entry) === index);
+  if (items.length === 0) {
+    return DEFAULT_LANGUAGE_PREFERENCES;
+  }
+  return items.join(':');
 }
 
 function normalizeUiLang(value) {
@@ -2901,16 +2913,19 @@ function normalizeUiLang(value) {
   return '';
 }
 
-function uiLangFromLocale(localeValue) {
-  const locale = normalizeLocale(localeValue);
-  if (locale === 'nb-NO') {
+function uiLangFromLanguage(languageValue) {
+  const lang = normalizeLanguageTag(languageValue).toLowerCase();
+  if (lang.startsWith('nb') || lang.startsWith('nn') || lang === 'no') {
     return 'nb';
+  }
+  if (lang.startsWith('en')) {
+    return 'en';
   }
   return DEFAULT_UI_LANG;
 }
 
 function setUiLanguage(value) {
-  const normalized = normalizeUiLang(value) || uiLangFromLocale(state.locale);
+  const normalized = normalizeUiLang(value) || uiLangFromLanguage(state.lang);
   state.uiLang = normalized;
   if (typeof document !== 'undefined' && document.documentElement) {
     document.documentElement.lang = normalized;
@@ -2931,17 +2946,25 @@ const identityStore = createIdentityStore({
     aliasKey: LEGACY_ALIAS_KEY,
     bundleKey: LEGACY_BUNDLE_KEY,
     recoveryPhraseKey: 'ma.identity.v2.recoveryPhrase',
-    defaultLocale: DEFAULT_LOCALE
+    defaultLang: DEFAULT_LANG,
+    defaultLanguage: DEFAULT_LANGUAGE_PREFERENCES
   },
   isValidAliasName,
-  normalizeLocale
+  normalizeLanguageTag,
+  normalizeLanguagePreferences
 });
 
-function setLanguageSelection(value) {
-  const locale = normalizeLocale(value);
-  byId('actor-language').value = locale;
-  state.locale = locale;
-  setUiLanguage(uiLangFromLocale(locale));
+function setLanguageSelection(langValue, languageListValue) {
+  const lang = normalizeLanguageTag(langValue);
+  const language = normalizeLanguagePreferences(languageListValue || lang);
+  byId('actor-language').value = lang;
+  const languageListInput = byId('actor-language-list');
+  if (languageListInput) {
+    languageListInput.value = language;
+  }
+  state.lang = lang;
+  state.languagePreferences = language;
+  setUiLanguage(uiLangFromLanguage(lang));
 }
 
 function toSequenceNumber(value) {
@@ -2963,7 +2986,12 @@ function toSequenceBigInt(value) {
 }
 
 function saveIdentityRecord(aliasName, encryptedBundle) {
-  identityStore.saveIdentityRecord(aliasName, encryptedBundle, byId('actor-language').value);
+  identityStore.saveIdentityRecord(
+    aliasName,
+    encryptedBundle,
+    byId('actor-language').value,
+    byId('actor-language-list')?.value || byId('actor-language').value
+  );
 }
 
 function resolveIdentityRecord(aliasName) {
@@ -2998,7 +3026,7 @@ function loadAliasDraft(aliasName, options = {}) {
   }
   const record = resolveIdentityRecord(normalized);
   byId('bundle-text').value = record?.encryptedBundle || '';
-  setLanguageSelection(record?.locale || DEFAULT_LOCALE);
+  setLanguageSelection(record?.lang || DEFAULT_LANG, record?.language || record?.lang || DEFAULT_LANGUAGE_PREFERENCES);
 
   if (!byId('recovery-phrase').value.trim()) {
     onNewPhrase();
@@ -3376,20 +3404,22 @@ async function onCreateIdentity() {
   setSetupStatus('Creating identity...');
   try {
     const { aliasName, passphrase } = validateSetupInputs(false);
-    const locale = normalizeLocale(byId('actor-language').value);
+    const lang = normalizeLanguageTag(byId('actor-language').value);
+    const language = normalizeLanguagePreferences(byId('actor-language-list')?.value || lang);
     localStorage.setItem(API_KEY, getApiBase());
     setActiveAlias(aliasName);
 
     const ipns = await ensureKuboAliasKey(aliasName);
     const created = JSON.parse(create_identity_with_ipns(passphrase, ipns));
-    const localized = JSON.parse(set_bundle_locale(passphrase, created.encrypted_bundle, locale));
+    const localized = JSON.parse(set_bundle_language_preferences(passphrase, created.encrypted_bundle, lang, language));
     const result = JSON.parse(ensure_bundle_iroh_secret(passphrase, localized.encrypted_bundle));
 
     state.identity = result;
     state.encryptedBundle = result.encrypted_bundle;
     state.passphrase = passphrase;
     state.aliasName = aliasName;
-    state.locale = locale;
+    state.lang = lang;
+    state.languagePreferences = language;
     loadBlockedDidRootsForIdentity(result.did);
     setCurrentPublishInfo({ ipns: result.ipns || '' });
 
@@ -3418,7 +3448,8 @@ async function onUnlockIdentity() {
   setSetupStatus('Unlocking bundle...');
   try {
     const { aliasName, passphrase, bundle } = validateSetupInputs(true);
-    const locale = normalizeLocale(byId('actor-language').value);
+    const lang = normalizeLanguageTag(byId('actor-language').value);
+    const language = normalizeLanguagePreferences(byId('actor-language-list')?.value || lang);
     localStorage.setItem(API_KEY, getApiBase());
     setActiveAlias(aliasName);
 
@@ -3429,14 +3460,15 @@ async function onUnlockIdentity() {
       appendMessage('system', `Warning: bundle ipns (${unlocked.ipns}) does not match alias key ipns (${ipns}).`);
     }
 
-    const localized = JSON.parse(set_bundle_locale(passphrase, bundle, locale));
+    const localized = JSON.parse(set_bundle_language_preferences(passphrase, bundle, lang, language));
     const updated = JSON.parse(ensure_bundle_iroh_secret(passphrase, localized.encrypted_bundle));
 
     state.identity = updated;
     state.encryptedBundle = updated.encrypted_bundle;
     state.passphrase = passphrase;
     state.aliasName = aliasName;
-    state.locale = locale;
+    state.lang = lang;
+    state.languagePreferences = language;
     loadBlockedDidRootsForIdentity(updated.did);
     setCurrentPublishInfo({ ipns: updated.ipns || '' });
 
@@ -3473,22 +3505,26 @@ function onNewPhrase() {
 }
 
 function onLanguageChange() {
-  const locale = normalizeLocale(byId('actor-language').value);
-  applyLocaleChange(locale).catch((error) => {
-    appendMessage('system', `Locale change failed: ${error instanceof Error ? error.message : String(error)}`);
+  const lang = normalizeLanguageTag(byId('actor-language').value);
+  const language = normalizeLanguagePreferences(byId('actor-language-list')?.value || lang);
+  applyLanguageChange(lang, language).catch((error) => {
+    appendMessage('system', `Language update failed: ${error instanceof Error ? error.message : String(error)}`);
   });
 }
 
-async function applyLocaleChange(localeValue) {
-  const locale = normalizeLocale(localeValue);
-  setLanguageSelection(locale);
+async function applyLanguageChange(langValue, languageValue) {
+  const lang = normalizeLanguageTag(langValue);
+  const language = normalizeLanguagePreferences(languageValue || lang);
+  setLanguageSelection(lang, language);
 
   const aliasName = (state.aliasName || byId('alias-name').value || '').trim();
   const phrase = byId('recovery-phrase').value.trim();
   const passphrase = byId('passphrase').value;
 
   if (state.identity && state.encryptedBundle && passphrase.length >= 8) {
-    const updated = JSON.parse(set_bundle_locale(passphrase, state.encryptedBundle, locale));
+    const updated = JSON.parse(
+      set_bundle_language_preferences(passphrase, state.encryptedBundle, lang, language)
+    );
     state.identity = updated;
     state.encryptedBundle = updated.encrypted_bundle;
     byId('bundle-text').value = updated.encrypted_bundle;
@@ -3499,7 +3535,7 @@ async function applyLocaleChange(localeValue) {
   }
 
   updateIdentityLine();
-  setSetupStatus(`Actor language set to ${locale}.`);
+  setSetupStatus(`Actor language preferences set to ${lang} / ${language}.`);
 }
 
 function lockSession() {
@@ -4483,7 +4519,7 @@ async function sendCurrentWorldMessage(text) {
           state.encryptedBundle,
           state.aliasName,
           state.currentHome.room,
-          state.locale,
+          state.languagePreferences,
           trimmedText
         )
       );
@@ -4557,7 +4593,7 @@ async function sendCurrentWorldMessage(text) {
           state.encryptedBundle,
           state.aliasName,
           state.currentHome.room,
-          state.locale,
+          state.languagePreferences,
           normalized
         )
       );
@@ -4587,7 +4623,7 @@ async function sendCurrentWorldMessage(text) {
         state.encryptedBundle,
         state.aliasName,
         state.currentHome.room,
-        state.locale,
+        state.languagePreferences,
         trimmedText
       )
     );
@@ -4685,7 +4721,8 @@ function parseDot(input) {
     appendSystemUi('  .mail [list|pick|reply|delete|clear] - inspect mailbox queue', '  .mail [list|pick|reply|delete|clear] - inspiser mailbox-kø');
     appendSystemUi('  .invite <did|alias> [note] - allow DID and send invite notice', '  .invite <did|alias> [note] - tillat DID og send invitasjonsmelding');
     appendSystemUi('  .smoke [alias]             - run connectivity smoke test', '  .smoke [alias]             - kjør enkel tilkoblingstest');
-    appendSystemUi('  .locale <en|nb-NO>         - change actor language for this alias', '  .locale <en|nb-NO>         - endre actorspråk for dette aliaset');
+    appendMessage('system', '  .lang <tag>                - set primary language (e.g. nb)');
+    appendMessage('system', '  .language <a:b:c>          - set preference chain (e.g. nb_NO:nn_NO:en_UK)');
     appendSystemUi('  .publish                   - publish DID document to IPNS', '  .publish                   - publiser DID-dokument til IPNS');
     appendSystemUi('  .block <did|alias|handle>  - block sender DID root', '  .block <did|alias|handle>  - blokker avsenders DID-root');
     appendSystemUi('  .unblock <did|alias|handle>- remove sender from block list', '  .unblock <did|alias|handle>- fjern avsender fra blokkeringslisten');
@@ -4716,9 +4753,10 @@ function parseDot(input) {
       `Alias:           ${state.aliasName || '(none)'}`,
       `Alias:           ${state.aliasName || '(ingen)'}`
     ));
-    appendMessage('system', uiText(`Locale:          ${state.locale}`, `Locale:          ${state.locale}`));
+    appendMessage('system', uiText(`Lang:            ${state.lang}`, `Lang:            ${state.lang}`));
     appendMessage('system', uiText(`UI language:     ${state.uiLang}`, `UI-språk:        ${state.uiLang}`));
-    appendMessage('system', uiText(`Published field: ma:locale = ${state.locale}`, `Publisert felt:  ma:locale = ${state.locale}`));
+    appendMessage('system', uiText(`Published field: ma:lang = ${state.lang}`, `Publisert felt:  ma:lang = ${state.lang}`));
+    appendMessage('system', uiText(`Published field: ma:language = ${state.languagePreferences}`, `Publisert felt:  ma:language = ${state.languagePreferences}`));
     appendMessage('system', uiText(`DID document at: https://ipfs.io/ipns/${ipns}`, `DID-dokument på: https://ipfs.io/ipns/${ipns}`));
     appendMessage('system', uiText(
       `Current world:   ${state.currentHome ? `${humanizeIdentifier(state.currentHome.endpointId)} (${state.currentHome.room})` : '(none)'}`,
@@ -4740,17 +4778,36 @@ function parseDot(input) {
     return true;
   }
 
-  if (verb === 'locale' || verb === 'lang' || verb === 'language') {
+  if (verb === 'lang') {
     if (args.length !== 1) {
-      appendMessage('system', 'Usage: .locale <en|nb-NO>');
+      appendMessage('system', 'Usage: .lang <tag>');
       return true;
     }
-    applyLocaleChange(args[0])
+    const lang = normalizeLanguageTag(args[0]);
+    const language = normalizeLanguagePreferences(byId('actor-language-list')?.value || lang);
+    applyLanguageChange(lang, language)
       .then(() => {
-        appendMessage('system', `Locale is now ${state.locale}.`);
+        appendMessage('system', `Primary language is now ${state.lang}.`);
       })
       .catch((error) => {
-        appendMessage('system', `Locale change failed: ${error instanceof Error ? error.message : String(error)}`);
+        appendMessage('system', `Language update failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    return true;
+  }
+
+  if (verb === 'language') {
+    if (args.length !== 1) {
+      appendMessage('system', 'Usage: .language <a:b:c>');
+      return true;
+    }
+    const lang = normalizeLanguageTag(byId('actor-language').value);
+    const language = normalizeLanguagePreferences(args[0]);
+    applyLanguageChange(lang, language)
+      .then(() => {
+        appendMessage('system', `Language preferences are now ${state.languagePreferences}.`);
+      })
+      .catch((error) => {
+        appendMessage('system', `Language update failed: ${error instanceof Error ? error.message : String(error)}`);
       });
     return true;
   }
@@ -5251,7 +5308,7 @@ function restoreSavedValues() {
     loadAliasDraft(savedAlias);
   } else {
     byId('bundle-text').value = '';
-    setLanguageSelection(DEFAULT_LOCALE);
+    setLanguageSelection(DEFAULT_LANG, DEFAULT_LANGUAGE_PREFERENCES);
     onNewPhrase();
   }
 
@@ -5291,6 +5348,10 @@ async function main() {
   byId('lock-overlay').addEventListener('click', hideLockOverlay);
   byId('lock-overlay').addEventListener('keydown', onLockOverlayKeydown);
   byId('actor-language').addEventListener('change', onLanguageChange);
+  const languageListInput = byId('actor-language-list');
+  if (languageListInput) {
+    languageListInput.addEventListener('change', onLanguageChange);
+  }
   let aliasDraftTimer = null;
   byId('alias-name').addEventListener('input', (event) => {
     if (aliasDraftTimer) {

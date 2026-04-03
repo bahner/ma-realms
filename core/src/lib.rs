@@ -2,7 +2,6 @@ pub mod addressing;
 pub mod capability_acl;
 pub mod domain;
 pub mod interfaces;
-pub mod locale;
 pub mod object_runtime;
 pub mod parser;
 pub mod protocol;
@@ -22,7 +21,6 @@ pub use capability_acl::{
 };
 pub use domain::{ActorType, AvatarActor, ExitData, ObjectData, RoomActor, WorldActor};
 pub use interfaces::{AclRuntime, DidPublisher, IpfsPublisher};
-pub use locale::{LocaleLexicon, canonical_locale, localized_here_alias, localized_say_verb};
 pub use object_runtime::{
     ObjectCommandOutput, ObjectCommandResult, ObjectDefinition, ObjectInboxMessage,
     ObjectMessageIntent, ObjectMessageKind, ObjectMessageRetention, ObjectMessageTarget, ObjectPersistencePolicy,
@@ -30,9 +28,7 @@ pub use object_runtime::{
     ObjectVerbDefinition, ObjectVerbEvaluator,
 };
 pub use parser::{
-    ActorCommand, MessageEnvelope, normalize_spoken_text, parse_actor_command,
-    parse_actor_command_with_lexicon, parse_actor_command_with_locale, parse_message,
-    parse_message_with_lexicon, parse_message_with_locale,
+    ActorCommand, MessageEnvelope, normalize_spoken_text, parse_actor_command, parse_message,
 };
 pub use protocol::{
     LaneCapability, PresenceAvatar, RoomEvent, TransportAck, TransportAckCode, WorldCommand,
@@ -50,10 +46,9 @@ pub use room_actor::{
 #[cfg(test)]
 mod tests {
     use super::{
-        ActorCommand, LocaleLexicon, MessageEnvelope, canonical_locale, did_root,
+        ActorCommand, MessageEnvelope, did_root,
         find_alias_for_address, find_did_by_endpoint, humanize_identifier, humanize_text,
-        localized_here_alias, normalize_endpoint_id, normalize_spoken_text, parse_message,
-        parse_message_with_lexicon, parse_message_with_locale, resolve_alias_input,
+        normalize_endpoint_id, normalize_spoken_text, parse_message, resolve_alias_input,
     };
     use std::collections::HashMap;
 
@@ -175,73 +170,6 @@ mod tests {
     #[test]
     fn normalizes_quoted_text() {
         assert_eq!(normalize_spoken_text("\"Hello\""), "Hello");
-    }
-
-    #[test]
-    fn normalizes_nb_locale_spellings() {
-        assert_eq!(canonical_locale("nb_NO.UTF8"), "nb-NO".to_string());
-    }
-
-    #[test]
-    fn parses_norwegian_here_alias() {
-        assert_eq!(
-            parse_message_with_locale("@her hvem", "nb-NO"),
-            MessageEnvelope::ActorCommand {
-                target: "here".to_string(),
-                command: ActorCommand::Raw {
-                    command: "who".to_string()
-                }
-            }
-        );
-    }
-
-    #[test]
-    fn parses_avatar_target() {
-        assert_eq!(
-            parse_message_with_locale("@avatar si hei", "nb-NO"),
-            MessageEnvelope::ActorCommand {
-                target: "avatar".to_string(),
-                command: ActorCommand::Say {
-                    payload: "hei".to_string()
-                }
-            }
-        );
-    }
-
-    #[test]
-    fn supports_custom_lexicon() {
-        let lexicon = LocaleLexicon {
-            canonical_locale: "xx".to_string(),
-            here_aliases: vec!["der".to_string()],
-            avatar_aliases: vec!["self".to_string()],
-            say_verbs: vec!["speak".to_string()],
-            room_command_aliases: HashMap::from([("wer".to_string(), "who".to_string())]),
-        };
-
-        assert_eq!(
-            parse_message_with_lexicon("@der wer", &lexicon),
-            MessageEnvelope::ActorCommand {
-                target: "here".to_string(),
-                command: ActorCommand::Raw {
-                    command: "who".to_string(),
-                },
-            }
-        );
-
-        assert_eq!(
-            parse_message_with_lexicon("@self speak hi", &lexicon),
-            MessageEnvelope::ActorCommand {
-                target: "avatar".to_string(),
-                command: ActorCommand::Say {
-                    payload: "hi".to_string(),
-                },
-            }
-        );
-    }
-
-    #[test]
-    fn exposes_localized_aliases() {
-        assert_eq!(localized_here_alias("nb-NO"), "her".to_string());
     }
 
     #[test]

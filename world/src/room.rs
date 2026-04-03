@@ -103,26 +103,26 @@ impl Room {
         }
     }
 
-    pub fn set_title(&mut self, locale: &str, value: String) {
-        self.titles.insert(locale.to_string(), value);
+    pub fn set_title(&mut self, language: &str, value: String) {
+        self.titles.insert(language.to_string(), value);
     }
 
-    pub fn set_description(&mut self, locale: &str, value: String) {
-        self.descriptions.insert(locale.to_string(), value);
+    pub fn set_description(&mut self, language: &str, value: String) {
+        self.descriptions.insert(language.to_string(), value);
     }
 
-    pub fn description_or_default(&self, locale: &str) -> String {
+    pub fn description_or_default(&self, language: &str) -> String {
         self.descriptions
-            .get(locale)
-            .or_else(|| self.descriptions.get("en"))
+            .get(language)
+            .or_else(|| self.descriptions.get("und"))
             .cloned()
             .unwrap_or_else(|| "(no description)".to_string())
     }
 
-    pub fn title_or_default(&self, locale: &str) -> String {
+    pub fn title_or_default(&self, language: &str) -> String {
         self.titles
-            .get(locale)
-            .or_else(|| self.titles.get("en"))
+            .get(language)
+            .or_else(|| self.titles.get("und"))
             .cloned()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| default_room_title(&self.name))
