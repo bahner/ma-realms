@@ -23,7 +23,7 @@ pub use capability_acl::{
 pub use domain::{ActorType, AvatarActor, ExitData, ObjectData, RoomActor, WorldActor};
 pub use interfaces::{AclRuntime, DidPublisher, IpfsPublisher};
 pub use object_runtime::{
-    MAILBOX_COMMANDS_INLINE,
+    CLOSET_COMMANDS_INLINE, MAILBOX_COMMANDS_INLINE,
     ObjectCommandOutput, ObjectCommandResult, ObjectDefinition, ObjectInboxMessage,
     ObjectMessageIntent, ObjectMessageKind, ObjectMessageRetention, ObjectMessageTarget, ObjectPersistencePolicy,
     ObjectProgramRef, ObjectReceiverListener, ObjectRuntimeState, PendingEphemeralRequest,
@@ -43,7 +43,8 @@ pub use protocol::{
     CONTENT_TYPE_DOC, CONTENT_TYPE_WHISPER,
 };
 pub use requirements::{
-    RequirementArgArity, RequirementChecker, RequirementEvaluation,
+    LegacyRequirement, RequirementArgArity, RequirementChecker, RequirementEvaluation,
+    RequirementValue,
     RequirementSet, RequirementSignature, RequirementSpec,
     RequirementValidationIssue, RequirementValidationIssueKind, RequirementValidationReport,
     REQUIREMENT_SIGNATURES, evaluate_requirements, requirement_catalog, validate_requirements,

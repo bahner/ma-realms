@@ -1435,8 +1435,8 @@ async function inspectObjectByQuery(queryText) {
     appendMessage('system', `  use ${objectDid} as @${suggestedAlias}`);
   }
 
-  if (kv.definition_cid) {
-    appendMessage('system', `  definition_cid: ${kv.definition_cid}`);
+  if (kv.cid) {
+    appendMessage('system', `  cid: ${kv.cid}`);
   }
   if (kv.persistence) {
     appendMessage('system', `  persistence: ${kv.persistence}`);

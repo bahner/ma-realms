@@ -29,15 +29,16 @@ use iroh::{
 use ma_core::{
     ActorCommand, BROADCAST_ALPN, CHAT_ALPN, CMD_ALPN, CONTENT_TYPE_CHAT, CONTENT_TYPE_CMD,
     CLOSET_ALPN, ClosetRequest, ClosetResponse,
-    CONTENT_TYPE_PRESENCE, CONTENT_TYPE_WORLD, CompiledCapabilityAcl, DEFAULT_WORLD_RELAY_URL,
+    CONTENT_TYPE_BROADCAST, CONTENT_TYPE_PRESENCE, CONTENT_TYPE_WORLD, CompiledCapabilityAcl,
+    DEFAULT_WORLD_RELAY_URL,
     ExitData, LaneCapability, MessageEnvelope, ObjectDefinition, ObjectInboxMessage,
-    MAILBOX_COMMANDS_INLINE,
+    CLOSET_COMMANDS_INLINE, MAILBOX_COMMANDS_INLINE,
     ObjectMessageIntent, ObjectMessageKind, ObjectMessageRetention, ObjectMessageTarget,
     ObjectRuntimeState, PRESENCE_ALPN, PresenceAvatar, RoomActorAction, RoomActorContext,
     RoomEvent, TransportAck, TransportAckCode, WORLD_ALPN, WorldCommand, WorldLane, WorldRequest,
     WorldResponse, compile_acl, evaluate_compiled_acl_with_owner, execute_room_actor_command,
     normalize_spoken_text, parse_capability_acl_text, parse_object_local_capability_acl,
-    RequirementChecker, RequirementSet, RequirementSpec,
+    LegacyRequirement, RequirementChecker, RequirementSet, RequirementValue,
 };
 use nanoid::nanoid;
 use rand::RngCore;
@@ -51,6 +52,7 @@ use tracing_subscriber::prelude::*;
 mod actor;
 mod actor_web;
 mod bootstrap;
+mod content_validation;
 mod kubo;
 mod room;
 mod schema;
@@ -81,7 +83,8 @@ const MAX_KNOCK_INBOX: usize = 512;
 #[allow(dead_code)]
 const MAX_OBJECT_INBOX: usize = 512;
 const MAILBOX_LOCK_SECS: u64 = 600;
-const DID_CACHE_TTL: Duration = Duration::from_secs(60);
+const OBJECT_WASHER_INTERVAL_SECS: u64 = 20;
+const CLOSET_LISTENING_MESSAGE: &str = "someone appears to be listening from the closet";
 const RELAY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_WORLD_SLUG: &str = "ma";
 const DEFAULT_KUBO_API_URL: &str = "http://127.0.0.1:5001";
@@ -107,7 +110,7 @@ fn extract_global_config_arg(raw_args: Vec<String>) -> Result<Vec<String>> {
 #[derive(Clone, Debug)]
 struct CachedDidDocument {
     document: Document,
-    fetched_at: Instant,
+    dirty: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -190,6 +193,18 @@ struct PresenceSnapshotEvent {
     ts: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct RoomBroadcastEvent {
+    v: u8,
+    kind: String,
+    room: String,
+    room_did: String,
+    sender: Option<String>,
+    message: String,
+    seq: u64,
+    ts: String,
+}
+
 
 
 #[derive(Clone, Debug)]
@@ -212,59 +227,80 @@ struct ClosetSession {
     endpoint: String,
     created_at: String,
     last_lobby_sequence: u64,
+    announced_listening: bool,
     name: Option<String>,
     description: Option<String>,
     did: Option<String>,
     fragment: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct ClosetProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery_checksum: Option<String>,
+    updated_at: String,
+}
+
 #[derive(Clone, Debug, Default)]
 struct ObjectRequirementRuntime {
     room_name: String,
-    actor_handle: String,
-    caller_root: String,
-    is_world_owner: bool,
-    object_exists: bool,
-    object_holder: Option<String>,
-    object_opened_by: Option<String>,
-    object_owner: Option<String>,
+    user: String,
+    owner: Option<String>,
+    location: String,
+    opened_by: Option<String>,
+    world_owner: Option<String>,
 }
 
 impl RequirementChecker for ObjectRequirementRuntime {
-    fn check_requirement(&self, requirement: &RequirementSpec) -> bool {
+    fn resolve_symbol(&self, symbol: &str) -> Option<RequirementValue> {
+        match symbol {
+            "user" => Some(RequirementValue::String(self.user.clone())),
+            "owner" => Some(
+                self.owner
+                    .clone()
+                    .map(RequirementValue::String)
+                    .unwrap_or(RequirementValue::Null),
+            ),
+            "location" => Some(RequirementValue::String(self.location.clone())),
+            "opened_by" => Some(
+                self.opened_by
+                    .clone()
+                    .map(RequirementValue::String)
+                    .unwrap_or(RequirementValue::Null),
+            ),
+            "world.owner" => Some(
+                self.world_owner
+                    .clone()
+                    .map(RequirementValue::String)
+                    .unwrap_or(RequirementValue::Null),
+            ),
+            "world.slug" => Some(RequirementValue::String(DEFAULT_WORLD_SLUG.to_string())),
+            _ => {
+                if let Some(state_key) = symbol.strip_prefix("state.") {
+                    let _ = state_key;
+                    return Some(RequirementValue::Null);
+                }
+                None
+            }
+        }
+    }
+
+    fn check_legacy_requirement(&self, requirement: &LegacyRequirement) -> bool {
         match requirement.name.as_str() {
-            "object.exists" => self.object_exists,
-            "object.held" => self.object_holder.is_some(),
-            "object.not_held" => self.object_holder.is_none(),
-            "object.held_by_self" => self
-                .object_holder
-                .as_ref()
-                .map(|holder| holder == &self.actor_handle)
-                .unwrap_or(false),
-            "object.held_by_other" => self
-                .object_holder
-                .as_ref()
-                .map(|holder| holder != &self.actor_handle)
-                .unwrap_or(false),
-            "object.open" => self.object_opened_by.is_some(),
-            "object.closed" => self.object_opened_by.is_none(),
             "object.opened_by_self" => self
-                .object_opened_by
+                .opened_by
                 .as_ref()
-                .map(|did| did == &self.caller_root)
+                .map(|did| did == &self.user)
                 .unwrap_or(false),
-            "object.opened_by_other" => self
-                .object_opened_by
+            "world.owned" => self
+                .world_owner
                 .as_ref()
-                .map(|did| did != &self.caller_root)
+                .map(|owner| owner == &self.user)
                 .unwrap_or(false),
-            "object.owned" => self.object_owner.is_some(),
-            "object.owner_is_self" => self
-                .object_owner
-                .as_ref()
-                .map(|owner| owner == &self.caller_root)
-                .unwrap_or(false),
-            "world.owned" => self.is_world_owner,
             "room.in" => requirement
                 .arg
                 .as_ref()
@@ -366,6 +402,8 @@ pub struct World {
     next_knock_id: Arc<RwLock<u64>>,
     /// Ephemeral pre-DID onboarding sessions keyed by session id.
     closet_sessions: Arc<RwLock<HashMap<String, ClosetSession>>>,
+    /// DID-root keyed profile data established via closet onboarding.
+    closet_profiles: Arc<RwLock<HashMap<String, ClosetProfile>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -551,13 +589,6 @@ struct PersistedWorldEnvelope {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct ObjectDefinitionDoc {
-    kind: String,
-    version: u32,
-    definition: ObjectDefinition,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 struct RoomAclDoc {
     kind: String,
     version: u32,
@@ -615,6 +646,8 @@ struct RuntimeStateDoc {
     room_cids: HashMap<String, String>,
     #[serde(default)]
     room_objects: HashMap<String, Vec<ObjectRuntimeState>>,
+    #[serde(default)]
+    closet_profiles: HashMap<String, ClosetProfile>,
 }
 
 fn exit_for_language(id: String, name: String, to: String, language: &str) -> ExitData {
@@ -687,6 +720,14 @@ struct LegacyRoomYaml {
 }
 
 impl World {
+    fn recovery_checksum(secret: &str) -> String {
+        let normalized = secret.trim();
+        let mut hasher = Sha256::new();
+        hasher.update(b"ma/closet/recovery/v1");
+        hasher.update(normalized.as_bytes());
+        B64.encode(hasher.finalize())
+    }
+
     pub(crate) fn new(entry_acl: EntryAcl, kubo_url: String, world_root_pin_name: String) -> Self {
         Self {
             rooms: Arc::new(RwLock::new(HashMap::new())),
@@ -721,6 +762,7 @@ impl World {
             knock_inbox: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_KNOCK_INBOX))),
             next_knock_id: Arc::new(RwLock::new(0)),
             closet_sessions: Arc::new(RwLock::new(HashMap::new())),
+            closet_profiles: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -783,21 +825,67 @@ impl World {
     async fn closet_start_session(&self, endpoint: &str) -> Result<(String, u64)> {
         let session_id = nanoid!();
         let latest_lobby_sequence = self.latest_room_event_sequence(DEFAULT_ROOM).await?;
+        let mut profile_name: Option<String> = None;
+        let mut profile_description: Option<String> = None;
+        let mut profile_did: Option<String> = None;
+
+        if let Some(did_root) = self.did_root_by_endpoint(DEFAULT_ROOM, endpoint).await {
+            profile_did = Some(did_root.clone());
+            if let Some(profile) = self
+                .closet_profiles
+                .read()
+                .await
+                .get(&did_root)
+                .cloned()
+            {
+                profile_name = profile.name;
+                profile_description = profile.description;
+            }
+        }
+
         let session = ClosetSession {
             id: session_id.clone(),
             endpoint: endpoint.to_string(),
             created_at: Utc::now().to_rfc3339(),
             last_lobby_sequence: latest_lobby_sequence,
-            name: None,
-            description: None,
-            did: None,
+            announced_listening: false,
+            name: profile_name,
+            description: profile_description,
+            did: profile_did,
             fragment: None,
         };
         self.closet_sessions
             .write()
             .await
             .insert(session_id.clone(), session);
+        self.announce_closet_listener(session_id.as_str(), endpoint).await?;
         Ok((session_id, latest_lobby_sequence))
+    }
+
+    async fn announce_closet_listener(&self, session_id: &str, endpoint: &str) -> Result<()> {
+        let mut sessions = self.closet_sessions.write().await;
+        let Some(session) = sessions.get_mut(session_id) else {
+            return Err(anyhow!("unknown closet session"));
+        };
+        if session.endpoint != endpoint {
+            return Err(anyhow!("closet session endpoint mismatch"));
+        }
+        if session.announced_listening {
+            return Ok(());
+        }
+        session.announced_listening = true;
+        drop(sessions);
+
+        self.record_room_event(
+            DEFAULT_ROOM,
+            "system",
+            None,
+            None,
+            Some(endpoint.to_string()),
+            CLOSET_LISTENING_MESSAGE.to_string(),
+        )
+        .await;
+        Ok(())
     }
 
     async fn closet_session_owned_by(
@@ -838,7 +926,7 @@ impl World {
                     return Err(anyhow!("name cannot be empty"));
                 }
                 session.name = Some(normalized_value);
-                Ok("name stored".to_string())
+                Ok("name stored (used on first world enter)".to_string())
             }
             "description" | "desc" => {
                 if normalized_value.is_empty() {
@@ -851,18 +939,230 @@ impl World {
         }
     }
 
+    async fn upsert_closet_profile(
+        &self,
+        did_raw: &str,
+        name: Option<String>,
+        description: Option<String>,
+    ) -> Result<()> {
+        let did = Did::try_from(did_raw)
+            .map_err(|e| anyhow!("invalid closet profile DID '{}': {}", did_raw, e))?;
+        let did_root = did.without_fragment().id();
+
+        let mut profiles = self.closet_profiles.write().await;
+        let profile = profiles.entry(did_root).or_default();
+        if let Some(value) = name {
+            let normalized = value.trim().to_string();
+            if !normalized.is_empty() {
+                profile.name = Some(normalized);
+            }
+        }
+        if let Some(value) = description {
+            let normalized = value.trim().to_string();
+            if !normalized.is_empty() {
+                profile.description = Some(normalized);
+            }
+        }
+        profile.updated_at = Utc::now().to_rfc3339();
+        Ok(())
+    }
+
+    async fn set_recovery_secret_for_did(&self, did_raw: &str, secret: &str) -> Result<()> {
+        let did = Did::try_from(did_raw)
+            .map_err(|e| anyhow!("invalid DID '{}': {}", did_raw, e))?;
+        let did_root = did.without_fragment().id();
+        let checksum = Self::recovery_checksum(secret);
+        let mut profiles = self.closet_profiles.write().await;
+        let profile = profiles.entry(did_root).or_default();
+        profile.recovery_checksum = Some(checksum);
+        profile.updated_at = Utc::now().to_rfc3339();
+        Ok(())
+    }
+
+    async fn rekey_identity_from_recovery(
+        &self,
+        handle_raw: &str,
+        recovery_secret: &str,
+        new_did_raw: &str,
+    ) -> Result<(String, String, String)> {
+        let handle = handle_raw.trim().trim_start_matches('@').to_string();
+        if handle.is_empty() {
+            return Err(anyhow!("handle cannot be empty"));
+        }
+        let secret = recovery_secret.trim();
+        if secret.is_empty() {
+            return Err(anyhow!("recovery secret cannot be empty"));
+        }
+
+        let new_did = Did::try_from(new_did_raw)
+            .map_err(|e| anyhow!("invalid new DID '{}': {}", new_did_raw, e))?;
+        let new_root = new_did.without_fragment().id();
+
+        let old_root = {
+            let handle_to_did = self.handle_to_did.read().await;
+            handle_to_did
+                .get(&handle)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown avatar handle '{}'; expected existing handle", handle))?
+        };
+
+        let expected_checksum = {
+            let profiles = self.closet_profiles.read().await;
+            profiles
+                .get(&old_root)
+                .and_then(|p| p.recovery_checksum.clone())
+                .ok_or_else(|| anyhow!("no recovery checksum is set for @{}", handle))?
+        };
+        if expected_checksum != Self::recovery_checksum(secret) {
+            return Err(anyhow!("invalid recovery secret"));
+        }
+
+        {
+            let did_to_handle = self.did_to_handle.read().await;
+            if let Some(existing_handle) = did_to_handle.get(&new_root) {
+                if existing_handle != &handle {
+                    return Err(anyhow!(
+                        "new DID already owns handle @{}; choose another DID",
+                        existing_handle
+                    ));
+                }
+            }
+        }
+
+        {
+            let mut handle_to_did = self.handle_to_did.write().await;
+            let current = handle_to_did
+                .get(&handle)
+                .cloned()
+                .ok_or_else(|| anyhow!("handle mapping disappeared for @{}", handle))?;
+            if current != old_root {
+                return Err(anyhow!("handle @{} no longer maps to expected DID", handle));
+            }
+            handle_to_did.insert(handle.clone(), new_root.clone());
+        }
+        {
+            let mut did_to_handle = self.did_to_handle.write().await;
+            did_to_handle.remove(&old_root);
+            did_to_handle.insert(new_root.clone(), handle.clone());
+        }
+
+        {
+            let mut acl = self.entry_acl.write().await;
+            acl.allowed_dids.remove(&old_root);
+            acl.allowed_dids.insert(new_root.clone());
+        }
+
+        {
+            let mut owner = self.owner_did.write().await;
+            if owner.as_deref() == Some(old_root.as_str()) {
+                *owner = Some(new_root.clone());
+            }
+        }
+
+        {
+            let mut rooms = self.rooms.write().await;
+            for room in rooms.values_mut() {
+                if room.acl.owner.as_deref() == Some(old_root.as_str()) {
+                    room.acl.owner = Some(new_root.clone());
+                }
+                if room.acl.allow.remove(&old_root) {
+                    room.acl.allow.insert(new_root.clone());
+                }
+                room.acl.deny.remove(&new_root);
+
+                room.avatars
+                    .retain(|_, av| av.agent_did.without_fragment().id() != old_root);
+            }
+        }
+
+        {
+            let mut room_objects = self.room_objects.write().await;
+            for room_map in room_objects.values_mut() {
+                for object in room_map.values_mut() {
+                    if object.owner_did.as_deref() == Some(old_root.as_str()) {
+                        object.owner_did = Some(new_root.clone());
+                        object.meta_dirty = true;
+                    }
+                }
+            }
+        }
+
+        {
+            let mut profiles = self.closet_profiles.write().await;
+            let mut profile = profiles.remove(&old_root).unwrap_or_default();
+            profile.updated_at = Utc::now().to_rfc3339();
+            profiles.insert(new_root.clone(), profile);
+        }
+
+        self.record_room_event(
+            DEFAULT_ROOM,
+            "system",
+            Some(handle.clone()),
+            Some(new_root.clone()),
+            None,
+            format!("{} rekeyed identity", handle),
+        )
+        .await;
+
+        Ok((handle, old_root, new_root))
+    }
+
+    async fn did_root_by_endpoint(&self, room_name: &str, endpoint: &str) -> Option<String> {
+        let rooms = self.rooms.read().await;
+        let room = rooms.get(room_name)?;
+        room.avatars
+            .values()
+            .find(|avatar| avatar.agent_endpoint == endpoint)
+            .map(|avatar| avatar.agent_did.without_fragment().id())
+    }
+
+    async fn set_avatar_description_for_did(
+        &self,
+        room_name: &str,
+        did_root: &str,
+        description: &str,
+    ) -> bool {
+        let mut rooms = self.rooms.write().await;
+        let Some(room) = rooms.get_mut(room_name) else {
+            return false;
+        };
+
+        let mut updated = false;
+        for avatar in room.avatars.values_mut() {
+            if avatar.agent_did.without_fragment().id() == did_root {
+                avatar.set_description("und", description.to_string());
+                updated = true;
+            }
+        }
+        updated
+    }
+
     async fn closet_submit_citizenship(
         &self,
         session_id: &str,
         endpoint: &str,
         ipns_private_key_base64: &str,
     ) -> Result<(String, String, String)> {
-        let _session = self.closet_session_owned_by(session_id, endpoint).await?;
-        if ipns_private_key_base64.trim().is_empty() {
-            return self.issue_bootstrap_did(endpoint).await;
+        let session = self.closet_session_owned_by(session_id, endpoint).await?;
+        let (did, fragment, key_name) = if ipns_private_key_base64.trim().is_empty() {
+            self.issue_bootstrap_did(endpoint).await?
+        } else {
+            self.issue_bootstrap_citizenship(endpoint, ipns_private_key_base64)
+                .await?
+        };
+
+        self.upsert_closet_profile(&did, session.name.clone(), session.description.clone())
+            .await?;
+
+        {
+            let mut sessions = self.closet_sessions.write().await;
+            if let Some(active) = sessions.get_mut(session_id) {
+                active.did = Some(did.clone());
+                active.fragment = Some(fragment.clone());
+            }
         }
-        self.issue_bootstrap_citizenship(endpoint, ipns_private_key_base64)
-            .await
+
+        Ok((did, fragment, key_name))
     }
 
     async fn closet_command(
@@ -893,7 +1193,7 @@ impl World {
         if verb == "help" {
             return Ok(ClosetResponse {
                 ok: true,
-                message: "Closet commands: help | hear | name <text> | description <text> | citizen [ipns_key_base64]".to_string(),
+                message: "Closet commands: help | hear | name <text> | description <text> | citizen [ipns_key_base64] | enter [room] | recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>".to_string(),
                 session_id: Some(session_id.to_string()),
                 prompt: Some("You are in the closet with no avatar yet. Fill profile fields, then run 'citizen'.".to_string()),
                 lobby_events: Vec::new(),
@@ -946,6 +1246,26 @@ impl World {
                 return Err(anyhow!("usage: {} <value>", verb));
             }
             let msg = self.closet_answer(session_id, endpoint, &verb, tail).await?;
+
+            let session = self.closet_session_owned_by(session_id, endpoint).await?;
+            if let Some(did) = session.did.as_deref() {
+                self.upsert_closet_profile(did, session.name.clone(), session.description.clone())
+                    .await?;
+                if verb == "description" {
+                    let did_root = Did::try_from(did)
+                        .map_err(|e| anyhow!("invalid closet DID '{}': {}", did, e))?
+                        .without_fragment()
+                        .id();
+                    let _ = self
+                        .set_avatar_description_for_did(
+                            DEFAULT_ROOM,
+                            did_root.as_str(),
+                            tail.trim(),
+                        )
+                        .await;
+                }
+            }
+
             return Ok(ClosetResponse {
                 ok: true,
                 message: msg,
@@ -963,13 +1283,6 @@ impl World {
             let (did, fragment, key_name) = self
                 .closet_submit_citizenship(session_id, endpoint, tail)
                 .await?;
-            {
-                let mut sessions = self.closet_sessions.write().await;
-                if let Some(session) = sessions.get_mut(session_id) {
-                    session.did = Some(did.clone());
-                    session.fragment = Some(fragment.clone());
-                }
-            }
             return Ok(ClosetResponse {
                 ok: true,
                 message: "Citizenship granted. You can now enter the world.".to_string(),
@@ -980,6 +1293,279 @@ impl World {
                 did: Some(did),
                 fragment: Some(fragment),
                 key_name: Some(key_name),
+            });
+        }
+
+        if verb == "recovery" {
+            let mut args = tail.split_whitespace();
+            let action = args.next().unwrap_or_default().to_ascii_lowercase();
+
+            if action.is_empty() {
+                return Ok(ClosetResponse {
+                    ok: false,
+                    message: "usage: recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>".to_string(),
+                    session_id: Some(session_id.to_string()),
+                    prompt: None,
+                    lobby_events: Vec::new(),
+                    latest_lobby_sequence: 0,
+                    did: None,
+                    fragment: None,
+                    key_name: None,
+                });
+            }
+
+            if action == "set" {
+                let passphrase = tail.strip_prefix("set").unwrap_or_default().trim();
+                if passphrase.len() < 8 {
+                    return Ok(ClosetResponse {
+                        ok: false,
+                        message: "recovery passphrase must be at least 8 characters".to_string(),
+                        session_id: Some(session_id.to_string()),
+                        prompt: None,
+                        lobby_events: Vec::new(),
+                        latest_lobby_sequence: 0,
+                        did: None,
+                        fragment: None,
+                        key_name: None,
+                    });
+                }
+
+                let session = self.closet_session_owned_by(session_id, endpoint).await?;
+                let did = if let Some(did) = session.did.clone() {
+                    did
+                } else if let Some(root) = self.did_root_by_endpoint(DEFAULT_ROOM, endpoint).await {
+                    root
+                } else {
+                    return Ok(ClosetResponse {
+                        ok: false,
+                        message: "recovery set requires a DID in this closet session (run citizen first or open closet while logged in)".to_string(),
+                        session_id: Some(session_id.to_string()),
+                        prompt: None,
+                        lobby_events: Vec::new(),
+                        latest_lobby_sequence: 0,
+                        did: None,
+                        fragment: None,
+                        key_name: None,
+                    });
+                };
+
+                self.set_recovery_secret_for_did(&did, passphrase).await?;
+                return Ok(ClosetResponse {
+                    ok: true,
+                    message: "recovery checksum stored".to_string(),
+                    session_id: Some(session_id.to_string()),
+                    prompt: None,
+                    lobby_events: Vec::new(),
+                    latest_lobby_sequence: 0,
+                    did: None,
+                    fragment: None,
+                    key_name: None,
+                });
+            }
+
+            if action == "status" {
+                let session = self.closet_session_owned_by(session_id, endpoint).await?;
+                let did = if let Some(did) = session.did.clone() {
+                    Some(did)
+                } else {
+                    self.did_root_by_endpoint(DEFAULT_ROOM, endpoint).await
+                };
+                let Some(did) = did else {
+                    return Ok(ClosetResponse {
+                        ok: false,
+                        message: "no DID context for this closet session".to_string(),
+                        session_id: Some(session_id.to_string()),
+                        prompt: None,
+                        lobby_events: Vec::new(),
+                        latest_lobby_sequence: 0,
+                        did: None,
+                        fragment: None,
+                        key_name: None,
+                    });
+                };
+                let did_root = Did::try_from(did.as_str())
+                    .map_err(|e| anyhow!("invalid DID '{}': {}", did, e))?
+                    .without_fragment()
+                    .id();
+                let configured = self
+                    .closet_profiles
+                    .read()
+                    .await
+                    .get(&did_root)
+                    .and_then(|profile| profile.recovery_checksum.clone())
+                    .is_some();
+
+                return Ok(ClosetResponse {
+                    ok: true,
+                    message: if configured {
+                        "recovery is configured".to_string()
+                    } else {
+                        "recovery is not configured".to_string()
+                    },
+                    session_id: Some(session_id.to_string()),
+                    prompt: None,
+                    lobby_events: Vec::new(),
+                    latest_lobby_sequence: 0,
+                    did: None,
+                    fragment: None,
+                    key_name: None,
+                });
+            }
+
+            if action == "rekey" {
+                let mut split = tail
+                    .strip_prefix("rekey")
+                    .unwrap_or_default()
+                    .trim()
+                    .splitn(2, char::is_whitespace);
+                let Some(handle) = split.next() else {
+                    return Ok(ClosetResponse {
+                        ok: false,
+                        message: "usage: recovery rekey <@handle> <passphrase>".to_string(),
+                        session_id: Some(session_id.to_string()),
+                        prompt: None,
+                        lobby_events: Vec::new(),
+                        latest_lobby_sequence: 0,
+                        did: None,
+                        fragment: None,
+                        key_name: None,
+                    });
+                };
+                let passphrase = split.next().unwrap_or_default().trim();
+                if passphrase.is_empty() {
+                    return Ok(ClosetResponse {
+                        ok: false,
+                        message: "usage: recovery rekey <@handle> <passphrase>".to_string(),
+                        session_id: Some(session_id.to_string()),
+                        prompt: None,
+                        lobby_events: Vec::new(),
+                        latest_lobby_sequence: 0,
+                        did: None,
+                        fragment: None,
+                        key_name: None,
+                    });
+                }
+
+                let session = self.closet_session_owned_by(session_id, endpoint).await?;
+                let Some(new_did) = session.did.clone() else {
+                    return Ok(ClosetResponse {
+                        ok: false,
+                        message: "recovery rekey requires a new DID in this session (run citizen first)".to_string(),
+                        session_id: Some(session_id.to_string()),
+                        prompt: None,
+                        lobby_events: Vec::new(),
+                        latest_lobby_sequence: 0,
+                        did: None,
+                        fragment: None,
+                        key_name: None,
+                    });
+                };
+
+                let (handle, old_root, new_root) = self
+                    .rekey_identity_from_recovery(handle, passphrase, &new_did)
+                    .await?;
+                return Ok(ClosetResponse {
+                    ok: true,
+                    message: format!(
+                        "rekey complete for @{} ({} -> {})",
+                        handle, old_root, new_root
+                    ),
+                    session_id: Some(session_id.to_string()),
+                    prompt: None,
+                    lobby_events: Vec::new(),
+                    latest_lobby_sequence: 0,
+                    did: Some(new_did),
+                    fragment: None,
+                    key_name: None,
+                });
+            }
+
+            return Ok(ClosetResponse {
+                ok: false,
+                message: "usage: recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>".to_string(),
+                session_id: Some(session_id.to_string()),
+                prompt: None,
+                lobby_events: Vec::new(),
+                latest_lobby_sequence: 0,
+                did: None,
+                fragment: None,
+                key_name: None,
+            });
+        }
+
+        if verb == "enter" {
+            let (did, preferred_handle) = {
+                let sessions = self.closet_sessions.read().await;
+                let Some(session) = sessions.get(session_id) else {
+                    return Err(anyhow!("unknown closet session"));
+                };
+                if session.endpoint != endpoint {
+                    return Err(anyhow!("closet session endpoint mismatch"));
+                }
+                let did = session
+                    .did
+                    .clone()
+                    .ok_or_else(|| anyhow!("no DID in session; run 'citizen' first"))?;
+                (did, session.name.clone())
+            };
+
+            let room = if tail.is_empty() {
+                DEFAULT_ROOM.to_string()
+            } else {
+                tail.trim().to_string()
+            };
+
+            let did_obj = Did::try_from(did.as_str())
+                .map_err(|e| anyhow!("invalid session DID '{}': {}", did, e))?;
+            let root_did = did_obj.without_fragment();
+
+            if !self.can_enter(&root_did).await {
+                let did_root = root_did.id();
+                let (knock_id, duplicate) = self
+                    .enqueue_knock(&room, &did_root, endpoint, preferred_handle)
+                    .await;
+                let detail = if duplicate {
+                    format!(
+                        "entry denied for {}; existing knock request id={} is pending",
+                        did_root, knock_id
+                    )
+                } else {
+                    format!(
+                        "entry denied for {}; knock request queued with id={}",
+                        did_root, knock_id
+                    )
+                };
+                return Ok(ClosetResponse {
+                    ok: false,
+                    message: detail,
+                    session_id: Some(session_id.to_string()),
+                    prompt: None,
+                    lobby_events: Vec::new(),
+                    latest_lobby_sequence: 0,
+                    did: Some(did_root),
+                    fragment: None,
+                    key_name: None,
+                });
+            }
+
+            let inbox = resolve_avatar_inbox(&did_obj)?;
+            let avatar_req = AvatarRequest {
+                inbox,
+                did: root_did,
+                agent_endpoint: endpoint.to_string(),
+            };
+            let handle = self.join_room(&room, avatar_req, preferred_handle).await?;
+
+            return Ok(ClosetResponse {
+                ok: true,
+                message: format!("entered {} as @{}", room, handle),
+                session_id: Some(session_id.to_string()),
+                prompt: None,
+                lobby_events: Vec::new(),
+                latest_lobby_sequence: 0,
+                did: Some(did),
+                fragment: None,
+                key_name: None,
             });
         }
 
@@ -1063,9 +1649,24 @@ impl World {
         let room_map = objects
             .entry(room_name.to_string())
             .or_insert_with(HashMap::new);
-        room_map
-            .entry("mailbox".to_string())
-            .or_insert_with(|| ObjectRuntimeState::intrinsic_mailbox(room_name));
+        room_map.entry("mailbox".to_string()).or_insert_with(|| {
+            let mailbox = ObjectRuntimeState::intrinsic_mailbox(room_name);
+            if let Some(definition) = mailbox.definition.as_ref() {
+                if let Err(err) = content_validation::validate_object_definition(definition, "intrinsic:mailbox") {
+                    warn!("invalid intrinsic mailbox definition: {}", err);
+                }
+            }
+            mailbox
+        });
+        room_map.entry("closet".to_string()).or_insert_with(|| {
+            let closet = ObjectRuntimeState::intrinsic_closet(room_name);
+            if let Some(definition) = closet.definition.as_ref() {
+                if let Err(err) = content_validation::validate_object_definition(definition, "intrinsic:closet") {
+                    warn!("invalid intrinsic closet definition: {}", err);
+                }
+            }
+            closet
+        });
     }
 
     async fn find_intrinsic_mailbox_location(&self) -> Option<(String, String)> {
@@ -1210,15 +1811,6 @@ impl World {
         };
         object.queue_outbound_intent(intent);
         true
-    }
-
-    async fn is_world_owner(&self, caller_root_did: &str) -> bool {
-        self.owner_did
-            .read()
-            .await
-            .as_ref()
-            .map(|owner| owner == caller_root_did)
-            .unwrap_or(false)
     }
 
     async fn load_global_capability_acl_from_cid(&self, acl_cid: &str) -> Result<()> {
@@ -1838,88 +2430,14 @@ impl World {
     }
 
     fn parse_object_definition_text(raw: &str, cid: &str) -> Result<ObjectDefinition> {
-        fn validate_definition(definition: &ObjectDefinition, cid: &str) -> Result<()> {
-            if definition.verbs.is_empty() {
-                return Ok(());
-            }
-
-            let has_help = definition.verbs.iter().any(|verb| {
-                verb.name.trim().eq_ignore_ascii_case("help")
-                    || verb
-                        .aliases
-                        .iter()
-                        .any(|alias| alias.trim().eq_ignore_ascii_case("help"))
-            });
-
-            if !has_help {
-                return Err(anyhow!(
-                    "object definition at CID {} declares methods but no help verb/alias",
-                    cid
-                ));
-            }
-
-            for verb in &definition.verbs {
-                if verb.requirements.is_empty() {
-                    continue;
-                }
-                let set = RequirementSet::parse_many(&verb.requirements).map_err(|e| {
-                    anyhow!(
-                        "invalid requirements in object definition {} for verb '{}': {}",
-                        cid,
-                        verb.name,
-                        e
-                    )
-                })?;
-                let report = set.validate();
-                if !report.is_ok() {
-                    let first = report
-                        .issues
-                        .first()
-                        .map(|issue| issue.message.clone())
-                        .unwrap_or_else(|| "unknown requirements validation error".to_string());
-                    return Err(anyhow!(
-                        "invalid requirements in object definition {} for verb '{}': {}",
-                        cid,
-                        verb.name,
-                        first
-                    ));
-                }
-            }
-
-            Ok(())
-        }
-
-        if let Ok(doc) = serde_yaml::from_str::<ObjectDefinitionDoc>(raw) {
-            if doc.kind == "ma_object_definition" && doc.version == 1 {
-                validate_definition(&doc.definition, cid)?;
-                return Ok(doc.definition);
-            }
-        }
-        if let Ok(doc) = serde_json::from_str::<ObjectDefinitionDoc>(raw) {
-            if doc.kind == "ma_object_definition" && doc.version == 1 {
-                validate_definition(&doc.definition, cid)?;
-                return Ok(doc.definition);
-            }
-        }
-        if let Ok(def) = serde_yaml::from_str::<ObjectDefinition>(raw) {
-            validate_definition(&def, cid)?;
-            return Ok(def);
-        }
-        if let Ok(def) = serde_json::from_str::<ObjectDefinition>(raw) {
-            validate_definition(&def, cid)?;
-            return Ok(def);
-        }
-        Err(anyhow!(
-            "unsupported object definition format at CID {}",
-            cid
-        ))
+        content_validation::parse_object_definition_text(raw, cid)
     }
 
-    async fn load_object_definition_from_cid(&self, definition_cid: &str) -> Result<ObjectDefinition> {
+    async fn load_object_definition_from_cid(&self, cid: &str) -> Result<ObjectDefinition> {
         let kubo_url = self.kubo_url().await;
-        let raw = kubo::cat_cid(&kubo_url, definition_cid).await
-            .map_err(|e| anyhow!("failed to load object definition {}: {}", definition_cid, e))?;
-        Self::parse_object_definition_text(&raw, definition_cid)
+        let raw = kubo::cat_cid(&kubo_url, cid).await
+            .map_err(|e| anyhow!("failed to load object definition {}: {}", cid, e))?;
+        Self::parse_object_definition_text(&raw, cid)
     }
 
     async fn hydrate_object_definition_by_cid(
@@ -1938,20 +2456,20 @@ impl World {
             if object.definition.is_some() {
                 return Ok(());
             }
-            object.definition_cid.clone()
+            object.cid.clone()
         };
 
-        let Some(definition_cid) = cid_to_load else {
+        let Some(cid) = cid_to_load else {
             return Ok(());
         };
 
-        let definition = self.load_object_definition_from_cid(&definition_cid).await?;
+        let definition = self.load_object_definition_from_cid(&cid).await?;
 
         let mut objects = self.room_objects.write().await;
         if let Some(room_map) = objects.get_mut(room_name) {
             if let Some(object) = room_map.get_mut(object_id) {
                 if object.definition.is_none()
-                    && object.definition_cid.as_deref() == Some(definition_cid.as_str())
+                    && object.cid.as_deref() == Some(cid.as_str())
                 {
                     object.definition = Some(definition);
                 }
@@ -2883,6 +3401,11 @@ impl World {
     }
 
     pub async fn save_encrypted_state(&self) -> Result<(String, String)> {
+        let flushed = self.flush_dirty_object_blobs().await?;
+        if flushed > 0 {
+            info!("flushed {} dirty object blobs before save", flushed);
+        }
+
         let kubo_url = self.kubo_url().await;
         let secrets = self.read_world_runtime_secrets().await?;
         let world_root = self
@@ -2973,6 +3496,7 @@ impl World {
             owner_did,
             room_cids,
             room_objects,
+            closet_profiles: self.closet_profiles.read().await.clone(),
         };
 
         let plaintext = serde_json::to_vec(&state)
@@ -3038,6 +3562,208 @@ impl World {
         *self.last_pointer_publish_error.write().await = None;
 
         Ok((state_cid, root_cid))
+    }
+
+    async fn flush_dirty_object_blobs(&self) -> Result<usize> {
+        #[derive(Serialize)]
+        struct BlobEnvelope<'a> {
+            kind: &'static str,
+            version: u32,
+            #[serde(rename = "type")]
+            blob_type: &'static str,
+            content: &'a serde_json::Value,
+        }
+
+        let candidates = {
+            let objects = self.room_objects.read().await;
+            let mut out = Vec::new();
+            for (room_id, room_map) in objects.iter() {
+                for (object_id, object) in room_map.iter() {
+                    if !(object.state_dirty || object.meta_dirty) {
+                        continue;
+                    }
+                    out.push((
+                        room_id.clone(),
+                        object_id.clone(),
+                        object.state_dirty,
+                        object.meta_dirty,
+                        object.state.clone(),
+                        object.meta.clone(),
+                    ));
+                }
+            }
+            out
+        };
+
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        let kubo_url = self.kubo_url().await;
+        let mut updates: Vec<(String, String, Option<String>, Option<String>)> = Vec::new();
+
+        for (room_id, object_id, state_dirty, meta_dirty, state_value, meta_value) in candidates {
+            let mut state_cid: Option<String> = None;
+            let mut meta_cid: Option<String> = None;
+
+            if state_dirty {
+                let env = BlobEnvelope {
+                    kind: "/ma/realms/1",
+                    version: 1,
+                    blob_type: "state",
+                    content: &state_value,
+                };
+                let yaml = serde_yaml::to_string(&env)
+                    .map_err(|e| anyhow!("failed to serialize object state blob: {}", e))?;
+                match ipfs_add(&kubo_url, yaml.into_bytes()).await {
+                    Ok(cid) => state_cid = Some(cid),
+                    Err(err) => {
+                        warn!(
+                            "failed publishing state blob for object '{}' in room '{}': {}",
+                            object_id,
+                            room_id,
+                            err
+                        );
+                    }
+                }
+            }
+
+            if meta_dirty {
+                let env = BlobEnvelope {
+                    kind: "/ma/realms/1",
+                    version: 1,
+                    blob_type: "meta",
+                    content: &meta_value,
+                };
+                let yaml = serde_yaml::to_string(&env)
+                    .map_err(|e| anyhow!("failed to serialize object meta blob: {}", e))?;
+                match ipfs_add(&kubo_url, yaml.into_bytes()).await {
+                    Ok(cid) => meta_cid = Some(cid),
+                    Err(err) => {
+                        warn!(
+                            "failed publishing meta blob for object '{}' in room '{}': {}",
+                            object_id,
+                            room_id,
+                            err
+                        );
+                    }
+                }
+            }
+
+            if state_cid.is_some() || meta_cid.is_some() {
+                updates.push((room_id, object_id, state_cid, meta_cid));
+            }
+        }
+
+        if updates.is_empty() {
+            return Ok(0);
+        }
+
+        let mut applied = 0usize;
+        let mut objects = self.room_objects.write().await;
+        for (room_id, object_id, state_cid, meta_cid) in updates {
+            let Some(room_map) = objects.get_mut(&room_id) else {
+                continue;
+            };
+            let Some(object) = room_map.get_mut(&object_id) else {
+                continue;
+            };
+
+            if let Some(cid) = state_cid {
+                object.state_cid = Some(cid);
+                object.state_dirty = false;
+                applied = applied.saturating_add(1);
+            }
+            if let Some(cid) = meta_cid {
+                object.meta_cid = Some(cid);
+                object.meta_dirty = false;
+                applied = applied.saturating_add(1);
+            }
+        }
+
+        Ok(applied)
+    }
+
+    async fn flush_object_blobs(
+        &self,
+        room_name: &str,
+        object_id: &str,
+    ) -> Result<(Option<String>, Option<String>)> {
+        #[derive(Serialize)]
+        struct BlobEnvelope<'a> {
+            kind: &'static str,
+            version: u32,
+            #[serde(rename = "type")]
+            blob_type: &'static str,
+            content: &'a serde_json::Value,
+        }
+
+        let (state_dirty, meta_dirty, state_value, meta_value) = {
+            let objects = self.room_objects.read().await;
+            let room_map = objects
+                .get(room_name)
+                .ok_or_else(|| anyhow!("room '{}' not found", room_name))?;
+            let object = room_map
+                .get(object_id)
+                .ok_or_else(|| anyhow!("object '{}' not found in room '{}'", object_id, room_name))?;
+            (
+                object.state_dirty,
+                object.meta_dirty,
+                object.state.clone(),
+                object.meta.clone(),
+            )
+        };
+
+        if !state_dirty && !meta_dirty {
+            return Ok((None, None));
+        }
+
+        let kubo_url = self.kubo_url().await;
+        let mut new_state_cid: Option<String> = None;
+        let mut new_meta_cid: Option<String> = None;
+
+        if state_dirty {
+            let env = BlobEnvelope {
+                kind: "/ma/realms/1",
+                version: 1,
+                blob_type: "state",
+                content: &state_value,
+            };
+            let yaml = serde_yaml::to_string(&env)
+                .map_err(|e| anyhow!("failed to serialize object state blob: {}", e))?;
+            new_state_cid = Some(ipfs_add(&kubo_url, yaml.into_bytes()).await?);
+        }
+
+        if meta_dirty {
+            let env = BlobEnvelope {
+                kind: "/ma/realms/1",
+                version: 1,
+                blob_type: "meta",
+                content: &meta_value,
+            };
+            let yaml = serde_yaml::to_string(&env)
+                .map_err(|e| anyhow!("failed to serialize object meta blob: {}", e))?;
+            new_meta_cid = Some(ipfs_add(&kubo_url, yaml.into_bytes()).await?);
+        }
+
+        let mut objects = self.room_objects.write().await;
+        let room_map = objects
+            .get_mut(room_name)
+            .ok_or_else(|| anyhow!("room '{}' disappeared during flush", room_name))?;
+        let object = room_map
+            .get_mut(object_id)
+            .ok_or_else(|| anyhow!("object '{}' disappeared during flush", object_id))?;
+
+        if let Some(cid) = new_state_cid.clone() {
+            object.state_cid = Some(cid);
+            object.state_dirty = false;
+        }
+        if let Some(cid) = new_meta_cid.clone() {
+            object.meta_cid = Some(cid);
+            object.meta_dirty = false;
+        }
+
+        Ok((new_state_cid, new_meta_cid))
     }
 
     pub async fn load_encrypted_state(&self, state_cid: &str) -> Result<String> {
@@ -3155,15 +3881,15 @@ impl World {
             for mut object in object_list {
                 object.clear_expired_lock(Utc::now().timestamp().max(0) as u64);
                 if object.definition.is_none() {
-                    if let Some(definition_cid) = object.definition_cid.as_deref() {
-                        match self.load_object_definition_from_cid(definition_cid).await {
+                    if let Some(cid) = object.cid.as_deref() {
+                        match self.load_object_definition_from_cid(cid).await {
                             Ok(definition) => {
                                 object.definition = Some(definition);
                             }
                             Err(err) => {
                                 warn!(
                                     "failed to hydrate object definition from CID {} for object '{}' in room '{}': {}",
-                                    definition_cid,
+                                    cid,
                                     object.id,
                                     room_id,
                                     err
@@ -3190,6 +3916,7 @@ impl World {
             self.allow_entry_did(&owner).await;
         }
         *self.room_cids.write().await = state.room_cids;
+        *self.closet_profiles.write().await = state.closet_profiles;
         *self.state_cid.write().await = Some(state_cid.to_string());
 
         self.ensure_lobby_intrinsic_objects().await;
@@ -3419,6 +4146,38 @@ impl World {
         let mut parts = trimmed.split_whitespace();
         let verb = parts.next().unwrap_or("help").to_ascii_lowercase();
 
+        if object_id == "closet" {
+            if matches!(verb.as_str(), "take" | "pickup" | "hold" | "drop" | "open" | "close") {
+                return Some((
+                    "@closet is fixed in the lobby and cannot be moved.".to_string(),
+                    room_name.to_string(),
+                ));
+            }
+
+            if matches!(verb.as_str(), "help" | "hjelp") {
+                return Some((
+                    format!("{} commands: {}", object_label, CLOSET_COMMANDS_INLINE),
+                    room_name.to_string(),
+                ));
+            }
+
+            if matches!(verb.as_str(), "show" | "status" | "look") {
+                let listeners = self.closet_sessions.read().await.len();
+                return Some((
+                    format!(
+                        "{} is fixed in the lobby. active_closet_sessions={} notice='{}'",
+                        object_label, listeners, CLOSET_LISTENING_MESSAGE
+                    ),
+                    room_name.to_string(),
+                ));
+            }
+
+            return Some((
+                format!("{} commands: {}", object_label, CLOSET_COMMANDS_INLINE),
+                room_name.to_string(),
+            ));
+        }
+
         let verb_requirements = {
             let objects = self.room_objects.read().await;
             let room_map = objects.get(room_name)?;
@@ -3489,19 +4248,24 @@ impl World {
             }
 
             let req_context = {
-                let is_world_owner = self.is_world_owner(&caller_root).await;
+                let world_owner = self.owner_did.read().await.clone();
+                let handle_to_did = self.handle_to_did.read().await.clone();
+                let room_location = self.build_room_did(room_name).await;
                 let objects = self.room_objects.read().await;
                 let room_map = objects.get(room_name)?;
                 let object = room_map.get(&object_id)?;
+                let location = object
+                    .holder
+                    .as_ref()
+                    .and_then(|holder| handle_to_did.get(holder).cloned())
+                    .unwrap_or(room_location);
                 ObjectRequirementRuntime {
                     room_name: room_name.to_string(),
-                    actor_handle: from.to_string(),
-                    caller_root: caller_root.clone(),
-                    is_world_owner,
-                    object_exists: true,
-                    object_holder: object.holder.clone(),
-                    object_opened_by: object.opened_by.clone(),
-                    object_owner: object.owner_did.clone(),
+                    user: caller_root.clone(),
+                    owner: object.owner_did.clone().or_else(|| world_owner.clone()),
+                    location,
+                    opened_by: object.opened_by.clone(),
+                    world_owner,
                 }
             };
 
@@ -3523,7 +4287,7 @@ impl World {
             if req_set
                 .all_of
                 .iter()
-                .any(|req| req.name == "object.opened_by_self")
+                .any(|req| req.references_symbol("opened_by"))
             {
                 let mut objects = self.room_objects.write().await;
                 let room_map = objects.get_mut(room_name)?;
@@ -3550,8 +4314,138 @@ impl World {
             ));
         }
 
+        if verb == "set" {
+            let sub = parts.next().unwrap_or_default().to_ascii_lowercase();
+            let rest = parts.collect::<Vec<_>>().join(" ");
+            let value = rest.trim();
+
+            let (object_name, object_owner, is_world_owner) = {
+                let owner = self.owner_did.read().await.clone();
+                let objects = self.room_objects.read().await;
+                let room_map = objects.get(room_name)?;
+                let object = room_map.get(&object_id)?;
+                (
+                    object.name.clone(),
+                    object.owner_did.clone(),
+                    owner
+                        .as_deref()
+                        .map(|did| did == caller_root.as_str())
+                        .unwrap_or(false),
+                )
+            };
+
+            let is_object_owner = object_owner
+                .as_deref()
+                .map(|did| did == caller_root.as_str())
+                .unwrap_or(false);
+            if !is_object_owner && !is_world_owner {
+                return Some((
+                    format!("only @{} owner or world owner can set definition", object_name),
+                    room_name.to_string(),
+                ));
+            }
+
+            if sub == "cid" {
+                if value.is_empty() {
+                    return Some((
+                        format!("usage: {} set cid <cid>", object_label),
+                        room_name.to_string(),
+                    ));
+                }
+
+                let cid = value.to_string();
+                let definition = match self.load_object_definition_from_cid(&cid).await {
+                    Ok(def) => def,
+                    Err(err) => {
+                        return Some((
+                            format!("invalid object definition at {}: {}", cid, err),
+                            room_name.to_string(),
+                        ));
+                    }
+                };
+
+                let mut objects = self.room_objects.write().await;
+                let room_map = objects.get_mut(room_name)?;
+                let object = room_map.get_mut(&object_id)?;
+                object.cid = Some(cid.clone());
+                object.definition = Some(definition);
+                object.meta_dirty = true;
+
+                return Some((
+                    format!("@{} cid set to {}", object.name, cid),
+                    room_name.to_string(),
+                ));
+            }
+
+            if sub == "content" || sub == "content-b64" {
+                if value.is_empty() {
+                    return Some((
+                        format!("usage: {} set content-b64 <base64-yaml>", object_label),
+                        room_name.to_string(),
+                    ));
+                }
+
+                let decoded = match B64.decode(value.as_bytes()) {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        return Some((
+                            format!("invalid base64 content: {}", err),
+                            room_name.to_string(),
+                        ));
+                    }
+                };
+                let yaml = match String::from_utf8(decoded) {
+                    Ok(text) => text,
+                    Err(err) => {
+                        return Some((
+                            format!("invalid UTF-8 YAML payload: {}", err),
+                            room_name.to_string(),
+                        ));
+                    }
+                };
+
+                let definition = match Self::parse_object_definition_text(&yaml, "inline-content") {
+                    Ok(def) => def,
+                    Err(err) => {
+                        return Some((
+                            format!("invalid object definition content: {}", err),
+                            room_name.to_string(),
+                        ));
+                    }
+                };
+
+                let kubo_url = self.kubo_url().await;
+                let cid = match ipfs_add(&kubo_url, yaml.into_bytes()).await {
+                    Ok(cid) => cid,
+                    Err(err) => {
+                        return Some((
+                            format!("failed to publish object definition: {}", err),
+                            room_name.to_string(),
+                        ));
+                    }
+                };
+
+                let mut objects = self.room_objects.write().await;
+                let room_map = objects.get_mut(room_name)?;
+                let object = room_map.get_mut(&object_id)?;
+                object.cid = Some(cid.clone());
+                object.definition = Some(definition);
+                object.meta_dirty = true;
+
+                return Some((
+                    format!("@{} cid published and set to {}", object.name, cid),
+                    room_name.to_string(),
+                ));
+            }
+
+            return Some((
+                format!("usage: {} set cid <cid> | {} set content-b64 <base64-yaml>", object_label, object_label),
+                room_name.to_string(),
+            ));
+        }
+
         if verb == "show" || verb == "status" || verb == "look" {
-            let (device_name, device_kind, object_did, definition_cid, holder, opened_by, durable, persistence, durable_inbox_messages, ephemeral_inbox_messages, outbound_messages) = {
+            let (device_name, device_kind, object_did, cid, holder, opened_by, durable, persistence, durable_inbox_messages, ephemeral_inbox_messages, outbound_messages) = {
                 let objects = self.room_objects.read().await;
                 let room_map = objects.get(room_name)?;
                 let device = room_map.get(&object_id)?;
@@ -3563,7 +4457,7 @@ impl World {
                     device.name.clone(),
                     device.kind.clone(),
                     format!("{}#{}", world_did_root, device.id),
-                    device.definition_cid.clone().unwrap_or_else(|| "(builtin)".to_string()),
+                    device.cid.clone().unwrap_or_else(|| "(builtin)".to_string()),
                     device.holder.clone().unwrap_or_else(|| "(none)".to_string()),
                     device
                         .opened_by
@@ -3579,8 +4473,8 @@ impl World {
             let pending = self.list_knocks(true).await.len();
             return Some((
                 format!(
-                    "@{} did={} kind={} definition_cid={} holder={} opened_by={} durable={} persistence={} durable_inbox_messages={} ephemeral_inbox_messages={} outbound_messages={} pending_messages={}",
-                    device_name, object_did, device_kind, definition_cid, holder, opened_by, durable, persistence, durable_inbox_messages, ephemeral_inbox_messages, outbound_messages, pending
+                    "@{} did={} kind={} cid={} holder={} opened_by={} durable={} persistence={} durable_inbox_messages={} ephemeral_inbox_messages={} outbound_messages={} pending_messages={}",
+                    device_name, object_did, device_kind, cid, holder, opened_by, durable, persistence, durable_inbox_messages, ephemeral_inbox_messages, outbound_messages, pending
                 ),
                 room_name.to_string(),
             ));
@@ -3596,6 +4490,7 @@ impl World {
                 }
             }
             device.holder = Some(from.to_string());
+            device.state_dirty = true;
             return Some((format!("You pick up @{}.", device.name), room_name.to_string()));
         }
 
@@ -3612,6 +4507,7 @@ impl World {
                 device.locked_by = None;
                 device.lock_expires_at = None;
             }
+            device.state_dirty = true;
             return Some((format!("You drop @{}.", device.name), room_name.to_string()));
         }
 
@@ -3630,6 +4526,7 @@ impl World {
             device.opened_by = Some(caller_root.clone());
             device.locked_by = Some(caller_root.clone());
             device.lock_expires_at = Some(now_secs + MAILBOX_LOCK_SECS);
+            device.state_dirty = true;
             return Some((format!("@{} opened for {}", device.name, caller_root), room_name.to_string()));
         }
 
@@ -3643,7 +4540,37 @@ impl World {
             device.opened_by = None;
             device.locked_by = None;
             device.lock_expires_at = None;
+            device.state_dirty = true;
             return Some((format!("@{} closed.", device.name), room_name.to_string()));
+        }
+
+        if verb == "flush" {
+            let object_name = {
+                let objects = self.room_objects.read().await;
+                let room_map = objects.get(room_name)?;
+                let object = room_map.get(&object_id)?;
+                object.name.clone()
+            };
+
+            return Some(match self.flush_object_blobs(room_name, &object_id).await {
+                Ok((None, None)) => (
+                    format!("@{} flush: no dirty meta/state", object_name),
+                    room_name.to_string(),
+                ),
+                Ok((state_cid, meta_cid)) => (
+                    format!(
+                        "@{} flush: state_cid={} meta_cid={}",
+                        object_name,
+                        state_cid.unwrap_or_else(|| "(unchanged)".to_string()),
+                        meta_cid.unwrap_or_else(|| "(unchanged)".to_string())
+                    ),
+                    room_name.to_string(),
+                ),
+                Err(err) => (
+                    format!("@{} flush failed: {}", object_name, err),
+                    room_name.to_string(),
+                ),
+            });
         }
 
         if verb == "list" {
@@ -5297,6 +6224,81 @@ impl WorldProtocol {
         }
     }
 
+    async fn push_room_broadcast(
+        &self,
+        room_name: &str,
+        sender: Option<String>,
+        message: String,
+    ) {
+        let context = self.room_presence_context(room_name).await;
+        let (room_did, _room_title, _room_description, _avatars, endpoints) = match context {
+            Ok(value) => value,
+            Err(err) => {
+                warn!("broadcast context unavailable for room '{}': {}", room_name, err);
+                return;
+            }
+        };
+        let signing_key = match self.room_signing_key(&room_did).await {
+            Ok(key) => key,
+            Err(err) => {
+                warn!("broadcast signing key unavailable for {}: {}", room_did, err);
+                return;
+            }
+        };
+
+        let seq = self
+            .world
+            .latest_room_event_sequence(room_name)
+            .await
+            .unwrap_or(0);
+        let payload = RoomBroadcastEvent {
+            v: 1,
+            kind: "room.broadcast".to_string(),
+            room: room_name.to_string(),
+            room_did: room_did.clone(),
+            sender,
+            message,
+            seq,
+            ts: Utc::now().to_rfc3339(),
+        };
+        let content = match serde_json::to_vec(&payload) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!("broadcast encode failed for room '{}': {}", room_name, err);
+                return;
+            }
+        };
+        let message = match Message::new(
+            room_did.clone(),
+            room_did,
+            CONTENT_TYPE_BROADCAST,
+            content,
+            &signing_key,
+        ) {
+            Ok(msg) => msg,
+            Err(err) => {
+                warn!("broadcast message build failed: {}", err);
+                return;
+            }
+        };
+        let cbor = match message.to_cbor() {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!("broadcast cbor encode failed: {}", err);
+                return;
+            }
+        };
+
+        for endpoint in endpoints {
+            if let Err(err) = self
+                .send_signed_push_to_endpoint_on_lane(&endpoint, cbor.clone(), BROADCAST_ALPN)
+                .await
+            {
+                warn!("broadcast push to {} failed: {}", endpoint, err);
+            }
+        }
+    }
+
     async fn process_request(&self, request: WorldRequest, agent_endpoint: String) -> WorldResponse {
         match self.handle_request(request, agent_endpoint).await {
             Ok(resp) => resp,
@@ -5334,31 +6336,42 @@ impl WorldProtocol {
         }
     }
 
-    async fn get_sender_document(&self, sender_root: &Did) -> Result<(Document, bool)> {
+    async fn get_sender_document(&self, sender_root: &Did, force_refresh: bool) -> Result<(Document, bool, bool)> {
         let cache_key = sender_root.id();
 
-        {
+        if !force_refresh {
             let cache = self.did_cache.read().await;
             if let Some(cached) = cache.get(&cache_key) {
-                if cached.fetched_at.elapsed() <= DID_CACHE_TTL {
-                    return Ok((cached.document.clone(), false));
-                }
+                return Ok((cached.document.clone(), false, cached.dirty));
             }
         }
 
         let kubo_url = self.world.kubo_url().await;
         let fetched = kubo::fetch_did_document(&kubo_url, sender_root).await?;
 
+        let existing_dirty = {
+            let cache = self.did_cache.read().await;
+            cache.get(&cache_key).map(|entry| entry.dirty).unwrap_or(false)
+        };
+
         let mut cache = self.did_cache.write().await;
         cache.insert(
             cache_key,
             CachedDidDocument {
                 document: fetched.clone(),
-                fetched_at: Instant::now(),
+                dirty: existing_dirty,
             },
         );
 
-        Ok((fetched, true))
+        Ok((fetched, true, existing_dirty))
+    }
+
+    async fn set_sender_dirty(&self, sender_root: &Did, dirty: bool) {
+        let cache_key = sender_root.id();
+        let mut cache = self.did_cache.write().await;
+        if let Some(cached) = cache.get_mut(&cache_key) {
+            cached.dirty = dirty;
+        }
     }
 
     async fn verify_message(&self, message_cbor: Vec<u8>) -> Result<(Message, Did, Document)> {
@@ -5367,7 +6380,7 @@ impl WorldProtocol {
         let sender_root = sender_did.without_fragment();
 
         let t0 = std::time::Instant::now();
-        let (sender_document, fetched_from_kubo) = self.get_sender_document(&sender_root).await
+        let (sender_document, fetched_from_kubo, is_dirty) = self.get_sender_document(&sender_root, false).await
             .map_err(|e| {
                 warn!("DID doc fetch failed for {} after {:?}: {}", sender_root.id(), t0.elapsed(), e);
                 e
@@ -5377,9 +6390,61 @@ impl WorldProtocol {
         } else {
             debug!("DID doc for {} served from cache in {:?}", sender_root.id(), t0.elapsed());
         }
+        if is_dirty {
+            warn!("DID {} is marked dirty; using cached document", sender_root.id());
+        }
 
-        message.verify_with_document(&sender_document)?;
-        Ok((message, sender_did, sender_document))
+        if message.verify_with_document(&sender_document).is_ok() {
+            if is_dirty {
+                self.set_sender_dirty(&sender_root, false).await;
+                info!("DID {} cleared from dirty state after successful verification", sender_root.id());
+            }
+            return Ok((message, sender_did, sender_document));
+        }
+
+        warn!(
+            "signature verification failed with cached DID doc for {}; retrying fresh fetch",
+            sender_root.id()
+        );
+
+        let refresh_t0 = std::time::Instant::now();
+        let (refreshed_document, refreshed_from_kubo, _) =
+            match self.get_sender_document(&sender_root, true).await {
+                Ok(value) => value,
+                Err(e) => {
+                    self.set_sender_dirty(&sender_root, true).await;
+                    warn!(
+                        "forced DID doc refetch failed for {} after {:?}: {}",
+                        sender_root.id(),
+                        refresh_t0.elapsed(),
+                        e
+                    );
+                    return Err(e);
+                }
+            };
+        if refreshed_from_kubo {
+            info!(
+                "DID doc for {} force-fetched via Kubo in {:?}",
+                sender_root.id(),
+                refresh_t0.elapsed()
+            );
+        }
+
+        if message.verify_with_document(&refreshed_document).is_ok() {
+            self.set_sender_dirty(&sender_root, false).await;
+            return Ok((message, sender_did, refreshed_document));
+        }
+
+        self.set_sender_dirty(&sender_root, true).await;
+        warn!(
+            "DID {} marked dirty: signature verification still failed after forced refresh",
+            sender_root.id()
+        );
+
+        Err(anyhow!(
+            "message signature verification failed for {} (cached and refreshed DID document)",
+            sender_root.id()
+        ))
     }
 
     async fn handle_request(&self, request: WorldRequest, agent_endpoint: String) -> Result<WorldResponse> {
@@ -5471,6 +6536,62 @@ impl WorldProtocol {
                 }
                 let room = room.unwrap_or_else(|| DEFAULT_ROOM.to_string());
                 let root_did = sender_did.without_fragment();
+                let root_did_id = root_did.id();
+                let is_first_enter = self
+                    .world
+                    .did_to_handle
+                    .read()
+                    .await
+                    .get(&root_did_id)
+                    .is_none();
+                let closet_profile = self
+                    .world
+                    .closet_profiles
+                    .read()
+                    .await
+                    .get(&root_did_id)
+                    .cloned();
+                let has_closet_profile = closet_profile
+                    .as_ref()
+                    .map(|profile| {
+                        profile
+                            .name
+                            .as_ref()
+                            .map(|v| !v.trim().is_empty())
+                            .unwrap_or(false)
+                            && profile
+                                .description
+                                .as_ref()
+                                .map(|v| !v.trim().is_empty())
+                                .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+
+                if is_first_enter {
+                    if !has_closet_profile {
+                        return Ok(WorldResponse {
+                            ok: false,
+                            room,
+                            message: "first login requires closet profile setup (name + description)".to_string(),
+                            endpoint_id: self.endpoint_id.clone(),
+                            latest_event_sequence: 0,
+                            broadcasted: false,
+                            events: Vec::new(),
+                            handle: String::new(),
+                            room_description: String::new(),
+                            room_title: String::new(),
+                            room_did: String::new(),
+                            avatars: Vec::new(),
+                            room_object_dids: HashMap::new(),
+                            transport_ack: Some(TransportAck {
+                                lane: self.lane.label().to_string(),
+                                code: TransportAckCode::Rejected,
+                                detail: "closet profile required".to_string(),
+                            }),
+                        });
+                    }
+                }
+
                 if !self.world.can_enter(&root_did).await {
                     let (allow_all, allow_owner, allow_count, owner_did, acl_source) =
                         self.world.entry_acl_debug().await;
@@ -5528,12 +6649,39 @@ impl WorldProtocol {
                     });
                 }
                 let inbox = resolve_avatar_inbox(sender_did)?;
+                let profile_name = closet_profile
+                    .as_ref()
+                    .and_then(|profile| profile.name.clone());
+                let selected_handle = preferred_handle.or(profile_name);
                 let avatar_req = AvatarRequest {
                     inbox,
                     did: root_did,
                     agent_endpoint: agent_endpoint.clone(),
                 };
-                let handle = self.world.join_room(&room, avatar_req, preferred_handle).await?;
+                let handle = self.world.join_room(&room, avatar_req, selected_handle).await?;
+                if let Some(profile) = closet_profile {
+                    if let Some(description) = profile.description {
+                        let _ = self
+                            .world
+                            .set_avatar_description_for_did(&room, &root_did_id, &description)
+                            .await;
+                    }
+                }
+                if room == DEFAULT_ROOM && is_first_enter && has_closet_profile {
+                    let closet_exit_text = format!("{} comes out of the closet and into the lobby.", handle);
+                    self.world
+                        .record_room_event(
+                            DEFAULT_ROOM,
+                            "broadcast",
+                            Some(handle.clone()),
+                            Some(root_did_id.clone()),
+                            Some(agent_endpoint.clone()),
+                            closet_exit_text.clone(),
+                        )
+                        .await;
+                    self.push_room_broadcast(DEFAULT_ROOM, Some(handle.clone()), closet_exit_text)
+                        .await;
+                }
                 self.push_presence_snapshot(&room).await;
                 let latest_event_sequence = self.world.latest_room_event_sequence(&room).await?;
                 Ok(WorldResponse {
@@ -7270,6 +8418,25 @@ async fn main() -> Result<()> {
                 state_cid,
                 root_cid
             );
+        }
+
+        {
+            let world_for_washer = world.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(OBJECT_WASHER_INTERVAL_SECS));
+                loop {
+                    ticker.tick().await;
+                    match world_for_washer.flush_dirty_object_blobs().await {
+                        Ok(count) if count > 0 => {
+                            debug!("object washer flushed {} dirty blobs", count);
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            warn!("object washer flush failed: {}", err);
+                        }
+                    }
+                }
+            });
         }
 
         let did_cache = Arc::new(RwLock::new(HashMap::new()));

@@ -5,8 +5,10 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
+use base64::Engine;
 use chrono::Utc;
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, RelayUrl};
+use libp2p_identity::Keypair;
 use ma_core::{
     normalize_relay_url,
     ClosetRequest, ClosetResponse, CLOSET_ALPN, DEFAULT_WORLD_RELAY_URL,
@@ -33,6 +35,7 @@ struct BotIdentityRecord {
     did: String,
     fragment: String,
     key_name: Option<String>,
+    ipns_private_key_path: String,
 }
 
 #[derive(Debug)]
@@ -150,6 +153,38 @@ fn save_identity(record: &BotIdentityRecord) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn ensure_local_ipns_key() -> Result<(Vec<u8>, PathBuf)> {
+    let root = config_root()?;
+    let keys_dir = root.join("keys");
+    fs::create_dir_all(&keys_dir).context("failed to create ~/.config/ma/keys directory")?;
+
+    let key_path = keys_dir.join("bot_ipns.key");
+    if key_path.exists() {
+        let existing = fs::read(&key_path).context("failed to read local bot ipns key")?;
+        if !existing.is_empty() {
+            return Ok((existing, key_path));
+        }
+    }
+
+    let keypair = Keypair::generate_ed25519();
+    let encoded = keypair
+        .to_protobuf_encoding()
+        .map_err(|e| anyhow!("failed to encode local ipns key: {}", e))?;
+
+    fs::write(&key_path, &encoded).context("failed to write local bot ipns key")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&key_path)
+            .context("failed to read key permissions")?
+            .permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&key_path, perms).context("failed setting key file permissions")?;
+    }
+
+    Ok((encoded, key_path))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = parse_args();
@@ -168,6 +203,7 @@ async fn main() -> Result<()> {
         .parse()
         .map_err(|e| anyhow!("relay URL parse failed for '{}': {}", relay_source, e))?;
     let endpoint_addr = EndpointAddr::new(target).with_relay_url(relay_url);
+    let (ipns_key_bytes, ipns_key_path) = ensure_local_ipns_key()?;
 
     let endpoint = Endpoint::builder(presets::N0)
         .bind()
@@ -222,10 +258,10 @@ async fn main() -> Result<()> {
 
     let citizen = send_closet_request(
         &endpoint,
-        endpoint_addr,
-        ClosetRequest::Command {
+        endpoint_addr.clone(),
+        ClosetRequest::SubmitCitizenship {
             session_id: session_id.clone(),
-            input: "citizen".to_string(),
+            ipns_private_key_base64: base64::engine::general_purpose::STANDARD.encode(ipns_key_bytes),
         },
     )
     .await?;
@@ -247,18 +283,31 @@ async fn main() -> Result<()> {
         created_at: Utc::now().to_rfc3339(),
         status_url: args.status_url,
         endpoint_id,
-        session_id,
+        session_id: session_id.clone(),
         did: did.clone(),
         fragment: fragment.clone(),
         key_name: citizen.key_name.clone(),
+        ipns_private_key_path: ipns_key_path.display().to_string(),
     };
 
     let saved_path = save_identity(&record)?;
 
+    let enter = send_closet_request(
+        &endpoint,
+        endpoint_addr,
+        ClosetRequest::Command {
+            session_id: session_id.clone(),
+            input: "enter".to_string(),
+        },
+    )
+    .await?;
+
     println!("Citizen allocated DID: {did}");
     println!("Fragment: {fragment}");
+    println!("Local IPNS key: {}", ipns_key_path.display());
+    println!("Enter result: ok={} message='{}'", enter.ok, enter.message);
     println!("Saved bot identity metadata to: {}", saved_path.display());
-    println!("Avatar enter attempt is deferred until signing key custody is available in this MVP.");
+    println!("Avatar enter attempted via closet lane.");
 
     endpoint.close().await;
 

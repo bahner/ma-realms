@@ -201,9 +201,15 @@ pub struct ObjectRuntimeState {
     pub name: String,
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub definition_cid: Option<String>,
+    pub cid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition: Option<ObjectDefinition>,
+    #[serde(default = "default_object_meta")]
+    pub meta: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta_cid: Option<String>,
+    #[serde(default)]
+    pub meta_dirty: bool,
     pub room: String,
     #[serde(default)]
     pub aliases: Vec<String>,
@@ -235,9 +241,17 @@ pub struct ObjectRuntimeState {
     pub next_ephemeral_request_seq: u64,
     #[serde(default = "default_object_state")]
     pub state: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_cid: Option<String>,
+    #[serde(default)]
+    pub state_dirty: bool,
 }
 
 fn default_object_state() -> Value {
+    Value::Object(Map::new())
+}
+
+fn default_object_meta() -> Value {
     Value::Object(Map::new())
 }
 
@@ -249,14 +263,19 @@ fn default_object_persistence_policy() -> ObjectPersistencePolicy {
     ObjectPersistencePolicy::DurableDebounced
 }
 
-pub const MAILBOX_COMMANDS_INLINE: &str = "help | show | take | drop | open | close | list | pop | pending | ask <target> <text> | retry <request_id> | reply <request_id> <text> | accept <id> | reject <id> [note] | invite <did>";
+pub const MAILBOX_COMMANDS_INLINE: &str = "help | show | take | drop | open | close | list | pop | pending | ask <target> <text> | retry <request_id> | reply <request_id> <text> | accept <id> | reject <id> [note] | invite <did> | set cid <cid> | set content-b64 <base64-yaml> | flush";
+pub const CLOSET_COMMANDS_INLINE: &str = "help | show";
 
-const MAILBOX_HELP_NB: &str = "mailbox kommandoer:\n- show/status/look\n- take, drop\n- open, close\n- list, pop, pending\n- ask <target> <text>\n- retry <request_id>\n- reply <request_id> <text>\n- accept <id>, reject <id> [note]\n- invite <did> [note]";
+const MAILBOX_HELP_NB: &str = "mailbox kommandoer:\n- show/status/look\n- take, drop\n- open, close\n- list, pop, pending\n- ask <target> <text>\n- retry <request_id>\n- reply <request_id> <text>\n- accept <id>, reject <id> [note]\n- invite <did> [note]\n- set cid <cid>\n- set content-b64 <base64-yaml>\n- flush";
 
-const MAILBOX_HELP_EN: &str = "mailbox commands:\n- show/status/look\n- take, drop\n- open, close\n- list, pop, pending\n- ask <target> <text>\n- retry <request_id>\n- reply <request_id> <text>\n- accept <id>, reject <id> [note]\n- invite <did> [note]";
+const MAILBOX_HELP_EN: &str = "mailbox commands:\n- show/status/look\n- take, drop\n- open, close\n- list, pop, pending\n- ask <target> <text>\n- retry <request_id>\n- reply <request_id> <text>\n- accept <id>, reject <id> [note]\n- invite <did> [note]\n- set cid <cid>\n- set content-b64 <base64-yaml>\n- flush";
+
+const CLOSET_HELP_NB: &str = "closet kommandoer:\n- show/status/look\n\ncloset står fast i lobbyen og kan ikke flyttes.\nBruk ma/closet/1 for profilflyt (navn/beskrivelse).";
+
+const CLOSET_HELP_EN: &str = "closet commands:\n- show/status/look\n\nThe closet is fixed in the lobby and cannot be moved.\nUse ma/closet/1 for profile flow (name/description).";
 
 fn mailbox_admin_requirements() -> Vec<String> {
-    vec!["object.opened_by_self".to_string(), "world.owned".to_string()]
+    vec!["user == location".to_string(), "user == world.owner".to_string()]
 }
 
 fn mailbox_admin_verb(name: &str) -> ObjectVerbDefinition {
@@ -280,7 +299,7 @@ impl ObjectRuntimeState {
             id: "mailbox".to_string(),
             name: "mailbox".to_string(),
             kind: "receiver".to_string(),
-            definition_cid: None,
+            cid: None,
             definition: Some(ObjectDefinition {
                 id: "mailbox".to_string(),
                 name: "mailbox".to_string(),
@@ -321,9 +340,13 @@ impl ObjectRuntimeState {
                     mailbox_admin_verb("accept"),
                     mailbox_admin_verb("reject"),
                     mailbox_admin_verb("invite"),
+                    mailbox_admin_verb("flush"),
                 ],
                 program: None,
             }),
+            meta: default_object_meta(),
+            meta_cid: None,
+            meta_dirty: true,
             room: room.to_string(),
             aliases: vec!["mailbox".to_string(), "messaging-device".to_string()],
             receivers: vec![ObjectReceiverListener {
@@ -345,6 +368,72 @@ impl ObjectRuntimeState {
             pending_ephemeral_requests: HashMap::new(),
             next_ephemeral_request_seq: 0,
             state: default_object_state(),
+            state_cid: None,
+            state_dirty: true,
+        }
+    }
+
+    pub fn intrinsic_closet(room: &str) -> Self {
+        Self {
+            id: "closet".to_string(),
+            name: "closet".to_string(),
+            kind: "fixture".to_string(),
+            cid: None,
+            definition: Some(ObjectDefinition {
+                id: "closet".to_string(),
+                name: "closet".to_string(),
+                descriptions: HashMap::new(),
+                tags: vec!["system".to_string(), "closet".to_string(), "lobby".to_string()],
+                aliases: vec!["closet".to_string(), "skap".to_string()],
+                verbs: vec![
+                    ObjectVerbDefinition {
+                        name: "hjelp".to_string(),
+                        lang: Some("nb".to_string()),
+                        aliases: vec!["hjelp".to_string(), "help".to_string()],
+                        requirements: Vec::new(),
+                        evaluator: ObjectVerbEvaluator {
+                            evaluator_type: "built-in".to_string(),
+                            name: "print".to_string(),
+                            version: 1,
+                        },
+                        content: Some(CLOSET_HELP_NB.to_string()),
+                    },
+                    ObjectVerbDefinition {
+                        name: "help".to_string(),
+                        lang: Some("en".to_string()),
+                        aliases: vec!["help".to_string(), "hjelp".to_string()],
+                        requirements: Vec::new(),
+                        evaluator: ObjectVerbEvaluator {
+                            evaluator_type: "built-in".to_string(),
+                            name: "print".to_string(),
+                            version: 1,
+                        },
+                        content: Some(CLOSET_HELP_EN.to_string()),
+                    },
+                ],
+                program: None,
+            }),
+            meta: default_object_meta(),
+            meta_cid: None,
+            meta_dirty: true,
+            room: room.to_string(),
+            aliases: vec!["closet".to_string(), "skap".to_string()],
+            receivers: Vec::new(),
+            owner_did: None,
+            durable: true,
+            persistence: ObjectPersistencePolicy::DurableDebounced,
+            ttl_secs: None,
+            holder: None,
+            opened_by: None,
+            locked_by: None,
+            lock_expires_at: None,
+            inbox: VecDeque::new(),
+            pending_outbox: Vec::new(),
+            pending_ephemeral_requests: HashMap::new(),
+            next_ephemeral_request_seq: 0,
+            state: default_object_state(),
+            state_cid: None,
+            state_dirty: true,
         }
     }
 
@@ -362,6 +451,7 @@ impl ObjectRuntimeState {
             self.opened_by = None;
             self.locked_by = None;
             self.lock_expires_at = None;
+            self.state_dirty = true;
         }
     }
 
@@ -401,6 +491,7 @@ impl ObjectRuntimeState {
             let overflow = self.inbox.len() - max_items;
             self.inbox.drain(..overflow);
         }
+        self.state_dirty = true;
     }
 
     pub fn push_ephemeral_inbox_message(
@@ -422,11 +513,16 @@ impl ObjectRuntimeState {
     }
 
     pub fn pop_inbox_message(&mut self) -> Option<ObjectInboxMessage> {
-        self.inbox.pop_front()
+        let popped = self.inbox.pop_front();
+        if popped.is_some() {
+            self.state_dirty = true;
+        }
+        popped
     }
 
     pub fn queue_outbound_intent(&mut self, intent: ObjectMessageIntent) {
         self.pending_outbox.push(intent);
+        self.state_dirty = true;
     }
 
     pub fn begin_ephemeral_request(
@@ -460,6 +556,8 @@ impl ObjectRuntimeState {
             },
         );
 
+        self.state_dirty = true;
+
         request_id
     }
 
@@ -485,6 +583,7 @@ impl ObjectRuntimeState {
         };
 
         self.queue_outbound_intent(intent);
+        self.state_dirty = true;
         Some(attempt)
     }
 
@@ -492,7 +591,11 @@ impl ObjectRuntimeState {
         let Some(request_id) = reply.reply_to_request_id.as_deref() else {
             return false;
         };
-        self.pending_ephemeral_requests.remove(request_id).is_some()
+        let resolved = self.pending_ephemeral_requests.remove(request_id).is_some();
+        if resolved {
+            self.state_dirty = true;
+        }
+        resolved
     }
 
     pub fn has_pending_ephemeral_request(&self, request_id: &str) -> bool {
@@ -508,11 +611,18 @@ impl ObjectRuntimeState {
             }
             keep
         });
+        if !expired.is_empty() {
+            self.state_dirty = true;
+        }
         expired
     }
 
     pub fn drain_outbound_intents(&mut self) -> Vec<ObjectMessageIntent> {
-        self.pending_outbox.drain(..).collect()
+        let drained = self.pending_outbox.drain(..).collect::<Vec<_>>();
+        if !drained.is_empty() {
+            self.state_dirty = true;
+        }
+        drained
     }
 
     pub fn durable_inbox_len(&self) -> usize {
