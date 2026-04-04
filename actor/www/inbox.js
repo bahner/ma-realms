@@ -18,7 +18,6 @@ export function createInboundDispatcher(deps) {
     logger,
     appendMessage,
     displayActor,
-    humanizeText,
     fetchDidDocumentJsonByDid,
     decodeChatEventMessage,
     decodeWhisperEventMessage,
@@ -79,20 +78,20 @@ export function createInboundDispatcher(deps) {
 
   function writeDialogChat(senderDid, senderHandle, text) {
     const actor = displayActor(senderDid, senderHandle);
-    appendMessage('world', humanizeText(`${actor}: ${text}`));
+    appendMessage('world', `${actor}: ${text}`);
   }
 
   function writeDialogWhisper(senderDid, senderHandle, text) {
     const actor = displayActor(senderDid, senderHandle);
-    appendMessage('world', humanizeText(`${actor} whispers ${text}.`));
+    appendMessage('world', `${actor} whispers ${text}.`);
   }
 
   function writeDialogSystem(text) {
-    appendMessage('system', humanizeText(text));
+    appendMessage('system', String(text || ''));
   }
 
   function writeDialogWorld(text) {
-    appendMessage('world', humanizeText(text));
+    appendMessage('world', String(text || ''));
   }
 
   function logInboundDispatch(evt, routeName) {

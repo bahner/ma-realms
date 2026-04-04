@@ -71,14 +71,6 @@ export function parseExitCidsFromRoomYaml(sourceText) {
   return map;
 }
 
-export function roomLanguageKey(uiLang) {
-  const primary = uiLang === 'nb' ? 'nb' : 'en';
-  if (!primary) {
-    return 'und';
-  }
-  return primary;
-}
-
 export function sanitizeRoomYamlForEdit(sourceText) {
   const lines = String(sourceText || '').replace(/\r\n/g, '\n').split('\n');
   const output = [];
@@ -272,6 +264,7 @@ export function createRoomPresencePayloadFlow({
   trackRoomPresence,
   removeRoomPresence,
   clearRoomPresence,
+  appendMessage,
 }) {
   function applyPresenceRoomMetadata(payload) {
     if (typeof payload.room_title === 'string' && payload.room_title) {
@@ -303,12 +296,31 @@ export function createRoomPresencePayloadFlow({
     if (handle) {
       trackRoomPresence(handle, did);
     }
+    if (typeof appendMessage === 'function') {
+      if (handle && did) {
+        appendMessage('world', `${handle} entered the room. (${did})`);
+      } else if (handle) {
+        appendMessage('world', `${handle} entered the room.`);
+      } else if (did) {
+        appendMessage('world', `${did} entered the room.`);
+      }
+    }
   }
 
   function applyPresenceLeave(payload) {
     const handle = String(payload.actor_handle || '').trim();
+    const did = String(payload.actor_did || '').trim();
     if (handle) {
       removeRoomPresence(handle);
+    }
+    if (typeof appendMessage === 'function') {
+      if (handle && did) {
+        appendMessage('world', `${handle} left the room. (${did})`);
+      } else if (handle) {
+        appendMessage('world', `${handle} left the room.`);
+      } else if (did) {
+        appendMessage('world', `${did} left the room.`);
+      }
     }
   }
 

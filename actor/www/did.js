@@ -76,7 +76,9 @@ export function createDidRuntimeHelpers({
     }
     const resolved = resolveAliasInput(key);
     const mappedDid = state.handleDidMap[key] || state.handleDidMap[resolved] || '';
-    const candidate = mappedDid || findDidByEndpoint(resolved) || resolved;
+    const candidate = isMaDid(key)
+      ? key
+      : (isMaDid(resolved) ? resolved : (mappedDid || findDidByEndpoint(resolved) || resolved));
     const root = didRoot(candidate);
     if (!isMaDid(root)) {
       throw new Error(`Could not resolve a did:ma target from '${key}'.`);

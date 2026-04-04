@@ -28,6 +28,51 @@ export function createDotCommands({
   sendWhisperToDid,
   runSmokeTest,
 }) {
+  function didFragmentOf(did) {
+    const value = String(did || '').trim();
+    const idx = value.indexOf('#');
+    if (idx === -1 || idx === value.length - 1) {
+      return '';
+    }
+    return value.slice(idx + 1).trim();
+  }
+
+  async function resolveAliasAddress(addressInput) {
+    const raw = String(addressInput || '').trim();
+    if (!raw) {
+      throw new Error('Usage: .alias <name> <address|#fragment>');
+    }
+    if (!raw.startsWith('#')) {
+      return raw;
+    }
+
+    const fragment = raw.slice(1).trim();
+    if (!fragment) {
+      throw new Error('Usage: .alias <name> <address|#fragment>');
+    }
+
+    if (!state.currentHome) {
+      throw new Error('Fragment lookup requires an active room connection. Connect first, then run .alias #fragment <name>.');
+    }
+
+    for (const entry of state.roomPresence.values()) {
+      const did = String(entry?.did || '').trim();
+      if (!isMaDid(did)) {
+        continue;
+      }
+      const didFragment = didFragmentOf(did);
+      if (didFragment && didFragment.toLowerCase() === fragment.toLowerCase()) {
+        return did;
+      }
+    }
+
+    try {
+      return await lookupDidInCurrentRoom(`#${fragment}`);
+    } catch (_) {
+      return await lookupDidInCurrentRoom(fragment);
+    }
+  }
+
   function parseDot(input) {
     const trimmed = String(input || '').trim();
     if (!trimmed.startsWith('.')) {
@@ -49,6 +94,8 @@ export function createDotCommands({
       appendSystemUi('  .help                      - this message', '  .help                      - denne meldingen');
       appendSystemUi('  .identity                  - show current identity details', '  .identity                  - vis detaljer for aktiv identitet');
       appendSystemUi('  .alias <name> <address>    - save an address alias', '  .alias <name> <address>    - lagre adressealias');
+      appendSystemUi('  .alias <name> #fragment    - resolve fragment in room and save DID alias', '  .alias <name> #fragment    - slå opp fragment i rommet og lagre DID-alias');
+      appendSystemUi('  .alias #fragment <name>    - same as above, reversed order', '  .alias #fragment <navn>    - samme som over, omvendt rekkefølge');
       appendSystemUi('  .set home [did:ma:...#room]- set home target (or current position)', '  .set home [did:ma:...#room]- sett home-mål (eller nåværende posisjon)');
       appendSystemUi('  .unalias <name>            - remove a saved alias', '  .unalias <name>            - fjern et lagret alias');
       appendSystemUi('  .aliases                   - list saved aliases', '  .aliases                   - list lagrede alias');
@@ -115,18 +162,36 @@ export function createDotCommands({
 
     if (verb === 'alias') {
       if (args.length < 2) {
-        appendMessage('system', 'Usage: .alias <name> <address>');
+        appendMessage('system', 'Usage: .alias <name> <address|#fragment> | .alias #fragment <name>');
         return true;
       }
-      const [name, ...addressParts] = args;
-      const address = addressParts.join(' ');
+
+      let name = String(args[0] || '').trim();
+      let address = String(args.slice(1).join(' ') || '').trim();
+      if (name.startsWith('#') && args.length === 2) {
+        address = name;
+        name = String(args[1] || '').trim();
+      }
+
       if (!isPrintableAliasLabel(name)) {
         appendMessage('system', 'Alias name must be printable UTF-8 (no spaces/control chars), up to 64 chars.');
         return true;
       }
-      state.aliasBook[name] = address;
-      saveAliasBook();
-      appendMessage('system', `Alias saved: ${name} => ${address}`);
+
+      Promise.resolve()
+        .then(async () => {
+          const resolvedAddress = await resolveAliasAddress(address);
+          state.aliasBook[name] = resolvedAddress;
+          saveAliasBook();
+          if (address.startsWith('#')) {
+            appendMessage('system', `Alias saved: ${name} => ${resolvedAddress} (resolved from ${address})`);
+          } else {
+            appendMessage('system', `Alias saved: ${name} => ${resolvedAddress}`);
+          }
+        })
+        .catch((error) => {
+          appendMessage('system', `Alias failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
       return true;
     }
 

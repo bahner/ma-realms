@@ -1,5 +1,6 @@
 import {
   create_identity_with_ipns,
+  set_bundle_language,
   set_bundle_transports,
   start_inbox_listener,
   closet_start,
@@ -14,11 +15,42 @@ export function createClosetFlow({
   byId,
   appendMessage,
   didRoot,
+  didPublishPendingTtlMs = 5 * 60 * 1000,
   isValidAliasName,
   saveIdentityRecord,
   updateIdentityLine,
   ensureBundleIrohSecret,
 }) {
+  function pendingDidRoot(didLike = '') {
+    const root = didRoot(String(didLike || '').trim());
+    return String(root || '').trim();
+  }
+
+  function clearDidPublishPending(didLike = '') {
+    const root = pendingDidRoot(didLike);
+    if (!root) return;
+    state.didPublishPendingCache.delete(root);
+  }
+
+  function markDidPublishPending(didLike = '') {
+    const root = pendingDidRoot(didLike);
+    if (!root) return 0;
+    const ttlMs = Math.max(1_000, Number(didPublishPendingTtlMs || 0));
+    const expiresAt = Date.now() + ttlMs;
+    state.didPublishPendingCache.set(root, expiresAt);
+    return expiresAt;
+  }
+
+  function pendingDidPublishExpiresAt(didLike = '') {
+    const root = pendingDidRoot(didLike);
+    if (!root) return 0;
+    const expiresAt = Number(state.didPublishPendingCache.get(root) || 0);
+    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+      state.didPublishPendingCache.delete(root);
+      return 0;
+    }
+    return expiresAt;
+  }
   function isClosetRequiredMessage(message) {
     const text = String(message || '').toLowerCase();
     return text.includes('closet') || text.includes('not registered in room');
@@ -64,6 +96,9 @@ export function createClosetFlow({
       'help',
       'show',
       'hear',
+      'reset',
+      'restart',
+      'kill',
       'name',
       'description',
       'desc',
@@ -301,6 +336,20 @@ export function createClosetFlow({
       );
       let updated = localized;
 
+      try {
+        const preferredLanguageOrder = String(state.languageOrder || '').trim();
+        if (preferredLanguageOrder) {
+          updated = JSON.parse(
+            set_bundle_language(state.passphrase, updated.encrypted_bundle, preferredLanguageOrder)
+          );
+        }
+      } catch (languageError) {
+        appendMessage(
+          'system',
+          `Warning: could not set DID language before publish (${languageError instanceof Error ? languageError.message : String(languageError)}).`
+        );
+      }
+
       state.identity = updated;
       state.encryptedBundle = updated.encrypted_bundle;
       const bundleEl = byId('bundle-text');
@@ -362,6 +411,7 @@ export function createClosetFlow({
         state.closetPendingIpnsPrivateKeyB64 = '';
         state.didDocCache.delete(root);
         state.didPublishError = '';
+        clearDidPublishPending(root);
         appendMessage('system', `Published DID document to /ipns/${ipns} (key: ${assignedFragment || '(session key)'}).`);
       })();
 
@@ -370,7 +420,7 @@ export function createClosetFlow({
           const message = error instanceof Error ? error.message : String(error);
           state.didPublishError = message;
           appendMessage('system', `Warning: DID document not published yet (${message}).`);
-          throw error;
+          return null;
         })
         .finally(() => {
           if (state.didPublishPromise === publishWork || state.didPublishPromise) {
@@ -406,6 +456,7 @@ export function createClosetFlow({
       const previousSessionDid = String(state.closetSessionDid || '').trim();
       state.closetSessionDid = assignedDid;
       appendMessage('system', `Assigned DID: ${assignedDid}`);
+      markDidPublishPending(assignedDid);
 
       if (assignedDid && assignedDid !== previousSessionDid) {
         adoptClosetAssignedDid(assignedDid, String(response?.fragment || ''));
@@ -443,6 +494,20 @@ export function createClosetFlow({
     }
     const rawInput = String(input || '').trim();
     const normalizedInput = normalizeStructuredClosetCommand(rawInput) || rawInput;
+
+    if (/^(reset|restart|kill)$/i.test(normalizedInput)) {
+      const endpointId = String(state.closetEndpointId || '').trim();
+      if (!endpointId) {
+        throw new Error('No world endpoint available for closet reset.');
+      }
+      const restarted = await closetStartSessionForEndpoint(endpointId);
+      return {
+        ok: true,
+        session_id: restarted.session_id,
+        latest_lobby_sequence: restarted.latest_lobby_sequence,
+        message: `Closet session reset. New session: ${restarted.session_id || state.closetSessionId}`,
+      };
+    }
 
     const resourceHelpMatch = normalizedInput.match(/^__resource_help__\s+([A-Za-z][A-Za-z0-9_-]*)$/);
     if (resourceHelpMatch) {
@@ -520,6 +585,28 @@ export function createClosetFlow({
       return response;
     }
 
+    if (applyMatch && String(state.closetSessionDid || '').trim()) {
+      const response = parseClosetResponse(
+        await closet_command(endpointId, state.closetSessionId, normalizedInput)
+      );
+      if (!response.ok) {
+        const message = String(response.message || '').trim();
+        if (/ipns publish failed|did document is not published yet/i.test(message)) {
+          state.didPublishError = message;
+          const expiresAt = pendingDidPublishExpiresAt(state.closetSessionDid) || markDidPublishPending(state.closetSessionDid);
+          const secondsLeft = Math.max(1, Math.ceil((expiresAt - Date.now()) / 1000));
+          return {
+            ok: true,
+            latest_lobby_sequence: state.closetLobbySeq,
+            message: `${message}\nBackground publish is still pending (TTL ${secondsLeft}s). You can continue and use go out.`
+          };
+        }
+        throw new Error(message || 'Closet apply failed.');
+      }
+      state.closetLobbySeq = Number(response.latest_lobby_sequence || state.closetLobbySeq || 0);
+      return response;
+    }
+
     const resourceApplyMatch = normalizedInput.match(/^__resource_apply__\s+([A-Za-z][A-Za-z0-9_-]*)(?:\s+(.+))?$/);
     if (resourceApplyMatch) {
       const resource = String(resourceApplyMatch[1] || '').trim().toLowerCase();
@@ -541,6 +628,12 @@ export function createClosetFlow({
         updated = JSON.parse(
           set_bundle_transports(state.passphrase, state.encryptedBundle, state.inboxEndpointId)
         );
+        const preferredLanguageOrder = String(state.languageOrder || '').trim();
+        if (preferredLanguageOrder) {
+          updated = JSON.parse(
+            set_bundle_language(state.passphrase, updated.encrypted_bundle, preferredLanguageOrder)
+          );
+        }
         state.identity = updated;
         state.encryptedBundle = updated.encrypted_bundle;
         const bundleEl = byId('bundle-text');
@@ -563,11 +656,24 @@ export function createClosetFlow({
         )
       );
       if (!response.ok) {
-        throw new Error(response.message || 'Closet DID publish failed.');
+        const message = String(response.message || '').trim();
+        if (/ipns publish failed|did document is not published yet/i.test(message)) {
+          state.didPublishError = message;
+          const didForPending = String(state.identity?.did || state.closetSessionDid || '').trim();
+          const expiresAt = pendingDidPublishExpiresAt(didForPending) || markDidPublishPending(didForPending);
+          const secondsLeft = Math.max(1, Math.ceil((expiresAt - Date.now()) / 1000));
+          return {
+            ok: true,
+            latest_lobby_sequence: state.closetLobbySeq,
+            message: `${message}\nBackground publish is still pending (TTL ${secondsLeft}s). You can continue and use go out.`
+          };
+        }
+        throw new Error(message || 'Closet DID publish failed.');
       }
       const didForCache = didRoot(String(response.did || state.identity?.did || ''));
       if (didForCache) {
         state.didDocCache.delete(didForCache);
+        clearDidPublishPending(didForCache);
       }
       return response;
     }

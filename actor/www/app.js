@@ -44,9 +44,14 @@ import {
   createRoomStorage,
   humanRoomTitle,
   parseExitYamlSummary,
-  roomLanguageKey,
   sanitizeRoomYamlForEdit,
 } from './room.js';
+import {
+  normalizeLanguageOrder as normalizeLanguageOrderValue,
+  normalizeUiLang,
+  roomLanguageKey,
+  uiLangFromLanguage,
+} from './language.js';
 import {
   createDidDocFlow,
   createDidRoot,
@@ -108,6 +113,7 @@ const LAST_PUBLISHED_CID_KEY = `${STORAGE_PREFIX}.lastPublishedCid`;
 const LEGACY_ALIAS_KEY = 'ma.identity.v2.alias';
 const DEFAULT_UI_LANG = 'en';
 const DEFAULT_LANGUAGE_ORDER = 'nb_NO:en_UK';
+const DID_PUBLISH_PENDING_TTL_MS = 5 * 60 * 1000;
 const KNOWN_IPFS_HELLO_WORLD_CID = 'bafkreidfdrlkeq4m4xnxuyx6iae76fdm4wgl5d4xzsb77ixhyqwumhz244';
 const IPFS_GATEWAY_FALLBACKS = [
   'http://localhost:8080',
@@ -180,6 +186,7 @@ const state = {
   closetPendingIpnsPrivateKeyB64: '',
   didPublishPromise: null,
   didPublishError: '',
+  didPublishPendingCache: new Map(),
   transparentReentryPromise: null,
   editSession: null,
   editBusy: false,
@@ -607,16 +614,28 @@ async function lookupDidInCurrentRoom(query) {
   }
 
   const lookupPromise = (async () => {
-    const response = await sendWorldCommandQuery(`@here id ${token}`);
-    const did = extractDidFromLookupResponse(response);
-    if (!did) {
-      throw new Error(uiText(
-        `Could not resolve DID for '${token}'.`,
-        `Fant ikke DID for '${token}'.`
-      ));
+    const candidates = token.startsWith('#')
+      ? [token, token.slice(1)]
+      : [token];
+
+    for (const candidate of candidates) {
+      const normalized = String(candidate || '').trim();
+      if (!normalized) {
+        continue;
+      }
+      const response = await sendWorldCommandQuery(`@here id ${normalized}`);
+      const did = extractDidFromLookupResponse(response);
+      if (did) {
+        cacheRoomDidLookup(token, did);
+        cacheRoomDidLookup(normalized, did);
+        return did;
+      }
     }
-    cacheRoomDidLookup(token, did);
-    return did;
+
+    throw new Error(uiText(
+      `Could not resolve DID for '${token}'.`,
+      `Fant ikke DID for '${token}'.`
+    ));
   })();
 
   if (inflightKey) {
@@ -637,6 +656,24 @@ function isBuiltinTargetToken(value) {
   return token === 'here' || token === 'room' || token === 'avatar' || token === 'world';
 }
 
+function lookupHandleDid(handle) {
+  const key = String(handle || '').trim();
+  if (!key) {
+    return '';
+  }
+  const direct = String(state.handleDidMap[key] || '').trim();
+  if (isMaDid(direct)) {
+    return direct;
+  }
+  const lowered = key.toLowerCase();
+  for (const [knownHandle, knownDid] of Object.entries(state.handleDidMap || {})) {
+    if (String(knownHandle || '').trim().toLowerCase() === lowered && isMaDid(String(knownDid || '').trim())) {
+      return String(knownDid || '').trim();
+    }
+  }
+  return '';
+}
+
 async function resolveCommandTargetDidOrToken(targetToken) {
   const raw = String(targetToken || '').trim().replace(/^@+/, '');
   if (!raw) {
@@ -655,17 +692,38 @@ async function resolveCommandTargetDidOrToken(targetToken) {
     return raw;
   }
 
+  if (raw.startsWith('#')) {
+    const fragment = raw.slice(1).trim().toLowerCase();
+    if (fragment) {
+      for (const entry of state.roomPresence.values()) {
+        const did = String(entry?.did || '').trim();
+        if (!isMaDid(did) || !did.includes('#')) {
+          continue;
+        }
+        const didFragment = String(did.split('#')[1] || '').trim().toLowerCase();
+        if (didFragment && didFragment === fragment) {
+          cacheRoomDidLookup(raw, did);
+          return did;
+        }
+      }
+    }
+  }
+
   const resolvedAlias = String(resolveAliasInput(raw) || '').trim();
   if (isMaDid(resolvedAlias)) {
     return resolvedAlias;
   }
 
-  const mappedDid = state.handleDidMap[raw]
-    || state.handleDidMap[resolvedAlias]
-    || '';
+  const mappedDid = lookupHandleDid(raw) || lookupHandleDid(resolvedAlias) || '';
   if (isMaDid(String(mappedDid))) {
     cacheRoomDidLookup(raw, mappedDid);
     return mappedDid;
+  }
+
+  const didByEndpoint = String(findDidByEndpoint(resolvedAlias) || '').trim();
+  if (isMaDid(didByEndpoint)) {
+    cacheRoomDidLookup(raw, didByEndpoint);
+    return didByEndpoint;
   }
 
   return await lookupDidInCurrentRoom(raw);
@@ -1211,6 +1269,7 @@ const { applyPresencePayload } = createRoomPresencePayloadFlow({
   trackRoomPresence,
   removeRoomPresence,
   clearRoomPresence,
+  appendMessage: (...args) => appendMessage(...args),
 });
 
 function setCurrentPublishInfo({ ipns = '', cid = '' } = {}) {
@@ -1254,13 +1313,18 @@ function setSetupStatus(message) {
 
 function displayActor(senderDid, senderHandle) {
   const handle = String(senderHandle || '').trim();
+  const did = String(senderDid || '').trim();
+
+  if (handle && did) {
+    return `${handle} (${did})`;
+  }
+
   if (handle) {
     return handle.startsWith('@') ? handle : `@${handle}`;
   }
 
-  const did = String(senderDid || '').trim();
   if (did) {
-    return humanizeIdentifier(did);
+    return did;
   }
 
   return '@unknown';
@@ -1273,7 +1337,7 @@ function renderLocalBroadcastMessage(text) {
     state.identity?.did,
     state.currentHome?.handle || state.aliasName || '@you'
   );
-  appendMessage('world', humanizeText(`${actor}: ${payload}`));
+  appendMessage('world', `${actor}: ${payload}`);
 }
 
 const {
@@ -1308,6 +1372,7 @@ const closetFlow = createClosetFlow({
   byId,
   appendMessage,
   didRoot,
+  didPublishPendingTtlMs: DID_PUBLISH_PENDING_TTL_MS,
   isValidAliasName,
   saveIdentityRecord,
   updateIdentityLine,
@@ -1401,7 +1466,6 @@ const inboundDispatcher = createInboundDispatcher({
   logger,
   appendMessage,
   displayActor,
-  humanizeText,
   fetchDidDocumentJsonByDid,
   decodeChatEventMessage: decode_chat_event_message,
   decodeWhisperEventMessage: decode_whisper_event_message,
@@ -1666,36 +1730,8 @@ function resolveCurrentPositionTarget() {
   return '';
 }
 
-function normalizeUiLang(value) {
-  const normalized = String(value || '').trim().replace(/_/g, '-').toLowerCase();
-  if (['nb', 'nb-no', 'no'].includes(normalized)) {
-    return 'nb';
-  }
-  if (['en', 'en-us', 'en-gb'].includes(normalized)) {
-    return 'en';
-  }
-  if (['se', 'sv', 'sv-se'].includes(normalized)) {
-    return 'se';
-  }
-  if (['da', 'da-dk'].includes(normalized)) {
-    return 'da';
-  }
-  return '';
-}
-
-function uiLangFromLanguage(languageValue) {
-  const lang = String(languageValue || '').trim().replace(/_/g, '-').toLowerCase();
-  if (lang.startsWith('nb') || lang.startsWith('nn') || lang === 'no') {
-    return 'nb';
-  }
-  if (lang.startsWith('en')) {
-    return 'en';
-  }
-  return DEFAULT_UI_LANG;
-}
-
 function setUiLanguage(value) {
-  const normalized = normalizeUiLang(value) || uiLangFromLanguage('en');
+  const normalized = normalizeUiLang(value) || uiLangFromLanguage('en', DEFAULT_UI_LANG);
   state.uiLang = normalized;
   if (typeof document !== 'undefined' && document.documentElement) {
     document.documentElement.lang = normalized;
@@ -1824,6 +1860,7 @@ const identityFlow = createIdentityFlow({
   unlockIdentity: unlock_identity,
   ensureBundleIrohSecret: ensure_bundle_iroh_secret,
   setBundleLanguage: set_bundle_language,
+  normalizeLanguageOrder: (value) => normalizeLanguageOrderValue(value, DEFAULT_LANGUAGE_ORDER),
   generateBip39Phrase: generate_bip39_phrase,
   normalizeBip39Phrase: normalize_bip39_phrase,
   defaultLanguageOrder: DEFAULT_LANGUAGE_ORDER,
@@ -2236,10 +2273,9 @@ async function enterHome(target, preferredRoom = null) {
   }
 
   if (state.didPublishPromise) {
-    await state.didPublishPromise;
-  }
-  if (state.didPublishError) {
-    throw new Error(`DID document is not published yet: ${state.didPublishError}`);
+    appendMessage('system', 'DID publish is still running in background. Continuing world enter attempt.');
+  } else if (state.didPublishError) {
+    appendMessage('system', `DID publish is pending/retrying in background (${state.didPublishError}). Continuing world enter attempt.`);
   }
 
   const alias = String(target || '').trim();

@@ -10,3 +10,6 @@
 - Observasjon: "Editor: CodeMirror (esm.sh) aktiv med YAML-syntax", men bruker opplever fortsatt fallback.
 - Kontekst: `ma-realms/actor/www/editor.js`, `.edit`-flyten.
 - Dato: 2026-04-04
+
+## BUG
+ma.deactivated is supposed to be a timestamp, not a boolean

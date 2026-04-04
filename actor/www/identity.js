@@ -217,6 +217,7 @@ export function createIdentityFlow({
   unlockIdentity,
   ensureBundleIrohSecret,
   setBundleLanguage,
+  normalizeLanguageOrder,
   generateBip39Phrase,
   normalizeBip39Phrase,
   defaultLanguageOrder,
@@ -234,17 +235,8 @@ export function createIdentityFlow({
   showSetup,
   showLockOverlay,
 }) {
-  function normalizeLanguageOrder(value) {
-    const normalized = String(value || '')
-      .split(':')
-      .map((entry) => String(entry || '').trim())
-      .filter(Boolean)
-      .join(':');
-    return normalized || defaultLanguageOrder;
-  }
-
   function applyBundleLanguagePreference(languageOrder) {
-    const normalized = normalizeLanguageOrder(languageOrder);
+    const normalized = normalizeLanguageOrder(languageOrder || defaultLanguageOrder);
     state.languageOrder = normalized;
 
     if (!state.passphrase || !state.encryptedBundle) {
@@ -286,7 +278,7 @@ export function createIdentityFlow({
     const aliasName = byId('alias-name').value.trim();
     const passphrase = byId('passphrase').value;
     const bundle = byId('bundle-text').value.trim();
-    const languageOrder = normalizeLanguageOrder(byId('language-order')?.value || '');
+    const languageOrder = normalizeLanguageOrder(byId('language-order')?.value || defaultLanguageOrder);
 
     if (!isValidAliasName(aliasName)) {
       throw new Error('Alias must be 2-32 chars using letters, numbers, underscore, or dash.');
@@ -377,7 +369,7 @@ export function createIdentityFlow({
 
     const aliasName = byId('alias-name').value.trim();
     const bundle = byId('bundle-text').value.trim();
-    state.languageOrder = normalizeLanguageOrder(byId('language-order')?.value || '');
+    state.languageOrder = normalizeLanguageOrder(byId('language-order')?.value || defaultLanguageOrder);
     if (isValidAliasName(aliasName)) {
       saveIdentityRecord(aliasName, bundle);
     }

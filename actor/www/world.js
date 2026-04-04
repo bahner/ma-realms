@@ -364,6 +364,28 @@ export function createWorldDispatchFlow({
         return;
       }
 
+      const fragmentWhisperMatch = trimmedText.match(/^#([^\s:]+)\s*:\s*(.+)$/);
+      if (fragmentWhisperMatch) {
+        const fragment = String(fragmentWhisperMatch[1] || '').trim();
+        const payload = String(fragmentWhisperMatch[2] || '').trim();
+        if (!fragment || !payload) {
+          appendMessage('system', 'Usage: #fragment: message');
+          return;
+        }
+        try {
+          const targetDid = await resolveCommandTargetDidOrToken(`#${fragment}`);
+          if (!isMaDid(String(targetDid))) {
+            throw new Error(`Fragment target must resolve to did:ma, got: ${targetDid}`);
+          }
+          await sendWhisperToDid(targetDid, payload);
+          appendMessage('system', `Chat sent to ${targetDid}.`);
+          return;
+        } catch (err) {
+          appendMessage('system', `Error sending chat to #${fragment}: ${err.message}`);
+          return;
+        }
+      }
+
       if (trimmedText.startsWith("'")) {
         const payload = trimmedText.substring(1);
         const sendStart = Date.now();
@@ -426,18 +448,10 @@ export function createWorldDispatchFlow({
 
       if (trimmedText.startsWith('@')) {
         const trimmed = trimmedText;
-        const spaceIdx = trimmed.indexOf(' ');
-
-        if (spaceIdx === -1) {
-          appendMessage('system', '?');
-          return;
-        }
-
-        const target = trimmed.substring(1, spaceIdx);
-        const remainder = trimmed.substring(spaceIdx + 1);
-
-        if (remainder.startsWith("'")) {
-          const payload = remainder.substring(1);
+        const whisperSep = trimmed.indexOf(" '");
+        if (whisperSep > 1) {
+          const target = trimmed.substring(1, whisperSep).trim();
+          const payload = trimmed.substring(whisperSep + 2);
           try {
             const targetDid = await resolveCommandTargetDidOrToken(target);
             if (!isMaDid(String(targetDid))) {
@@ -451,6 +465,16 @@ export function createWorldDispatchFlow({
             return;
           }
         }
+
+        const spaceIdx = trimmed.indexOf(' ');
+
+        if (spaceIdx === -1) {
+          appendMessage('system', '?');
+          return;
+        }
+
+        const target = trimmed.substring(1, spaceIdx);
+        const remainder = trimmed.substring(spaceIdx + 1);
 
         if (!remainder.trim()) {
           appendMessage('system', '?');

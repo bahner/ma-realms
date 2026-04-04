@@ -939,10 +939,9 @@ impl World {
             did: profile_did,
             fragment: None,
         };
-        self.closet_sessions
-            .write()
-            .await
-            .insert(session_id.clone(), session);
+        let mut sessions = self.closet_sessions.write().await;
+        sessions.retain(|_, existing| existing.endpoint != endpoint);
+        sessions.insert(session_id.clone(), session);
         self.announce_closet_listener(session_id.as_str(), endpoint).await?;
         Ok((session_id, latest_lobby_sequence))
     }

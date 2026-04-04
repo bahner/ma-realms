@@ -1482,7 +1482,6 @@ fn initialize_document_lifecycle_metadata(document: &mut Document) {
     let now = now_iso_utc();
     document.set_ma_created(now.clone());
     document.set_ma_updated(now);
-    document.set_ma_deactivated(false);
     document.set_ma_version_id(actor_version_id());
 }
 
@@ -1497,7 +1496,6 @@ fn bump_document_lifecycle_metadata(document: &mut Document) {
         document.set_ma_created(now.clone());
     }
     document.set_ma_updated(now);
-    document.set_ma_deactivated(false);
     document.set_ma_version_id(actor_version_id());
 }
 
