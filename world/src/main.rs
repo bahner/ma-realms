@@ -8856,8 +8856,13 @@ async fn main() -> Result<()> {
         .or(runtime_actor_web_cid);
     let authored_actor_web_version = authored_actor_web.as_ref().map(|(version, _)| version.clone());
     let authored_actor_web_cid = authored_actor_web.as_ref().map(|(_, cid)| cid.clone());
+    let env_actor_web_version = std::env::var("MA_WORLD_VERSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let actor_web_version = runtime_actor_web_version
         .or(authored_actor_web_version)
+        .or(env_actor_web_version)
         .or_else(|| Some("local-dev".to_string()));
 
     let mut actor_web_cid = manual_actor_web_cid;

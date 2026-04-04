@@ -1479,7 +1479,6 @@ fn iso_utc_from_unix_secs(unix_secs: u64) -> String {
 
 fn actor_version_id() -> String {
     let compile_time = option_env!("MA_ACTOR_VERSION")
-        .or(option_env!("MA_WORLD_VERSION"))
         .unwrap_or(env!("CARGO_PKG_VERSION"));
     let normalized = compile_time.trim();
     if normalized.is_empty() {

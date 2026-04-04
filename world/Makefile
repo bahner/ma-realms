@@ -3,6 +3,7 @@
 BINARY := target/debug/ma-world
 RELEASE_BINARY := target/release/ma-world
 STAMP := target/.build_stamp
+MA_WORLD_VERSION ?=
 
 help:
 	@echo "Available targets:"
@@ -15,16 +16,16 @@ help:
 build: $(STAMP)
 
 $(STAMP): Cargo.toml src/*.rs ../../ma/src/*.rs ../core/src/*.rs
-	cargo build
+	MA_WORLD_VERSION="$(MA_WORLD_VERSION)" cargo build
 	@mkdir -p $(dir $(STAMP))
 	@touch $(STAMP)
 
 release: Cargo.toml src/*.rs ../../ma/src/*.rs ../core/src/*.rs
-	cargo build --release
+	MA_WORLD_VERSION="$(MA_WORLD_VERSION)" cargo build --release
 	@echo "🏗️  Release binary at $(RELEASE_BINARY)"
 
 run: build
-	RUST_LOG=ma_world=debug ./$(BINARY)
+	MA_WORLD_VERSION="$(MA_WORLD_VERSION)" RUST_LOG=ma_world=debug ./$(BINARY)
 
 clean:
 	rm -f $(STAMP)

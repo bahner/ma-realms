@@ -3,7 +3,18 @@
 WORLD_SLUG ?= ma
 WORLD_LISTEN ?=
 WORLD_KUBO_URL ?=
-MA_WORLD_VERSION ?=
+
+ifeq ($(origin MA_REALMS_VERSION), undefined)
+MA_REALMS_VERSION := dev-$(shell date +%s)
+endif
+
+ifeq ($(origin MA_WORLD_VERSION), undefined)
+MA_WORLD_VERSION := $(MA_REALMS_VERSION)
+endif
+
+ifeq ($(origin MA_ACTOR_VERSION), undefined)
+MA_ACTOR_VERSION := $(MA_REALMS_VERSION)
+endif
 
 help:
 	@echo "ma-realms targets:"
@@ -21,10 +32,10 @@ core-build:
 	$(MAKE) -C core build
 
 actor-build:
-	$(MAKE) -C actor build MA_WORLD_VERSION="$(MA_WORLD_VERSION)"
+	$(MAKE) -C actor build MA_ACTOR_VERSION="$(MA_ACTOR_VERSION)"
 
 world-build:
-	$(MAKE) -C world build
+	$(MAKE) -C world build MA_WORLD_VERSION="$(MA_WORLD_VERSION)"
 
 actor-cid:
 	$(MAKE) -C actor show-cid
@@ -40,8 +51,11 @@ run-world: core-build actor-build world-build
 		args="$$args --kubo-url $(WORLD_KUBO_URL)"; \
 	fi; \
 	echo "Starting ma-world with actor CID=$$cid"; \
+	echo "MA_REALMS_VERSION=$(MA_REALMS_VERSION)"; \
+	echo "MA_WORLD_VERSION=$(MA_WORLD_VERSION)"; \
+	echo "MA_ACTOR_VERSION=$(MA_ACTOR_VERSION)"; \
 	echo "Command: cargo run --manifest-path world/Cargo.toml -- $$args"; \
-	cargo run --manifest-path world/Cargo.toml -- $$args
+	MA_WORLD_VERSION="$(MA_WORLD_VERSION)" cargo run --manifest-path world/Cargo.toml -- $$args
 
 dev: run-world
 

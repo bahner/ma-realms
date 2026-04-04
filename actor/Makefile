@@ -10,7 +10,11 @@ PKG_DEV_STAMP := .build/pkg-dev.stamp
 CID_FILE := .cid
 IPNS_ALIAS := ma-actor
 SOURCE_DATE_EPOCH ?= $(shell git log -1 --format=%ct 2>/dev/null || date +%s)
-MA_WORLD_VERSION ?= dev-$(shell date +%s)
+MA_ACTOR_VERSION ?=
+MA_ACTOR_VERSION_EFFECTIVE := $(strip $(MA_ACTOR_VERSION))
+ifeq ($(MA_ACTOR_VERSION_EFFECTIVE),)
+MA_ACTOR_VERSION_EFFECTIVE := $(shell printf 'dev-%s' "$$(date +%s)")
+endif
 VERSION_FILE := www/pkg/build-version.js
 
 
@@ -23,11 +27,11 @@ build-release: $(PKG_STAMP)
 $(PKG_STAMP): $(BUILD_INPUTS)
 	mkdir -p .build
 	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) \
-	MA_ACTOR_VERSION=$(MA_WORLD_VERSION) \
+	MA_ACTOR_VERSION=$(MA_ACTOR_VERSION_EFFECTIVE) \
 	CARGO_INCREMENTAL=0 \
 	RUSTFLAGS="--remap-path-prefix=$(CURDIR)=." \
 	wasm-pack build --release --target web --out-dir www/pkg
-	@printf "globalThis.MA_ACTOR_VERSION = '%s';\n" "$(MA_WORLD_VERSION)" > $(VERSION_FILE)
+	@printf "globalThis.MA_ACTOR_VERSION = '%s';\n" "$(MA_ACTOR_VERSION_EFFECTIVE)" > $(VERSION_FILE)
 	touch $(PKG_STAMP)
 
 cid: $(PKG_DEV_STAMP)
@@ -46,8 +50,8 @@ show-cid:
 
 $(PKG_DEV_STAMP): $(BUILD_INPUTS)
 	mkdir -p .build
-	MA_ACTOR_VERSION=$(MA_WORLD_VERSION) wasm-pack build --dev --target web --out-dir www/pkg
-	@printf "globalThis.MA_ACTOR_VERSION = '%s';\n" "$(MA_WORLD_VERSION)" > $(VERSION_FILE)
+	MA_ACTOR_VERSION=$(MA_ACTOR_VERSION_EFFECTIVE) wasm-pack build --dev --target web --out-dir www/pkg
+	@printf "globalThis.MA_ACTOR_VERSION = '%s';\n" "$(MA_ACTOR_VERSION_EFFECTIVE)" > $(VERSION_FILE)
 	touch $(PKG_DEV_STAMP)
 
 serve: build
