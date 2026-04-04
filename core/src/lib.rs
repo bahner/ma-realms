@@ -33,13 +33,10 @@ pub use closet_domain::{
     CLOSET_EMPTY_MESSAGE,
     CLOSET_HELP_MESSAGE,
     CLOSET_HELP_PROMPT,
-    CLOSET_REQUIRED_FIELDS_MESSAGE,
-    CLOSET_REQUIRED_FIELDS_PROMPT,
     ClosetCommand,
     ClosetProfileField,
     ClosetRecoveryCommand,
     parse_closet_command,
-    required_profile_fields_missing,
 };
 pub use closet_policy::{
     ClosetDidPublishPlan,

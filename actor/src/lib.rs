@@ -1435,6 +1435,7 @@ where
         .map_err(|e| js_err(format!("bundle corrupted: {e}")))?;
 
     update(&mut plain.document)?;
+    bump_document_lifecycle_metadata(&mut plain.document);
 
     let signing_key = restore_signing_key(&plain.ipns, &plain.signing_private_key_hex)?;
     let assertion_method = plain
@@ -1458,10 +1459,63 @@ where
     serde_json::to_string(&result).map_err(js_err)
 }
 
+fn now_iso_utc() -> String {
+    js_sys::Date::new_0()
+        .to_iso_string()
+        .as_string()
+        .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string())
+}
+
+fn actor_version_id() -> String {
+    let compile_time = option_env!("MA_ACTOR_VERSION")
+        .or(option_env!("MA_WORLD_VERSION"))
+        .unwrap_or(env!("CARGO_PKG_VERSION"));
+    let normalized = compile_time.trim();
+    if normalized.is_empty() {
+        env!("CARGO_PKG_VERSION").to_string()
+    } else {
+        normalized.to_string()
+    }
+}
+
+fn initialize_document_lifecycle_metadata(document: &mut Document) {
+    let now = now_iso_utc();
+    document.set_ma_created(now.clone());
+    document.set_ma_updated(now);
+    document.set_ma_deactivated(false);
+    document.set_ma_version_id(actor_version_id());
+}
+
+fn bump_document_lifecycle_metadata(document: &mut Document) {
+    let now = now_iso_utc();
+    if document
+        .ma
+        .as_ref()
+        .and_then(|ma| ma.created.as_ref())
+        .is_none()
+    {
+        document.set_ma_created(now.clone());
+    }
+    document.set_ma_updated(now);
+    document.set_ma_deactivated(false);
+    document.set_ma_version_id(actor_version_id());
+}
+
 // ── Exported WASM functions ────────────────────────────────────────────────────
 
 fn create_identity_internal(passphrase: &str, ipns: &str) -> Result<String, JsValue> {
-    let generated = generate_agent_identity(ipns).map_err(js_err)?;
+    let mut generated = generate_agent_identity(ipns).map_err(js_err)?;
+    initialize_document_lifecycle_metadata(&mut generated.document);
+    let signing_key = restore_signing_key(ipns, &generated.signing_private_key_hex)?;
+    let assertion_method = generated
+        .document
+        .get_verification_method_by_id(&generated.document.assertion_method)
+        .map_err(js_err)?
+        .clone();
+    generated
+        .document
+        .sign(&signing_key, &assertion_method)
+        .map_err(js_err)?;
     let iroh_secret_key = SecretKey::from_bytes(&random_bytes::<32>().map_err(js_err)?);
 
     let plain = IdentityBundlePlain {
@@ -1718,12 +1772,21 @@ pub async fn closet_submit_citizenship(
     endpoint_id: &str,
     session_id: &str,
     ipns_private_key_base64: &str,
+    desired_fragment: &str,
 ) -> Result<String, JsValue> {
     let response = send_closet_request(
         endpoint_id,
         ClosetRequest::SubmitCitizenship {
             session_id: session_id.trim().to_string(),
             ipns_private_key_base64: ipns_private_key_base64.trim().to_string(),
+            desired_fragment: {
+                let fragment = desired_fragment.trim();
+                if fragment.is_empty() {
+                    None
+                } else {
+                    Some(fragment.to_string())
+                }
+            },
         },
     )
     .await?;
@@ -1736,6 +1799,7 @@ pub async fn closet_publish_did_document(
     session_id: &str,
     did_document_json: &str,
     ipns_private_key_base64: &str,
+    desired_fragment: &str,
 ) -> Result<String, JsValue> {
     let response = send_closet_request(
         endpoint_id,
@@ -1743,6 +1807,14 @@ pub async fn closet_publish_did_document(
             session_id: session_id.trim().to_string(),
             did_document_json: did_document_json.to_string(),
             ipns_private_key_base64: ipns_private_key_base64.trim().to_string(),
+            desired_fragment: {
+                let fragment = desired_fragment.trim();
+                if fragment.is_empty() {
+                    None
+                } else {
+                    Some(fragment.to_string())
+                }
+            },
         },
     )
     .await?;

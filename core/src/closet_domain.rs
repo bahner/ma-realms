@@ -27,7 +27,6 @@ pub enum ClosetCommand {
 pub enum ClosetProfileField {
     Name,
     Description,
-    Alias,
 }
 
 impl ClosetProfileField {
@@ -35,7 +34,6 @@ impl ClosetProfileField {
         match self {
             Self::Name => "name",
             Self::Description => "description",
-            Self::Alias => "alias",
         }
     }
 }
@@ -48,24 +46,11 @@ pub enum ClosetRecoveryCommand {
     Rekey { handle: String, passphrase: String },
 }
 
-pub const CLOSET_HELP_MESSAGE: &str = "Closet commands: help | show | hear | name <text> | description <text> | alias <text> | apply [ipns_key_base64] | citizen [ipns_key_base64] | recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>\nRequired fields: name, description, alias.\nAlias is your requested username/fragment and can be rejected if taken.\nWhen done: run apply, then type 'go lobby' in the actor UI to enter the world.";
+pub const CLOSET_HELP_MESSAGE: &str = "Closet commands: help | show | hear | apply [ipns_key_base64] | citizen [ipns_key_base64] | name <text> | description <text> | recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>\nIf actor DID does not exist yet: run apply first. After actor is created, set avatar name/description.\nFragment is requested by the actor during DID publish; if occupied, retry with another fragment.\nWhen done: type 'go out' in the actor UI to leave the closet.";
 
-pub const CLOSET_HELP_PROMPT: &str = "You are in the closet with no avatar yet. Required: name + description + alias. Then run apply. When done, type 'go lobby' in the actor UI.";
+pub const CLOSET_HELP_PROMPT: &str = "If actor DID does not exist yet: run apply first. After actor is created, set avatar name/description. Then type 'go out' in the actor UI.";
 
 pub const CLOSET_EMPTY_MESSAGE: &str = "You are in the closet and have no avatar yet. Type 'help'.";
-
-pub const CLOSET_REQUIRED_FIELDS_MESSAGE: &str = "required fields are: name, description, alias";
-pub const CLOSET_REQUIRED_FIELDS_PROMPT: &str = "set name/description/alias, then run apply";
-
-pub fn required_profile_fields_missing(
-    name: Option<&str>,
-    description: Option<&str>,
-    alias: Option<&str>,
-) -> bool {
-    name.map(|v| v.trim().is_empty()).unwrap_or(true)
-        || description.map(|v| v.trim().is_empty()).unwrap_or(true)
-        || alias.map(|v| v.trim().is_empty()).unwrap_or(true)
-}
 
 pub fn parse_closet_command(input: &str) -> ClosetCommand {
     let trimmed = input.trim();
@@ -101,18 +86,6 @@ pub fn parse_closet_command(input: &str) -> ClosetCommand {
             } else {
                 ClosetCommand::SetField {
                     field: ClosetProfileField::Description,
-                    value: tail.to_string(),
-                }
-            }
-        }
-        "alias" => {
-            if tail.is_empty() {
-                ClosetCommand::MissingFieldValue {
-                    field: ClosetProfileField::Alias,
-                }
-            } else {
-                ClosetCommand::SetField {
-                    field: ClosetProfileField::Alias,
                     value: tail.to_string(),
                 }
             }
@@ -159,10 +132,7 @@ pub fn parse_closet_command(input: &str) -> ClosetCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ClosetCommand, ClosetProfileField, ClosetRecoveryCommand, parse_closet_command,
-        required_profile_fields_missing,
-    };
+    use super::{ClosetCommand, ClosetProfileField, ClosetRecoveryCommand, parse_closet_command};
 
     #[test]
     fn parses_apply_alias() {
@@ -175,11 +145,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_missing_alias_value() {
+    fn parses_missing_name_value() {
         assert_eq!(
-            parse_closet_command("alias"),
+            parse_closet_command("name"),
             ClosetCommand::MissingFieldValue {
-                field: ClosetProfileField::Alias,
+                field: ClosetProfileField::Name,
             }
         );
     }
@@ -193,19 +163,5 @@ mod tests {
                 passphrase: "hemmelig".to_string(),
             })
         );
-    }
-
-    #[test]
-    fn required_fields_detects_missing_values() {
-        assert!(required_profile_fields_missing(
-            Some("name"),
-            Some("desc"),
-            Some("   "),
-        ));
-        assert!(!required_profile_fields_missing(
-            Some("name"),
-            Some("desc"),
-            Some("alias"),
-        ));
     }
 }

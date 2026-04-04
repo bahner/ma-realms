@@ -40,7 +40,7 @@ use ma_core::{
     RoomEvent, TransportAck, TransportAckCode, WORLD_ALPN, WorldCommand, WorldLane, WorldRequest,
     WorldResponse, compile_acl, evaluate_compiled_acl_with_owner, execute_room_actor_command,
     normalize_spoken_text, parse_capability_acl_text, parse_object_local_capability_acl,
-    parse_closet_command, plan_closet_did_publish, required_profile_fields_missing,
+    parse_closet_command, plan_closet_did_publish,
     LegacyRequirement, RequirementChecker, RequirementSet, RequirementValue,
 };
 use nanoid::nanoid;
@@ -1011,29 +1011,16 @@ impl World {
                     return Err(anyhow!("name cannot be empty"));
                 }
                 session.name = Some(normalized_value);
-                Ok("name stored (used on first world enter)".to_string())
+                Ok("avatar name stored".to_string())
             }
             "description" | "desc" => {
                 if normalized_value.is_empty() {
                     return Err(anyhow!("description cannot be empty"));
                 }
                 session.description = Some(normalized_value);
-                Ok("description stored".to_string())
+                Ok("avatar description stored".to_string())
             }
-            "alias" => {
-                if normalized_value.is_empty() {
-                    return Err(anyhow!("alias cannot be empty"));
-                }
-                if !is_valid_nanoid_id(&normalized_value) {
-                    return Err(anyhow!(
-                        "invalid alias '{}': expected [A-Za-z0-9_-]+",
-                        normalized_value
-                    ));
-                }
-                session.alias = Some(normalized_value);
-                Ok("alias stored".to_string())
-            }
-            _ => Err(anyhow!("unknown closet field '{}': use name|description|alias", field)),
+            _ => Err(anyhow!("unknown closet field '{}': use name|description", field)),
         }
     }
 
@@ -1292,6 +1279,7 @@ impl World {
         endpoint: &str,
         did_document_json: &str,
         ipns_private_key_base64: &str,
+        desired_fragment: Option<&str>,
     ) -> Result<(String, String, String)> {
         let session = self.closet_session_owned_by(session_id, endpoint).await?;
         let document = Document::unmarshal(did_document_json)
@@ -1338,7 +1326,10 @@ impl World {
 
         let key_name = match publish_plan {
             ClosetDidPublishPlan::ImportProvidedKey => {
-                let desired_alias = document_did.fragment.as_deref();
+                let desired_alias = desired_fragment
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .or(document_did.fragment.as_deref());
                 let (issued_did, _fragment, key_name) = self
                     .closet_submit_citizenship(session_id, endpoint, provided_key, desired_alias)
                     .await?;
@@ -1360,7 +1351,7 @@ impl World {
         ipns_publish_with_retry(
             &kubo_url,
             &key_name,
-            &format!("/ipfs/{}", document_cid),
+            &document_cid,
             &ipns_options,
             3,
             Duration::from_millis(1_000),
@@ -1390,9 +1381,9 @@ impl World {
             return Ok(
                 ClosetResponse::ok(
                     session_id,
-                    tr_world(active_lang, "closet.help", "Closet commands: help | show | hear | name <text> | description <text> | alias <text> | apply [ipns_key_base64] | citizen [ipns_key_base64] | recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>"),
+                    tr_world(active_lang, "closet.help", "Closet commands: help | show | hear | apply [ipns_key_base64] | citizen [ipns_key_base64] | avatar.help | avatar.peek | avatar.apply [ipns_key_base64] | avatar.name: <text> | avatar.description: <text> | avatar.name peek | avatar.description peek | document.help | document.peek | document.id peek | document.ma.transports peek | document.publish [ipns_key_base64] | document.republish [ipns_key_base64] | document.apply [ipns_key_base64] | recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>"),
                 )
-                .with_prompt(tr_world(active_lang, "closet.help.prompt", "You are in the closet with no avatar yet. Required: name + description + alias. Then run apply. When done, type 'go lobby' in the actor UI.")),
+                .with_prompt(tr_world(active_lang, "closet.help.prompt", "If actor DID does not exist yet: run apply first. After actor is created, set avatar name/description. Then type 'go out' in the actor UI.")),
             );
         }
 
@@ -1404,7 +1395,6 @@ impl World {
                 .description
                 .clone()
                 .unwrap_or_else(|| "(unset)".to_string());
-            let alias = session.alias.clone().unwrap_or_else(|| "(unset)".to_string());
             let recovery = if let Some(did_raw) = session.did.as_deref() {
                 let did_root = Did::try_from(did_raw)
                     .map_err(|e| anyhow!("invalid closet DID '{}': {}", did_raw, e))?
@@ -1424,11 +1414,10 @@ impl World {
                 ClosetResponse::ok(
                     session_id,
                     format!(
-                        "closet profile: did={} name={} description={} alias={} recovery={}",
+                        "closet profile: did={} name={} description={} recovery={}",
                         did,
                         name,
                         description,
-                        alias,
                         if recovery { "set" } else { "unset" }
                     ),
                 )
@@ -1480,11 +1469,29 @@ impl World {
                 return Err(anyhow!("usage: {} <value>", field.as_str()));
             }
             ClosetCommand::SetField { field, value } => {
+                let session = self.closet_session_owned_by(session_id, endpoint).await?;
+                if session.did.is_none() {
+                    return Ok(
+                        ClosetResponse::err(
+                            session_id,
+                            tr_world(
+                                active_lang,
+                                "closet.actor.required",
+                                "actor identity does not exist in this world yet; run apply first",
+                            ),
+                        )
+                        .with_prompt(tr_world(
+                            active_lang,
+                            "closet.actor.required.prompt",
+                            "run apply first; after actor creation you can set name/description",
+                        )),
+                    );
+                }
+
                 let msg = self
                     .closet_answer(session_id, endpoint, field.as_str(), value.as_str())
                     .await?;
 
-                let session = self.closet_session_owned_by(session_id, endpoint).await?;
                 if let Some(did) = session.did.as_deref() {
                     self.upsert_closet_profile(
                         did,
@@ -1515,29 +1522,6 @@ impl World {
                 ipns_private_key_base64,
             } => {
                 let session = self.closet_session_owned_by(session_id, endpoint).await?;
-                let required_missing = required_profile_fields_missing(
-                    session.name.as_deref(),
-                    session.description.as_deref(),
-                    session.alias.as_deref(),
-                );
-
-                if session.did.is_none() && required_missing {
-                    return Ok(
-                        ClosetResponse::err(
-                            session_id,
-                            tr_world(
-                                active_lang,
-                                "closet.required_fields",
-                                "required fields are: name, description, alias",
-                            ),
-                        )
-                        .with_prompt(tr_world(
-                            active_lang,
-                            "closet.required_fields.prompt",
-                            "set name/description/alias, then run apply",
-                        )),
-                    );
-                }
 
                 if let Some(existing_did) = session.did.as_deref() {
                     self.upsert_closet_profile(
@@ -1553,7 +1537,7 @@ impl World {
                             tr_world(
                                 active_lang,
                                 "closet.apply.updated",
-                                "changes applied. You can stay in the closet and keep editing; type 'go lobby' when ready.",
+                                "changes applied. You can stay in the closet and keep editing; type 'go out' when ready.",
                             ),
                         )
                         .with_did(existing_did.to_string())
@@ -1575,7 +1559,7 @@ impl World {
                         tr_world(
                             active_lang,
                             "closet.apply.accepted",
-                            "application accepted. type 'go lobby' in the actor UI to enter the world.",
+                            "application accepted. type 'go out' in the actor UI to enter the world.",
                         ),
                     )
                     .with_did(did)
@@ -1698,7 +1682,7 @@ impl World {
                                 tr_world(
                                     active_lang,
                                     "closet.recovery.rekey.requires_new_did",
-                                    "recovery rekey requires a new DID in this session (run citizen first)",
+                                    "closet_recovery_rekey_requires_new_did: run apply first",
                                 ),
                             ));
                         };
@@ -1729,7 +1713,7 @@ impl World {
                 }
             }
             ClosetCommand::Enter { room } => {
-                let (did, preferred_handle) = {
+                let (did, preferred_handle, session_fragment) = {
                     let sessions = self.closet_sessions.read().await;
                     let Some(session) = sessions.get(session_id) else {
                         return Err(anyhow!("unknown closet session"));
@@ -1740,11 +1724,21 @@ impl World {
                     let did = session
                         .did
                         .clone()
-                        .ok_or_else(|| anyhow!("no DID in session; run 'citizen' first"))?;
-                    (did, session.name.clone())
+                        .ok_or_else(|| anyhow!("no DID in session; run 'apply' first"))?;
+                    (did, session.name.clone(), session.fragment.clone())
                 };
 
-                let room = room.unwrap_or_else(|| DEFAULT_ROOM.to_string());
+                let room = room
+                    .map(|value| {
+                        let trimmed = value.trim();
+                        if trimmed.eq_ignore_ascii_case("out") {
+                            DEFAULT_ROOM.to_string()
+                        } else {
+                            trimmed.to_string()
+                        }
+                    })
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| DEFAULT_ROOM.to_string());
 
                 let did_obj = Did::try_from(did.as_str())
                     .map_err(|e| anyhow!("invalid session DID '{}': {}", did, e))?;
@@ -1769,7 +1763,7 @@ impl World {
                     return Ok(ClosetResponse::err(session_id, detail).with_did(did_root));
                 }
 
-                let inbox = resolve_avatar_inbox(&did_obj)?;
+                let inbox = resolve_avatar_inbox_from_session(&did_obj, session_fragment.as_deref())?;
                 let avatar_req = AvatarRequest {
                     inbox,
                     did: root_did,
@@ -7155,7 +7149,7 @@ impl WorldProtocol {
                         return Ok(WorldResponse {
                             ok: false,
                             room,
-                            message: "first login requires closet profile setup (name + description)".to_string(),
+                            message: "no avatar profile available yet; complete closet onboarding (name + description), then enter again".to_string(),
                             endpoint_id: self.endpoint_id.clone(),
                             latest_event_sequence: 0,
                             broadcasted: false,
@@ -7560,14 +7554,19 @@ impl ProtocolHandler for ClosetProtocol {
                 Ok(ClosetRequest::SubmitCitizenship {
                     session_id,
                     ipns_private_key_base64,
+                    desired_fragment,
                 }) => {
+                    let desired_fragment = desired_fragment
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
                     match self
                         .world
                         .closet_submit_citizenship(
                             &session_id,
                             &requester_endpoint,
                             &ipns_private_key_base64,
-                            None,
+                            desired_fragment,
                         )
                         .await
                     {
@@ -7600,7 +7599,12 @@ impl ProtocolHandler for ClosetProtocol {
                     session_id,
                     did_document_json,
                     ipns_private_key_base64,
+                    desired_fragment,
                 }) => {
+                    let desired_fragment = desired_fragment
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
                     match self
                         .world
                         .closet_publish_did_document(
@@ -7608,20 +7612,22 @@ impl ProtocolHandler for ClosetProtocol {
                             &requester_endpoint,
                             &did_document_json,
                             &ipns_private_key_base64,
+                            desired_fragment,
                         )
                         .await
                     {
-                        Ok((did, _cid, key_name)) => {
+                        Ok((did, cid, key_name)) => {
                             let active_lang = self
                                 .world
                                 .closet_lang_for_session(&session_id, &requester_endpoint)
                                 .await;
                             ClosetResponse::ok(
                                 &session_id,
-                                tr_world(
+                                tr_world_vars(
                                     active_lang,
                                     "closet.did.published",
-                                    "did document published",
+                                    &[("cid", cid.clone())],
+                                    &format!("did document published at /ipfs/{}", cid),
                                 ),
                             )
                             .with_did(did)
@@ -9287,6 +9293,23 @@ fn resolve_avatar_inbox(did: &Did) -> Result<String> {
     did.fragment
         .clone()
         .ok_or_else(|| anyhow!("sender DID must include #fragment (local avatar inbox atom)"))
+}
+
+fn resolve_avatar_inbox_from_session(did: &Did, session_fragment: Option<&str>) -> Result<String> {
+    if let Some(fragment) = did.fragment.clone() {
+        return Ok(fragment);
+    }
+
+    let fallback = session_fragment
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+
+    fallback.ok_or_else(|| {
+        anyhow!(
+            "sender DID must include #fragment (local avatar inbox atom); run apply in closet to assign alias/fragment first"
+        )
+    })
 }
 
 fn load_entry_acl() -> Result<EntryAcl> {

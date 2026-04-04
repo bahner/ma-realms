@@ -295,8 +295,19 @@ export function createWorldDispatchFlow({
           if (goMatch) {
             const room = String(goMatch[1] || '').trim();
             if (room) {
+              if (!String(state.closetSessionDid || '').trim()) {
+                const applyResponse = await closetCommandForCurrentWorld('apply');
+                renderClosetResponse(applyResponse);
+                if (!String(state.closetSessionDid || '').trim()) {
+                  appendMessage('system', 'Closet session still has no DID. Complete required profile fields, then try go out again.');
+                  return;
+                }
+              }
+
               const response = await closetCommandForCurrentWorld(`enter ${room}`);
               renderClosetResponse(response);
+              const reconnectRoom = room.toLowerCase() === 'out' ? 'lobby' : room;
+              await enterHome(state.closetEndpointId, reconnectRoom, { silent: true });
               return;
             }
           }

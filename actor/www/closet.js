@@ -1,7 +1,10 @@
 import {
   create_identity_with_ipns,
+  set_bundle_transports,
+  start_inbox_listener,
   closet_start,
   closet_command,
+  closet_submit_citizenship,
   closet_publish_did_document,
 } from './pkg/ma_actor.js';
 import { DID_MA_PREFIX, isMaDid } from './did.js';
@@ -31,6 +34,11 @@ export function createClosetFlow({
       || text.includes('verify') && text.includes('signature')
       || text.includes('sender document')
       || text.includes('unknown did')
+      || text.includes('failed to fetch did document')
+      || text.includes('name/resolve failed')
+      || text.includes('/ipns/')
+      || text.includes('enter request timed out')
+      || text.includes('did document is not published yet')
     );
   }
 
@@ -43,7 +51,12 @@ export function createClosetFlow({
     const prefixed = raw.match(/^\/?closet\s+(.+)$/i);
     if (prefixed) {
       const command = String(prefixed[1] || '').trim();
-      return command || null;
+      return normalizeStructuredClosetCommand(command);
+    }
+
+    const structured = normalizeStructuredClosetCommand(raw);
+    if (structured && structured !== raw) {
+      return structured;
     }
 
     const first = raw.split(/\s+/, 1)[0].toLowerCase();
@@ -54,7 +67,6 @@ export function createClosetFlow({
       'name',
       'description',
       'desc',
-      'alias',
       'apply',
       'citizen',
       'enter',
@@ -67,12 +79,211 @@ export function createClosetFlow({
     return null;
   }
 
+  function normalizeStructuredClosetCommand(input) {
+    const raw = String(input || '').trim();
+    if (!raw) {
+      return null;
+    }
+
+    const scoped = raw.match(/^([A-Za-z][A-Za-z0-9_-]*)(?:\.|\s+)(.+)$/);
+    if (!scoped) {
+      return raw;
+    }
+
+    const scope = String(scoped[1] || '').trim().toLowerCase();
+    const rest = String(scoped[2] || '').trim();
+    if (!scope || !rest) {
+      return raw;
+    }
+
+    const pathPeek = rest.match(/^([A-Za-z0-9_.-]+)\s+(show|peek)$/i);
+    if (pathPeek) {
+      const path = String(pathPeek[1] || '').trim();
+      const mode = String(pathPeek[2] || 'peek').toLowerCase();
+      return `__resource_show_path__ ${scope} ${mode} ${path}`;
+    }
+
+    const opMatch = rest.match(/^([A-Za-z][A-Za-z0-9_-]*)(?:\s*:?\s*(.*))?$/);
+    if (!opMatch) {
+      return raw;
+    }
+    const op = String(opMatch[1] || '').trim().toLowerCase();
+    const args = String(opMatch[2] || '').trim();
+
+    const table = {
+      avatar: {
+        help: () => 'help',
+        show: () => 'show',
+        peek: () => '__resource_show__ avatar peek',
+        apply: () => (args ? `apply ${args}` : 'apply'),
+        name: () => (args ? `name ${args}` : 'name'),
+        description: () => (args ? `description ${args}` : 'description'),
+      },
+      document: {
+        help: () => `__resource_help__ ${scope}`,
+        show: () => `__resource_show__ ${scope} show`,
+        peek: () => `__resource_show__ ${scope} peek`,
+        apply: () => (args ? `__resource_apply__ ${scope} ${args}` : `__resource_apply__ ${scope}`),
+        publish: () => (args ? `__resource_apply__ ${scope} ${args}` : `__resource_apply__ ${scope}`),
+        republish: () => (args ? `__resource_apply__ ${scope} ${args}` : `__resource_apply__ ${scope}`),
+      },
+    };
+
+    const resolver = table?.[scope]?.[op];
+    if (typeof resolver === 'function') {
+      return resolver();
+    }
+
+    return raw;
+  }
+
+  function readPathValue(root, pathParts) {
+    let cursor = root;
+    for (const part of pathParts) {
+      if (!cursor || typeof cursor !== 'object') {
+        return { found: false, value: null };
+      }
+
+      if (part in cursor) {
+        cursor = cursor[part];
+        continue;
+      }
+
+      const camel = String(part || '').replace(/_([a-z])/g, (_, ch) => ch.toUpperCase());
+      if (camel && camel in cursor) {
+        cursor = cursor[camel];
+        continue;
+      }
+
+      return { found: false, value: null };
+    }
+    return { found: true, value: cursor };
+  }
+
+  function assertSnakeCasePath(path) {
+    const parts = String(path || '').split('.').map((entry) => entry.trim()).filter(Boolean);
+    for (const part of parts) {
+      if (!/^[a-z0-9_]+$/.test(part)) {
+        throw new Error(`invalid path '${path}': use snake_case segments only`);
+      }
+    }
+  }
+
+  function renderDocumentShowMessage(path = '') {
+    const docJson = String(state.identity?.document_json || '').trim();
+    if (!docJson) {
+      throw new Error('No local DID document is available. Unlock identity first.');
+    }
+    const document = JSON.parse(docJson);
+    const normalizedPath = String(path || '').trim();
+    if (!normalizedPath) {
+      const summary = {
+        id: document?.id || null,
+        assertionMethod: document?.assertionMethod || null,
+        keyAgreement: document?.keyAgreement || null,
+        ma: document?.ma || null,
+      };
+      return `document.peek\n${JSON.stringify(summary, null, 2)}`;
+    }
+
+    assertSnakeCasePath(normalizedPath);
+
+    const parts = normalizedPath.split('.').map((entry) => entry.trim()).filter(Boolean);
+    const resolved = readPathValue(document, parts);
+    if (!resolved.found) {
+      throw new Error(`document path not found: ${normalizedPath}`);
+    }
+    return `document.${normalizedPath} peek\n${JSON.stringify(resolved.value, null, 2)}`;
+  }
+
+  function parseClosetProfileMessage(message) {
+    const text = String(message || '').trim();
+    const match = text.match(/^closet profile:\s+did=(.*?)\s+name=(.*?)\s+description=(.*?)\s+recovery=(\S+)$/i);
+    if (!match) {
+      return null;
+    }
+    return {
+      did: String(match[1] || '').trim(),
+      name: String(match[2] || '').trim(),
+      description: String(match[3] || '').trim(),
+      recovery: String(match[4] || '').trim(),
+      fragment: String(state.closetSessionFragment || '').trim(),
+    };
+  }
+
+  async function fetchClosetProfileSnapshot(endpointId) {
+    const response = parseClosetResponse(
+      await closet_command(endpointId, state.closetSessionId, 'show')
+    );
+    if (!response.ok) {
+      throw new Error(response.message || 'Closet show failed.');
+    }
+    const snapshot = parseClosetProfileMessage(response.message);
+    if (snapshot) {
+      state.closetProfile = snapshot;
+    }
+    return snapshot;
+  }
+
+  async function renderAvatarPeekMessage(path = '', endpointId = '') {
+    let snapshot = state.closetProfile || null;
+    if (!snapshot && endpointId) {
+      snapshot = await fetchClosetProfileSnapshot(endpointId);
+    }
+    if (!snapshot) {
+      throw new Error('No closet avatar profile is available. Run avatar.show first.');
+    }
+
+    const normalizedPath = String(path || '').trim();
+    if (!normalizedPath) {
+      return `avatar.peek\n${JSON.stringify(snapshot, null, 2)}`;
+    }
+
+    const key = normalizedPath.toLowerCase();
+    const map = {
+      did: snapshot.did,
+      name: snapshot.name,
+      description: snapshot.description,
+      recovery: snapshot.recovery,
+      fragment: snapshot.fragment,
+    };
+    if (!(key in map)) {
+      throw new Error(`avatar path not found: ${normalizedPath}`);
+    }
+    return `avatar.${normalizedPath} peek\n${JSON.stringify(map[key], null, 2)}`;
+  }
+
   function parseClosetResponse(rawJson) {
     const parsed = JSON.parse(String(rawJson || '{}'));
     if (!parsed || typeof parsed !== 'object') {
       throw new Error('Invalid closet response.');
     }
     return parsed;
+  }
+
+  function normalizeDesiredFragment(raw) {
+    const fragment = String(raw || '').trim().replace(/^#/, '');
+    return isValidAliasName(fragment) ? fragment : '';
+  }
+
+  function desiredFragmentFromIdentityDid() {
+    const did = String(state.identity?.did || '').trim();
+    if (!did) {
+      return '';
+    }
+    const idx = did.indexOf('#');
+    if (idx < 0 || idx >= did.length - 1) {
+      return '';
+    }
+    return normalizeDesiredFragment(did.slice(idx + 1));
+  }
+
+  function desiredFragmentForCloset() {
+    const fromAlias = normalizeDesiredFragment(state.aliasName || '');
+    if (fromAlias) {
+      return fromAlias;
+    }
+    return desiredFragmentFromIdentityDid();
   }
 
   function adoptClosetAssignedDid(assignedDid, assignedFragment = '') {
@@ -88,7 +299,7 @@ export function createClosetFlow({
       const localized = JSON.parse(
         ensureBundleIrohSecret(state.passphrase, created.encrypted_bundle)
       );
-      const updated = localized;
+      let updated = localized;
 
       state.identity = updated;
       state.encryptedBundle = updated.encrypted_bundle;
@@ -109,12 +320,40 @@ export function createClosetFlow({
         if (!endpointId || !sessionId) {
           throw new Error('No active closet session for DID publish.');
         }
+
+        if (!state.inboxEndpointId) {
+          state.inboxEndpointId = await start_inbox_listener(state.passphrase, updated.encrypted_bundle);
+        }
+
+        if (state.inboxEndpointId) {
+          try {
+            updated = JSON.parse(
+              set_bundle_transports(state.passphrase, updated.encrypted_bundle, state.inboxEndpointId)
+            );
+            state.identity = updated;
+            state.encryptedBundle = updated.encrypted_bundle;
+            const bundleEl = byId('bundle-text');
+            if (bundleEl) {
+              bundleEl.value = updated.encrypted_bundle;
+            }
+            if (isValidAliasName(state.aliasName || '')) {
+              saveIdentityRecord(state.aliasName, updated.encrypted_bundle);
+            }
+          } catch (transportError) {
+            appendMessage(
+              'system',
+              `Warning: could not set DID transport hints before publish (${transportError instanceof Error ? transportError.message : String(transportError)}).`
+            );
+          }
+        }
+
         const published = parseClosetResponse(
           await closet_publish_did_document(
             endpointId,
             sessionId,
             updated.document_json,
-            ipnsPrivateKeyBase64
+            ipnsPrivateKeyBase64,
+            desiredFragmentForCloset()
           )
         );
         if (!published.ok) {
@@ -163,11 +402,22 @@ export function createClosetFlow({
       }
     }
     if (response?.did) {
-      appendMessage('system', `Assigned DID: ${response.did}`);
-      adoptClosetAssignedDid(String(response.did), String(response?.fragment || ''));
+      const assignedDid = String(response.did || '').trim();
+      const previousSessionDid = String(state.closetSessionDid || '').trim();
+      state.closetSessionDid = assignedDid;
+      appendMessage('system', `Assigned DID: ${assignedDid}`);
+
+      if (assignedDid && assignedDid !== previousSessionDid) {
+        adoptClosetAssignedDid(assignedDid, String(response?.fragment || ''));
+      }
     }
     if (response?.fragment) {
+      state.closetSessionFragment = String(response.fragment || '').trim();
       appendMessage('system', `Assigned fragment: ${response.fragment}`);
+    }
+    const profileSnapshot = parseClosetProfileMessage(message);
+    if (profileSnapshot) {
+      state.closetProfile = profileSnapshot;
     }
   }
 
@@ -181,6 +431,7 @@ export function createClosetFlow({
       throw new Error(response.message || 'Closet session failed to start.');
     }
     state.closetSessionId = String(response.session_id || '').trim();
+    state.closetSessionDid = '';
     state.closetEndpointId = normalizedEndpoint;
     state.closetLobbySeq = Number(response.latest_lobby_sequence || 0);
     return response;
@@ -191,7 +442,61 @@ export function createClosetFlow({
       throw new Error('No active closet session.');
     }
     const rawInput = String(input || '').trim();
-    const applyMatch = rawInput.match(/^(apply|citizen)(?:\s+(.+))?$/i);
+    const normalizedInput = normalizeStructuredClosetCommand(rawInput) || rawInput;
+
+    const resourceHelpMatch = normalizedInput.match(/^__resource_help__\s+([A-Za-z][A-Za-z0-9_-]*)$/);
+    if (resourceHelpMatch) {
+      const resource = String(resourceHelpMatch[1] || '').trim().toLowerCase();
+      if (resource === 'document') {
+        return {
+          ok: true,
+          message: 'document commands: document.help | document.show | document.ma.<field> show | document.publish [ipns_private_key_base64] | document.republish [ipns_private_key_base64] | document.apply [ipns_private_key_base64]'
+        };
+      }
+      return {
+        ok: false,
+        message: `unsupported resource help: ${resource}`
+      };
+    }
+
+    const resourceShowMatch = normalizedInput.match(/^__resource_show__\s+([A-Za-z][A-Za-z0-9_-]*)(?:\s+(show|peek))?$/);
+    if (resourceShowMatch) {
+      const resource = String(resourceShowMatch[1] || '').trim().toLowerCase();
+      if (resource === 'document') {
+        return {
+          ok: true,
+          message: renderDocumentShowMessage('')
+        };
+      }
+      if (resource === 'avatar') {
+        return {
+          ok: true,
+          message: await renderAvatarPeekMessage('', String(state.closetEndpointId || '').trim())
+        };
+      }
+      throw new Error(`unsupported show resource: ${resource}`);
+    }
+
+    const resourcePathShowMatch = normalizedInput.match(/^__resource_show_path__\s+([A-Za-z][A-Za-z0-9_-]*)\s+(show|peek)\s+(.+)$/);
+    if (resourcePathShowMatch) {
+      const resource = String(resourcePathShowMatch[1] || '').trim().toLowerCase();
+      const path = String(resourcePathShowMatch[3] || '').trim();
+      if (resource === 'document') {
+        return {
+          ok: true,
+          message: renderDocumentShowMessage(path)
+        };
+      }
+      if (resource === 'avatar') {
+        return {
+          ok: true,
+          message: await renderAvatarPeekMessage(path, String(state.closetEndpointId || '').trim())
+        };
+      }
+      throw new Error(`unsupported show resource path: ${resource}`);
+    }
+
+    const applyMatch = normalizedInput.match(/^(apply|citizen)(?:\s+(.+))?$/i);
     if (applyMatch) {
       state.closetPendingIpnsPrivateKeyB64 = String(applyMatch[2] || '').trim();
     }
@@ -199,8 +504,76 @@ export function createClosetFlow({
     if (!endpointId) {
       throw new Error('No world endpoint available for closet command.');
     }
+    if (applyMatch && !String(state.closetSessionDid || '').trim()) {
+      const response = parseClosetResponse(
+        await closet_submit_citizenship(
+          endpointId,
+          state.closetSessionId,
+          state.closetPendingIpnsPrivateKeyB64,
+          desiredFragmentForCloset()
+        )
+      );
+      if (!response.ok) {
+        throw new Error(response.message || 'Closet citizenship request failed.');
+      }
+      state.closetLobbySeq = Number(response.latest_lobby_sequence || state.closetLobbySeq || 0);
+      return response;
+    }
+
+    const resourceApplyMatch = normalizedInput.match(/^__resource_apply__\s+([A-Za-z][A-Za-z0-9_-]*)(?:\s+(.+))?$/);
+    if (resourceApplyMatch) {
+      const resource = String(resourceApplyMatch[1] || '').trim().toLowerCase();
+      if (resource !== 'document') {
+        throw new Error(`unsupported apply resource: ${resource}`);
+      }
+      if (!String(state.closetSessionDid || '').trim()) {
+        throw new Error('actor identity does not exist in this world yet; run apply first');
+      }
+      if (!state.passphrase || !state.encryptedBundle || !state.identity?.document_json) {
+        throw new Error('No local DID document is available to publish. Unlock identity first.');
+      }
+
+      let updated = state.identity;
+      if (!state.inboxEndpointId) {
+        state.inboxEndpointId = await start_inbox_listener(state.passphrase, state.encryptedBundle);
+      }
+      if (state.inboxEndpointId) {
+        updated = JSON.parse(
+          set_bundle_transports(state.passphrase, state.encryptedBundle, state.inboxEndpointId)
+        );
+        state.identity = updated;
+        state.encryptedBundle = updated.encrypted_bundle;
+        const bundleEl = byId('bundle-text');
+        if (bundleEl) {
+          bundleEl.value = updated.encrypted_bundle;
+        }
+        if (isValidAliasName(state.aliasName || '')) {
+          saveIdentityRecord(state.aliasName, updated.encrypted_bundle);
+        }
+      }
+
+      const providedKey = String(resourceApplyMatch[2] || '').trim();
+      const response = parseClosetResponse(
+        await closet_publish_did_document(
+          endpointId,
+          state.closetSessionId,
+          updated.document_json,
+          providedKey,
+          desiredFragmentForCloset()
+        )
+      );
+      if (!response.ok) {
+        throw new Error(response.message || 'Closet DID publish failed.');
+      }
+      const didForCache = didRoot(String(response.did || state.identity?.did || ''));
+      if (didForCache) {
+        state.didDocCache.delete(didForCache);
+      }
+      return response;
+    }
+
     const response = parseClosetResponse(
-      await closet_command(endpointId, state.closetSessionId, rawInput)
+      await closet_command(endpointId, state.closetSessionId, normalizedInput)
     );
     if (!response.ok) {
       throw new Error(response.message || 'Closet command failed.');

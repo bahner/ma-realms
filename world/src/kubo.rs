@@ -16,9 +16,11 @@ pub async fn pin_add_named(kubo_url: &str, cid: &str, name: &str) -> Result<()> 
         .timeout(Duration::from_secs(10))
         .build()?;
 
+    let arg = normalize_ipfs_publish_arg(cid);
+
     client
         .post(url)
-        .query(&[("arg", cid), ("recursive", "true"), ("name", name)])
+        .query(&[("arg", arg.as_str()), ("recursive", "true"), ("name", name)])
         .send()
         .await?
         .error_for_status()?;
@@ -34,9 +36,11 @@ pub async fn pin_rm(kubo_url: &str, cid: &str) -> Result<()> {
         .timeout(Duration::from_secs(10))
         .build()?;
 
+    let arg = normalize_ipfs_publish_arg(cid);
+
     client
         .post(url)
-        .query(&[("arg", cid), ("recursive", "true")])
+        .query(&[("arg", arg.as_str()), ("recursive", "true")])
         .send()
         .await?
         .error_for_status()?;
@@ -52,11 +56,14 @@ pub async fn pin_update(kubo_url: &str, from_cid: &str, to_cid: &str) -> Result<
         .timeout(Duration::from_secs(10))
         .build()?;
 
+    let from_arg = normalize_ipfs_publish_arg(from_cid);
+    let to_arg = normalize_ipfs_publish_arg(to_cid);
+
     client
         .post(url)
         .query(&[
-            ("arg", from_cid),
-            ("arg", to_cid),
+            ("arg", from_arg.as_str()),
+            ("arg", to_arg.as_str()),
             ("unpin", "true"),
         ])
         .send()
@@ -81,6 +88,7 @@ pub async fn fetch_did_document(kubo_url: &str, did: &Did) -> Result<Document> {
                         ipns_path,
                         resolved_path
                     ));
+                    break;
                 } else {
                     match cat_cid(kubo_url, &resolved_path).await {
                         Ok(text) => {
@@ -99,6 +107,9 @@ pub async fn fetch_did_document(kubo_url: &str, did: &Did) -> Result<Document> {
             }
             Err(err) => {
                 last_err = Some(anyhow!("name/resolve failed for {}: {}", ipns_path, err));
+                if !should_retry_name_resolve_error(&err) {
+                    break;
+                }
             }
         }
 
@@ -135,6 +146,61 @@ pub async fn fetch_did_document(kubo_url: &str, did: &Did) -> Result<Document> {
     }
 
     Ok(document)
+}
+
+fn should_retry_name_resolve_error(err: &anyhow::Error) -> bool {
+    let text = err.to_string().to_ascii_lowercase();
+    if text.contains("http status client error") || text.contains("http status server error") {
+        return false;
+    }
+    if text.contains("missing path in name/resolve response") {
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_ipfs_publish_arg, should_retry_name_resolve_error};
+    use anyhow::anyhow;
+
+    #[test]
+    fn does_not_retry_http_status_errors() {
+        let err = anyhow!(
+            "HTTP status server error (500 Internal Server Error) for url (http://127.0.0.1:5001/api/v0/name/resolve)"
+        );
+        assert!(!should_retry_name_resolve_error(&err));
+    }
+
+    #[test]
+    fn retries_network_errors() {
+        let err = anyhow!("error sending request for url (http://127.0.0.1:5001/api/v0/name/resolve)");
+        assert!(should_retry_name_resolve_error(&err));
+    }
+
+    #[test]
+    fn normalizes_publish_arg_from_raw_cid() {
+        assert_eq!(
+            normalize_ipfs_publish_arg("QmExampleCid"),
+            "/ipfs/QmExampleCid"
+        );
+    }
+
+    #[test]
+    fn normalizes_publish_arg_from_prefixed_path() {
+        assert_eq!(
+            normalize_ipfs_publish_arg("/ipfs/QmExampleCid"),
+            "/ipfs/QmExampleCid"
+        );
+    }
+
+    #[test]
+    fn normalizes_publish_arg_from_double_prefixed_path() {
+        assert_eq!(
+            normalize_ipfs_publish_arg("/ipfs//ipfs/QmExampleCid"),
+            "/ipfs/QmExampleCid"
+        );
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -358,7 +424,7 @@ pub async fn ipns_publish_with_options(
 ) -> Result<String> {
     let base = kubo_url.trim_end_matches('/');
     let url = format!("{base}/api/v0/name/publish");
-    let arg = format!("/ipfs/{cid}");
+    let arg = normalize_ipfs_publish_arg(cid);
 
     let client = reqwest::Client::builder()
         .timeout(options.timeout)
@@ -396,6 +462,23 @@ pub async fn ipns_publish_with_options(
     Ok(value)
 }
 
+fn normalize_ipfs_publish_arg(cid_or_path: &str) -> String {
+    let mut value = String::from(cid_or_path.trim());
+    if value.is_empty() {
+        return "/ipfs/".to_string();
+    }
+
+    while let Some(rest) = value.strip_prefix("/ipfs/") {
+        value = rest.to_string();
+    }
+
+    while let Some(rest) = value.strip_prefix('/') {
+        value = rest.to_string();
+    }
+
+    format!("/ipfs/{value}")
+}
+
 pub async fn ipns_publish_with_retry(
     kubo_url: &str,
     key_name: &str,
@@ -415,6 +498,16 @@ pub async fn ipns_publish_with_retry(
         match ipns_publish_with_options(kubo_url, key_name, cid, options).await {
             Ok(value) => return Ok(value),
             Err(err) => {
+                if let Ok(value) = verify_ipns_target_after_publish_error(kubo_url, key_name, cid).await {
+                    warn!(
+                        "IPNS publish attempt {}/{} reported error for key '{}' but resolve confirms target; accepting success: {}",
+                        attempt,
+                        attempts,
+                        key_name,
+                        value
+                    );
+                    return Ok(value);
+                }
                 warn!(
                     "IPNS publish attempt {}/{} failed for key '{}' and cid '{}': {}",
                     attempt,
@@ -441,6 +534,24 @@ pub async fn ipns_publish_with_retry(
         last_err
             .map(|e| e.to_string())
             .unwrap_or_else(|| "unknown error".to_string())
+    ))
+}
+
+async fn verify_ipns_target_after_publish_error(
+    kubo_url: &str,
+    key_name: &str,
+    cid: &str,
+) -> Result<String> {
+    let expected = normalize_ipfs_publish_arg(cid);
+    let resolved = name_resolve(kubo_url, &format!("/ipns/{key_name}"), true).await?;
+    if resolved.trim() == expected {
+        return Ok(resolved);
+    }
+    Err(anyhow!(
+        "post-error resolve mismatch for key '{}': expected '{}' got '{}'",
+        key_name,
+        expected,
+        resolved
     ))
 }
 

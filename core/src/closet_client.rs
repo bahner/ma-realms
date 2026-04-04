@@ -66,6 +66,7 @@ pub async fn closet_submit_citizenship(
     endpoint_addr: EndpointAddr,
     session_id: impl Into<String>,
     ipns_private_key_base64: impl Into<String>,
+    desired_fragment: Option<String>,
 ) -> Result<ClosetResponse> {
     send_closet_request(
         endpoint,
@@ -73,6 +74,7 @@ pub async fn closet_submit_citizenship(
         ClosetRequest::SubmitCitizenship {
             session_id: session_id.into(),
             ipns_private_key_base64: ipns_private_key_base64.into(),
+            desired_fragment,
         },
     )
     .await

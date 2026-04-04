@@ -3,6 +3,7 @@ import init, {
   unlock_identity,
   ensure_bundle_iroh_secret,
   set_bundle_language,
+  set_bundle_transports,
   set_bundle_world,
   generate_bip39_phrase,
   normalize_bip39_phrase,
@@ -86,7 +87,6 @@ import {
 } from './runtime-utils.js';
 import {
   asIpfsGatewayPath,
-  createIpfsClient,
   fetchGatewayTextByPath as fetchGatewayTextByPathRaw,
   normalizeIpfsGatewayBase,
 } from './gateway-client.js';
@@ -108,6 +108,7 @@ const LAST_PUBLISHED_CID_KEY = `${STORAGE_PREFIX}.lastPublishedCid`;
 const LEGACY_ALIAS_KEY = 'ma.identity.v2.alias';
 const DEFAULT_UI_LANG = 'en';
 const DEFAULT_LANGUAGE_ORDER = 'nb_NO:en_UK';
+const KNOWN_IPFS_HELLO_WORLD_CID = 'bafkreidfdrlkeq4m4xnxuyx6iae76fdm4wgl5d4xzsb77ixhyqwumhz244';
 const IPFS_GATEWAY_FALLBACKS = [
   'http://localhost:8080',
   'https://ipfs.io',
@@ -115,7 +116,7 @@ const IPFS_GATEWAY_FALLBACKS = [
   'https://w3s.link',
 ];
 const LOCAL_EDIT_SCRIPT_KEY = `${STORAGE_PREFIX}.localEditScript`;
-const LOCAL_EDIT_SCRIPT_CID_KEY = `${STORAGE_PREFIX}.localEditScriptCid`;
+const LEGACY_LOCAL_EDIT_SCRIPT_CID_KEY = `${STORAGE_PREFIX}.localEditScriptCid`;
 
 const ROOM_POLL_INTERVAL_MS = 1500;
 const DID_DOC_CACHE_TTL_MS = 60_000;
@@ -131,15 +132,6 @@ async function fetchGatewayTextByPath(contentPath) {
     getApiBase,
     fallbackBases: IPFS_GATEWAY_FALLBACKS,
   });
-}
-
-const ipfsClient = createIpfsClient({
-  getApiBase,
-  isLocalhostLikeHost,
-});
-
-async function ipfsRpcPost(path, query = {}, body = null) {
-  return await ipfsClient.ipfsRpcPost(path, query, body);
 }
 
 
@@ -174,6 +166,7 @@ const state = {
   mailbox: [],
   mailboxSeq: 0,
   commandHistory: [],
+  commandQueue: Promise.resolve(),
   historyIndex: -1,
   historyDraft: '',
   roomPresence: new Map(),
@@ -181,6 +174,7 @@ const state = {
   activeObjectTargetDid: '',
   activeObjectTargetRequirement: 'none',
   closetSessionId: '',
+  closetSessionDid: '',
   closetEndpointId: '',
   closetLobbySeq: 0,
   closetPendingIpnsPrivateKeyB64: '',
@@ -214,21 +208,21 @@ const aliasFlowBridge = {
   humanizeText: (value) => String(value || ''),
 };
 
-function saveAliasBook(aliasBook) { return aliasFlowBridge.saveAliasBook(aliasBook); }
-function loadAliasBook() { return aliasFlowBridge.loadAliasBook(); }
-function setActiveAlias(aliasName) { return aliasFlowBridge.setActiveAlias(aliasName); }
-function resolveInitialAlias() { return aliasFlowBridge.resolveInitialAlias(); }
-function loadAliasDraft() { return aliasFlowBridge.loadAliasDraft(); }
-function roomDidLookupCacheKey(value) { return aliasFlowBridge.roomDidLookupCacheKey(value); }
-function getCachedRoomDidLookup(value) { return aliasFlowBridge.getCachedRoomDidLookup(value); }
-function cacheRoomDidLookup(key, did) { return aliasFlowBridge.cacheRoomDidLookup(key, did); }
-function dropCachedRoomDidLookup(key) { return aliasFlowBridge.dropCachedRoomDidLookup(key); }
-function normalizeEndpointId(value) { return aliasFlowBridge.normalizeEndpointId(value); }
-function findDidByEndpoint(value) { return aliasFlowBridge.findDidByEndpoint(value); }
-function findAliasForAddress(value) { return aliasFlowBridge.findAliasForAddress(value); }
-function resolveAliasInput(value) { return aliasFlowBridge.resolveAliasInput(value); }
-function humanizeIdentifier(value) { return aliasFlowBridge.humanizeIdentifier(value); }
-function humanizeText(value) { return aliasFlowBridge.humanizeText(value); }
+function saveAliasBook(...args) { return aliasFlowBridge.saveAliasBook(...args); }
+function loadAliasBook(...args) { return aliasFlowBridge.loadAliasBook(...args); }
+function setActiveAlias(...args) { return aliasFlowBridge.setActiveAlias(...args); }
+function resolveInitialAlias(...args) { return aliasFlowBridge.resolveInitialAlias(...args); }
+function loadAliasDraft(...args) { return aliasFlowBridge.loadAliasDraft(...args); }
+function roomDidLookupCacheKey(...args) { return aliasFlowBridge.roomDidLookupCacheKey(...args); }
+function getCachedRoomDidLookup(...args) { return aliasFlowBridge.getCachedRoomDidLookup(...args); }
+function cacheRoomDidLookup(...args) { return aliasFlowBridge.cacheRoomDidLookup(...args); }
+function dropCachedRoomDidLookup(...args) { return aliasFlowBridge.dropCachedRoomDidLookup(...args); }
+function normalizeEndpointId(...args) { return aliasFlowBridge.normalizeEndpointId(...args); }
+function findDidByEndpoint(...args) { return aliasFlowBridge.findDidByEndpoint(...args); }
+function findAliasForAddress(...args) { return aliasFlowBridge.findAliasForAddress(...args); }
+function resolveAliasInput(...args) { return aliasFlowBridge.resolveAliasInput(...args); }
+function humanizeIdentifier(...args) { return aliasFlowBridge.humanizeIdentifier(...args); }
+function humanizeText(...args) { return aliasFlowBridge.humanizeText(...args); }
 
 let updateIdentityLineImpl = () => {};
 function updateIdentityLine(...args) {
@@ -445,14 +439,19 @@ async function closeAndEvalEditorScript() {
     return;
   }
 
-  await saveEditorChanges();
-  const cid = String(state.editSession.sourceCid || '').trim();
-  if (!cid || cid === '(not published yet)') {
+  const scriptText = getEditorText();
+  if (!scriptText.trim()) {
+    setEditorStatus('Refusing to eval empty local script.', 'error');
     return;
   }
 
+  localStorage.setItem(LOCAL_EDIT_SCRIPT_KEY, scriptText);
+  localStorage.removeItem(LEGACY_LOCAL_EDIT_SCRIPT_CID_KEY);
+  state.editSession.sourceCid = '(not published yet)';
+  updateEditorContext();
+
   closeEditorModal();
-  parseDot(`.eval ${cid}`);
+  await evaluateScriptText(scriptText, 'local .edit script');
 }
 
 function normalizeEditTarget(rawTarget) {
@@ -761,11 +760,11 @@ async function sendWorldCommandQuery(commandText) {
 }
 
 async function loadLocalScriptEditor() {
-  const storedCid = localStorage.getItem(LOCAL_EDIT_SCRIPT_CID_KEY) || '';
+  localStorage.removeItem(LEGACY_LOCAL_EDIT_SCRIPT_CID_KEY);
   state.editSession = {
     mode: 'script',
     target: 'local-script',
-    sourceCid: storedCid || '(not published yet)'
+    sourceCid: '(local only)'
   };
 
   setEditorText(localStorage.getItem(LOCAL_EDIT_SCRIPT_KEY) || '');
@@ -831,24 +830,28 @@ async function executeScriptLine(line) {
   await sendCurrentWorldMessage(text);
 }
 
+async function evaluateScriptText(scriptText, sourceLabel = 'script') {
+  appendMessage('system', `Evaluating ${sourceLabel}...`);
+  const lines = String(scriptText || '').replace(/\r\n/g, '\n').split('\n');
+
+  let executed = 0;
+  for (const line of lines) {
+    const candidate = String(line || '').trim();
+    if (!candidate || candidate.startsWith('#')) {
+      continue;
+    }
+    await executeScriptLine(candidate);
+    executed += 1;
+  }
+
+  appendMessage('system', `.eval complete (${executed} command${executed === 1 ? '' : 's'}).`);
+}
+
 async function onDotEval(rawArgs) {
   try {
     const resolved = resolveEvalSourceToken(rawArgs);
-    appendMessage('system', `Evaluating script from ${resolved}...`);
     const scriptText = await fetchGatewayTextByPath(asIpfsGatewayPath(resolved));
-    const lines = String(scriptText || '').replace(/\r\n/g, '\n').split('\n');
-
-    let executed = 0;
-    for (const line of lines) {
-      const candidate = String(line || '').trim();
-      if (!candidate || candidate.startsWith('#')) {
-        continue;
-      }
-      await executeScriptLine(candidate);
-      executed += 1;
-    }
-
-    appendMessage('system', `.eval complete (${executed} command${executed === 1 ? '' : 's'}).`);
+    await evaluateScriptText(scriptText, `script from ${resolved}`);
   } catch (error) {
     appendMessage('system', `Eval failed: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -1016,25 +1019,14 @@ async function saveEditorChanges() {
 
   if (state.editSession.mode === 'script') {
     setEditorBusy(true);
-    setEditorStatus('Saving local script and publishing CID...', 'working');
+    setEditorStatus('Saving local script...', 'working');
     try {
       localStorage.setItem(LOCAL_EDIT_SCRIPT_KEY, yamlText);
-
-      const blob = new Blob([yamlText], { type: 'text/plain' });
-      const formData = new FormData();
-      formData.append('file', blob, 'local-script.ma');
-      const addResult = await ipfsRpcPost('/api/v0/add', { pin: 'true' }, formData);
-      const cid = String(addResult?.Hash || '').trim();
-      if (!cid) {
-        throw new Error('IPFS RPC add did not return a CID.');
-      }
-
-      state.editSession.sourceCid = cid;
-      localStorage.setItem(LOCAL_EDIT_SCRIPT_CID_KEY, cid);
+      localStorage.removeItem(LEGACY_LOCAL_EDIT_SCRIPT_CID_KEY);
+      state.editSession.sourceCid = '(not published yet)';
       updateEditorContext();
-      setEditorStatus(`Saved and published: ${cid}`, 'ok');
-      appendMessage('system', `Saved local .edit script and published CID ${cid}.`);
-      appendMessage('system', `Run .eval ${cid} to execute it.`);
+      setEditorStatus('Saved local script.', 'ok');
+      appendMessage('system', 'Saved local .edit script.');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setEditorStatus(`Script save failed: ${message}`, 'error');
@@ -1901,7 +1893,7 @@ async function checkGateway() {
 
   const probeGateway = async (base) => {
     const normalized = normalizeIpfsGatewayBase(base);
-    const probeUrl = `${normalized}/ipfs/`;
+    const probeUrl = `${normalized}/ipfs/${KNOWN_IPFS_HELLO_WORLD_CID}`;
     try {
       const response = await fetch(probeUrl, {
         method: 'GET',
@@ -1959,10 +1951,38 @@ async function autoFollowEnterDirective(message) {
   return await didDocFlow.autoFollowEnterDirective(message);
 }
 
+function syncBundleTransportsFromEndpoint(endpointId) {
+  const inboxEndpointId = String(endpointId || '').trim();
+  if (!inboxEndpointId || !state.passphrase || !state.encryptedBundle) {
+    return;
+  }
+
+  try {
+    const updated = JSON.parse(
+      set_bundle_transports(state.passphrase, state.encryptedBundle, inboxEndpointId)
+    );
+    state.identity = updated;
+    state.encryptedBundle = updated.encrypted_bundle;
+    const bundleEl = byId('bundle-text');
+    if (bundleEl) {
+      bundleEl.value = updated.encrypted_bundle;
+    }
+    if (isValidAliasName(state.aliasName || '')) {
+      saveIdentityRecord(state.aliasName, updated.encrypted_bundle);
+    }
+  } catch (error) {
+    logger.log('did.transports', `failed to sync ma.transports: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 function refillCommandInputWithActiveTarget() {
   const alias = String(state.activeObjectTargetAlias || '').trim();
   const inputEl = byId('command-input');
-  if (!alias || !inputEl) {
+  if (!inputEl) {
+    return;
+  }
+  if (!alias) {
+    inputEl.value = '';
     return;
   }
   inputEl.value = `${alias} `;
@@ -2130,6 +2150,7 @@ async function lookupWorldRelayHint(endpointId) {
 async function enterWorldWithRetry(endpointId, actorName, room) {
   const maxAttempts = 3;
   let lastError = null;
+  let announcedConnectivity = false;
   logger.log('enter.world', `starting enter sequence for endpoint=${endpointId.slice(0, 8)}... actor=${actorName} room=${room}`);
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -2157,6 +2178,10 @@ async function enterWorldWithRetry(endpointId, actorName, room) {
       );
       const connectElapsed = Date.now() - connectStart;
       logger.log(`enter.attempt.${attempt}`, `connected in ${connectElapsed}ms`);
+      if (!announcedConnectivity) {
+        appendMessage('system', `iroh node discovered at ${humanizeIdentifier(endpointId)}. Requesting avatar/session state...`);
+        announcedConnectivity = true;
+      }
 
       // Phase 2: World enter request
       logger.log(`enter.attempt.${attempt}`, `phase 2/2: sending enter request`);
@@ -2299,7 +2324,7 @@ async function enterHome(target, preferredRoom = null) {
     const message = error instanceof Error ? error.message : String(error);
     if (isClosetBootstrapFailureMessage(message)) {
       const closet = await closetStartSessionForEndpoint(endpointId);
-      appendMessage('system', 'Could not verify avatar identity for world enter yet. Starting closet onboarding.');
+      appendMessage('system', 'No avatar available for this DID yet, or DID publish is not ready. Entering closet onboarding.');
       appendMessage('system', `Closet session: ${closet.session_id || state.closetSessionId}`);
       renderClosetResponse(closet);
       return;
@@ -2311,7 +2336,7 @@ async function enterHome(target, preferredRoom = null) {
   if (!result.ok) {
     if (isClosetRequiredMessage(result.message) || isClosetBootstrapFailureMessage(result.message)) {
       const closet = await closetStartSessionForEndpoint(endpointId);
-      appendMessage('system', result.message || 'Entry denied. Closet onboarding is required first.');
+      appendMessage('system', result.message || 'No avatar profile is ready yet. Closet onboarding is required first.');
       appendMessage('system', `Closet session: ${closet.session_id || state.closetSessionId}`);
       renderClosetResponse(closet);
       return;
@@ -2335,6 +2360,7 @@ async function enterHome(target, preferredRoom = null) {
     handle: result.handle || state.aliasName
   };
   state.closetSessionId = '';
+  state.closetSessionDid = '';
   state.closetEndpointId = '';
   state.closetLobbySeq = 0;
   primeDidLookupCacheFromRoomObjectDids(result.room_object_dids);
@@ -2352,7 +2378,8 @@ async function enterHome(target, preferredRoom = null) {
   updateIdentityLine();
   updateRoomHeading(state.currentHome.roomTitle, state.currentHome.roomDescription);
 
-  await ensureInboxListener();
+  const inboxEndpointId = await ensureInboxListener();
+  syncBundleTransportsFromEndpoint(inboxEndpointId);
   updateIdentityLine();
 
   startHomeEventPolling();
@@ -2418,15 +2445,32 @@ function onCommandSubmit(event) {
   const text = inputEl.value.trim();
   if (!text) return;
 
+  enqueueCommandText(text);
+}
+
+function enqueueCommandText(text) {
+  const commandText = String(text || '').trim();
+  if (!commandText) {
+    return;
+  }
+
   // Readline-like history: keep unique latest entry and reset cursor.
-  state.commandHistory.push(text);
+  state.commandHistory.push(commandText);
   state.historyIndex = -1;
   state.historyDraft = '';
 
-  if (text.startsWith('.')) {
-    parseDot(text);
-  } else {
-    sendWithActiveTargetRequirementsIfNeeded(text).catch((err) => {
+  const queuedText = commandText;
+  state.commandQueue = state.commandQueue
+    .catch(() => {})
+    .then(async () => {
+      if (queuedText.startsWith('.')) {
+        parseDot(queuedText);
+        return;
+      }
+
+      await sendWithActiveTargetRequirementsIfNeeded(queuedText);
+    })
+    .catch((err) => {
       const message = err instanceof Error ? err.message : String(err);
       appendMessage('system', `Send failed: ${message}`);
       if (state.activeObjectTargetAlias && isActiveTargetGoneMessage(message)) {
@@ -2437,9 +2481,33 @@ function onCommandSubmit(event) {
         reportActiveTargetVanished(alias);
       }
     });
-  }
 
   refillCommandInputWithActiveTarget();
+}
+
+function onCommandPaste(event) {
+  const pasted = String(event.clipboardData?.getData('text') || '');
+  if (!pasted.includes('\n') && !pasted.includes('\r')) {
+    return;
+  }
+
+  event.preventDefault();
+  const lines = pasted
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+
+  if (lines.length === 0) {
+    return;
+  }
+
+  for (const line of lines) {
+    enqueueCommandText(line);
+  }
+
+  if (lines.length > 1) {
+    appendMessage('system', `Queued ${lines.length} pasted commands.`);
+  }
 }
 
 function onCommandKeyDown(event) {
@@ -2523,7 +2591,6 @@ function shouldAutoCheckIpfsRpc() {
 async function main() {
   await init();
   await updateAppVersionFooter();
-  await initEditorEngineFromCdn();
   applyProperName();
   restoreSavedValues();
   hideLockOverlay();
@@ -2579,6 +2646,7 @@ async function main() {
   }
   byId('command-form').addEventListener('submit', onCommandSubmit);
   byId('command-input').addEventListener('keydown', onCommandKeyDown);
+  byId('command-input').addEventListener('paste', onCommandPaste);
   byId('yaml-editor-cancel').addEventListener('click', closeEditorModal);
   byId('yaml-editor-reload').addEventListener('click', () => {
     if (!state.editSession) {

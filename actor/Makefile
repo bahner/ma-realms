@@ -23,6 +23,7 @@ build-release: $(PKG_STAMP)
 $(PKG_STAMP): $(BUILD_INPUTS)
 	mkdir -p .build
 	SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) \
+	MA_ACTOR_VERSION=$(MA_WORLD_VERSION) \
 	CARGO_INCREMENTAL=0 \
 	RUSTFLAGS="--remap-path-prefix=$(CURDIR)=." \
 	wasm-pack build --release --target web --out-dir www/pkg
@@ -45,7 +46,7 @@ show-cid:
 
 $(PKG_DEV_STAMP): $(BUILD_INPUTS)
 	mkdir -p .build
-	wasm-pack build --dev --target web --out-dir www/pkg
+	MA_ACTOR_VERSION=$(MA_WORLD_VERSION) wasm-pack build --dev --target web --out-dir www/pkg
 	@printf "globalThis.MA_ACTOR_VERSION = '%s';\n" "$(MA_WORLD_VERSION)" > $(VERSION_FILE)
 	touch $(PKG_DEV_STAMP)
 

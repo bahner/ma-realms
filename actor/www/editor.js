@@ -1,6 +1,15 @@
 export function createEditorUi({ byId, state, uiText, onEditorEngineStatus }) {
   let cmView = null;
   let cmContainer = null;
+  const CODEMIRROR_MAJOR = '6';
+  const CODEMIRROR_YAML_VERSION = '6.1.3';
+  const CODEMIRROR_CDN_NAME = 'esm.sh';
+  const CODEMIRROR_URLS = {
+    state: `https://esm.sh/@codemirror/state@${CODEMIRROR_MAJOR}`,
+    view: `https://esm.sh/@codemirror/view@${CODEMIRROR_MAJOR}`,
+    commands: `https://esm.sh/@codemirror/commands@${CODEMIRROR_MAJOR}`,
+    yaml: `https://esm.sh/@codemirror/lang-yaml@${CODEMIRROR_YAML_VERSION}`,
+  };
 
   function notifyEditorEngine(message) {
     if (typeof onEditorEngineStatus === 'function') {
@@ -15,19 +24,28 @@ export function createEditorUi({ byId, state, uiText, onEditorEngineStatus }) {
     }
 
     try {
-      const [stateMod, viewMod, commandsMod, languageMod, yamlMod] = await Promise.all([
-        import('https://cdn.jsdelivr.net/npm/@codemirror/state@6/+esm'),
-        import('https://cdn.jsdelivr.net/npm/@codemirror/view@6/+esm'),
-        import('https://cdn.jsdelivr.net/npm/@codemirror/commands@6/+esm'),
-        import('https://cdn.jsdelivr.net/npm/@codemirror/language@6/+esm'),
-        import('https://cdn.jsdelivr.net/npm/@codemirror/lang-yaml@6/+esm'),
-      ]);
-
+      const stateMod = await import(CODEMIRROR_URLS.state);
+      const viewMod = await import(CODEMIRROR_URLS.view);
+      const commandsMod = await import(CODEMIRROR_URLS.commands);
       const { EditorState } = stateMod;
-      const { EditorView, keymap, drawSelection, highlightActiveLine } = viewMod;
-      const { history, historyKeymap, defaultKeymap, indentWithTab } = commandsMod;
-      const { indentOnInput, bracketMatching, foldGutter } = languageMod;
-      const { yaml } = yamlMod;
+      const { EditorView, keymap } = viewMod;
+      const { defaultKeymap } = commandsMod;
+      if (!EditorState || !EditorView || !keymap || !defaultKeymap) {
+        throw new Error('CodeMirror core mangler nødvendige exports');
+      }
+
+      let yamlExtension = null;
+      let yamlLoadDetail = '';
+      try {
+        const yamlMod = await import(CODEMIRROR_URLS.yaml);
+        if (typeof yamlMod?.yaml === 'function') {
+          yamlExtension = yamlMod.yaml();
+        } else {
+          throw new Error('yaml() ikke tilgjengelig i @codemirror/lang-yaml');
+        }
+      } catch (yamlError) {
+        yamlLoadDetail = yamlError instanceof Error ? yamlError.message : String(yamlError || 'unknown error');
+      }
 
       cmContainer = document.createElement('div');
       cmContainer.id = 'yaml-editor-cm';
@@ -35,36 +53,59 @@ export function createEditorUi({ byId, state, uiText, onEditorEngineStatus }) {
       textEl.insertAdjacentElement('afterend', cmContainer);
       textEl.classList.add('hidden-by-cm');
 
-      cmView = new EditorView({
-        parent: cmContainer,
-        state: EditorState.create({
-          doc: String(textEl.value || ''),
-          extensions: [
-            keymap.of([indentWithTab, ...defaultKeymap, ...historyKeymap]),
-            history(),
-            drawSelection(),
-            highlightActiveLine(),
-            indentOnInput(),
-            bracketMatching(),
-            foldGutter(),
-            yaml(),
-            EditorView.lineWrapping,
-            EditorView.updateListener.of((update) => {
-              if (update.docChanged && textEl) {
-                textEl.value = update.state.doc.toString();
-              }
-            }),
-          ],
+      const baseExtensions = [
+        keymap.of(defaultKeymap),
+        EditorView.lineWrapping,
+        EditorView.updateListener.of((update) => {
+          if (update.docChanged && textEl) {
+            textEl.value = update.state.doc.toString();
+          }
         }),
-      });
+      ];
+      const withYamlExtensions = yamlExtension ? [...baseExtensions, yamlExtension] : baseExtensions;
+
+      try {
+        cmView = new EditorView({
+          parent: cmContainer,
+          state: EditorState.create({
+            doc: String(textEl.value || ''),
+            extensions: withYamlExtensions,
+          }),
+        });
+      } catch (viewError) {
+        const viewDetail = viewError instanceof Error ? viewError.message : String(viewError || 'unknown error');
+        const isStateMismatch = /Unrecognized extension value/i.test(viewDetail);
+        if (yamlExtension && isStateMismatch) {
+          // Known CDN module graph issue: YAML extension may carry a different @codemirror/state instance.
+          cmView = new EditorView({
+            parent: cmContainer,
+            state: EditorState.create({
+              doc: String(textEl.value || ''),
+              extensions: baseExtensions,
+            }),
+          });
+          yamlLoadDetail = yamlLoadDetail || viewDetail;
+        } else {
+          throw viewError;
+        }
+      }
 
       if (state.editBusy) {
         setEditorDisabled(true);
       }
 
-      notifyEditorEngine('Editor: CodeMirror (CDN) active.');
-    } catch (_) {
-      notifyEditorEngine('Editor: CodeMirror CDN unavailable, using textarea fallback.');
+      if (yamlLoadDetail) {
+        notifyEditorEngine(
+          `Editor: CodeMirror (${CODEMIRROR_CDN_NAME}) aktiv uten YAML-syntax (${yamlLoadDetail}). Bruker fortsatt rik editor.`
+        );
+      } else {
+        notifyEditorEngine(`Editor: CodeMirror (${CODEMIRROR_CDN_NAME}) aktiv med YAML-syntax.`);
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error || 'unknown error');
+      notifyEditorEngine(
+        `Editor: CodeMirror fra ${CODEMIRROR_CDN_NAME} kunne ikke lastes (${detail}). Forsøkte: ${Object.values(CODEMIRROR_URLS).join(' , ')}. Fortsetter med innebygd textarea-fallback.`
+      );
     }
   }
 
@@ -248,6 +289,9 @@ export function createEditorUi({ byId, state, uiText, onEditorEngineStatus }) {
   function openEditorModal() {
     const modal = byId('yaml-editor-modal');
     if (!modal) return;
+    // Lazy-load CodeMirror only when the editor is actually used.
+    initEditorEngineFromCdn().catch(() => {});
+    setEditorDisabled(state.editBusy);
     updateEditorContext();
     updateEditorControls();
     modal.classList.remove('hidden');

@@ -208,11 +208,15 @@ pub enum ClosetRequest {
     SubmitCitizenship {
         session_id: String,
         ipns_private_key_base64: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        desired_fragment: Option<String>,
     },
     PublishDidDocument {
         session_id: String,
         did_document_json: String,
         ipns_private_key_base64: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        desired_fragment: Option<String>,
     },
 }
 
