@@ -1588,6 +1588,37 @@ pub fn set_bundle_world(
     })
 }
 
+/// Update `ma:language` (priority list) in the DID document and re-sign it.
+/// Returns JSON: `{ encrypted_bundle, did, ipns, document_json }`
+#[wasm_bindgen]
+pub fn set_bundle_language(
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+    language_order: &str,
+) -> Result<String, JsValue> {
+    let normalized = language_order
+        .split(';')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(";");
+
+    if normalized.is_empty() {
+        return update_bundle_document(passphrase, encrypted_bundle_json, |document| {
+            document.clear_language();
+            document.clear_lang();
+            Ok(())
+        });
+    }
+
+    update_bundle_document(passphrase, encrypted_bundle_json, move |document| {
+        document.set_language(normalized.clone()).map_err(js_err)?;
+        // Keep clearing ma.lang until we explicitly support it again.
+        document.clear_lang();
+        Ok(())
+    })
+}
+
 /// Update the `ma:transports` field in the DID document with the agent's live
 /// iroh inbox endpoint and re-sign it.
 /// Returns JSON: `{ encrypted_bundle, did, ipns, document_json }`

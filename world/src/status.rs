@@ -76,6 +76,7 @@ async fn index(State(state): State<StatusState>) -> Html<String> {
         owner_did: state.world.owner_did().await,
         world_cid: state.world.world_cid().await,
         state_cid: state.world.state_cid().await,
+        lang_cid: state.world.lang_cid().await,
         persisted_room_count: state.world.persisted_room_count().await,
         world_root_pin_name: state.world.world_root_pin_name().await,
         ma_runtime_mode,
@@ -108,6 +109,7 @@ async fn status_json(State(state): State<StatusState>) -> Json<StatusDocument> {
         owner_did: state.world.owner_did().await,
         world_cid: state.world.world_cid().await,
         state_cid: state.world.state_cid().await,
+        lang_cid: state.world.lang_cid().await,
         persisted_room_count: state.world.persisted_room_count().await,
         world_root_pin_name: state.world.world_root_pin_name().await,
         ma_runtime_mode,
@@ -485,6 +487,7 @@ struct RuntimeStatus {
     owner_did: Option<String>,
     world_cid: Option<String>,
     state_cid: Option<String>,
+    lang_cid: Option<String>,
     persisted_room_count: usize,
     world_root_pin_name: String,
     ma_runtime_mode: String,
@@ -793,6 +796,7 @@ fn render_unlocked_html(world: &WorldInfo, snapshot: &WorldSnapshot, runtime: &R
         let relay_urls = render_list(&world.relay_urls, "No relay URLs available yet.");
         let world_cid_input = runtime.world_cid.as_deref().unwrap_or("");
         let state_cid_input = runtime.state_cid.as_deref().unwrap_or("");
+        let lang_cid = runtime.lang_cid.as_deref().unwrap_or("(none)");
         let actor_count = snapshot.rooms.iter().map(|room| room.avatars.len()).sum::<usize>();
 
         format!(
@@ -864,6 +868,7 @@ fn render_unlocked_html(world: &WorldInfo, snapshot: &WorldSnapshot, runtime: &R
                 <div class=\"metric\"><span>World DID</span><code id=\"world-did-metric\">{world_did}</code></div>
                 <div class=\"metric\"><span>World Owner DID</span><code id=\"owner-did-metric\">{owner_did}</code></div>
                 <div class=\"metric\"><span>Encrypted State CID</span><code id=\"state-cid-metric\">{state_cid}</code></div>
+                <div class=\"metric\"><span>Language Pack CID</span><code id=\"lang-cid-metric\">{lang_cid}</code></div>
                 <div class=\"metric\"><span>Kubo API</span><code id=\"kubo-url-metric\">{kubo_url}</code></div>
                 <div class=\"metric\"><span>Runtime</span><code>unlocked</code></div>
                 <div class=\"metric\"><span>Rooms (live)</span><code>{room_count}</code></div>
@@ -1189,6 +1194,7 @@ fn render_unlocked_html(world: &WorldInfo, snapshot: &WorldSnapshot, runtime: &R
                 owner_did_input = escape_html(runtime.owner_did.as_deref().unwrap_or("")),
                 world_cid = escape_html(runtime.world_cid.as_deref().unwrap_or("(none)")),
                 state_cid = escape_html(runtime.state_cid.as_deref().unwrap_or("(none)")),
+                lang_cid = escape_html(lang_cid),
                 state_cid_input = escape_html(state_cid_input),
                 world_cid_input = escape_html(world_cid_input),
                 kubo_url = escape_html(&runtime.kubo_url),

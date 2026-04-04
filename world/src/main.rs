@@ -54,6 +54,7 @@ mod actor_web;
 mod bootstrap;
 mod content_validation;
 mod kubo;
+mod lang;
 mod room;
 mod schema;
 mod status;
@@ -61,6 +62,13 @@ mod status;
 use actor::Avatar;
 use actor_web::{
     materialize_actor_web_from_cid, publish_actor_web_from_dir, resolve_actor_web_cid_from_ipns_key,
+};
+use lang::{
+    collapse_world_language_order_strict,
+    supported_world_languages_text,
+    tr_world,
+    tr_world_vars,
+    world_lang_from_profile,
 };
 use kubo::{
     IpnsPublishOptions, dag_get_dag_cbor, dag_put_dag_cbor, generate_kubo_key, ipfs_add,
@@ -118,6 +126,7 @@ pub(crate) struct AvatarRequest {
     pub inbox: String,
     pub did: Did,
     pub agent_endpoint: String,
+    pub language_order: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -391,6 +400,8 @@ pub struct World {
     unlocked_world_encryption_key: Arc<RwLock<Option<[u8; 32]>>>,
     /// CID of the latest encrypted runtime state envelope.
     state_cid: Arc<RwLock<Option<String>>>,
+    /// CID of the active language package manifest for this world.
+    lang_cid: Arc<RwLock<Option<String>>>,
     /// Stable Kubo pin name for world root index snapshots.
     world_root_pin_name: Arc<RwLock<String>>,
     /// Last result of publishing world root CID to the runtime state pointer IPNS key.
@@ -578,6 +589,8 @@ struct WorldRootIndexDag {
     rooms: HashMap<String, WorldRootRoomDagValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     state_cid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lang_cid: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -613,6 +626,8 @@ struct AvatarStateDoc {
     inbox: String,
     agent_did: String,
     agent_endpoint: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    language_order: String,
     owner: String,
     descriptions: HashMap<String, String>,
     acl: actor::ActorAcl,
@@ -651,6 +666,8 @@ struct RuntimeStateDoc {
     room_objects: HashMap<String, Vec<ObjectRuntimeState>>,
     #[serde(default)]
     closet_profiles: HashMap<String, ClosetProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lang_cid: Option<String>,
 }
 
 fn build_exit_entry(id: String, name: String, to: String) -> ExitData {
@@ -664,8 +681,14 @@ fn build_exit_entry(id: String, name: String, to: String) -> ExitData {
 }
 
 fn sender_profile_from_document(document: &Document) -> String {
-    let _ = document;
-    // World runtime uses one world-authored profile.
+    if let Some(ma) = document.ma.as_ref() {
+        if let Some(language) = ma.language.as_ref() {
+            let normalized = language.trim();
+            if !normalized.is_empty() {
+                return normalized.to_string();
+            }
+        }
+    }
     "und".to_string()
 }
 
@@ -756,6 +779,7 @@ impl World {
             unlocked_world_signing_key: Arc::new(RwLock::new(None)),
             unlocked_world_encryption_key: Arc::new(RwLock::new(None)),
             state_cid: Arc::new(RwLock::new(None)),
+            lang_cid: Arc::new(RwLock::new(None)),
             world_root_pin_name: Arc::new(RwLock::new(world_root_pin_name)),
             last_pointer_publish_ok: Arc::new(RwLock::new(None)),
             last_pointer_publish_root_cid: Arc::new(RwLock::new(None)),
@@ -1181,6 +1205,16 @@ impl World {
             }
         }
         updated
+    }
+
+    async fn avatar_language_order_for_did(&self, room_name: &str, did_root: &str) -> Option<String> {
+        let rooms = self.rooms.read().await;
+        let room = rooms.get(room_name)?;
+        room.avatars
+            .values()
+            .find(|avatar| avatar.agent_did.without_fragment().id() == did_root)
+            .map(|avatar| avatar.language_order.clone())
+            .filter(|value| !value.trim().is_empty())
     }
 
     async fn closet_submit_citizenship(
@@ -1711,6 +1745,7 @@ impl World {
                 inbox,
                 did: root_did,
                 agent_endpoint: endpoint.to_string(),
+                language_order: "en_UK".to_string(),
             };
             let handle = self.join_room(&room, avatar_req, preferred_handle).await?;
 
@@ -2751,6 +2786,7 @@ impl World {
             match dag_get_dag_cbor::<WorldRootIndexDag>(&kubo_url, root_cid).await {
                 Ok(dag) => {
                     *self.state_cid.write().await = dag.state_cid.clone();
+                    *self.lang_cid.write().await = dag.lang_cid.clone();
                     let mut had_embedded = false;
                     let rooms = dag
                         .rooms
@@ -3034,6 +3070,7 @@ impl World {
         let index = WorldRootIndexDag {
             rooms: rooms_index,
             state_cid: self.state_cid.read().await.clone(),
+            lang_cid: self.lang_cid.read().await.clone(),
         };
         let new_cid = kubo::dag_put_dag_cbor(&kubo_url, &index).await?;
 
@@ -3195,7 +3232,12 @@ impl World {
             }
         }
 
-        let avatar = Avatar::new(req.inbox.clone(), req.did.clone(), req.agent_endpoint.clone());
+        let avatar = Avatar::new(
+            req.inbox.clone(),
+            req.did.clone(),
+            req.agent_endpoint.clone(),
+            req.language_order.clone(),
+        );
         room.add_avatar(avatar);
         drop(rooms);
 
@@ -3510,6 +3552,14 @@ impl World {
         self.state_cid.read().await.clone()
     }
 
+    pub async fn lang_cid(&self) -> Option<String> {
+        self.lang_cid.read().await.clone()
+    }
+
+    pub async fn set_lang_cid(&self, cid: Option<String>) {
+        *self.lang_cid.write().await = cid.map(|value| value.trim().to_string()).filter(|value| !value.is_empty());
+    }
+
     pub async fn persisted_room_count(&self) -> usize {
         self.room_cids.read().await.len()
     }
@@ -3575,6 +3625,7 @@ impl World {
                         inbox: avatar.inbox.clone(),
                         agent_did: avatar.agent_did.id(),
                         agent_endpoint: avatar.agent_endpoint.clone(),
+                        language_order: avatar.language_order.clone(),
                         owner: avatar.owner.clone(),
                         descriptions: avatar.descriptions.clone(),
                         acl: avatar.acl.clone(),
@@ -3638,6 +3689,7 @@ impl World {
             room_cids,
             room_objects,
             closet_profiles: self.closet_profiles.read().await.clone(),
+            lang_cid: self.lang_cid.read().await.clone(),
         };
 
         let plaintext = serde_json::to_vec(&state)
@@ -4000,6 +4052,7 @@ impl World {
                     avatar_doc.inbox.clone(),
                     avatar_did,
                     avatar_doc.agent_endpoint,
+                    avatar_doc.language_order,
                 );
                 avatar.owner = avatar_doc.owner;
                 avatar.descriptions = avatar_doc.descriptions;
@@ -4058,6 +4111,7 @@ impl World {
         }
         *self.room_cids.write().await = state.room_cids;
         *self.closet_profiles.write().await = state.closet_profiles;
+        *self.lang_cid.write().await = state.lang_cid;
         *self.state_cid.write().await = Some(state_cid.to_string());
 
         self.ensure_lobby_intrinsic_objects().await;
@@ -5267,6 +5321,54 @@ impl World {
                     ), room_name.to_string());
                 }
 
+                if trimmed.eq_ignore_ascii_case("language show") || trimmed.eq_ignore_ascii_case("lang show") {
+                    let rooms = self.rooms.read().await;
+                    let Some(room) = rooms.get(room_name) else {
+                        return (format!("@here room '{}' not found", room_name), room_name.to_string());
+                    };
+                    let Some(avatar) = room.avatars.get(from) else {
+                        return (format!("@avatar '{}' not found", from), room_name.to_string());
+                    };
+                    return (
+                        format!("@avatar language={}", avatar.language_order),
+                        room_name.to_string(),
+                    );
+                }
+
+                if let Some(rest) = trimmed
+                    .strip_prefix("language ")
+                    .or_else(|| trimmed.strip_prefix("lang "))
+                {
+                    let value = rest.trim();
+                    if value.is_empty() {
+                        return (
+                            "@avatar usage: language <ordered-list> (example: nb_NO; en_UK, en; nn_NO)".to_string(),
+                            room_name.to_string(),
+                        );
+                    }
+                    let Some(collapsed) = collapse_world_language_order_strict(value) else {
+                        return (
+                            format!(
+                                "@avatar language rejected. supported={}. Set language in closet, or leave.",
+                                supported_world_languages_text()
+                            ),
+                            room_name.to_string(),
+                        );
+                    };
+                    let mut rooms = self.rooms.write().await;
+                    let Some(room) = rooms.get_mut(room_name) else {
+                        return (format!("@here room '{}' not found", room_name), room_name.to_string());
+                    };
+                    let Some(avatar) = room.avatars.get_mut(from) else {
+                        return (format!("@avatar '{}' not found", from), room_name.to_string());
+                    };
+                    avatar.language_order = collapsed.clone();
+                    return (
+                        format!("@avatar language set to {}", collapsed),
+                        room_name.to_string(),
+                    );
+                }
+
                 // Unqualified input is gameplay-first: unknown avatar commands are treated as room commands.
                 (
                     self
@@ -5289,24 +5391,31 @@ impl World {
         room_name: &str,
         _from: &str,
         from_did: &Did,
-        _sender_profile: &str,
+        sender_profile: &str,
         command: &str,
     ) -> String {
         let normalized = command.trim();
+        let active_lang = world_lang_from_profile(sender_profile);
 
         if normalized.is_empty() || normalized.eq_ignore_ascii_case("help") {
-            return "@world commands: help | list | show [did] | describe [did] | private [on|off|status] | knock list [all] | knock accept <id> | knock reject <id> [note] | knock delete <id> | invite <did> [note] | room <name> acl show|open|close|allow <did>|deny <did> | migrate-index | save | load <cid> | dig <direction> [to|til <#dest|did>]"
-                .to_string();
+            return tr_world(
+                active_lang,
+                "world.help.commands",
+                "@world commands: help | list | show [did] | describe [did] | lang [show|set <cid>|clear] | private [on|off|status] | knock list [all] | knock accept <id> | knock reject <id> [note] | knock delete <id> | invite <did> [note] | room <name> acl show|open|close|allow <did>|deny <did> | migrate-index | save | load <cid> | dig <direction> [to|til <#dest|did>]",
+            );
         }
 
         let mut parts = normalized.splitn(2, char::is_whitespace);
         let verb = parts.next().unwrap_or_default().to_ascii_lowercase();
         let arg = parts.next().unwrap_or_default().trim().to_string();
 
+        // Command tokens are world/realm-defined and intentionally invariant.
+        // Localized input aliases (e.g. "grave" -> "dig") belong in actor/client.
+
         if verb == "list" {
             let rooms = self.rooms.read().await;
             if rooms.is_empty() {
-                return "@world objects: (none)".to_string();
+                return tr_world(active_lang, "world.list.empty", "@world objects: (none)");
             }
 
             let mut rows: Vec<(String, String)> = rooms
@@ -5335,7 +5444,8 @@ impl World {
             if arg.is_empty() {
                 let owner = self.owner_did.read().await.clone().unwrap_or_else(|| "(none)".to_string());
                 let room_count = self.rooms.read().await.len();
-                return format!("@world did={} owner={} rooms={}", world_did_root, owner, room_count);
+                let lang_cid = self.lang_cid.read().await.clone().unwrap_or_else(|| "(none)".to_string());
+                return format!("@world did={} owner={} rooms={} lang_cid={}", world_did_root, owner, room_count, lang_cid);
             }
 
             let target_fragment = match Did::try_from(arg.as_str()) {
@@ -5360,7 +5470,8 @@ impl World {
             let Some(fragment) = target_fragment else {
                 let owner = self.owner_did.read().await.clone().unwrap_or_else(|| "(none)".to_string());
                 let room_count = self.rooms.read().await.len();
-                return format!("@world did={} owner={} rooms={}", world_did_root, owner, room_count);
+                let lang_cid = self.lang_cid.read().await.clone().unwrap_or_else(|| "(none)".to_string());
+                return format!("@world did={} owner={} rooms={} lang_cid={}", world_did_root, owner, room_count, lang_cid);
             };
 
             let rooms = self.rooms.read().await;
@@ -5426,9 +5537,17 @@ impl World {
             let mode = arg.to_ascii_lowercase();
             if mode.is_empty() || mode == "status" {
                 if self.is_private_world().await {
-                    return "@world private=on (new entrants must knock)".to_string();
+                    return tr_world(
+                        active_lang,
+                        "world.private.status.on",
+                        "@world private=on (new entrants must knock)",
+                    );
                 }
-                return "@world private=off (open entry)".to_string();
+                return tr_world(
+                    active_lang,
+                    "world.private.status.off",
+                    "@world private=off (open entry)",
+                );
             }
         }
 
@@ -5440,20 +5559,70 @@ impl World {
             .unwrap_or(false);
 
         if !is_owner {
-            return "@world only the world owner can run that command.".to_string();
+            return tr_world(
+                active_lang,
+                "world.owner.required",
+                "@world only the world owner can run that command.",
+            );
+        }
+
+        if verb == "lang" {
+            let trimmed = arg.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("show") {
+                let value = self.lang_cid.read().await.clone().unwrap_or_else(|| "(none)".to_string());
+                return tr_world_vars(active_lang, "world.lang.show", &[("cid", value.clone())], &format!("@world lang_cid={}", value));
+            }
+            if trimmed.eq_ignore_ascii_case("clear") {
+                self.set_lang_cid(None).await;
+                return tr_world(
+                    active_lang,
+                    "world.lang.cleared",
+                    "@world lang_cid cleared (save world to persist)",
+                );
+            }
+            if let Some(cid) = trimmed.strip_prefix("set ") {
+                let candidate = cid.trim();
+                if candidate.is_empty() {
+                    return tr_world(active_lang, "world.lang.usage.set", "@world usage: @@lang set <cid>");
+                }
+                self.set_lang_cid(Some(candidate.to_string())).await;
+                return tr_world_vars(
+                    active_lang,
+                    "world.lang.set",
+                    &[("cid", candidate.to_string())],
+                    &format!("@world lang_cid set to {} (save world to persist)", candidate),
+                );
+            }
+            return tr_world(
+                active_lang,
+                "world.lang.usage",
+                "@world usage: @@lang [show|set <cid>|clear]",
+            );
         }
 
         if verb == "private" {
             let mode = arg.to_ascii_lowercase();
             if mode == "on" || mode == "true" {
                 self.set_private_world(true).await;
-                return "@world private mode enabled; new entrants must knock".to_string();
+                return tr_world(
+                    active_lang,
+                    "world.private.on",
+                    "@world private mode enabled; new entrants must knock",
+                );
             }
             if mode == "off" || mode == "false" {
                 self.set_private_world(false).await;
-                return "@world private mode disabled; entry is now open".to_string();
+                return tr_world(
+                    active_lang,
+                    "world.private.off",
+                    "@world private mode disabled; entry is now open",
+                );
             }
-            return "@world usage: @@private [on|off|status]".to_string();
+            return tr_world(
+                active_lang,
+                "world.private.usage",
+                "@world usage: @@private [on|off|status]",
+            );
         }
 
         if verb == "knock" {
@@ -5463,7 +5632,7 @@ impl World {
                 let include_all = parts.next().map(|v| v.eq_ignore_ascii_case("all")).unwrap_or(false);
                 let items = self.list_knocks(!include_all).await;
                 if items.is_empty() {
-                    return "@world knock inbox is empty".to_string();
+                    return tr_world(active_lang, "world.knock.empty", "@world knock inbox is empty");
                 }
                 let mut lines = Vec::new();
                 for item in items {
@@ -6779,10 +6948,37 @@ impl WorldProtocol {
                     .as_ref()
                     .and_then(|profile| profile.name.clone());
                 let selected_handle = preferred_handle.or(profile_name);
+                let Some(collapsed_language_order) = collapse_world_language_order_strict(&sender_profile) else {
+                    return Ok(WorldResponse {
+                        ok: false,
+                        room,
+                        message: format!(
+                            "no supported language found in ma.language='{}'. supported={}. Choose language in closet, or leave.",
+                            sender_profile,
+                            supported_world_languages_text()
+                        ),
+                        endpoint_id: self.endpoint_id.clone(),
+                        latest_event_sequence: 0,
+                        broadcasted: false,
+                        events: Vec::new(),
+                        handle: String::new(),
+                        room_description: String::new(),
+                        room_title: String::new(),
+                        room_did: String::new(),
+                        avatars: Vec::new(),
+                        room_object_dids: HashMap::new(),
+                        transport_ack: Some(TransportAck {
+                            lane: self.lane.label().to_string(),
+                            code: TransportAckCode::Rejected,
+                            detail: "language selection required".to_string(),
+                        }),
+                    });
+                };
                 let avatar_req = AvatarRequest {
                     inbox,
                     did: root_did,
                     agent_endpoint: agent_endpoint.clone(),
+                    language_order: collapsed_language_order,
                 };
                 let handle = self.world.join_room(&room, avatar_req, selected_handle).await?;
                 if let Some(profile) = closet_profile {
@@ -6828,6 +7024,11 @@ impl WorldProtocol {
                 })
             }
             WorldCommand::Message { room, envelope } => {
+                let effective_sender_profile = self
+                    .world
+                    .avatar_language_order_for_did(&room, sender_root)
+                    .await
+                    .unwrap_or_else(|| "en_UK".to_string());
                 let is_world_admin = matches!(
                     &envelope,
                     MessageEnvelope::ActorCommand { target, .. } if target.eq_ignore_ascii_case("world")
@@ -6860,7 +7061,7 @@ impl WorldProtocol {
                 }
                 let (message, broadcasted, effective_room) = self
                     .world
-                    .send_message(&room, &actor_name, sender_did, &sender_profile, envelope)
+                    .send_message(&room, &actor_name, sender_did, &effective_sender_profile, envelope)
                     .await?;
                 if effective_room != room {
                     self.push_presence_snapshot(&room).await;

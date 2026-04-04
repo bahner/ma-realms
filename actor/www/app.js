@@ -3,6 +3,7 @@ import init, {
   create_identity_with_ipns,
   unlock_identity,
   ensure_bundle_iroh_secret,
+  set_bundle_language,
   set_bundle_world,
   generate_bip39_phrase,
   normalize_bip39_phrase,
@@ -54,6 +55,7 @@ const HOME_PUBLISH_KEY_ALIAS = 'ma-actor';
 const LEGACY_API_KEY = 'ma.identity.v2.kuboApi';
 const LEGACY_ALIAS_KEY = 'ma.identity.v2.alias';
 const DEFAULT_UI_LANG = 'en';
+const DEFAULT_LANGUAGE_ORDER = 'en_UK;en_US';
 const LOCAL_EDIT_SCRIPT_KEY = `${STORAGE_PREFIX}.localEditScript`;
 const LOCAL_EDIT_SCRIPT_CID_KEY = `${STORAGE_PREFIX}.localEditScriptCid`;
 
@@ -220,6 +222,7 @@ const state = {
   identity: null,
   encryptedBundle: '',
   aliasName: '',
+  languageOrder: DEFAULT_LANGUAGE_ORDER,
   uiLang: DEFAULT_UI_LANG,
   debug: false,
   aliasBook: {},
@@ -2945,7 +2948,7 @@ function toSequenceBigInt(value) {
 }
 
 function saveIdentityRecord(aliasName, encryptedBundle) {
-  identityStore.saveIdentityRecord(aliasName, encryptedBundle);
+  identityStore.saveIdentityRecord(aliasName, encryptedBundle, state.languageOrder);
 }
 
 function resolveIdentityRecord(aliasName) {
@@ -2980,6 +2983,11 @@ function loadAliasDraft(aliasName, options = {}) {
   }
   const record = resolveIdentityRecord(normalized);
   byId('bundle-text').value = record?.encryptedBundle || '';
+  state.languageOrder = normalizeLanguageOrder(record?.language || DEFAULT_LANGUAGE_ORDER);
+  const languageInput = byId('language-order');
+  if (languageInput) {
+    languageInput.value = state.languageOrder;
+  }
   setUiLanguage(record?.uiLang || DEFAULT_UI_LANG);
 
   if (!byId('recovery-phrase').value.trim()) {
@@ -3319,6 +3327,7 @@ function validateSetupInputs(requireBundle) {
   const aliasName = byId('alias-name').value.trim();
   const passphrase = byId('passphrase').value;
   const bundle = byId('bundle-text').value.trim();
+  const languageOrder = normalizeLanguageOrder(byId('language-order')?.value || '');
 
   if (!isValidAliasName(aliasName)) {
     throw new Error('Alias must be 2-32 chars using letters, numbers, underscore, or dash.');
@@ -3330,7 +3339,34 @@ function validateSetupInputs(requireBundle) {
     throw new Error('Provide an encrypted bundle to unlock.');
   }
 
-  return { aliasName, passphrase, bundle };
+  return { aliasName, passphrase, bundle, languageOrder };
+}
+
+function normalizeLanguageOrder(value) {
+  const normalized = String(value || '')
+    .split(';')
+    .map((entry) => String(entry || '').trim())
+    .filter(Boolean)
+    .join(';');
+  return normalized || DEFAULT_LANGUAGE_ORDER;
+}
+
+function applyBundleLanguagePreference(languageOrder) {
+  const normalized = normalizeLanguageOrder(languageOrder);
+  state.languageOrder = normalized;
+
+  if (!state.passphrase || !state.encryptedBundle) {
+    return false;
+  }
+
+  const updated = JSON.parse(set_bundle_language(state.passphrase, state.encryptedBundle, normalized));
+  state.identity = updated;
+  state.encryptedBundle = updated.encrypted_bundle;
+  const bundleEl = byId('bundle-text');
+  if (bundleEl) {
+    bundleEl.value = updated.encrypted_bundle;
+  }
+  return true;
 }
 
 function generateRecoveryPhrase(wordCount = 12) {
@@ -3357,7 +3393,7 @@ function resolveRecoveryPhraseFromInput() {
 async function onCreateIdentity() {
   setSetupStatus('Creating identity...');
   try {
-    const { aliasName, passphrase } = validateSetupInputs(false);
+    const { aliasName, passphrase, languageOrder } = validateSetupInputs(false);
     localStorage.setItem(API_KEY, getApiBase());
     setActiveAlias(aliasName);
 
@@ -3368,6 +3404,7 @@ async function onCreateIdentity() {
     state.encryptedBundle = result.encrypted_bundle;
     state.passphrase = passphrase;
     state.aliasName = aliasName;
+    applyBundleLanguagePreference(languageOrder);
     setUiLanguage(DEFAULT_UI_LANG);
     loadBlockedDidRootsForIdentity(result.did);
     setCurrentPublishInfo({ ipns: result.ipns || '' });
@@ -3391,7 +3428,7 @@ async function onCreateIdentity() {
 async function onUnlockIdentity() {
   setSetupStatus('Unlocking bundle...');
   try {
-    const { aliasName, passphrase, bundle } = validateSetupInputs(true);
+    const { aliasName, passphrase, bundle, languageOrder } = validateSetupInputs(true);
     localStorage.setItem(API_KEY, getApiBase());
     setActiveAlias(aliasName);
 
@@ -3403,6 +3440,7 @@ async function onUnlockIdentity() {
     state.encryptedBundle = updated.encrypted_bundle;
     state.passphrase = passphrase;
     state.aliasName = aliasName;
+    applyBundleLanguagePreference(languageOrder);
     setUiLanguage(DEFAULT_UI_LANG);
     loadBlockedDidRootsForIdentity(updated.did);
     setCurrentPublishInfo({ ipns: updated.ipns || '' });
@@ -3429,6 +3467,7 @@ function onNewPhrase() {
 
   const aliasName = byId('alias-name').value.trim();
   const bundle = byId('bundle-text').value.trim();
+  state.languageOrder = normalizeLanguageOrder(byId('language-order')?.value || '');
   if (isValidAliasName(aliasName)) {
     saveIdentityRecord(aliasName, bundle);
   }
@@ -4808,6 +4847,7 @@ function parseDot(input) {
       `Alias:           ${state.aliasName || '(ingen)'}`
     ));
     appendMessage('system', uiText(`UI language:     ${state.uiLang}`, `UI-språk:        ${state.uiLang}`));
+    appendMessage('system', uiText(`Language order:  ${state.languageOrder}`, `Språk-rekkefølge: ${state.languageOrder}`));
     appendMessage('system', uiText(`DID document at: https://ipfs.io/ipns/${ipns}`, `DID-dokument på: https://ipfs.io/ipns/${ipns}`));
     appendMessage('system', uiText(
       `Current world:   ${state.currentHome ? `${humanizeIdentifier(state.currentHome.endpointId)} (${state.currentHome.room})` : '(none)'}`,
@@ -5272,6 +5312,11 @@ function restoreSavedValues() {
     loadAliasDraft(savedAlias);
   } else {
     byId('bundle-text').value = '';
+    const languageInput = byId('language-order');
+    if (languageInput) {
+      languageInput.value = DEFAULT_LANGUAGE_ORDER;
+    }
+    state.languageOrder = DEFAULT_LANGUAGE_ORDER;
     setUiLanguage(DEFAULT_UI_LANG);
     onNewPhrase();
   }
@@ -5323,6 +5368,25 @@ async function main() {
   byId('alias-name').addEventListener('change', (event) => {
     loadAliasDraft(event.target.value, { persistActive: true });
   });
+  const languageInput = byId('language-order');
+  if (languageInput) {
+    languageInput.addEventListener('change', (event) => {
+      const value = normalizeLanguageOrder(event.target?.value || '');
+      event.target.value = value;
+
+      try {
+        applyBundleLanguagePreference(value);
+      } catch (err) {
+        appendMessage('system', `Failed to save language preference: ${err instanceof Error ? err.message : String(err)}`);
+      }
+
+      const aliasName = byId('alias-name').value.trim();
+      const bundle = byId('bundle-text').value.trim();
+      if (isValidAliasName(aliasName)) {
+        saveIdentityRecord(aliasName, bundle);
+      }
+    });
+  }
   byId('command-form').addEventListener('submit', onCommandSubmit);
   byId('command-input').addEventListener('keydown', onCommandKeyDown);
   byId('yaml-editor-cancel').addEventListener('click', closeYamlEditorModal);

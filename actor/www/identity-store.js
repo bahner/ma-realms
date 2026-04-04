@@ -36,7 +36,7 @@ export function createIdentityStore({
     }
   }
 
-  function saveIdentityRecord(aliasName, encryptedBundle) {
+  function saveIdentityRecord(aliasName, encryptedBundle, language) {
     if (!isValidAliasName(aliasName)) {
       return;
     }
@@ -45,7 +45,8 @@ export function createIdentityStore({
       identityRecordKey(aliasName),
       JSON.stringify({
         aliasName,
-        encryptedBundle
+        encryptedBundle,
+        language: String(language || '').trim()
       })
     );
   }
@@ -62,7 +63,8 @@ export function createIdentityStore({
 
     return {
       aliasName: typeof parsed.aliasName === 'string' ? parsed.aliasName : aliasName,
-      encryptedBundle: typeof parsed.encryptedBundle === 'string' ? parsed.encryptedBundle : ''
+      encryptedBundle: typeof parsed.encryptedBundle === 'string' ? parsed.encryptedBundle : '',
+      language: typeof parsed.language === 'string' ? parsed.language : ''
     };
   }
 
@@ -74,7 +76,8 @@ export function createIdentityStore({
 
     return {
       aliasName,
-      encryptedBundle: localStorage.getItem(legacy.bundleKey) || ''
+      encryptedBundle: localStorage.getItem(legacy.bundleKey) || '',
+      language: ''
     };
   }
 

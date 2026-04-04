@@ -195,6 +195,23 @@ cargo run --bin ma-world -- run --world-slug panteia
 RUST_LOG=ma_world=debug cargo run --bin ma-world -- run --world-slug panteia
 ```
 
+## Language Pack Defaults
+
+The repository now includes starter language files for `lang_cid` workflows:
+
+- `world/lang/manifest.yaml`
+- `world/lang/en_UK.ftl`
+- `world/lang/nb_NO.ftl`
+
+`manifest.yaml` is a template. Replace `TODO_CID_*` values with published IPFS
+CIDs for each language file when preparing a world language pack.
+
+Language packs change world response text, not world command grammar.
+Command tokens stay standard/invariant (`help`, `show`, `describe`, `lang`,
+`private`, `knock`, `invite`, `room`, `dig`). If clients want localized
+command words, they must translate input to standard tokens before sending to
+world.
+
 ## Release Builds (GitHub Actions)
 
 `ma-world` now includes a release workflow at:

@@ -44,6 +44,7 @@ pub struct Avatar {
     pub inbox: String,
     pub agent_did: Did,
     pub agent_endpoint: String,
+    pub language_order: String,
     pub owner: String,
     pub descriptions: HashMap<String, String>,
     pub object_shortcuts: HashMap<String, String>,
@@ -52,12 +53,13 @@ pub struct Avatar {
 }
 
 impl Avatar {
-    pub fn new(inbox: String, agent_did: Did, agent_endpoint: String) -> Self {
+    pub fn new(inbox: String, agent_did: Did, agent_endpoint: String, language_order: String) -> Self {
         let owner = agent_did.without_fragment().id();
         Self {
             inbox,
             agent_did,
             agent_endpoint,
+            language_order,
             owner: owner.clone(),
             descriptions: HashMap::new(),
             object_shortcuts: HashMap::new(),
