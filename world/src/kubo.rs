@@ -157,6 +157,18 @@ struct KeyListResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct KeyImportResponse {
+    #[serde(default, rename = "Name")]
+    name_upper: String,
+    #[serde(default, rename = "name")]
+    name_lower: String,
+    #[serde(default, rename = "Id")]
+    id_upper: String,
+    #[serde(default, rename = "id")]
+    id_lower: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct AddResponse {
     #[serde(rename = "Hash")]
     hash: String,
@@ -558,4 +570,65 @@ pub async fn generate_kubo_key(kubo_url: &str, key_name: &str) -> Result<()> {
         .error_for_status()?;
 
     Ok(())
+}
+
+pub async fn remove_kubo_key(kubo_url: &str, key_name: &str) -> Result<()> {
+    let base = kubo_url.trim_end_matches('/');
+    let url = format!("{base}/api/v0/key/rm");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+
+    client
+        .post(url)
+        .query(&[("arg", key_name)])
+        .send()
+        .await?
+        .error_for_status()?;
+
+    Ok(())
+}
+
+pub async fn import_kubo_key(kubo_url: &str, key_name: &str, key_bytes: Vec<u8>) -> Result<KuboKey> {
+    let base = kubo_url.trim_end_matches('/');
+    let url = format!("{base}/api/v0/key/import");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+
+    let part = multipart::Part::bytes(key_bytes)
+        .file_name("ipns.key")
+        .mime_str("application/octet-stream")?;
+    let form = multipart::Form::new().part("file", part);
+
+    let response = client
+        .post(url)
+        .query(&[("arg", key_name), ("allow-any-key-type", "true")])
+        .multipart(form)
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let body = response.text().await?;
+    let parsed: KeyImportResponse = serde_json::from_str(&body)
+        .map_err(|e| anyhow!("failed parsing key/import response: {} body={}", e, body))?;
+
+    let name = if !parsed.name_upper.trim().is_empty() {
+        parsed.name_upper.trim().to_string()
+    } else {
+        parsed.name_lower.trim().to_string()
+    };
+    let id = if !parsed.id_upper.trim().is_empty() {
+        parsed.id_upper.trim().to_string()
+    } else {
+        parsed.id_lower.trim().to_string()
+    };
+
+    if name.is_empty() || id.is_empty() {
+        return Err(anyhow!("missing name/id in key/import response: {}", body));
+    }
+
+    Ok(KuboKey { name, id })
 }

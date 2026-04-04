@@ -28,13 +28,16 @@ use iroh::{
 };
 use ma_core::{
     ActorCommand, BROADCAST_ALPN, CHAT_ALPN, CMD_ALPN, CONTENT_TYPE_CHAT, CONTENT_TYPE_CMD,
+    CLOSET_ALPN, ClosetRequest, ClosetResponse,
     CONTENT_TYPE_PRESENCE, CONTENT_TYPE_WORLD, CompiledCapabilityAcl, DEFAULT_WORLD_RELAY_URL,
     ExitData, LaneCapability, MessageEnvelope, ObjectDefinition, ObjectInboxMessage,
+    MAILBOX_COMMANDS_INLINE,
     ObjectMessageIntent, ObjectMessageKind, ObjectMessageRetention, ObjectMessageTarget,
     ObjectRuntimeState, PRESENCE_ALPN, PresenceAvatar, RoomActorAction, RoomActorContext,
     RoomEvent, TransportAck, TransportAckCode, WORLD_ALPN, WorldCommand, WorldLane, WorldRequest,
     WorldResponse, compile_acl, evaluate_compiled_acl_with_owner, execute_room_actor_command,
     normalize_spoken_text, parse_capability_acl_text, parse_object_local_capability_acl,
+    RequirementChecker, RequirementSet, RequirementSpec,
 };
 use nanoid::nanoid;
 use rand::RngCore;
@@ -59,8 +62,9 @@ use actor_web::{
 };
 use kubo::{
     IpnsPublishOptions, dag_get_dag_cbor, dag_put_dag_cbor, generate_kubo_key, ipfs_add,
-    ipns_publish_with_retry, list_kubo_key_names, list_kubo_keys, name_resolve, pin_add_named,
+    import_kubo_key, ipns_publish_with_retry, list_kubo_key_names, list_kubo_keys, name_resolve, pin_add_named,
     pin_rm, pin_update, wait_for_kubo_api,
+    remove_kubo_key,
 };
 use room::{Room, RoomAcl};
 use schema::{
@@ -198,6 +202,80 @@ struct WorldProtocol {
 }
 
 #[derive(Clone, Debug)]
+struct ClosetProtocol {
+    world: Arc<World>,
+}
+
+#[derive(Clone, Debug)]
+struct ClosetSession {
+    id: String,
+    endpoint: String,
+    created_at: String,
+    last_lobby_sequence: u64,
+    name: Option<String>,
+    description: Option<String>,
+    did: Option<String>,
+    fragment: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ObjectRequirementRuntime {
+    room_name: String,
+    actor_handle: String,
+    caller_root: String,
+    is_world_owner: bool,
+    object_exists: bool,
+    object_holder: Option<String>,
+    object_opened_by: Option<String>,
+    object_owner: Option<String>,
+}
+
+impl RequirementChecker for ObjectRequirementRuntime {
+    fn check_requirement(&self, requirement: &RequirementSpec) -> bool {
+        match requirement.name.as_str() {
+            "object.exists" => self.object_exists,
+            "object.held" => self.object_holder.is_some(),
+            "object.not_held" => self.object_holder.is_none(),
+            "object.held_by_self" => self
+                .object_holder
+                .as_ref()
+                .map(|holder| holder == &self.actor_handle)
+                .unwrap_or(false),
+            "object.held_by_other" => self
+                .object_holder
+                .as_ref()
+                .map(|holder| holder != &self.actor_handle)
+                .unwrap_or(false),
+            "object.open" => self.object_opened_by.is_some(),
+            "object.closed" => self.object_opened_by.is_none(),
+            "object.opened_by_self" => self
+                .object_opened_by
+                .as_ref()
+                .map(|did| did == &self.caller_root)
+                .unwrap_or(false),
+            "object.opened_by_other" => self
+                .object_opened_by
+                .as_ref()
+                .map(|did| did != &self.caller_root)
+                .unwrap_or(false),
+            "object.owned" => self.object_owner.is_some(),
+            "object.owner_is_self" => self
+                .object_owner
+                .as_ref()
+                .map(|owner| owner == &self.caller_root)
+                .unwrap_or(false),
+            "world.owned" => self.is_world_owner,
+            "room.in" => requirement
+                .arg
+                .as_ref()
+                .map(|room| room.trim().eq_ignore_ascii_case(self.room_name.as_str()))
+                .unwrap_or(true),
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 struct EntryAcl {
     allow_all: bool,
     allow_owner: bool,
@@ -286,6 +364,8 @@ pub struct World {
     knock_inbox: Arc<RwLock<VecDeque<KnockMessage>>>,
     /// Monotonic knock id sequence.
     next_knock_id: Arc<RwLock<u64>>,
+    /// Ephemeral pre-DID onboarding sessions keyed by session id.
+    closet_sessions: Arc<RwLock<HashMap<String, ClosetSession>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -537,24 +617,9 @@ struct RuntimeStateDoc {
     room_objects: HashMap<String, Vec<ObjectRuntimeState>>,
 }
 
-fn normalize_language_tag(value: &str) -> String {
-    let raw = value.trim();
-    if raw.is_empty() {
-        return "und".to_string();
-    }
-    let cleaned = raw.replace('-', "_");
-    if cleaned
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ':')
-    {
-        cleaned
-    } else {
-        "und".to_string()
-    }
-}
-
 fn exit_for_language(id: String, name: String, to: String, language: &str) -> ExitData {
-    let normalized = normalize_language_tag(language);
+    let _ = language;
+    let normalized = "und".to_string();
     let mut exit = ExitData::new(id, name.clone(), to);
     exit.names.clear();
     if !name.trim().is_empty() {
@@ -564,17 +629,8 @@ fn exit_for_language(id: String, name: String, to: String, language: &str) -> Ex
 }
 
 fn sender_language_from_document(document: &Document) -> String {
-    if let Some(ma) = document.ma.as_ref() {
-        if let Some(language) = ma.language.as_deref() {
-            let first = language.split(':').find(|entry| !entry.trim().is_empty());
-            if let Some(primary) = first {
-                return normalize_language_tag(primary);
-            }
-        }
-        if let Some(lang) = ma.lang.as_deref() {
-            return normalize_language_tag(lang);
-        }
-    }
+    let _ = document;
+    // World runtime uses one world-authored language profile.
     "und".to_string()
 }
 
@@ -664,11 +720,335 @@ impl World {
             room_objects: Arc::new(RwLock::new(HashMap::new())),
             knock_inbox: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_KNOCK_INBOX))),
             next_knock_id: Arc::new(RwLock::new(0)),
+            closet_sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     pub async fn world_root_pin_name(&self) -> String {
         self.world_root_pin_name.read().await.clone()
+    }
+
+    async fn issue_bootstrap_did(&self, requester_endpoint: &str) -> Result<(String, String, String)> {
+        let kubo_url = self.kubo_url.read().await.clone();
+        let existing_names = list_kubo_key_names(&kubo_url).await?;
+
+        let mut generated: Option<String> = None;
+        for _ in 0..64 {
+            let candidate = nanoid!();
+            if !existing_names.iter().any(|name| name == &candidate) {
+                generated = Some(candidate);
+                break;
+            }
+        }
+        let fragment = generated.ok_or_else(|| anyhow!("failed to allocate a unique fragment"))?;
+
+        generate_kubo_key(&kubo_url, &fragment).await?;
+        let keys = list_kubo_keys(&kubo_url).await?;
+        let did_ipns = keys
+            .iter()
+            .find(|key| key.name == fragment)
+            .map(|key| key.id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| anyhow!("kubo key '{}' created but missing usable Id", fragment))?;
+
+        let did = Did::new_root(&did_ipns)
+            .map_err(|e| anyhow!("failed to construct did from key id '{}': {}", did_ipns, e))?
+            .id();
+
+        let did_obj = Did::try_from(did.as_str())
+            .map_err(|e| anyhow!("failed to parse generated did '{}': {}", did, e))?;
+        if !self.can_enter(&did_obj).await {
+            let _ = remove_kubo_key(&kubo_url, &fragment).await;
+            let did_root = did_obj.without_fragment().id();
+            let (knock_id, duplicate) = self
+                .enqueue_knock(DEFAULT_ROOM, &did_root, requester_endpoint, None)
+                .await;
+            let message = if duplicate {
+                format!(
+                    "entry denied for {}; existing knock request id={} is pending",
+                    did_root, knock_id
+                )
+            } else {
+                format!(
+                    "entry denied for {}; knock request queued with id={}",
+                    did_root, knock_id
+                )
+            };
+            return Err(anyhow!(message));
+        }
+
+        Ok((did, fragment.clone(), fragment))
+    }
+
+    async fn closet_start_session(&self, endpoint: &str) -> Result<(String, u64)> {
+        let session_id = nanoid!();
+        let latest_lobby_sequence = self.latest_room_event_sequence(DEFAULT_ROOM).await?;
+        let session = ClosetSession {
+            id: session_id.clone(),
+            endpoint: endpoint.to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            last_lobby_sequence: latest_lobby_sequence,
+            name: None,
+            description: None,
+            did: None,
+            fragment: None,
+        };
+        self.closet_sessions
+            .write()
+            .await
+            .insert(session_id.clone(), session);
+        Ok((session_id, latest_lobby_sequence))
+    }
+
+    async fn closet_session_owned_by(
+        &self,
+        session_id: &str,
+        endpoint: &str,
+    ) -> Result<ClosetSession> {
+        let sessions = self.closet_sessions.read().await;
+        let session = sessions
+            .get(session_id)
+            .ok_or_else(|| anyhow!("unknown closet session"))?;
+        if session.endpoint != endpoint {
+            return Err(anyhow!("closet session endpoint mismatch"));
+        }
+        Ok(session.clone())
+    }
+
+    async fn closet_answer(
+        &self,
+        session_id: &str,
+        endpoint: &str,
+        field: &str,
+        value: &str,
+    ) -> Result<String> {
+        let mut sessions = self.closet_sessions.write().await;
+        let Some(session) = sessions.get_mut(session_id) else {
+            return Err(anyhow!("unknown closet session"));
+        };
+        if session.endpoint != endpoint {
+            return Err(anyhow!("closet session endpoint mismatch"));
+        }
+
+        let normalized_field = field.trim().to_ascii_lowercase();
+        let normalized_value = value.trim().to_string();
+        match normalized_field.as_str() {
+            "name" => {
+                if normalized_value.is_empty() {
+                    return Err(anyhow!("name cannot be empty"));
+                }
+                session.name = Some(normalized_value);
+                Ok("name stored".to_string())
+            }
+            "description" | "desc" => {
+                if normalized_value.is_empty() {
+                    return Err(anyhow!("description cannot be empty"));
+                }
+                session.description = Some(normalized_value);
+                Ok("description stored".to_string())
+            }
+            _ => Err(anyhow!("unknown closet field '{}': use name|description", field)),
+        }
+    }
+
+    async fn closet_submit_citizenship(
+        &self,
+        session_id: &str,
+        endpoint: &str,
+        ipns_private_key_base64: &str,
+    ) -> Result<(String, String, String)> {
+        let _session = self.closet_session_owned_by(session_id, endpoint).await?;
+        if ipns_private_key_base64.trim().is_empty() {
+            return self.issue_bootstrap_did(endpoint).await;
+        }
+        self.issue_bootstrap_citizenship(endpoint, ipns_private_key_base64)
+            .await
+    }
+
+    async fn closet_command(
+        &self,
+        session_id: &str,
+        endpoint: &str,
+        input: &str,
+    ) -> Result<ClosetResponse> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Ok(ClosetResponse {
+                ok: true,
+                message: "You are in the closet and have no avatar yet. Type 'help'.".to_string(),
+                session_id: Some(session_id.to_string()),
+                prompt: None,
+                lobby_events: Vec::new(),
+                latest_lobby_sequence: 0,
+                did: None,
+                fragment: None,
+                key_name: None,
+            });
+        }
+
+        let mut parts = trimmed.split_whitespace();
+        let verb = parts.next().unwrap_or_default().to_ascii_lowercase();
+        let tail = trimmed[verb.len()..].trim();
+
+        if verb == "help" {
+            return Ok(ClosetResponse {
+                ok: true,
+                message: "Closet commands: help | hear | name <text> | description <text> | citizen [ipns_key_base64]".to_string(),
+                session_id: Some(session_id.to_string()),
+                prompt: Some("You are in the closet with no avatar yet. Fill profile fields, then run 'citizen'.".to_string()),
+                lobby_events: Vec::new(),
+                latest_lobby_sequence: 0,
+                did: None,
+                fragment: None,
+                key_name: None,
+            });
+        }
+
+        if verb == "hear" {
+            let since = {
+                let sessions = self.closet_sessions.read().await;
+                let Some(session) = sessions.get(session_id) else {
+                    return Err(anyhow!("unknown closet session"));
+                };
+                if session.endpoint != endpoint {
+                    return Err(anyhow!("closet session endpoint mismatch"));
+                }
+                session.last_lobby_sequence
+            };
+
+            let (events, latest_lobby_sequence) = self.room_events_since(DEFAULT_ROOM, since).await?;
+            {
+                let mut sessions = self.closet_sessions.write().await;
+                if let Some(session) = sessions.get_mut(session_id) {
+                    session.last_lobby_sequence = latest_lobby_sequence;
+                }
+            }
+
+            return Ok(ClosetResponse {
+                ok: true,
+                message: if events.is_empty() {
+                    "No new lobby events.".to_string()
+                } else {
+                    format!("Heard {} lobby event(s).", events.len())
+                },
+                session_id: Some(session_id.to_string()),
+                prompt: None,
+                lobby_events: events,
+                latest_lobby_sequence,
+                did: None,
+                fragment: None,
+                key_name: None,
+            });
+        }
+
+        if verb == "name" || verb == "description" {
+            if tail.is_empty() {
+                return Err(anyhow!("usage: {} <value>", verb));
+            }
+            let msg = self.closet_answer(session_id, endpoint, &verb, tail).await?;
+            return Ok(ClosetResponse {
+                ok: true,
+                message: msg,
+                session_id: Some(session_id.to_string()),
+                prompt: None,
+                lobby_events: Vec::new(),
+                latest_lobby_sequence: 0,
+                did: None,
+                fragment: None,
+                key_name: None,
+            });
+        }
+
+        if verb == "citizen" {
+            let (did, fragment, key_name) = self
+                .closet_submit_citizenship(session_id, endpoint, tail)
+                .await?;
+            {
+                let mut sessions = self.closet_sessions.write().await;
+                if let Some(session) = sessions.get_mut(session_id) {
+                    session.did = Some(did.clone());
+                    session.fragment = Some(fragment.clone());
+                }
+            }
+            return Ok(ClosetResponse {
+                ok: true,
+                message: "Citizenship granted. You can now enter the world.".to_string(),
+                session_id: Some(session_id.to_string()),
+                prompt: None,
+                lobby_events: Vec::new(),
+                latest_lobby_sequence: 0,
+                did: Some(did),
+                fragment: Some(fragment),
+                key_name: Some(key_name),
+            });
+        }
+
+        Ok(ClosetResponse {
+            ok: false,
+            message: format!("Unknown closet command '{}'. Type 'help'.", verb),
+            session_id: Some(session_id.to_string()),
+            prompt: None,
+            lobby_events: Vec::new(),
+            latest_lobby_sequence: 0,
+            did: None,
+            fragment: None,
+            key_name: None,
+        })
+    }
+
+    async fn issue_bootstrap_citizenship(
+        &self,
+        requester_endpoint: &str,
+        ipns_private_key_base64: &str,
+    ) -> Result<(String, String, String)> {
+        let kubo_url = self.kubo_url.read().await.clone();
+        let existing_names = list_kubo_key_names(&kubo_url).await?;
+
+        let mut generated: Option<String> = None;
+        for _ in 0..64 {
+            let candidate = nanoid!();
+            if !existing_names.iter().any(|name| name == &candidate) {
+                generated = Some(candidate);
+                break;
+            }
+        }
+        let fragment = generated.ok_or_else(|| anyhow!("failed to allocate a unique fragment"))?;
+
+        let key_bytes = B64
+            .decode(ipns_private_key_base64.trim().as_bytes())
+            .map_err(|e| anyhow!("invalid ipns key base64: {}", e))?;
+        if key_bytes.is_empty() {
+            return Err(anyhow!("ipns key payload is empty"));
+        }
+
+        let imported = import_kubo_key(&kubo_url, &fragment, key_bytes).await?;
+        let did = Did::new_root(&imported.id)
+            .map_err(|e| anyhow!("failed to construct did from key id '{}': {}", imported.id, e))?
+            .id();
+
+        let did_obj = Did::try_from(did.as_str())
+            .map_err(|e| anyhow!("failed to parse imported did '{}': {}", did, e))?;
+        if !self.can_enter(&did_obj).await {
+            let _ = remove_kubo_key(&kubo_url, &imported.name).await;
+            let did_root = did_obj.without_fragment().id();
+            let (knock_id, duplicate) = self
+                .enqueue_knock(DEFAULT_ROOM, &did_root, requester_endpoint, None)
+                .await;
+            let message = if duplicate {
+                format!(
+                    "entry denied for {}; existing knock request id={} is pending",
+                    did_root, knock_id
+                )
+            } else {
+                format!(
+                    "entry denied for {}; knock request queued with id={}",
+                    did_root, knock_id
+                )
+            };
+            return Err(anyhow!(message));
+        }
+
+        Ok((did, fragment, imported.name))
     }
 
     async fn ensure_lobby_intrinsic_objects(&self) {
@@ -1435,21 +1815,98 @@ impl World {
         best.map(|(_, content)| content)
     }
 
+    fn lookup_object_verb_definition(
+        object: &ObjectRuntimeState,
+        verb: &str,
+    ) -> Option<ma_core::ObjectVerbDefinition> {
+        let verbs = object.definition.as_ref().map(|def| &def.verbs)?;
+        let needle = verb.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return None;
+        }
+
+        verbs
+            .iter()
+            .find(|entry| {
+                entry.name.trim().eq_ignore_ascii_case(needle.as_str())
+                    || entry
+                        .aliases
+                        .iter()
+                        .any(|value| value.trim().eq_ignore_ascii_case(needle.as_str()))
+            })
+            .cloned()
+    }
+
     fn parse_object_definition_text(raw: &str, cid: &str) -> Result<ObjectDefinition> {
+        fn validate_definition(definition: &ObjectDefinition, cid: &str) -> Result<()> {
+            if definition.verbs.is_empty() {
+                return Ok(());
+            }
+
+            let has_help = definition.verbs.iter().any(|verb| {
+                verb.name.trim().eq_ignore_ascii_case("help")
+                    || verb
+                        .aliases
+                        .iter()
+                        .any(|alias| alias.trim().eq_ignore_ascii_case("help"))
+            });
+
+            if !has_help {
+                return Err(anyhow!(
+                    "object definition at CID {} declares methods but no help verb/alias",
+                    cid
+                ));
+            }
+
+            for verb in &definition.verbs {
+                if verb.requirements.is_empty() {
+                    continue;
+                }
+                let set = RequirementSet::parse_many(&verb.requirements).map_err(|e| {
+                    anyhow!(
+                        "invalid requirements in object definition {} for verb '{}': {}",
+                        cid,
+                        verb.name,
+                        e
+                    )
+                })?;
+                let report = set.validate();
+                if !report.is_ok() {
+                    let first = report
+                        .issues
+                        .first()
+                        .map(|issue| issue.message.clone())
+                        .unwrap_or_else(|| "unknown requirements validation error".to_string());
+                    return Err(anyhow!(
+                        "invalid requirements in object definition {} for verb '{}': {}",
+                        cid,
+                        verb.name,
+                        first
+                    ));
+                }
+            }
+
+            Ok(())
+        }
+
         if let Ok(doc) = serde_yaml::from_str::<ObjectDefinitionDoc>(raw) {
             if doc.kind == "ma_object_definition" && doc.version == 1 {
+                validate_definition(&doc.definition, cid)?;
                 return Ok(doc.definition);
             }
         }
         if let Ok(doc) = serde_json::from_str::<ObjectDefinitionDoc>(raw) {
             if doc.kind == "ma_object_definition" && doc.version == 1 {
+                validate_definition(&doc.definition, cid)?;
                 return Ok(doc.definition);
             }
         }
         if let Ok(def) = serde_yaml::from_str::<ObjectDefinition>(raw) {
+            validate_definition(&def, cid)?;
             return Ok(def);
         }
         if let Ok(def) = serde_json::from_str::<ObjectDefinition>(raw) {
+            validate_definition(&def, cid)?;
             return Ok(def);
         }
         Err(anyhow!(
@@ -2962,6 +3419,15 @@ impl World {
         let mut parts = trimmed.split_whitespace();
         let verb = parts.next().unwrap_or("help").to_ascii_lowercase();
 
+        let verb_requirements = {
+            let objects = self.room_objects.read().await;
+            let room_map = objects.get(room_name)?;
+            let object = room_map.get(&object_id)?;
+            Self::lookup_object_verb_definition(object, &verb)
+                .map(|entry| entry.requirements)
+                .unwrap_or_default()
+        };
+
         let cap_verb = match verb.as_str() {
             "pickup" | "hold" => "take",
             "status" | "look" => "show",
@@ -2998,6 +3464,75 @@ impl World {
             }
         }
 
+        if !verb_requirements.is_empty() {
+            let req_set = match RequirementSet::parse_many(&verb_requirements) {
+                Ok(set) => set,
+                Err(err) => {
+                    return Some((
+                        format!("invalid object requirements: {}", err),
+                        room_name.to_string(),
+                    ));
+                }
+            };
+
+            let report = req_set.validate();
+            if !report.is_ok() {
+                let first_issue = report
+                    .issues
+                    .first()
+                    .map(|issue| issue.message.clone())
+                    .unwrap_or_else(|| "unknown requirements validation error".to_string());
+                return Some((
+                    format!("invalid object requirements: {}", first_issue),
+                    room_name.to_string(),
+                ));
+            }
+
+            let req_context = {
+                let is_world_owner = self.is_world_owner(&caller_root).await;
+                let objects = self.room_objects.read().await;
+                let room_map = objects.get(room_name)?;
+                let object = room_map.get(&object_id)?;
+                ObjectRequirementRuntime {
+                    room_name: room_name.to_string(),
+                    actor_handle: from.to_string(),
+                    caller_root: caller_root.clone(),
+                    is_world_owner,
+                    object_exists: true,
+                    object_holder: object.holder.clone(),
+                    object_opened_by: object.opened_by.clone(),
+                    object_owner: object.owner_did.clone(),
+                }
+            };
+
+            let eval = req_set.evaluate(&req_context);
+            if !eval.passed {
+                let failed = eval
+                    .failed
+                    .iter()
+                    .map(|req| req.render())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Some((
+                    format!("requirements not satisfied: {}", failed),
+                    room_name.to_string(),
+                ));
+            }
+
+            // Keep mailbox lock alive while caller executes verbs that require an open mailbox session.
+            if req_set
+                .all_of
+                .iter()
+                .any(|req| req.name == "object.opened_by_self")
+            {
+                let mut objects = self.room_objects.write().await;
+                let room_map = objects.get_mut(room_name)?;
+                if let Some(device) = room_map.get_mut(&object_id) {
+                    device.lock_expires_at = Some(now_secs + MAILBOX_LOCK_SECS);
+                }
+            }
+        }
+
         let declarative = {
             let objects = self.room_objects.read().await;
             let room_map = objects.get(room_name)?;
@@ -3008,7 +3543,14 @@ impl World {
             return Some((output, room_name.to_string()));
         }
 
-        if verb == "help" || verb == "show" || verb == "status" || verb == "look" {
+        if verb == "help" {
+            return Some((
+                format!("{} commands: {}", object_label, MAILBOX_COMMANDS_INLINE),
+                room_name.to_string(),
+            ));
+        }
+
+        if verb == "show" || verb == "status" || verb == "look" {
             let (device_name, device_kind, object_did, definition_cid, holder, opened_by, durable, persistence, durable_inbox_messages, ephemeral_inbox_messages, outbound_messages) = {
                 let objects = self.room_objects.read().await;
                 let room_map = objects.get(room_name)?;
@@ -3102,32 +3644,6 @@ impl World {
             device.locked_by = None;
             device.lock_expires_at = None;
             return Some((format!("@{} closed.", device.name), room_name.to_string()));
-        }
-
-        let (is_open_for_caller, device_name) = {
-            let mut objects = self.room_objects.write().await;
-            let room_map = objects.get_mut(room_name)?;
-            let device = room_map.get_mut(&object_id)?;
-            device.clear_expired_lock(now_secs);
-            let is_open = device.opened_by.as_deref() == Some(caller_root.as_str());
-            if is_open {
-                device.lock_expires_at = Some(now_secs + MAILBOX_LOCK_SECS);
-            }
-            (is_open, device.name.clone())
-        };
-        if !is_open_for_caller {
-            return Some((
-                format!("@{} is closed. Use '@{} open' first.", device_name, device_name),
-                room_name.to_string(),
-            ));
-        }
-
-        let is_owner = self.is_world_owner(&caller_root).await;
-        if !is_owner {
-            return Some((
-                "Only the world owner may operate this messaging device.".to_string(),
-                room_name.to_string(),
-            ));
         }
 
         if verb == "list" {
@@ -3393,10 +3909,7 @@ impl World {
         }
 
         Some((
-            format!(
-                "{} commands: show | take | drop | open | close | list | pop | pending | ask <target> <text> | retry <request_id> | reply <request_id> <text> | accept <id> | reject <id> [note] | invite <did>",
-                object_label
-            ),
+            format!("{} commands: {}", object_label, MAILBOX_COMMANDS_INLINE),
             room_name.to_string(),
         ))
     }
@@ -3421,7 +3934,7 @@ impl World {
                 if let Some(rest) = trimmed.strip_prefix("use ") {
                     let Some((target_raw, alias_raw)) = rest.split_once(" as ") else {
                         return (
-                            "usage: use <did:ma:...#object> as @alias".to_string(),
+                            "usage: use <object|did:ma:...#object> as @alias".to_string(),
                             room_name.to_string(),
                         );
                     };
@@ -3430,37 +3943,63 @@ impl World {
                     let alias = alias_raw.trim();
                     if !alias.starts_with('@') {
                         return (
-                            "usage: use <did:ma:...#object> as @alias".to_string(),
+                            "usage: use <object|did:ma:...#object> as @alias".to_string(),
                             room_name.to_string(),
                         );
                     }
 
-                    let object_did = match Did::try_from(target_value) {
-                        Ok(did) => did,
-                        Err(err) => {
+                    let (object_id, object_did_id) = if target_value.starts_with("did:ma:") {
+                        let object_did = match Did::try_from(target_value) {
+                            Ok(did) => did,
+                            Err(err) => {
+                                return (
+                                    format!("invalid object DID '{}': {}", target_value, err),
+                                    room_name.to_string(),
+                                );
+                            }
+                        };
+
+                        let root = object_did.without_fragment().id();
+                        if !self.is_local_world_root(&root).await {
                             return (
-                                format!("invalid object DID '{}': {}", target_value, err),
+                                format!("object DID '{}' is not in this world", object_did.id()),
                                 room_name.to_string(),
                             );
                         }
+
+                        let Some(fragment) = object_did.fragment.clone() else {
+                            return (
+                                format!("object DID '{}' is missing #fragment", object_did.id()),
+                                room_name.to_string(),
+                            );
+                        };
+
+                        (fragment, object_did.id())
+                    } else {
+                        let token = target_value.trim().trim_start_matches('@').to_ascii_lowercase();
+                        let maybe_object_id = {
+                            let objects = self.room_objects.read().await;
+                            objects
+                                .get(room_name)
+                                .and_then(|room_map| {
+                                    room_map
+                                        .values()
+                                        .find(|obj| obj.matches_target(token.as_str()))
+                                        .map(|obj| obj.id.clone())
+                                })
+                        };
+                        let Some(object_id) = maybe_object_id else {
+                            return (
+                                format!("object '{}' is not present in room '{}'.", target_value, room_name),
+                                room_name.to_string(),
+                            );
+                        };
+                        let world_root = self
+                            .local_world_did_root()
+                            .await
+                            .unwrap_or_else(|| "did:ma:unconfigured".to_string());
+                        (object_id.clone(), format!("{}#{}", world_root, object_id))
                     };
-
-                    let root = object_did.without_fragment().id();
-                    if !self.is_local_world_root(&root).await {
-                        return (
-                            format!("object DID '{}' is not in this world", object_did.id()),
-                            room_name.to_string(),
-                        );
-                    }
-
-                    let Some(object_id) = object_did.fragment.clone() else {
-                        return (
-                            format!("object DID '{}' is missing #fragment", object_did.id()),
-                            room_name.to_string(),
-                        );
-                    };
-
-                    let object_did_id = object_did.id();
 
                     let object_exists_here = {
                         let objects = self.room_objects.read().await;
@@ -3553,13 +4092,13 @@ impl World {
                     rooms.get(room_name).and_then(|room| {
                         room.exits
                             .iter()
-                            .find(|e| e.matches_for_language_preferences(direction, &[sender_language.to_string()]))
+                            .find(|e| e.matches_for_language_preferences(direction, &["und".to_string()]))
                             .cloned()
                     })
                 };
 
                 if let Some(exit) = move_target {
-                    let exit_name = exit.name_for_language_preferences(&[sender_language.to_string()]);
+                    let exit_name = exit.name_for_language_preferences(&["und".to_string()]);
                     if exit.locked {
                         return (format!("The way {} is locked.", exit_name), room_name.to_string());
                     }
@@ -3569,7 +4108,7 @@ impl World {
                     }
 
                     let destination = exit.to.clone();
-                    let travel_text = exit.travel_text_for_language_preferences(&[sender_language.to_string()]);
+                    let travel_text = exit.travel_text_for_language_preferences(&["und".to_string()]);
 
                     // Exit destinations may be local room fragments or full room DIDs.
                     // If the DID root is not this world, we hand off via /enter.
@@ -4336,9 +4875,9 @@ impl World {
                         }
                     }
                     "title" => {
-                        let language_tag = language
-                            .map(|v| normalize_language_tag(&v))
-                            .unwrap_or_else(|| normalize_language_tag(sender_language));
+                        let _ = language;
+                        let _ = sender_language;
+                        let language_tag = "und".to_string();
                         let title_value = value.clone();
                         let mut rooms = self.rooms.write().await;
                         if let Some(room) = rooms.get_mut(room_name) {
@@ -4351,9 +4890,9 @@ impl World {
                         }
                     }
                     "description" => {
-                        let language_tag = language
-                            .map(|v| normalize_language_tag(&v))
-                            .unwrap_or_else(|| normalize_language_tag(sender_language));
+                        let _ = language;
+                        let _ = sender_language;
+                        let language_tag = "und".to_string();
                         let description_value = value.clone();
                         let mut rooms = self.rooms.write().await;
                         if let Some(room) = rooms.get_mut(room_name) {
@@ -5160,6 +5699,221 @@ impl ProtocolHandler for WorldProtocol {
     }
 }
 
+impl ProtocolHandler for ClosetProtocol {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let requester_endpoint = connection.remote_id().to_string();
+        let (mut send, mut recv) = connection.accept_bi().await?;
+
+        loop {
+            let frame_len = match recv.read_u32().await {
+                Ok(n) => n as usize,
+                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(err) => return Err(AcceptError::from_err(err)),
+            };
+
+            if frame_len > 128 * 1024 {
+                return Err(AcceptError::from_err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("closet frame too large: {}", frame_len),
+                )));
+            }
+
+            let mut bytes = vec![0u8; frame_len];
+            recv.read_exact(&mut bytes).await.map_err(AcceptError::from_err)?;
+
+            let response = match serde_json::from_slice::<ClosetRequest>(&bytes) {
+                Ok(ClosetRequest::Start) => {
+                    match self.world.closet_start_session(&requester_endpoint).await {
+                        Ok((session_id, latest_lobby_sequence)) => ClosetResponse {
+                            ok: true,
+                            message: "closet session ready".to_string(),
+                            session_id: Some(session_id),
+                            prompt: Some("Answer profile questions while waiting; you can hear lobby events from here.".to_string()),
+                            lobby_events: Vec::new(),
+                            latest_lobby_sequence,
+                            did: None,
+                            fragment: None,
+                            key_name: None,
+                        },
+                        Err(err) => ClosetResponse {
+                            ok: false,
+                            message: err.to_string(),
+                            session_id: None,
+                            prompt: None,
+                            lobby_events: Vec::new(),
+                            latest_lobby_sequence: 0,
+                            did: None,
+                            fragment: None,
+                            key_name: None,
+                        },
+                    }
+                }
+                Ok(ClosetRequest::HearLobby {
+                    session_id,
+                    since_sequence,
+                }) => {
+                    match self
+                        .world
+                        .closet_session_owned_by(&session_id, &requester_endpoint)
+                        .await
+                    {
+                        Ok(session) => match self.world.room_events_since(DEFAULT_ROOM, since_sequence).await {
+                            Ok((events, latest_lobby_sequence)) => ClosetResponse {
+                                ok: true,
+                                message: format!(
+                                    "closet session active since {}",
+                                    session.created_at
+                                ),
+                                session_id: Some(session.id),
+                                prompt: None,
+                                lobby_events: events,
+                                latest_lobby_sequence,
+                                did: None,
+                                fragment: None,
+                                key_name: None,
+                            },
+                            Err(err) => ClosetResponse {
+                                ok: false,
+                                message: err.to_string(),
+                                session_id: None,
+                                prompt: None,
+                                lobby_events: Vec::new(),
+                                latest_lobby_sequence: since_sequence,
+                                did: None,
+                                fragment: None,
+                                key_name: None,
+                            },
+                        },
+                        Err(err) => ClosetResponse {
+                            ok: false,
+                            message: err.to_string(),
+                            session_id: None,
+                            prompt: None,
+                            lobby_events: Vec::new(),
+                            latest_lobby_sequence: since_sequence,
+                            did: None,
+                            fragment: None,
+                            key_name: None,
+                        },
+                    }
+                }
+                Ok(ClosetRequest::Answer {
+                    session_id,
+                    field,
+                    value,
+                }) => {
+                    match self
+                        .world
+                        .closet_answer(&session_id, &requester_endpoint, &field, &value)
+                        .await
+                    {
+                        Ok(message) => ClosetResponse {
+                            ok: true,
+                            message,
+                            session_id: Some(session_id),
+                            prompt: None,
+                            lobby_events: Vec::new(),
+                            latest_lobby_sequence: 0,
+                            did: None,
+                            fragment: None,
+                            key_name: None,
+                        },
+                        Err(err) => ClosetResponse {
+                            ok: false,
+                            message: err.to_string(),
+                            session_id: None,
+                            prompt: None,
+                            lobby_events: Vec::new(),
+                            latest_lobby_sequence: 0,
+                            did: None,
+                            fragment: None,
+                            key_name: None,
+                        },
+                    }
+                }
+                Ok(ClosetRequest::SubmitCitizenship {
+                    session_id,
+                    ipns_private_key_base64,
+                }) => {
+                    match self
+                        .world
+                        .closet_submit_citizenship(
+                            &session_id,
+                            &requester_endpoint,
+                            &ipns_private_key_base64,
+                        )
+                        .await
+                    {
+                        Ok((did, fragment, key_name)) => ClosetResponse {
+                            ok: true,
+                            message: "citizenship imported".to_string(),
+                            session_id: Some(session_id),
+                            prompt: Some("Citizenship granted. Rebind your local identity to the returned DID and enter the world.".to_string()),
+                            lobby_events: Vec::new(),
+                            latest_lobby_sequence: 0,
+                            did: Some(did),
+                            fragment: Some(fragment),
+                            key_name: Some(key_name),
+                        },
+                        Err(err) => ClosetResponse {
+                            ok: false,
+                            message: err.to_string(),
+                            session_id: None,
+                            prompt: None,
+                            lobby_events: Vec::new(),
+                            latest_lobby_sequence: 0,
+                            did: None,
+                            fragment: None,
+                            key_name: None,
+                        },
+                    }
+                }
+                Ok(ClosetRequest::Command { session_id, input }) => {
+                    match self
+                        .world
+                        .closet_command(&session_id, &requester_endpoint, &input)
+                        .await
+                    {
+                        Ok(response) => response,
+                        Err(err) => ClosetResponse {
+                            ok: false,
+                            message: err.to_string(),
+                            session_id: None,
+                            prompt: None,
+                            lobby_events: Vec::new(),
+                            latest_lobby_sequence: 0,
+                            did: None,
+                            fragment: None,
+                            key_name: None,
+                        },
+                    }
+                }
+                Err(err) => ClosetResponse {
+                    ok: false,
+                    message: format!("invalid closet request JSON: {}", err),
+                    session_id: None,
+                    prompt: None,
+                    lobby_events: Vec::new(),
+                    latest_lobby_sequence: 0,
+                    did: None,
+                    fragment: None,
+                    key_name: None,
+                },
+            };
+
+            let payload = serde_json::to_vec(&response).map_err(AcceptError::from_err)?;
+            send.write_u32(payload.len() as u32)
+                .await
+                .map_err(AcceptError::from_err)?;
+            send.write_all(&payload).await.map_err(AcceptError::from_err)?;
+            send.flush().await.map_err(AcceptError::from_err)?;
+        }
+
+        let _ = send.finish();
+        Ok(())
+    }
+}
+
 
 fn derive_world_master_key(secret_key: &SecretKey, world_slug: &str) -> [u8; 32] {
     // Deterministic per-world key derived from machine-local iroh identity.
@@ -5449,6 +6203,7 @@ async fn ensure_world_did_document(
         format!("/ma-iroh/{endpoint_id}/{}", String::from_utf8_lossy(WORLD_ALPN)),
         format!("/ma-iroh/{endpoint_id}/{}", String::from_utf8_lossy(CMD_ALPN)),
         format!("/ma-iroh/{endpoint_id}/{}", String::from_utf8_lossy(CHAT_ALPN)),
+        format!("/ma-iroh/{endpoint_id}/{}", String::from_utf8_lossy(CLOSET_ALPN)),
         format!("/ma-iroh/{endpoint_id}/{}", String::from_utf8_lossy(PRESENCE_ALPN)),
         format!("/ma-iroh/{endpoint_id}/{}", String::from_utf8_lossy(BROADCAST_ALPN)),
     ];
@@ -6549,6 +7304,12 @@ async fn main() -> Result<()> {
                     lane: WorldLane::Chat,
                 },
             )
+            .accept(
+                CLOSET_ALPN,
+                ClosetProtocol {
+                    world: world.clone(),
+                },
+            )
             .spawn();
         let online_started = Instant::now();
         let online_status = match tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await {
@@ -6624,6 +7385,7 @@ async fn main() -> Result<()> {
         info!("World protocol ALPN: {}", String::from_utf8_lossy(WORLD_ALPN));
         info!("Command protocol ALPN: {}", String::from_utf8_lossy(CMD_ALPN));
         info!("Chat protocol ALPN: {}", String::from_utf8_lossy(CHAT_ALPN));
+        info!("Closet protocol ALPN: {}", String::from_utf8_lossy(CLOSET_ALPN));
         info!("Broadcast protocol ALPN (outbound push to agents): {}", String::from_utf8_lossy(BROADCAST_ALPN));
         info!("World entry ACL: {}", world_info.entry_acl);
         info!("Optional DID field ma:presenceHint = {}", world_info.location_hint);

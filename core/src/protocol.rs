@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub const WORLD_ALPN: &[u8] = b"ma/world/1";
 pub const CMD_ALPN: &[u8] = b"ma/cmd/1";
 pub const CHAT_ALPN: &[u8] = b"ma/chat/1";
+pub const CLOSET_ALPN: &[u8] = b"ma/closet/1";
 pub const BROADCAST_ALPN: &[u8] = b"ma/broadcast/1";
 pub const PRESENCE_ALPN: &[u8] = b"ma/presence/1";
 pub const INBOX_ALPN: &[u8] = b"ma/inbox/1";
@@ -185,4 +186,48 @@ pub enum WorldRequest {
     Signed { message_cbor: Vec<u8> },
     Chat { room: String, message_cbor: Vec<u8> },
     Whisper { message_cbor: Vec<u8> },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ClosetRequest {
+    Start,
+    Command {
+        session_id: String,
+        input: String,
+    },
+    HearLobby {
+        session_id: String,
+        since_sequence: u64,
+    },
+    Answer {
+        session_id: String,
+        field: String,
+        value: String,
+    },
+    SubmitCitizenship {
+        session_id: String,
+        ipns_private_key_base64: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClosetResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub lobby_events: Vec<RoomEvent>,
+    #[serde(default)]
+    pub latest_lobby_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub did: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fragment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_name: Option<String>,
 }

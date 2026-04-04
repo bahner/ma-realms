@@ -5,6 +5,7 @@ pub mod interfaces;
 pub mod object_runtime;
 pub mod parser;
 pub mod protocol;
+pub mod requirements;
 pub mod room_actor;
 
 pub use addressing::{
@@ -22,6 +23,7 @@ pub use capability_acl::{
 pub use domain::{ActorType, AvatarActor, ExitData, ObjectData, RoomActor, WorldActor};
 pub use interfaces::{AclRuntime, DidPublisher, IpfsPublisher};
 pub use object_runtime::{
+    MAILBOX_COMMANDS_INLINE,
     ObjectCommandOutput, ObjectCommandResult, ObjectDefinition, ObjectInboxMessage,
     ObjectMessageIntent, ObjectMessageKind, ObjectMessageRetention, ObjectMessageTarget, ObjectPersistencePolicy,
     ObjectProgramRef, ObjectReceiverListener, ObjectRuntimeState, PendingEphemeralRequest,
@@ -31,13 +33,20 @@ pub use parser::{
     ActorCommand, MessageEnvelope, normalize_spoken_text, parse_actor_command, parse_message,
 };
 pub use protocol::{
+    ClosetRequest, ClosetResponse,
     LaneCapability, PresenceAvatar, RoomEvent, TransportAck, TransportAckCode, WorldCommand,
     WorldLane, WorldRequest, WorldResponse,
-    BROADCAST_ALPN, CHAT_ALPN, CMD_ALPN, DEFAULT_WORLD_RELAY_URL, INBOX_ALPN, PRESENCE_ALPN,
+    BROADCAST_ALPN, CHAT_ALPN, CLOSET_ALPN, CMD_ALPN, DEFAULT_WORLD_RELAY_URL, INBOX_ALPN, PRESENCE_ALPN,
     WHISPER_ALPN, WORLD_ALPN,
     DEFAULT_CONTENT_TYPE, CONTENT_TYPE_CHAT, CONTENT_TYPE_PRESENCE,
     CONTENT_TYPE_CMD, CONTENT_TYPE_WORLD, CONTENT_TYPE_BROADCAST,
     CONTENT_TYPE_DOC, CONTENT_TYPE_WHISPER,
+};
+pub use requirements::{
+    RequirementArgArity, RequirementChecker, RequirementEvaluation,
+    RequirementSet, RequirementSignature, RequirementSpec,
+    RequirementValidationIssue, RequirementValidationIssueKind, RequirementValidationReport,
+    REQUIREMENT_SIGNATURES, evaluate_requirements, requirement_catalog, validate_requirements,
 };
 pub use room_actor::{
     execute_room_actor_command, RoomActorAction, RoomActorContext, RoomActorResult,

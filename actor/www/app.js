@@ -1,10 +1,9 @@
 import init, {
-  create_identity_with_ipns,
+  create_identity,
   unlock_identity,
   ensure_bundle_iroh_secret,
   set_bundle_language_preferences,
   set_bundle_world,
-  set_bundle_transports,
   generate_bip39_phrase,
   normalize_bip39_phrase,
   connect_world,
@@ -27,6 +26,8 @@ import init, {
   alias_find_did_by_endpoint,
   alias_humanize_identifier,
   alias_humanize_text,
+  closet_start,
+  closet_command,
   disconnect_world
 } from './pkg/ma_actor.js';
 import { createInboundDispatcher } from './inbox-dispatcher.js';
@@ -248,6 +249,9 @@ const state = {
   activeObjectTargetAlias: '',
   activeObjectTargetDid: '',
   activeObjectTargetRequirement: 'none',
+  closetSessionId: '',
+  closetEndpointId: '',
+  closetLobbySeq: 0,
   transparentReentryPromise: null,
   editSession: null,
   editBusy: false,
@@ -2428,7 +2432,7 @@ function setKuboInstallNoteVisible(visible, mode = 'install') {
 
   if (mode === 'origin-blocked') {
     note.innerHTML =
-      `<p>Kubo appears to run locally, but this page origin cannot call <code>http://127.0.0.1:5001</code>.</p>` +
+      `<p>Kubo appears to run locally, but this page origin cannot call the configured local Kubo API (typically <code>http://localhost:8080</code>).</p>` +
       `<p>Use IPFS Desktop (Settings -> IPFS Config) or Kubo CLI (<code>ipfs config</code>) to merge the generated JSON file into your config:</p>` +
       `<p>Recommended: install <code>ma-extension</code> and reload this page to proxy local Kubo API calls safely.</p>` +
       `<p><code>${origin}</code><button type="button" class="copy-origin" id="copy-kubo-origin">Copy</button></p>` +
@@ -3049,7 +3053,7 @@ function exportBundle() {
 }
 
 function getApiBase() {
-  return (byId('kubo-api').value.trim() || 'http://127.0.0.1:5001').replace(/\/$/, '');
+  return (byId('kubo-api').value.trim() || 'http://localhost:8080').replace(/\/$/, '');
 }
 
 function nextBridgeRequestId() {
@@ -3409,8 +3413,7 @@ async function onCreateIdentity() {
     localStorage.setItem(API_KEY, getApiBase());
     setActiveAlias(aliasName);
 
-    const ipns = await ensureKuboAliasKey(aliasName);
-    const created = JSON.parse(create_identity_with_ipns(passphrase, ipns));
+    const created = JSON.parse(create_identity(passphrase));
     const localized = JSON.parse(set_bundle_language_preferences(passphrase, created.encrypted_bundle, lang, language));
     const result = JSON.parse(ensure_bundle_iroh_secret(passphrase, localized.encrypted_bundle));
 
@@ -3434,11 +3437,6 @@ async function onCreateIdentity() {
     restoreActiveHomeAfterUnlock().catch((err) => {
       appendMessage('system', `Restore failed: ${err instanceof Error ? err.message : String(err)}`);
     });
-
-    appendMessage('system', 'Publishing DID document on startup...');
-    publishDidDocument().catch((err) => {
-      appendMessage('system', `Startup publish failed: ${err instanceof Error ? err.message : String(err)}`);
-    });
   } catch (error) {
     setSetupStatus(error instanceof Error ? error.message : String(error));
   }
@@ -3453,12 +3451,7 @@ async function onUnlockIdentity() {
     localStorage.setItem(API_KEY, getApiBase());
     setActiveAlias(aliasName);
 
-    const ipns = await ensureKuboAliasKey(aliasName);
     const unlocked = JSON.parse(unlock_identity(passphrase, bundle));
-
-    if (unlocked.ipns !== ipns) {
-      appendMessage('system', `Warning: bundle ipns (${unlocked.ipns}) does not match alias key ipns (${ipns}).`);
-    }
 
     const localized = JSON.parse(set_bundle_language_preferences(passphrase, bundle, lang, language));
     const updated = JSON.parse(ensure_bundle_iroh_secret(passphrase, localized.encrypted_bundle));
@@ -3482,11 +3475,6 @@ async function onUnlockIdentity() {
     showChat();
     restoreActiveHomeAfterUnlock().catch((err) => {
       appendMessage('system', `Restore failed: ${err instanceof Error ? err.message : String(err)}`);
-    });
-
-    appendMessage('system', 'Publishing DID document on startup...');
-    publishDidDocument().catch((err) => {
-      appendMessage('system', `Startup publish failed: ${err instanceof Error ? err.message : String(err)}`);
     });
   } catch (error) {
     setSetupStatus(error instanceof Error ? error.message : String(error));
@@ -3553,48 +3541,6 @@ function lockSession() {
   setSetupStatus('Session locked. Bundle remains stored unless removed manually.');
   showSetup();
   showLockOverlay();
-}
-
-async function publishDidDocument() {
-  // Embed the agent's live iroh inbox endpoint into ma:transports.
-  const inboxId = state.inboxEndpointId || await start_inbox_listener(state.passphrase, state.encryptedBundle);
-  if (inboxId) {
-    if (!state.inboxEndpointId) state.inboxEndpointId = inboxId;
-    const withTransports = JSON.parse(
-      set_bundle_transports(state.passphrase, state.encryptedBundle, inboxId)
-    );
-    state.identity = withTransports;
-    state.encryptedBundle = withTransports.encrypted_bundle;
-    byId('bundle-text').value = withTransports.encrypted_bundle;
-  }
-
-  const blob = new Blob([state.identity.document_json], { type: 'application/json' });
-  const formData = new FormData();
-  formData.append('file', blob, 'did-document.json');
-
-  appendMessage('system', 'Step 1/2: Adding DID document to IPFS...');
-  const addResult = await kuboPost('/api/v0/add', { pin: 'true' }, formData);
-  const cid = addResult.Hash;
-  appendMessage('system', `DID document pinned as ${cid}`);
-
-  appendMessage('system', `Step 2/2: Publishing ${cid} to IPNS key "${state.aliasName}"...`);
-  const pubResult = await kuboPost('/api/v0/name/publish', {
-    arg: `/ipfs/${cid}`,
-    key: state.aliasName,
-    lifetime: '24h'
-  });
-
-  const ipnsName = pubResult.Name;
-  const ipfsValue = pubResult.Value;
-  appendMessage('system', `Published: /ipns/${ipnsName} -> ${ipfsValue}`);
-  const resolved = await kuboPost('/api/v0/name/resolve', {
-    arg: `/ipns/${ipnsName}`,
-    recursive: 'true'
-  });
-  const resolvedPath = String(resolved?.Path || '').trim() || '(no path)';
-  setCurrentPublishInfo({ ipns: ipnsName, cid });
-  appendMessage('system', `Resolved now: /ipns/${ipnsName} -> ${resolvedPath}`);
-  appendMessage('system', `DID document at: https://ipfs.io/ipns/${ipnsName}`);
 }
 
 function normalizeIrohAddress(address) {
@@ -4291,22 +4237,41 @@ async function enterHome(target, preferredRoom = null) {
   const requestedRoom = effectivePreferredRoom;
   const savedRoom = requestedRoom || loadLastRoom(endpointId);
   let result;
-  if (savedRoom && savedRoom !== 'lobby') {
-    try {
-      result = JSON.parse(await enterWorldWithRetry(endpointId, state.aliasName, savedRoom));
-      if (!result.ok) {
-        logger.log('enter.home', `last room '${savedRoom}' denied (${result.message}), falling back to lobby`);
+  try {
+    if (savedRoom && savedRoom !== 'lobby') {
+      try {
+        result = JSON.parse(await enterWorldWithRetry(endpointId, state.aliasName, savedRoom));
+        if (!result.ok) {
+          logger.log('enter.home', `last room '${savedRoom}' denied (${result.message}), falling back to lobby`);
+          result = JSON.parse(await enterWorldWithRetry(endpointId, state.aliasName, 'lobby'));
+        }
+      } catch (_) {
         result = JSON.parse(await enterWorldWithRetry(endpointId, state.aliasName, 'lobby'));
       }
-    } catch (_) {
+    } else {
       result = JSON.parse(await enterWorldWithRetry(endpointId, state.aliasName, 'lobby'));
     }
-  } else {
-    result = JSON.parse(await enterWorldWithRetry(endpointId, state.aliasName, 'lobby'));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (isClosetBootstrapFailureMessage(message)) {
+      const closet = await closetStartSessionForEndpoint(endpointId);
+      appendMessage('system', 'Could not verify avatar identity for world enter yet. Starting closet onboarding.');
+      appendMessage('system', `Closet session: ${closet.session_id || state.closetSessionId}`);
+      renderClosetResponse(closet);
+      return;
+    }
+    throw error;
   }
   logger.log('enter.home', `result ok=${result.ok} room=${result.room} endpoint=${result.endpoint_id?.slice(0, 8)}... latest_seq=${result.latest_event_sequence || 0}`);
 
   if (!result.ok) {
+    if (isClosetRequiredMessage(result.message) || isClosetBootstrapFailureMessage(result.message)) {
+      const closet = await closetStartSessionForEndpoint(endpointId);
+      appendMessage('system', result.message || 'Entry denied. Closet onboarding is required first.');
+      appendMessage('system', `Closet session: ${closet.session_id || state.closetSessionId}`);
+      renderClosetResponse(closet);
+      return;
+    }
     throw new Error(result.message || 'enter failed');
   }
 
@@ -4325,6 +4290,9 @@ async function enterHome(target, preferredRoom = null) {
     lastEventSequence: toSequenceNumber(result.latest_event_sequence || 0),
     handle: result.handle || state.aliasName
   };
+  state.closetSessionId = '';
+  state.closetEndpointId = '';
+  state.closetLobbySeq = 0;
   primeDidLookupCacheFromRoomObjectDids(result.room_object_dids);
   saveLastRoom(endpointId, activeRoom);
   saveActiveHomeSnapshot();
@@ -4360,6 +4328,24 @@ async function enterHome(target, preferredRoom = null) {
 function isNotRegisteredInRoomMessage(message) {
   const text = String(message || '').toLowerCase();
   return text.includes('not registered in room');
+}
+
+function isClosetRequiredMessage(message) {
+  const text = String(message || '').toLowerCase();
+  return text.includes('closet') || text.includes('not registered in room');
+}
+
+function isClosetBootstrapFailureMessage(message) {
+  const text = String(message || '').toLowerCase();
+  return (
+    text.includes('document signature is invalid')
+    || text.includes('failed to decode did document')
+    || text.includes('did document')
+    || text.includes('verify') && text.includes('message')
+    || text.includes('verify') && text.includes('signature')
+    || text.includes('sender document')
+    || text.includes('unknown did')
+  );
 }
 
 function isActiveTargetGoneMessage(message) {
@@ -4461,6 +4447,12 @@ async function sendCurrentWorldMessage(text) {
     }
 
     if (!state.currentHome) {
+      if (state.closetSessionId && state.closetEndpointId) {
+        const response = await closetCommandForCurrentWorld(trimmedText);
+        renderClosetResponse(response);
+        return;
+      }
+
       const bootstrapMatch = trimmedText.match(/^go\s+(.+)$/i);
       if (bootstrapMatch) {
         const target = String(bootstrapMatch[1] || '').trim();
@@ -4475,6 +4467,31 @@ async function sendCurrentWorldMessage(text) {
       }
 
       appendMessage('system', 'Not connected. Use go did:ma:<world>#<room> or go home (after .set home).');
+      return;
+    }
+
+    if (state.closetSessionId && state.closetEndpointId
+      && state.currentHome.endpointId === state.closetEndpointId) {
+      const response = await closetCommandForCurrentWorld(trimmedText);
+      renderClosetResponse(response);
+      return;
+    }
+
+    if (/^use\s+/i.test(trimmedText) || /^unuse\s+/i.test(trimmedText)) {
+      parseDot(`.${trimmedText}`);
+      return;
+    }
+
+    const pickUpMatch = trimmedText.match(/^(?:pick\s+up|pickup)\s+(.+)$/i);
+    if (pickUpMatch) {
+      const targetToken = String(pickUpMatch[1] || '').trim();
+      if (!targetToken) {
+        appendMessage('system', 'Usage: pick up <object>');
+        return;
+      }
+      const targetDid = await resolveCommandTargetDidOrToken(targetToken);
+      const result = await sendWorldCommandQuery(`@${targetDid} take`);
+      appendMessage('system', result || `Picked up ${targetToken}.`);
       return;
     }
 
@@ -4687,6 +4704,79 @@ async function sendWhisperToDid(targetDidOrAlias, text) {
   }
 }
 
+function parseClosetResponse(rawJson) {
+  const parsed = JSON.parse(String(rawJson || '{}'));
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('Invalid closet response.');
+  }
+  return parsed;
+}
+
+function renderClosetResponse(response) {
+  const message = String(response?.message || '').trim();
+  if (message) {
+    appendMessage('system', message);
+  }
+  const prompt = String(response?.prompt || '').trim();
+  if (prompt) {
+    appendMessage('system', prompt);
+  }
+  const events = Array.isArray(response?.lobby_events) ? response.lobby_events : [];
+  for (const event of events) {
+    const body = String(event?.message || '').trim();
+    const sender = String(event?.sender || 'lobby');
+    if (body) {
+      appendMessage('system', `[lobby/${sender}] ${body}`);
+    }
+  }
+  if (response?.did) {
+    appendMessage('system', `Assigned DID: ${response.did}`);
+  }
+  if (response?.fragment) {
+    appendMessage('system', `Assigned fragment: ${response.fragment}`);
+  }
+}
+
+async function closetStartSessionForEndpoint(endpointId) {
+  const normalizedEndpoint = String(endpointId || '').trim();
+  if (!normalizedEndpoint) {
+    throw new Error('Missing world endpoint for closet session.');
+  }
+  const response = parseClosetResponse(await closet_start(normalizedEndpoint));
+  if (!response.ok) {
+    throw new Error(response.message || 'Closet session failed to start.');
+  }
+  state.closetSessionId = String(response.session_id || '').trim();
+  state.closetEndpointId = normalizedEndpoint;
+  state.closetLobbySeq = Number(response.latest_lobby_sequence || 0);
+  return response;
+}
+
+async function closetCommandForCurrentWorld(input) {
+  if (!state.closetSessionId) {
+    throw new Error('No active closet session.');
+  }
+  const endpointId = String(
+    (state.currentHome && state.currentHome.endpointId) || state.closetEndpointId || ''
+  ).trim();
+  if (!endpointId) {
+    throw new Error('No world endpoint available for closet command.');
+  }
+  const response = parseClosetResponse(
+    await closet_command(endpointId, state.closetSessionId, String(input || ''))
+  );
+  if (!response.ok) {
+    throw new Error(response.message || 'Closet command failed.');
+  }
+  state.closetLobbySeq = Number(response.latest_lobby_sequence || state.closetLobbySeq || 0);
+  if (response.did) {
+    state.closetSessionId = '';
+    state.closetEndpointId = '';
+    state.closetLobbySeq = 0;
+  }
+  return response;
+}
+
 function parseDot(input) {
   const trimmed = String(input || '').trim();
   if (!trimmed.startsWith('.')) {
@@ -4713,7 +4803,7 @@ function parseDot(input) {
     appendSystemUi('  .unalias <name>            - remove a saved alias', '  .unalias <name>            - fjern et lagret alias');
     appendSystemUi('  .aliases                   - list saved aliases', '  .aliases                   - list lagrede alias');
     appendSystemUi('  .inspect @here|@me|@exit <name>|<object>- inspect room/me/exit/object and discover DID/CIDs', '  .inspect @here|@me|@exit <navn>|<objekt>- inspiser rom/meg/utgang/objekt og finn DID/CID');
-    appendSystemUi('  .use <object|did> [as alias] [when held] - set local default target', '  .use <objekt|did> [as alias] [when held] - sett lokal standardtarget');
+    appendSystemUi('  .use <object|did> [as alias] - set local default target', '  .use <objekt|did> [as alias] - sett lokal standardtarget');
     appendSystemUi('  .unuse @alias              - clear local default target', '  .unuse @alias              - fjern lokal standardtarget');
     appendSystemUi('  .edit [@here|@me|@exit <name>|did:ma:<world>#<room>] - open editor', '  .edit [@here|@me|@exit <navn>|did:ma:<world>#<room>] - åpne editor');
     appendSystemUi('  .eval <cid|alias>          - run script from IPFS CID or alias', '  .eval <cid|alias>          - kjør script fra IPFS CID eller alias');
@@ -4723,13 +4813,13 @@ function parseDot(input) {
     appendSystemUi('  .smoke [alias]             - run connectivity smoke test', '  .smoke [alias]             - kjør enkel tilkoblingstest');
     appendMessage('system', '  .lang <tag>                - set primary language (e.g. nb)');
     appendMessage('system', '  .language <a:b:c>          - set preference chain (e.g. nb_NO:nn_NO:en_UK)');
-    appendSystemUi('  .publish                   - publish DID document to IPNS', '  .publish                   - publiser DID-dokument til IPNS');
     appendSystemUi('  .block <did|alias|handle>  - block sender DID root', '  .block <did|alias|handle>  - blokker avsenders DID-root');
     appendSystemUi('  .unblock <did|alias|handle>- remove sender from block list', '  .unblock <did|alias|handle>- fjern avsender fra blokkeringslisten');
     appendSystemUi('  .blocks                    - list blocked sender DID roots', '  .blocks                    - list blokkerte avsender-DID-rooter');
     appendSystemUi('  .debug [on|off]            - toggle debug logs', '  .debug [on|off]            - slå debuglogger av/på');
     appendSystemUi('Gameplay (bare, no prefix):', 'Gameplay (bart, uten prefiks):');
     appendSystemUi('  go did:ma:<world>#<room>   - connect when currently disconnected', '  go did:ma:<world>#<room>   - koble til når du er frakoblet');
+    appendMessage('system', '  pick up <object>           - pick up object before open/list/accept actions');
     appendSystemUi('  go north                   - navigate (server resolves exit)', '  go north                   - naviger (server løser utgang)');
     appendSystemUi('  look                       - describe current room', '  look                       - beskriv nåværende rom');
     appendSystemUi('  attack goblin              - gameplay verb sent to world', '  attack goblin              - gameplay-verb sendt til world');
@@ -4762,7 +4852,6 @@ function parseDot(input) {
       `Current world:   ${state.currentHome ? `${humanizeIdentifier(state.currentHome.endpointId)} (${state.currentHome.room})` : '(none)'}`,
       `Nåværende world: ${state.currentHome ? `${humanizeIdentifier(state.currentHome.endpointId)} (${state.currentHome.room})` : '(ingen)'}`
     ));
-    appendSystemUi('(run .publish to update the IPNS record)', '(kjør .publish for å oppdatere IPNS-posten)');
     return true;
   }
 
@@ -4895,22 +4984,6 @@ function parseDot(input) {
     return true;
   }
 
-  if (verb === 'publish') {
-    if (!state.identity) {
-      appendMessage('system', 'No identity loaded. Create or unlock an identity first.');
-      return true;
-    }
-    if (!state.identity.document_json) {
-      appendMessage('system', 'DID document not available. Try unlocking the bundle again.');
-      return true;
-    }
-    appendMessage('system', 'Publishing DID document to IPNS via Kubo...');
-    publishDidDocument().catch((err) => {
-      appendMessage('system', `Publish failed: ${err instanceof Error ? err.message : String(err)}`);
-    });
-    return true;
-  }
-
   if (verb === 'debug') {
     if (args.length === 0) {
       setDebugMode(!state.debug);
@@ -5000,20 +5073,11 @@ function parseDot(input) {
   }
 
   if (verb === 'use') {
-    let requirement = 'none';
-    let useTail = String(tail || '').trim();
-    if (/\bwhen\s+held\b/i.test(useTail) || /\brequire-held\b/i.test(useTail)) {
-      requirement = 'held';
-      useTail = useTail
-        .replace(/\bwhen\s+held\b/ig, ' ')
-        .replace(/\brequire-held\b/ig, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-    }
-
+    const requirement = 'none';
+    const useTail = String(tail || '').trim();
     const didMatch = useTail.match(/^(\S+)(?:\s+as\s+(@?[A-Za-z0-9_-]+))?$/i);
     if (!didMatch) {
-      appendMessage('system', uiText('Usage: .use <object|did:ma:...#fragment> [as alias] [when held]', 'Bruk: .use <objekt|did:ma:...#fragment> [as alias] [when held]'));
+      appendMessage('system', uiText('Usage: .use <object|did:ma:...#fragment> [as alias]', 'Bruk: .use <objekt|did:ma:...#fragment> [as alias]'));
       return true;
     }
 
@@ -5031,18 +5095,14 @@ function parseDot(input) {
         const autoAlias = fragment ? `@${fragment.replace(/[^A-Za-z0-9_-]/g, '').toLowerCase()}` : '@obj';
         const alias = requestedAlias || autoAlias;
         if (!/^@[A-Za-z0-9_-]+$/.test(alias)) {
-          appendMessage('system', uiText('Usage: .use <object|did:ma:...#fragment> [as alias] [when held]', 'Bruk: .use <objekt|did:ma:...#fragment> [as alias] [when held]'));
+          appendMessage('system', uiText('Usage: .use <object|did:ma:...#fragment> [as alias]', 'Bruk: .use <objekt|did:ma:...#fragment> [as alias]'));
           return;
         }
         await sendWorldCommandQuery(`@${objectDid} id`);
-        if (requirement === 'held') {
-          await ensureHeldRequirementSatisfied(alias, objectDid);
-        }
         cacheRoomDidLookup(rawTarget, objectDid);
         cacheRoomDidLookup(alias, objectDid);
         setActiveObjectTarget(alias, objectDid, requirement);
-        const requirementLabel = requirement === 'held' ? ' [requires held]' : '';
-        appendMessage('system', `using ${alias} -> ${objectDid}${requirementLabel}`);
+        appendMessage('system', `using ${alias} -> ${objectDid}`);
         refillCommandInputWithActiveTarget();
       })
       .catch((error) => {
@@ -5332,9 +5392,8 @@ async function main() {
   if (shouldAutoCheckKubo()) {
     checkKubo().catch(() => {});
   } else {
-    setSetupActionsEnabled(false);
     setKuboStatus('not checked (remote origin)', 'idle');
-    setSetupStatus('This app requires local Kubo API access. Open local runtime URL on :8081 to continue.');
+    setSetupStatus('Local Kubo API is optional for create/unlock, but required for IPNS publish and edit publish flows.');
   }
 
   byId('btn-kubo-check').addEventListener('click', () => {

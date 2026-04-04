@@ -669,6 +669,7 @@ fn render_locked_html(world: &WorldInfo, runtime: &RuntimeStatus) -> String {
                     <div class=\"row\">
                         <button class=\"primary\" type=\"submit\">Unlock world</button>
                         <button type=\"button\" id=\"copy-bundle\">Copy bundle</button>
+                        <button type=\"button\" id=\"reset-local-cache\">Reset local cache</button>
                     </div>
                     <p class=\"note\">Unlock reloads this page and opens full world status and controls.</p>
                 </form>
@@ -686,6 +687,7 @@ fn render_locked_html(world: &WorldInfo, runtime: &RuntimeStatus) -> String {
         const bundlePassphrase = document.getElementById('bundle-passphrase');
         const unlockPassphrase = document.getElementById('unlock-passphrase');
         const copyBundle = document.getElementById('copy-bundle');
+        const resetLocalCache = document.getElementById('reset-local-cache');
 
         function showResult(ok, text) {{
             resultEl.hidden = false;
@@ -696,7 +698,7 @@ fn render_locked_html(world: &WorldInfo, runtime: &RuntimeStatus) -> String {
 
         const savedSlug = localStorage.getItem('ma.status.slug');
         const savedBundle = localStorage.getItem('ma.status.bundle');
-        if (savedSlug && slugInput) {{ slugInput.value = savedSlug; slugMetric.textContent = savedSlug; }}
+        if (savedSlug && slugInput) {{ slugInput.value = savedSlug; }}
         if (savedBundle && bundleInput) bundleInput.value = savedBundle;
 
         if (slugInput) {{
@@ -722,6 +724,19 @@ fn render_locked_html(world: &WorldInfo, runtime: &RuntimeStatus) -> String {
                 }} catch (error) {{
                     showResult(false, 'copy failed: ' + (error && error.message ? error.message : String(error)));
                 }}
+            }});
+        }}
+
+        if (resetLocalCache) {{
+            resetLocalCache.addEventListener('click', () => {{
+                localStorage.removeItem('ma.status.slug');
+                localStorage.removeItem('ma.status.bundle');
+                if (slugInput) slugInput.value = '{world_root_pin_name}';
+                if (bundleInput) bundleInput.value = '';
+                if (bundlePassphrase) bundlePassphrase.value = '';
+                if (unlockPassphrase) unlockPassphrase.value = '';
+                if (slugMetric) slugMetric.textContent = '{world_root_pin_name}';
+                showResult(true, 'local cache reset (slug + bundle)');
             }});
         }}
 

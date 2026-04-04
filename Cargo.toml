@@ -2,6 +2,7 @@
 members = [
   "core",
   "actor",
+  "bot",
   "world",
 ]
 resolver = "2"

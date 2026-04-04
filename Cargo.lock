@@ -2094,6 +2094,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ma-bot"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "iroh",
+ "ma-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "ma-core"
 version = "0.1.0"
 dependencies = [

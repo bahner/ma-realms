@@ -23,13 +23,13 @@
 
     <section id="setup-view" class="card">
       <h2>Create or provide identity</h2>
-      <p class="lead">Start with a username alias and passphrase. The alias is used as your Kubo key name.</p>
+      <p class="lead">Start with a username alias and passphrase. The alias is local to this app profile.</p>
       <p class="lead">Saved bundles are isolated per alias, and each browser tab remembers its active alias separately.</p>
 
       <div class="grid-2">
         <div>
           <label for="kubo-api">Kubo API</label>
-          <input id="kubo-api" type="text" value="http://127.0.0.1:5001" autocomplete="off">
+          <input id="kubo-api" type="text" value="http://localhost:8080" autocomplete="off">
         </div>
         <div>
           <label for="alias-name">Username Alias</label>

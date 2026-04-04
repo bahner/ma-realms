@@ -80,6 +80,8 @@ pub struct ObjectVerbDefinition {
     pub lang: Option<String>,
     #[serde(default)]
     pub aliases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requirements: Vec<String>,
     pub evaluator: ObjectVerbEvaluator,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
@@ -207,7 +209,7 @@ pub struct ObjectRuntimeState {
     pub aliases: Vec<String>,
     #[serde(default)]
     pub receivers: Vec<ObjectReceiverListener>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "owner")]
     pub owner_did: Option<String>,
     #[serde(default)]
     pub durable: bool,
@@ -247,6 +249,31 @@ fn default_object_persistence_policy() -> ObjectPersistencePolicy {
     ObjectPersistencePolicy::DurableDebounced
 }
 
+pub const MAILBOX_COMMANDS_INLINE: &str = "help | show | take | drop | open | close | list | pop | pending | ask <target> <text> | retry <request_id> | reply <request_id> <text> | accept <id> | reject <id> [note] | invite <did>";
+
+const MAILBOX_HELP_NB: &str = "mailbox kommandoer:\n- show/status/look\n- take, drop\n- open, close\n- list, pop, pending\n- ask <target> <text>\n- retry <request_id>\n- reply <request_id> <text>\n- accept <id>, reject <id> [note]\n- invite <did> [note]";
+
+const MAILBOX_HELP_EN: &str = "mailbox commands:\n- show/status/look\n- take, drop\n- open, close\n- list, pop, pending\n- ask <target> <text>\n- retry <request_id>\n- reply <request_id> <text>\n- accept <id>, reject <id> [note]\n- invite <did> [note]";
+
+fn mailbox_admin_requirements() -> Vec<String> {
+    vec!["object.opened_by_self".to_string(), "world.owned".to_string()]
+}
+
+fn mailbox_admin_verb(name: &str) -> ObjectVerbDefinition {
+    ObjectVerbDefinition {
+        name: name.to_string(),
+        lang: None,
+        aliases: vec![],
+        requirements: mailbox_admin_requirements(),
+        evaluator: ObjectVerbEvaluator {
+            evaluator_type: "built-in".to_string(),
+            name: name.to_string(),
+            version: 1,
+        },
+        content: None,
+    }
+}
+
 impl ObjectRuntimeState {
     pub fn intrinsic_mailbox(room: &str) -> Self {
         Self {
@@ -265,24 +292,35 @@ impl ObjectRuntimeState {
                         name: "hjelp".to_string(),
                         lang: Some("nb".to_string()),
                         aliases: vec!["hjelp".to_string(), "help".to_string()],
+                        requirements: Vec::new(),
                         evaluator: ObjectVerbEvaluator {
                             evaluator_type: "built-in".to_string(),
                             name: "print".to_string(),
                             version: 1,
                         },
-                        content: Some("mailbox kommandoer:\n- show/status/look\n- take, drop\n- open, close\n- list, pop, pending\n- ask <target> <text>\n- retry <request_id>\n- reply <request_id> <text>\n- accept <id>, reject <id> [note]\n- invite <did> [note]".to_string()),
+                        content: Some(MAILBOX_HELP_NB.to_string()),
                     },
                     ObjectVerbDefinition {
                         name: "help".to_string(),
                         lang: Some("en".to_string()),
                         aliases: vec!["help".to_string(), "hjelp".to_string()],
+                        requirements: Vec::new(),
                         evaluator: ObjectVerbEvaluator {
                             evaluator_type: "built-in".to_string(),
                             name: "print".to_string(),
                             version: 1,
                         },
-                        content: Some("mailbox commands:\n- show/status/look\n- take, drop\n- open, close\n- list, pop, pending\n- ask <target> <text>\n- retry <request_id>\n- reply <request_id> <text>\n- accept <id>, reject <id> [note]\n- invite <did> [note]".to_string()),
+                        content: Some(MAILBOX_HELP_EN.to_string()),
                     },
+                    mailbox_admin_verb("list"),
+                    mailbox_admin_verb("pop"),
+                    mailbox_admin_verb("pending"),
+                    mailbox_admin_verb("ask"),
+                    mailbox_admin_verb("retry"),
+                    mailbox_admin_verb("reply"),
+                    mailbox_admin_verb("accept"),
+                    mailbox_admin_verb("reject"),
+                    mailbox_admin_verb("invite"),
                 ],
                 program: None,
             }),

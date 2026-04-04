@@ -415,6 +415,9 @@ async fn exchange_on_stream(cache: &mut WorldConnCache, request: &WorldRequest) 
     serde_json::from_slice(&response_bytes).map_err(js_err)
 }
 use ma_core::{
+    CLOSET_ALPN,
+    ClosetRequest,
+    ClosetResponse,
     CompiledCapabilityAcl,
     compile_acl,
     CONTENT_TYPE_BROADCAST, CONTENT_TYPE_CHAT, CONTENT_TYPE_CMD, CONTENT_TYPE_PRESENCE,
@@ -1619,6 +1622,129 @@ pub async fn connect_world_with_relay(endpoint_id: &str, relay_url: &str) -> Res
     let cache = create_stream_cache(endpoint_id, Some(relay_url), WorldTransportKind::World).await?;
     store_conn_cache(WorldTransportKind::World, cache);
     Ok(())
+}
+
+async fn send_closet_request(endpoint_id: &str, request: ClosetRequest) -> Result<ClosetResponse, JsValue> {
+    let target: EndpointId = endpoint_id
+        .trim()
+        .parse()
+        .map_err(|e| js_err(format!("invalid endpoint id: {e}")))?;
+
+    let endpoint = Endpoint::builder(presets::N0)
+        .bind()
+        .await
+        .map_err(|e| js_err(format!("endpoint bind failed: {e}")))?;
+    let _ = endpoint.online().await;
+
+    let relay_source = core_normalize_relay_url(DEFAULT_WORLD_RELAY_URL);
+    let relay_url: RelayUrl = relay_source
+        .parse()
+        .map_err(|e| js_err(format!("relay URL parse failed for '{}': {}", relay_source, e)))?;
+    let endpoint_addr = EndpointAddr::new(target).with_relay_url(relay_url);
+
+    let connection = endpoint
+        .connect(endpoint_addr, CLOSET_ALPN)
+        .await
+        .map_err(|e| js_err(format!("closet endpoint.connect() failed: {}", e)))?;
+
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|e| js_err(format!("closet connection.open_bi() failed: {}", e)))?;
+
+    let payload = serde_json::to_vec(&request).map_err(js_err)?;
+    send.write_u32(payload.len() as u32).await.map_err(js_err)?;
+    send.write_all(&payload).await.map_err(js_err)?;
+    send.flush().await.map_err(js_err)?;
+
+    let frame_len = recv.read_u32().await.map_err(js_err)? as usize;
+    if frame_len > 512 * 1024 {
+        return Err(js_err(format!("closet response frame too large: {}", frame_len)));
+    }
+    let mut bytes = vec![0u8; frame_len];
+    recv.read_exact(&mut bytes).await.map_err(js_err)?;
+
+    let _ = send.finish();
+    connection.close(0u32.into(), b"ok");
+    endpoint.close().await;
+
+    serde_json::from_slice::<ClosetResponse>(&bytes).map_err(js_err)
+}
+
+#[wasm_bindgen]
+pub async fn closet_start(endpoint_id: &str) -> Result<String, JsValue> {
+    let response = send_closet_request(endpoint_id, ClosetRequest::Start).await?;
+    serde_json::to_string(&response).map_err(js_err)
+}
+
+#[wasm_bindgen]
+pub async fn closet_command(
+    endpoint_id: &str,
+    session_id: &str,
+    input: &str,
+) -> Result<String, JsValue> {
+    let response = send_closet_request(
+        endpoint_id,
+        ClosetRequest::Command {
+            session_id: session_id.trim().to_string(),
+            input: input.to_string(),
+        },
+    )
+    .await?;
+    serde_json::to_string(&response).map_err(js_err)
+}
+
+#[wasm_bindgen]
+pub async fn closet_hear_lobby(
+    endpoint_id: &str,
+    session_id: &str,
+    since_sequence: u64,
+) -> Result<String, JsValue> {
+    let response = send_closet_request(
+        endpoint_id,
+        ClosetRequest::HearLobby {
+            session_id: session_id.trim().to_string(),
+            since_sequence,
+        },
+    )
+    .await?;
+    serde_json::to_string(&response).map_err(js_err)
+}
+
+#[wasm_bindgen]
+pub async fn closet_answer(
+    endpoint_id: &str,
+    session_id: &str,
+    field: &str,
+    value: &str,
+) -> Result<String, JsValue> {
+    let response = send_closet_request(
+        endpoint_id,
+        ClosetRequest::Answer {
+            session_id: session_id.trim().to_string(),
+            field: field.trim().to_string(),
+            value: value.to_string(),
+        },
+    )
+    .await?;
+    serde_json::to_string(&response).map_err(js_err)
+}
+
+#[wasm_bindgen]
+pub async fn closet_submit_citizenship(
+    endpoint_id: &str,
+    session_id: &str,
+    ipns_private_key_base64: &str,
+) -> Result<String, JsValue> {
+    let response = send_closet_request(
+        endpoint_id,
+        ClosetRequest::SubmitCitizenship {
+            session_id: session_id.trim().to_string(),
+            ipns_private_key_base64: ipns_private_key_base64.trim().to_string(),
+        },
+    )
+    .await?;
+    serde_json::to_string(&response).map_err(js_err)
 }
 
 /// Enter a world over iroh using the world protocol.
