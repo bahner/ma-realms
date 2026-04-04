@@ -1,8 +1,8 @@
 import init, {
   create_identity,
+  create_identity_with_ipns,
   unlock_identity,
   ensure_bundle_iroh_secret,
-  set_bundle_language_preferences,
   set_bundle_world,
   generate_bip39_phrase,
   normalize_bip39_phrase,
@@ -53,8 +53,6 @@ const LAST_PUBLISHED_CID_KEY = `${STORAGE_PREFIX}.lastPublishedCid`;
 const HOME_PUBLISH_KEY_ALIAS = 'ma-actor';
 const LEGACY_API_KEY = 'ma.identity.v2.kuboApi';
 const LEGACY_ALIAS_KEY = 'ma.identity.v2.alias';
-const DEFAULT_LANG = 'en';
-const DEFAULT_LANGUAGE_PREFERENCES = 'en_UK';
 const DEFAULT_UI_LANG = 'en';
 const LOCAL_EDIT_SCRIPT_KEY = `${STORAGE_PREFIX}.localEditScript`;
 const LOCAL_EDIT_SCRIPT_CID_KEY = `${STORAGE_PREFIX}.localEditScriptCid`;
@@ -222,8 +220,6 @@ const state = {
   identity: null,
   encryptedBundle: '',
   aliasName: '',
-  lang: DEFAULT_LANG,
-  languagePreferences: DEFAULT_LANGUAGE_PREFERENCES,
   uiLang: DEFAULT_UI_LANG,
   debug: false,
   aliasBook: {},
@@ -1087,7 +1083,7 @@ function replaceExitCidInRoomYaml(roomYamlText, exitId, newCid) {
 }
 
 function roomLanguageKey() {
-  const primary = normalizeLanguageTag(state.lang).toLowerCase();
+  const primary = state.uiLang === 'nb' ? 'nb' : 'en';
   if (!primary) {
     return 'und';
   }
@@ -1506,7 +1502,6 @@ async function sendWorldCommandQuery(commandText) {
       state.encryptedBundle,
       state.aliasName,
       state.currentHome.room,
-      state.languagePreferences,
       commandText
     )
   );
@@ -2442,7 +2437,7 @@ function setKuboInstallNoteVisible(visible, mode = 'install') {
     note.innerHTML =
       `<p>Kubo is running, but API calls from gateway origin <code>${origin}</code> are blocked by Kubo security policy.</p>` +
       `<p>This is expected for pages opened from local gateway on port <code>8080</code>.</p>` +
-      `<p>This app requires Kubo API at runtime (key lookup and DID publish), so gateway-only mode is not sufficient.</p>` +
+      `<p>This app requires Kubo API at runtime (identity publish + content resolution), so gateway-only mode is not sufficient.</p>` +
       `<p>Preferred fix: install <code>ma-extension</code> and reload this page.</p>` +
       `<p>If you are in private/incognito mode, enable the extension for private windows too.</p>` +
       `<p>Fallback: open local runtime URL <code>http://127.0.0.1:8081</code> (or <code>http://localhost:8081</code>).</p>`;
@@ -2807,7 +2802,6 @@ async function runSmokeTest(targetAlias) {
         state.encryptedBundle,
         state.aliasName,
         state.currentHome.room,
-        state.languagePreferences,
         marker
       ),
       12000,
@@ -2878,28 +2872,6 @@ function isPrintableAliasLabel(label) {
   return value.length <= 64;
 }
 
-function normalizeLanguageTag(value) {
-  const normalized = String(value || '').trim().replace(/-/g, '_');
-  if (!normalized) {
-    return DEFAULT_LANG;
-  }
-  if (!/^[A-Za-z0-9_]+$/.test(normalized)) {
-    return DEFAULT_LANG;
-  }
-  return normalized;
-}
-
-function normalizeLanguagePreferences(value) {
-  const items = String(value || '')
-    .split(':')
-    .map((entry) => normalizeLanguageTag(entry))
-    .filter((entry, index, arr) => entry && arr.indexOf(entry) === index);
-  if (items.length === 0) {
-    return DEFAULT_LANGUAGE_PREFERENCES;
-  }
-  return items.join(':');
-}
-
 function normalizeUiLang(value) {
   const normalized = String(value || '').trim().replace(/_/g, '-').toLowerCase();
   if (['nb', 'nb-no', 'no'].includes(normalized)) {
@@ -2918,7 +2890,7 @@ function normalizeUiLang(value) {
 }
 
 function uiLangFromLanguage(languageValue) {
-  const lang = normalizeLanguageTag(languageValue).toLowerCase();
+  const lang = String(languageValue || '').trim().replace(/_/g, '-').toLowerCase();
   if (lang.startsWith('nb') || lang.startsWith('nn') || lang === 'no') {
     return 'nb';
   }
@@ -2929,7 +2901,7 @@ function uiLangFromLanguage(languageValue) {
 }
 
 function setUiLanguage(value) {
-  const normalized = normalizeUiLang(value) || uiLangFromLanguage(state.lang);
+  const normalized = normalizeUiLang(value) || uiLangFromLanguage('en');
   state.uiLang = normalized;
   if (typeof document !== 'undefined' && document.documentElement) {
     document.documentElement.lang = normalized;
@@ -2949,27 +2921,10 @@ const identityStore = createIdentityStore({
   legacy: {
     aliasKey: LEGACY_ALIAS_KEY,
     bundleKey: LEGACY_BUNDLE_KEY,
-    recoveryPhraseKey: 'ma.identity.v2.recoveryPhrase',
-    defaultLang: DEFAULT_LANG,
-    defaultLanguage: DEFAULT_LANGUAGE_PREFERENCES
+    recoveryPhraseKey: 'ma.identity.v2.recoveryPhrase'
   },
-  isValidAliasName,
-  normalizeLanguageTag,
-  normalizeLanguagePreferences
+  isValidAliasName
 });
-
-function setLanguageSelection(langValue, languageListValue) {
-  const lang = normalizeLanguageTag(langValue);
-  const language = normalizeLanguagePreferences(languageListValue || lang);
-  byId('actor-language').value = lang;
-  const languageListInput = byId('actor-language-list');
-  if (languageListInput) {
-    languageListInput.value = language;
-  }
-  state.lang = lang;
-  state.languagePreferences = language;
-  setUiLanguage(uiLangFromLanguage(lang));
-}
 
 function toSequenceNumber(value) {
   if (typeof value === 'bigint') {
@@ -2990,12 +2945,7 @@ function toSequenceBigInt(value) {
 }
 
 function saveIdentityRecord(aliasName, encryptedBundle) {
-  identityStore.saveIdentityRecord(
-    aliasName,
-    encryptedBundle,
-    byId('actor-language').value,
-    byId('actor-language-list')?.value || byId('actor-language').value
-  );
+  identityStore.saveIdentityRecord(aliasName, encryptedBundle);
 }
 
 function resolveIdentityRecord(aliasName) {
@@ -3030,7 +2980,7 @@ function loadAliasDraft(aliasName, options = {}) {
   }
   const record = resolveIdentityRecord(normalized);
   byId('bundle-text').value = record?.encryptedBundle || '';
-  setLanguageSelection(record?.lang || DEFAULT_LANG, record?.language || record?.lang || DEFAULT_LANGUAGE_PREFERENCES);
+  setUiLanguage(record?.uiLang || DEFAULT_UI_LANG);
 
   if (!byId('recovery-phrase').value.trim()) {
     onNewPhrase();
@@ -3297,11 +3247,11 @@ async function checkKubo() {
   try {
     const payload = await kuboPost('/api/v0/key/list', { l: 'true' });
     const keys = Array.isArray(payload?.Keys) ? payload.Keys : [];
-    setKuboStatus(`connected (${keys.length} keys)`, 'ok');
+    setKuboStatus(`Connected (${keys.length} entries available).`, 'ok');
     setSetupActionsEnabled(true);
     setKuboInstallNoteVisible(false);
     await refreshHomePublishInfoFromKubo(keys);
-    setSetupStatus('Kubo API reachable.');
+    setSetupStatus('Kubo API reachable. You can now create or unlock an identity bundle.');
     return keys;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -3408,21 +3358,17 @@ async function onCreateIdentity() {
   setSetupStatus('Creating identity...');
   try {
     const { aliasName, passphrase } = validateSetupInputs(false);
-    const lang = normalizeLanguageTag(byId('actor-language').value);
-    const language = normalizeLanguagePreferences(byId('actor-language-list')?.value || lang);
     localStorage.setItem(API_KEY, getApiBase());
     setActiveAlias(aliasName);
 
     const created = JSON.parse(create_identity(passphrase));
-    const localized = JSON.parse(set_bundle_language_preferences(passphrase, created.encrypted_bundle, lang, language));
-    const result = JSON.parse(ensure_bundle_iroh_secret(passphrase, localized.encrypted_bundle));
+    const result = JSON.parse(ensure_bundle_iroh_secret(passphrase, created.encrypted_bundle));
 
     state.identity = result;
     state.encryptedBundle = result.encrypted_bundle;
     state.passphrase = passphrase;
     state.aliasName = aliasName;
-    state.lang = lang;
-    state.languagePreferences = language;
+    setUiLanguage(DEFAULT_UI_LANG);
     loadBlockedDidRootsForIdentity(result.did);
     setCurrentPublishInfo({ ipns: result.ipns || '' });
 
@@ -3446,22 +3392,18 @@ async function onUnlockIdentity() {
   setSetupStatus('Unlocking bundle...');
   try {
     const { aliasName, passphrase, bundle } = validateSetupInputs(true);
-    const lang = normalizeLanguageTag(byId('actor-language').value);
-    const language = normalizeLanguagePreferences(byId('actor-language-list')?.value || lang);
     localStorage.setItem(API_KEY, getApiBase());
     setActiveAlias(aliasName);
 
     const unlocked = JSON.parse(unlock_identity(passphrase, bundle));
 
-    const localized = JSON.parse(set_bundle_language_preferences(passphrase, bundle, lang, language));
-    const updated = JSON.parse(ensure_bundle_iroh_secret(passphrase, localized.encrypted_bundle));
+    const updated = JSON.parse(ensure_bundle_iroh_secret(passphrase, bundle));
 
     state.identity = updated;
     state.encryptedBundle = updated.encrypted_bundle;
     state.passphrase = passphrase;
     state.aliasName = aliasName;
-    state.lang = lang;
-    state.languagePreferences = language;
+    setUiLanguage(DEFAULT_UI_LANG);
     loadBlockedDidRootsForIdentity(updated.did);
     setCurrentPublishInfo({ ipns: updated.ipns || '' });
 
@@ -3490,40 +3432,6 @@ function onNewPhrase() {
   if (isValidAliasName(aliasName)) {
     saveIdentityRecord(aliasName, bundle);
   }
-}
-
-function onLanguageChange() {
-  const lang = normalizeLanguageTag(byId('actor-language').value);
-  const language = normalizeLanguagePreferences(byId('actor-language-list')?.value || lang);
-  applyLanguageChange(lang, language).catch((error) => {
-    appendMessage('system', `Language update failed: ${error instanceof Error ? error.message : String(error)}`);
-  });
-}
-
-async function applyLanguageChange(langValue, languageValue) {
-  const lang = normalizeLanguageTag(langValue);
-  const language = normalizeLanguagePreferences(languageValue || lang);
-  setLanguageSelection(lang, language);
-
-  const aliasName = (state.aliasName || byId('alias-name').value || '').trim();
-  const phrase = byId('recovery-phrase').value.trim();
-  const passphrase = byId('passphrase').value;
-
-  if (state.identity && state.encryptedBundle && passphrase.length >= 8) {
-    const updated = JSON.parse(
-      set_bundle_language_preferences(passphrase, state.encryptedBundle, lang, language)
-    );
-    state.identity = updated;
-    state.encryptedBundle = updated.encrypted_bundle;
-    byId('bundle-text').value = updated.encrypted_bundle;
-  }
-
-  if (isValidAliasName(aliasName)) {
-    saveIdentityRecord(aliasName, byId('bundle-text').value.trim());
-  }
-
-  updateIdentityLine();
-  setSetupStatus(`Actor language preferences set to ${lang} / ${language}.`);
 }
 
 function lockSession() {
@@ -4181,13 +4089,11 @@ async function enterHome(target, preferredRoom = null) {
   const resolvedDidFragment = String(resolvedInput).includes('#') ? String(resolvedInput).split('#')[1] : '';
   let worldDidForBundle = '';
   let endpointId = '';
-  if (String(resolvedInput).startsWith('did:ma:')) {
-    endpointId = state.didEndpointMap[didRoot(resolvedInput)] || endpointId;
-  } else {
+  if (!String(resolvedInput).startsWith('did:ma:')) {
     endpointId = normalizeIrohAddress(resolvedInput);
   }
 
-  if (!endpointId && resolvedDidRoot) {
+  if (resolvedDidRoot) {
     const targetDocJson = await fetchDidDocumentJsonByDid(resolvedDidRoot);
     const targetDoc = parseDidDocument(targetDocJson);
     const hintedWorldDid = typeof targetDoc?.ma?.world === 'string'
@@ -4348,6 +4254,39 @@ function isClosetBootstrapFailureMessage(message) {
   );
 }
 
+function normalizeClosetInput(input) {
+  const raw = String(input || '').trim();
+  if (!raw) {
+    return null;
+  }
+
+  const prefixed = raw.match(/^\/?closet\s+(.+)$/i);
+  if (prefixed) {
+    const command = String(prefixed[1] || '').trim();
+    return command || null;
+  }
+
+  const first = raw.split(/\s+/, 1)[0].toLowerCase();
+  const closetVerbs = new Set([
+    'help',
+    'show',
+    'hear',
+    'name',
+    'description',
+    'desc',
+    'alias',
+    'apply',
+    'citizen',
+    'enter',
+    'recovery'
+  ]);
+
+  if (closetVerbs.has(first)) {
+    return raw;
+  }
+  return null;
+}
+
 function isActiveTargetGoneMessage(message) {
   const text = String(message || '').toLowerCase();
   return (
@@ -4440,6 +4379,7 @@ async function sendCurrentWorldMessage(text) {
 
   try {
     const trimmedText = text.trim();
+    const closetInput = normalizeClosetInput(trimmedText);
 
     if (!state.identity) {
       appendMessage('system', 'Create or unlock an identity first.');
@@ -4448,8 +4388,12 @@ async function sendCurrentWorldMessage(text) {
 
     if (!state.currentHome) {
       if (state.closetSessionId && state.closetEndpointId) {
-        const response = await closetCommandForCurrentWorld(trimmedText);
-        renderClosetResponse(response);
+        if (closetInput) {
+          const response = await closetCommandForCurrentWorld(closetInput);
+          renderClosetResponse(response);
+        } else {
+          appendMessage('system', 'Active closet session. Use closet <command> (for example: closet help).');
+        }
         return;
       }
 
@@ -4471,8 +4415,9 @@ async function sendCurrentWorldMessage(text) {
     }
 
     if (state.closetSessionId && state.closetEndpointId
-      && state.currentHome.endpointId === state.closetEndpointId) {
-      const response = await closetCommandForCurrentWorld(trimmedText);
+      && state.currentHome.endpointId === state.closetEndpointId
+      && closetInput) {
+      const response = await closetCommandForCurrentWorld(closetInput);
       renderClosetResponse(response);
       return;
     }
@@ -4536,7 +4481,6 @@ async function sendCurrentWorldMessage(text) {
           state.encryptedBundle,
           state.aliasName,
           state.currentHome.room,
-          state.languagePreferences,
           trimmedText
         )
       );
@@ -4610,7 +4554,6 @@ async function sendCurrentWorldMessage(text) {
           state.encryptedBundle,
           state.aliasName,
           state.currentHome.room,
-          state.languagePreferences,
           normalized
         )
       );
@@ -4640,7 +4583,6 @@ async function sendCurrentWorldMessage(text) {
         state.encryptedBundle,
         state.aliasName,
         state.currentHome.room,
-        state.languagePreferences,
         trimmedText
       )
     );
@@ -4731,9 +4673,41 @@ function renderClosetResponse(response) {
   }
   if (response?.did) {
     appendMessage('system', `Assigned DID: ${response.did}`);
+    adoptClosetAssignedDid(String(response.did));
   }
   if (response?.fragment) {
     appendMessage('system', `Assigned fragment: ${response.fragment}`);
+  }
+}
+
+function adoptClosetAssignedDid(assignedDid) {
+  const did = String(assignedDid || '').trim();
+  const root = didRoot(did);
+  const ipns = root.startsWith('did:ma:') ? root.slice('did:ma:'.length) : '';
+  if (!ipns || !state.passphrase) {
+    return;
+  }
+
+  try {
+    const created = JSON.parse(create_identity_with_ipns(state.passphrase, ipns));
+    const localized = JSON.parse(
+      ensure_bundle_iroh_secret(state.passphrase, created.encrypted_bundle)
+    );
+    const updated = localized;
+
+    state.identity = updated;
+    state.encryptedBundle = updated.encrypted_bundle;
+    const bundleEl = byId('bundle-text');
+    if (bundleEl) {
+      bundleEl.value = updated.encrypted_bundle;
+    }
+    if (isValidAliasName(state.aliasName || '')) {
+      saveIdentityRecord(state.aliasName, updated.encrypted_bundle);
+    }
+    appendMessage('system', `Identity rebound to ${root}.`);
+    updateIdentityLine();
+  } catch (error) {
+    appendMessage('system', `Warning: could not rebind local identity (${error instanceof Error ? error.message : String(error)}).`);
   }
 }
 
@@ -4756,9 +4730,7 @@ async function closetCommandForCurrentWorld(input) {
   if (!state.closetSessionId) {
     throw new Error('No active closet session.');
   }
-  const endpointId = String(
-    (state.currentHome && state.currentHome.endpointId) || state.closetEndpointId || ''
-  ).trim();
+  const endpointId = String(state.closetEndpointId || '').trim();
   if (!endpointId) {
     throw new Error('No world endpoint available for closet command.');
   }
@@ -4769,11 +4741,6 @@ async function closetCommandForCurrentWorld(input) {
     throw new Error(response.message || 'Closet command failed.');
   }
   state.closetLobbySeq = Number(response.latest_lobby_sequence || state.closetLobbySeq || 0);
-  if (response.did) {
-    state.closetSessionId = '';
-    state.closetEndpointId = '';
-    state.closetLobbySeq = 0;
-  }
   return response;
 }
 
@@ -4799,7 +4766,6 @@ function parseDot(input) {
     appendSystemUi('  .identity                  - show current identity details', '  .identity                  - vis detaljer for aktiv identitet');
     appendSystemUi('  .alias <name> <address>    - save an address alias', '  .alias <name> <address>    - lagre adressealias');
     appendSystemUi('  .set home [did:ma:...#room]- set home target (or current position)', '  .set home [did:ma:...#room]- sett home-mål (eller nåværende posisjon)');
-    appendSystemUi('  .set lang <nb|en|se|da>    - set ma-actor UI language for debugging', '  .set lang <nb|en|se|da>    - sett ma-actor UI-språk for feilsøking');
     appendSystemUi('  .unalias <name>            - remove a saved alias', '  .unalias <name>            - fjern et lagret alias');
     appendSystemUi('  .aliases                   - list saved aliases', '  .aliases                   - list lagrede alias');
     appendSystemUi('  .inspect @here|@me|@exit <name>|<object>- inspect room/me/exit/object and discover DID/CIDs', '  .inspect @here|@me|@exit <navn>|<objekt>- inspiser rom/meg/utgang/objekt og finn DID/CID');
@@ -4811,8 +4777,6 @@ function parseDot(input) {
     appendSystemUi('  .mail [list|pick|reply|delete|clear] - inspect mailbox queue', '  .mail [list|pick|reply|delete|clear] - inspiser mailbox-kø');
     appendSystemUi('  .invite <did|alias> [note] - allow DID and send invite notice', '  .invite <did|alias> [note] - tillat DID og send invitasjonsmelding');
     appendSystemUi('  .smoke [alias]             - run connectivity smoke test', '  .smoke [alias]             - kjør enkel tilkoblingstest');
-    appendMessage('system', '  .lang <tag>                - set primary language (e.g. nb)');
-    appendMessage('system', '  .language <a:b:c>          - set preference chain (e.g. nb_NO:nn_NO:en_UK)');
     appendSystemUi('  .block <did|alias|handle>  - block sender DID root', '  .block <did|alias|handle>  - blokker avsenders DID-root');
     appendSystemUi('  .unblock <did|alias|handle>- remove sender from block list', '  .unblock <did|alias|handle>- fjern avsender fra blokkeringslisten');
     appendSystemUi('  .blocks                    - list blocked sender DID roots', '  .blocks                    - list blokkerte avsender-DID-rooter');
@@ -4843,10 +4807,7 @@ function parseDot(input) {
       `Alias:           ${state.aliasName || '(none)'}`,
       `Alias:           ${state.aliasName || '(ingen)'}`
     ));
-    appendMessage('system', uiText(`Lang:            ${state.lang}`, `Lang:            ${state.lang}`));
     appendMessage('system', uiText(`UI language:     ${state.uiLang}`, `UI-språk:        ${state.uiLang}`));
-    appendMessage('system', uiText(`Published field: ma:lang = ${state.lang}`, `Publisert felt:  ma:lang = ${state.lang}`));
-    appendMessage('system', uiText(`Published field: ma:language = ${state.languagePreferences}`, `Publisert felt:  ma:language = ${state.languagePreferences}`));
     appendMessage('system', uiText(`DID document at: https://ipfs.io/ipns/${ipns}`, `DID-dokument på: https://ipfs.io/ipns/${ipns}`));
     appendMessage('system', uiText(
       `Current world:   ${state.currentHome ? `${humanizeIdentifier(state.currentHome.endpointId)} (${state.currentHome.room})` : '(none)'}`,
@@ -4864,40 +4825,6 @@ function parseDot(input) {
     for (const [name, address] of entries) {
       appendMessage('system', `${name} => ${address}`);
     }
-    return true;
-  }
-
-  if (verb === 'lang') {
-    if (args.length !== 1) {
-      appendMessage('system', 'Usage: .lang <tag>');
-      return true;
-    }
-    const lang = normalizeLanguageTag(args[0]);
-    const language = normalizeLanguagePreferences(byId('actor-language-list')?.value || lang);
-    applyLanguageChange(lang, language)
-      .then(() => {
-        appendMessage('system', `Primary language is now ${state.lang}.`);
-      })
-      .catch((error) => {
-        appendMessage('system', `Language update failed: ${error instanceof Error ? error.message : String(error)}`);
-      });
-    return true;
-  }
-
-  if (verb === 'language') {
-    if (args.length !== 1) {
-      appendMessage('system', 'Usage: .language <a:b:c>');
-      return true;
-    }
-    const lang = normalizeLanguageTag(byId('actor-language').value);
-    const language = normalizeLanguagePreferences(args[0]);
-    applyLanguageChange(lang, language)
-      .then(() => {
-        appendMessage('system', `Language preferences are now ${state.languagePreferences}.`);
-      })
-      .catch((error) => {
-        appendMessage('system', `Language update failed: ${error instanceof Error ? error.message : String(error)}`);
-      });
     return true;
   }
 
@@ -4920,31 +4847,8 @@ function parseDot(input) {
 
   if (verb === 'set') {
     const key = String(args[0] || '').toLowerCase();
-    if (key === 'lang') {
-      if (args.length !== 2) {
-        appendSystemUi('Usage: .set lang <nb|en|se|da>', 'Bruk: .set lang <nb|en|se|da>');
-        return true;
-      }
-
-      const candidate = normalizeUiLang(args[1]);
-      if (!candidate) {
-        appendSystemUi('Usage: .set lang <nb|en|se|da>', 'Bruk: .set lang <nb|en|se|da>');
-        return true;
-      }
-
-      setUiLanguage(candidate);
-      if (state.editSession) {
-        updateYamlEditorControls();
-      }
-      appendMessage('system', uiText(
-        `UI language is now ${state.uiLang}.`,
-        `UI-språk er nå ${state.uiLang}.`
-      ));
-      return true;
-    }
-
     if (key !== 'home') {
-      appendMessage('system', 'Usage: .set home [did:ma:<world>#<room>] | .set lang <nb|en|se|da>');
+      appendMessage('system', 'Usage: .set home [did:ma:<world>#<room>]');
       return true;
     }
 
@@ -5368,7 +5272,7 @@ function restoreSavedValues() {
     loadAliasDraft(savedAlias);
   } else {
     byId('bundle-text').value = '';
-    setLanguageSelection(DEFAULT_LANG, DEFAULT_LANGUAGE_PREFERENCES);
+    setUiLanguage(DEFAULT_UI_LANG);
     onNewPhrase();
   }
 
@@ -5406,11 +5310,6 @@ async function main() {
   byId('btn-lock').addEventListener('click', lockSession);
   byId('lock-overlay').addEventListener('click', hideLockOverlay);
   byId('lock-overlay').addEventListener('keydown', onLockOverlayKeydown);
-  byId('actor-language').addEventListener('change', onLanguageChange);
-  const languageListInput = byId('actor-language-list');
-  if (languageListInput) {
-    languageListInput.addEventListener('change', onLanguageChange);
-  }
   let aliasDraftTimer = null;
   byId('alias-name').addEventListener('input', (event) => {
     if (aliasDraftTimer) {

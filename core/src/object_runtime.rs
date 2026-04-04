@@ -76,8 +76,6 @@ pub struct ObjectVerbEvaluator {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectVerbDefinition {
     pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lang: Option<String>,
     #[serde(default)]
     pub aliases: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -281,7 +279,6 @@ fn mailbox_admin_requirements() -> Vec<String> {
 fn mailbox_admin_verb(name: &str) -> ObjectVerbDefinition {
     ObjectVerbDefinition {
         name: name.to_string(),
-        lang: None,
         aliases: vec![],
         requirements: mailbox_admin_requirements(),
         evaluator: ObjectVerbEvaluator {
@@ -309,7 +306,6 @@ impl ObjectRuntimeState {
                 verbs: vec![
                     ObjectVerbDefinition {
                         name: "hjelp".to_string(),
-                        lang: Some("nb".to_string()),
                         aliases: vec!["hjelp".to_string(), "help".to_string()],
                         requirements: Vec::new(),
                         evaluator: ObjectVerbEvaluator {
@@ -321,7 +317,6 @@ impl ObjectRuntimeState {
                     },
                     ObjectVerbDefinition {
                         name: "help".to_string(),
-                        lang: Some("en".to_string()),
                         aliases: vec!["help".to_string(), "hjelp".to_string()],
                         requirements: Vec::new(),
                         evaluator: ObjectVerbEvaluator {
@@ -388,7 +383,6 @@ impl ObjectRuntimeState {
                 verbs: vec![
                     ObjectVerbDefinition {
                         name: "hjelp".to_string(),
-                        lang: Some("nb".to_string()),
                         aliases: vec!["hjelp".to_string(), "help".to_string()],
                         requirements: Vec::new(),
                         evaluator: ObjectVerbEvaluator {
@@ -400,7 +394,6 @@ impl ObjectRuntimeState {
                     },
                     ObjectVerbDefinition {
                         name: "help".to_string(),
-                        lang: Some("en".to_string()),
                         aliases: vec!["help".to_string(), "hjelp".to_string()],
                         requirements: Vec::new(),
                         evaluator: ObjectVerbEvaluator {

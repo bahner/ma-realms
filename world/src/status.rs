@@ -593,7 +593,7 @@ fn render_html(world: &WorldInfo, snapshot: &WorldSnapshot, runtime: &RuntimeSta
 fn render_locked_html(world: &WorldInfo, runtime: &RuntimeStatus) -> String {
         format!(
                 "<!doctype html>
-<html lang=\"en\">
+<html>
 <head>
     <meta charset=\"utf-8\">
     <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
@@ -797,7 +797,7 @@ fn render_unlocked_html(world: &WorldInfo, snapshot: &WorldSnapshot, runtime: &R
 
         format!(
                 "<!doctype html>
-<html lang=\"en\">
+<html>
 <head>
     <meta charset=\"utf-8\">
     <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">

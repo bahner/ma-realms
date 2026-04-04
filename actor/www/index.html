@@ -22,17 +22,17 @@
     </div>
 
     <section id="setup-view" class="card">
-      <h2>Create or provide identity</h2>
-      <p class="lead">Start with a username alias and passphrase. The alias is local to this app profile.</p>
-      <p class="lead">Saved bundles are isolated per alias, and each browser tab remembers its active alias separately.</p>
+      <h2>Set Up Local Actor Identity</h2>
+      <p class="lead">Use a local alias + passphrase to create or unlock your identity bundle on this device.</p>
+      <p class="lead">Bundles are isolated per alias, and each tab keeps its own active alias.</p>
 
       <div class="grid-2">
         <div>
-          <label for="kubo-api">Kubo API</label>
+          <label for="kubo-api">Kubo API Endpoint</label>
           <input id="kubo-api" type="text" value="http://localhost:8080" autocomplete="off">
         </div>
         <div>
-          <label for="alias-name">Username Alias</label>
+          <label for="alias-name">Local Alias</label>
           <input id="alias-name" type="text" placeholder="for example: bahner" autocomplete="off">
         </div>
       </div>
@@ -42,18 +42,7 @@
           <label for="passphrase">Passphrase</label>
           <input id="passphrase" type="password" placeholder="minimum 8 characters" autocomplete="off">
         </div>
-        <div>
-          <label for="actor-language">Primary Language (lang)</label>
-          <select id="actor-language">
-            <option value="en">English</option>
-            <option value="nb">Norsk bokmal</option>
-          </select>
-        </div>
-      </div>
-
-      <div>
-        <label for="actor-language-list">Language Preferences (language)</label>
-        <input id="actor-language-list" type="text" placeholder="nb_NO:nn_NO:en_UK" autocomplete="off">
+        <div></div>
       </div>
 
       <div class="grid-2">
@@ -71,16 +60,16 @@
       <textarea id="bundle-text" placeholder="Paste a saved encrypted bundle to unlock, or leave empty when creating."></textarea>
 
       <div class="setup-actions">
-        <button id="btn-kubo-check" type="button">Check Kubo</button>
-        <button id="btn-create" class="primary" type="button">Create Identity</button>
-        <button id="btn-unlock" type="button">Unlock Provided Bundle</button>
+        <button id="btn-kubo-check" type="button">Test Kubo Connection</button>
+        <button id="btn-create" class="primary" type="button">Create Local Identity</button>
+        <button id="btn-unlock" type="button">Unlock Bundle</button>
       </div>
 
-      <p id="kubo-status" class="status idle">kubo not checked</p>
+      <p id="kubo-status" class="status idle">Kubo not checked yet.</p>
       <div id="kubo-install-note" class="kubo-install-note hidden"></div>
       <section id="publish-info" class="publish-info" aria-live="polite">
-        <p class="publish-line">Current IPNS: <a id="current-ipns-link" href="#">(not published yet)</a></p>
-        <p class="publish-line">Current CID: <a id="current-cid-link" href="#">(not published yet)</a></p>
+        <p class="publish-line">Current IPNS Pointer: <a id="current-ipns-link" href="#">(not published yet)</a></p>
+        <p class="publish-line">Current IPFS Content: <a id="current-cid-link" href="#">(not published yet)</a></p>
       </section>
       <p id="setup-status" class="setup-status"></p>
     </section>

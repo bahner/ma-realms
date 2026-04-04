@@ -230,6 +230,7 @@ struct ClosetSession {
     announced_listening: bool,
     name: Option<String>,
     description: Option<String>,
+    alias: Option<String>,
     did: Option<String>,
     fragment: Option<String>,
 }
@@ -240,6 +241,8 @@ struct ClosetProfile {
     name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preferred_alias: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recovery_checksum: Option<String>,
     updated_at: String,
@@ -650,8 +653,7 @@ struct RuntimeStateDoc {
     closet_profiles: HashMap<String, ClosetProfile>,
 }
 
-fn exit_for_language(id: String, name: String, to: String, language: &str) -> ExitData {
-    let _ = language;
+fn build_exit_entry(id: String, name: String, to: String) -> ExitData {
     let normalized = "und".to_string();
     let mut exit = ExitData::new(id, name.clone(), to);
     exit.names.clear();
@@ -661,9 +663,9 @@ fn exit_for_language(id: String, name: String, to: String, language: &str) -> Ex
     exit
 }
 
-fn sender_language_from_document(document: &Document) -> String {
+fn sender_profile_from_document(document: &Document) -> String {
     let _ = document;
-    // World runtime uses one world-authored language profile.
+    // World runtime uses one world-authored profile.
     "und".to_string()
 }
 
@@ -770,19 +772,40 @@ impl World {
         self.world_root_pin_name.read().await.clone()
     }
 
-    async fn issue_bootstrap_did(&self, requester_endpoint: &str) -> Result<(String, String, String)> {
+    async fn issue_bootstrap_did(
+        &self,
+        requester_endpoint: &str,
+        desired_alias: Option<&str>,
+    ) -> Result<(String, String, String)> {
         let kubo_url = self.kubo_url.read().await.clone();
         let existing_names = list_kubo_key_names(&kubo_url).await?;
 
-        let mut generated: Option<String> = None;
-        for _ in 0..64 {
-            let candidate = nanoid!();
-            if !existing_names.iter().any(|name| name == &candidate) {
-                generated = Some(candidate);
-                break;
+        let fragment = if let Some(alias) = desired_alias {
+            let normalized = alias.trim();
+            if normalized.is_empty() {
+                return Err(anyhow!("alias cannot be empty"));
             }
-        }
-        let fragment = generated.ok_or_else(|| anyhow!("failed to allocate a unique fragment"))?;
+            if !is_valid_nanoid_id(normalized) {
+                return Err(anyhow!(
+                    "invalid alias '{}': expected [A-Za-z0-9_-]+",
+                    normalized
+                ));
+            }
+            if existing_names.iter().any(|name| name == normalized) {
+                return Err(anyhow!("alias '{}' is already in use in kubo", normalized));
+            }
+            normalized.to_string()
+        } else {
+            let mut generated: Option<String> = None;
+            for _ in 0..64 {
+                let candidate = nanoid!();
+                if !existing_names.iter().any(|name| name == &candidate) {
+                    generated = Some(candidate);
+                    break;
+                }
+            }
+            generated.ok_or_else(|| anyhow!("failed to allocate a unique fragment"))?
+        };
 
         generate_kubo_key(&kubo_url, &fragment).await?;
         let keys = list_kubo_keys(&kubo_url).await?;
@@ -827,6 +850,7 @@ impl World {
         let latest_lobby_sequence = self.latest_room_event_sequence(DEFAULT_ROOM).await?;
         let mut profile_name: Option<String> = None;
         let mut profile_description: Option<String> = None;
+        let mut profile_alias: Option<String> = None;
         let mut profile_did: Option<String> = None;
 
         if let Some(did_root) = self.did_root_by_endpoint(DEFAULT_ROOM, endpoint).await {
@@ -840,6 +864,7 @@ impl World {
             {
                 profile_name = profile.name;
                 profile_description = profile.description;
+                profile_alias = profile.preferred_alias;
             }
         }
 
@@ -851,6 +876,7 @@ impl World {
             announced_listening: false,
             name: profile_name,
             description: profile_description,
+            alias: profile_alias,
             did: profile_did,
             fragment: None,
         };
@@ -935,7 +961,20 @@ impl World {
                 session.description = Some(normalized_value);
                 Ok("description stored".to_string())
             }
-            _ => Err(anyhow!("unknown closet field '{}': use name|description", field)),
+            "alias" => {
+                if normalized_value.is_empty() {
+                    return Err(anyhow!("alias cannot be empty"));
+                }
+                if !is_valid_nanoid_id(&normalized_value) {
+                    return Err(anyhow!(
+                        "invalid alias '{}': expected [A-Za-z0-9_-]+",
+                        normalized_value
+                    ));
+                }
+                session.alias = Some(normalized_value);
+                Ok("alias stored".to_string())
+            }
+            _ => Err(anyhow!("unknown closet field '{}': use name|description|alias", field)),
         }
     }
 
@@ -944,6 +983,7 @@ impl World {
         did_raw: &str,
         name: Option<String>,
         description: Option<String>,
+        preferred_alias: Option<String>,
     ) -> Result<()> {
         let did = Did::try_from(did_raw)
             .map_err(|e| anyhow!("invalid closet profile DID '{}': {}", did_raw, e))?;
@@ -961,6 +1001,12 @@ impl World {
             let normalized = value.trim().to_string();
             if !normalized.is_empty() {
                 profile.description = Some(normalized);
+            }
+        }
+        if let Some(value) = preferred_alias {
+            let normalized = value.trim().to_string();
+            if !normalized.is_empty() {
+                profile.preferred_alias = Some(normalized);
             }
         }
         profile.updated_at = Utc::now().to_rfc3339();
@@ -1130,7 +1176,7 @@ impl World {
         let mut updated = false;
         for avatar in room.avatars.values_mut() {
             if avatar.agent_did.without_fragment().id() == did_root {
-                avatar.set_description("und", description.to_string());
+                avatar.set_description(description.to_string());
                 updated = true;
             }
         }
@@ -1142,16 +1188,22 @@ impl World {
         session_id: &str,
         endpoint: &str,
         ipns_private_key_base64: &str,
+        desired_alias: Option<&str>,
     ) -> Result<(String, String, String)> {
         let session = self.closet_session_owned_by(session_id, endpoint).await?;
         let (did, fragment, key_name) = if ipns_private_key_base64.trim().is_empty() {
-            self.issue_bootstrap_did(endpoint).await?
+            self.issue_bootstrap_did(endpoint, desired_alias).await?
         } else {
-            self.issue_bootstrap_citizenship(endpoint, ipns_private_key_base64)
+            self.issue_bootstrap_citizenship(endpoint, ipns_private_key_base64, desired_alias)
                 .await?
         };
 
-        self.upsert_closet_profile(&did, session.name.clone(), session.description.clone())
+        self.upsert_closet_profile(
+            &did,
+            session.name.clone(),
+            session.description.clone(),
+            session.alias.clone(),
+        )
             .await?;
 
         {
@@ -1193,13 +1245,57 @@ impl World {
         if verb == "help" {
             return Ok(ClosetResponse {
                 ok: true,
-                message: "Closet commands: help | hear | name <text> | description <text> | citizen [ipns_key_base64] | enter [room] | recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>".to_string(),
+                message: "Closet commands: help | show | hear | name <text> | description <text> | alias <text> | apply [ipns_key_base64] | citizen [ipns_key_base64] | recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>\nRequired fields: name, description, alias.\nWhen done: run apply, then type 'go lobby' in the actor UI to enter the world.".to_string(),
                 session_id: Some(session_id.to_string()),
-                prompt: Some("You are in the closet with no avatar yet. Fill profile fields, then run 'citizen'.".to_string()),
+                prompt: Some("You are in the closet with no avatar yet. Required: name + description + alias. Then run apply. When done, type 'go lobby' in the actor UI.".to_string()),
                 lobby_events: Vec::new(),
                 latest_lobby_sequence: 0,
                 did: None,
                 fragment: None,
+                key_name: None,
+            });
+        }
+
+        if verb == "show" || verb == "status" || verb == "look" {
+            let session = self.closet_session_owned_by(session_id, endpoint).await?;
+            let did = session.did.clone().unwrap_or_else(|| "(none)".to_string());
+            let name = session.name.clone().unwrap_or_else(|| "(unset)".to_string());
+            let description = session
+                .description
+                .clone()
+                .unwrap_or_else(|| "(unset)".to_string());
+            let alias = session.alias.clone().unwrap_or_else(|| "(unset)".to_string());
+            let recovery = if let Some(did_raw) = session.did.as_deref() {
+                let did_root = Did::try_from(did_raw)
+                    .map_err(|e| anyhow!("invalid closet DID '{}': {}", did_raw, e))?
+                    .without_fragment()
+                    .id();
+                self.closet_profiles
+                    .read()
+                    .await
+                    .get(&did_root)
+                    .and_then(|profile| profile.recovery_checksum.clone())
+                    .is_some()
+            } else {
+                false
+            };
+
+            return Ok(ClosetResponse {
+                ok: true,
+                message: format!(
+                    "closet profile: did={} name={} description={} alias={} recovery={}",
+                    did,
+                    name,
+                    description,
+                    alias,
+                    if recovery { "set" } else { "unset" }
+                ),
+                session_id: Some(session_id.to_string()),
+                prompt: None,
+                lobby_events: Vec::new(),
+                latest_lobby_sequence: 0,
+                did: session.did,
+                fragment: session.fragment,
                 key_name: None,
             });
         }
@@ -1241,7 +1337,7 @@ impl World {
             });
         }
 
-        if verb == "name" || verb == "description" {
+        if verb == "name" || verb == "description" || verb == "alias" {
             if tail.is_empty() {
                 return Err(anyhow!("usage: {} <value>", verb));
             }
@@ -1249,7 +1345,12 @@ impl World {
 
             let session = self.closet_session_owned_by(session_id, endpoint).await?;
             if let Some(did) = session.did.as_deref() {
-                self.upsert_closet_profile(did, session.name.clone(), session.description.clone())
+                self.upsert_closet_profile(
+                    did,
+                    session.name.clone(),
+                    session.description.clone(),
+                    session.alias.clone(),
+                )
                     .await?;
                 if verb == "description" {
                     let did_root = Did::try_from(did)
@@ -1279,13 +1380,70 @@ impl World {
             });
         }
 
-        if verb == "citizen" {
+        if verb == "apply" || verb == "citizen" {
+            let session = self.closet_session_owned_by(session_id, endpoint).await?;
+            let required_missing = session
+                .name
+                .as_ref()
+                .map(|v| v.trim().is_empty())
+                .unwrap_or(true)
+                || session
+                    .description
+                    .as_ref()
+                    .map(|v| v.trim().is_empty())
+                    .unwrap_or(true)
+                || session
+                    .alias
+                    .as_ref()
+                    .map(|v| v.trim().is_empty())
+                    .unwrap_or(true);
+
+            if session.did.is_none() && required_missing {
+                return Ok(ClosetResponse {
+                    ok: false,
+                    message: "required fields are: name, description, alias".to_string(),
+                    session_id: Some(session_id.to_string()),
+                    prompt: Some("set name/description/alias, then run apply".to_string()),
+                    lobby_events: Vec::new(),
+                    latest_lobby_sequence: 0,
+                    did: None,
+                    fragment: None,
+                    key_name: None,
+                });
+            }
+
+            if let Some(existing_did) = session.did.as_deref() {
+                self.upsert_closet_profile(
+                    existing_did,
+                    session.name.clone(),
+                    session.description.clone(),
+                    session.alias.clone(),
+                )
+                .await?;
+                return Ok(ClosetResponse {
+                    ok: true,
+                    message: "changes applied. You can stay in the closet and keep editing; type 'go lobby' when ready.".to_string(),
+                    session_id: Some(session_id.to_string()),
+                    prompt: None,
+                    lobby_events: Vec::new(),
+                    latest_lobby_sequence: 0,
+                    did: Some(existing_did.to_string()),
+                    fragment: session.fragment,
+                    key_name: None,
+                });
+            }
+
             let (did, fragment, key_name) = self
-                .closet_submit_citizenship(session_id, endpoint, tail)
+                .closet_submit_citizenship(
+                    session_id,
+                    endpoint,
+                    tail,
+                    session.alias.as_deref(),
+                )
                 .await?;
             return Ok(ClosetResponse {
                 ok: true,
-                message: "Citizenship granted. You can now enter the world.".to_string(),
+                message: "application accepted. type 'go lobby' in the actor UI to enter the world.".to_string(),
                 session_id: Some(session_id.to_string()),
                 prompt: None,
                 lobby_events: Vec::new(),
@@ -1338,7 +1496,7 @@ impl World {
                 } else {
                     return Ok(ClosetResponse {
                         ok: false,
-                        message: "recovery set requires a DID in this closet session (run citizen first or open closet while logged in)".to_string(),
+                        message: "recovery set requires a DID in this closet session (run apply first or open closet while logged in)".to_string(),
                         session_id: Some(session_id.to_string()),
                         prompt: None,
                         lobby_events: Vec::new(),
@@ -1586,19 +1744,37 @@ impl World {
         &self,
         requester_endpoint: &str,
         ipns_private_key_base64: &str,
+        desired_alias: Option<&str>,
     ) -> Result<(String, String, String)> {
         let kubo_url = self.kubo_url.read().await.clone();
         let existing_names = list_kubo_key_names(&kubo_url).await?;
 
-        let mut generated: Option<String> = None;
-        for _ in 0..64 {
-            let candidate = nanoid!();
-            if !existing_names.iter().any(|name| name == &candidate) {
-                generated = Some(candidate);
-                break;
+        let fragment = if let Some(alias) = desired_alias {
+            let normalized = alias.trim();
+            if normalized.is_empty() {
+                return Err(anyhow!("alias cannot be empty"));
             }
-        }
-        let fragment = generated.ok_or_else(|| anyhow!("failed to allocate a unique fragment"))?;
+            if !is_valid_nanoid_id(normalized) {
+                return Err(anyhow!(
+                    "invalid alias '{}': expected [A-Za-z0-9_-]+",
+                    normalized
+                ));
+            }
+            if existing_names.iter().any(|name| name == normalized) {
+                return Err(anyhow!("alias '{}' is already in use in kubo", normalized));
+            }
+            normalized.to_string()
+        } else {
+            let mut generated: Option<String> = None;
+            for _ in 0..64 {
+                let candidate = nanoid!();
+                if !existing_names.iter().any(|name| name == &candidate) {
+                    generated = Some(candidate);
+                    break;
+                }
+            }
+            generated.ok_or_else(|| anyhow!("failed to allocate a unique fragment"))?
+        };
 
         let key_bytes = B64
             .decode(ipns_private_key_base64.trim().as_bytes())
@@ -2192,7 +2368,7 @@ impl World {
 
         let title_value = legacy.title.trim().to_string();
         if !title_value.is_empty() {
-            room.set_title("und", title_value);
+            room.set_title(title_value);
         }
 
         // ACL/owner are runtime metadata and are not loaded from room CID definitions.
@@ -2333,7 +2509,7 @@ impl World {
     fn lookup_object_print_verb(
         object: &ObjectRuntimeState,
         verb: &str,
-        sender_language: &str,
+        _sender_profile: &str,
     ) -> Option<String> {
         let verbs = object.definition.as_ref().map(|def| &def.verbs)?;
 
@@ -2341,15 +2517,6 @@ impl World {
         if needle.is_empty() {
             return None;
         }
-
-        let sender = sender_language.trim().to_ascii_lowercase();
-        let sender_base = sender
-            .split('-')
-            .next()
-            .unwrap_or(sender.as_str())
-            .to_string();
-
-        let mut best: Option<(u8, String)> = None;
 
         for entry in verbs {
             let name_matches = entry.name.trim().eq_ignore_ascii_case(needle.as_str());
@@ -2375,36 +2542,10 @@ impl World {
                 continue;
             };
 
-            let score = match entry.lang.as_deref() {
-                None => 1,
-                Some(lang_raw) => {
-                    let lang = lang_raw.trim().to_ascii_lowercase();
-                    let lang_base = lang.split('-').next().unwrap_or(lang.as_str()).to_string();
-                    if !sender.is_empty() && sender == lang {
-                        3
-                    } else if !sender.is_empty()
-                        && (sender.starts_with(&(lang.clone() + "-"))
-                            || lang.starts_with(&(sender_base.clone() + "-"))
-                            || sender_base == lang_base)
-                    {
-                        2
-                    } else {
-                        0
-                    }
-                }
-            };
-
-            if score == 0 {
-                continue;
-            }
-
-            match &best {
-                Some((best_score, _)) if *best_score >= score => {}
-                _ => best = Some((score, content)),
-            }
+            return Some(content);
         }
 
-        best.map(|(_, content)| content)
+        None
     }
 
     fn lookup_object_verb_definition(
@@ -2957,14 +3098,14 @@ impl World {
                 titles: {
                     let mut titles = room.titles.clone();
                     if !titles.contains_key("und") {
-                        titles.insert("und".to_string(), room.title_or_default("und"));
+                        titles.insert("und".to_string(), room.title_or_default());
                     }
                     titles
                 },
                 descriptions: {
                     let mut descriptions = room.descriptions.clone();
                     if !descriptions.contains_key("und") {
-                        descriptions.insert("und".to_string(), room.description_or_default("und"));
+                        descriptions.insert("und".to_string(), room.description_or_default());
                     }
                     descriptions
                 },
@@ -3215,7 +3356,7 @@ impl World {
         room_name: &str,
         from: &str,
         from_did: &Did,
-        sender_language: &str,
+        sender_profile: &str,
         envelope: MessageEnvelope,
     ) -> Result<(String, bool, String)> {
         {
@@ -3249,7 +3390,7 @@ impl World {
             MessageEnvelope::RoomCommand { command } => {
                 let caller_root_did = from_did.without_fragment().id();
                 let response = self
-                    .room_command(room_name, &command, from, sender_language, Some(caller_root_did.as_str()))
+                    .room_command(room_name, &command, from, sender_profile, Some(caller_root_did.as_str()))
                     .await;
                 info!("[{}] {} -> @here: {} -> {}", room_name, from, command, response);
                 self.record_event(format!("[{room_name}] {from} -> @here: {command} => {}", response))
@@ -3263,7 +3404,7 @@ impl World {
                     ActorCommand::Raw { .. } => None,
                 };
                 let (response, effective_room) = self
-                    .handle_actor_command(room_name, from, from_did, sender_language, &target, command)
+                    .handle_actor_command(room_name, from, from_did, sender_profile, &target, command)
                     .await;
                 info!("[{}] {} -> @{} -> {}", room_name, from, target, response);
                 self.record_event(format!(
@@ -3316,14 +3457,14 @@ impl World {
     async fn room_description(&self, room_name: &str) -> String {
         let rooms = self.rooms.read().await;
         rooms.get(room_name)
-            .map(|r| r.description_or_default("und"))
+            .map(|r| r.description_or_default())
             .unwrap_or_default()
     }
 
     async fn room_title(&self, room_name: &str) -> String {
         let rooms = self.rooms.read().await;
         rooms.get(room_name)
-            .map(|r| r.title_or_default("und"))
+            .map(|r| r.title_or_default())
             .unwrap_or_default()
     }
 
@@ -3938,7 +4079,7 @@ impl World {
                         agent_did: avatar.agent_did.id(),
                         agent_endpoint: avatar.agent_endpoint.clone(),
                         owner: avatar.owner.clone(),
-                        description: avatar.description_or_default("und"),
+                        description: avatar.description_or_default(),
                         acl: avatar.acl.summary(),
                         joined_at: format_system_time(avatar.joined_at),
                     })
@@ -3967,7 +4108,7 @@ impl World {
         room_name: &str,
         from: &str,
         from_did: &Did,
-        sender_language: &str,
+        sender_profile: &str,
         target: &str,
         command: ActorCommand,
     ) -> (String, String) {
@@ -3984,7 +4125,7 @@ impl World {
                             room_name,
                             &room_cmd,
                             from,
-                            sender_language,
+                            sender_profile,
                             Some(caller_root_did.as_str()),
                         )
                         .await,
@@ -3998,13 +4139,13 @@ impl World {
                 };
                 (
                     self
-                        .handle_world_command(room_name, from, from_did, sender_language, &cmd)
+                        .handle_world_command(room_name, from, from_did, sender_profile, &cmd)
                         .await,
                     room_name.to_string(),
                 )
             }
             "avatar" => self
-                .handle_avatar_command(room_name, from, from_did, sender_language, command)
+                .handle_avatar_command(room_name, from, from_did, sender_profile, command)
                 .await,
             _ => {
                 let rooms = self.rooms.read().await;
@@ -4032,7 +4173,7 @@ impl World {
 
                 if let Some(resolved_target) = shortcut_target {
                     if let Some(result) = self
-                        .handle_object_method(room_name, from, from_did, sender_language, &resolved_target, command.clone())
+                        .handle_object_method(room_name, from, from_did, sender_profile, &resolved_target, command.clone())
                         .await
                     {
                         return result;
@@ -4045,7 +4186,7 @@ impl World {
 
                 if !actor_exists {
                     if let Some(result) = self
-                        .handle_object_method(room_name, from, from_did, sender_language, target, command.clone())
+                        .handle_object_method(room_name, from, from_did, sender_profile, target, command.clone())
                         .await
                     {
                         return result;
@@ -4072,7 +4213,7 @@ impl World {
         room_name: &str,
         from: &str,
         from_did: &Did,
-        sender_language: &str,
+        sender_profile: &str,
         target: &str,
         command: ActorCommand,
     ) -> Option<(String, String)> {
@@ -4301,7 +4442,7 @@ impl World {
             let objects = self.room_objects.read().await;
             let room_map = objects.get(room_name)?;
             let object = room_map.get(&object_id)?;
-            Self::lookup_object_print_verb(object, &verb, sender_language)
+            Self::lookup_object_print_verb(object, &verb, sender_profile)
         };
         if let Some(output) = declarative {
             return Some((output, room_name.to_string()));
@@ -4846,7 +4987,7 @@ impl World {
         room_name: &str,
         from: &str,
         from_did: &Did,
-        sender_language: &str,
+        sender_profile: &str,
         command: ActorCommand,
     ) -> (String, String) {
         match command {
@@ -5019,13 +5160,13 @@ impl World {
                     rooms.get(room_name).and_then(|room| {
                         room.exits
                             .iter()
-                            .find(|e| e.matches_for_language_preferences(direction, &["und".to_string()]))
+                            .find(|e| e.matches_for_preferences(direction, &["und".to_string()]))
                             .cloned()
                     })
                 };
 
                 if let Some(exit) = move_target {
-                    let exit_name = exit.name_for_language_preferences(&["und".to_string()]);
+                    let exit_name = exit.name_for_preferences(&["und".to_string()]);
                     if exit.locked {
                         return (format!("The way {} is locked.", exit_name), room_name.to_string());
                     }
@@ -5035,7 +5176,7 @@ impl World {
                     }
 
                     let destination = exit.to.clone();
-                    let travel_text = exit.travel_text_for_language_preferences(&["und".to_string()]);
+                    let travel_text = exit.travel_text_for_preferences(&["und".to_string()]);
 
                     // Exit destinations may be local room fragments or full room DIDs.
                     // If the DID root is not this world, we hand off via /enter.
@@ -5105,7 +5246,7 @@ impl World {
                         return (format!("@avatar '{}' not found", from), room_name.to_string());
                     };
 
-                    avatar.set_description("und", description.clone());
+                    avatar.set_description(description.clone());
                     return (format!("@avatar owner={} desc={}", avatar.owner, description), room_name.to_string());
                 }
 
@@ -5120,7 +5261,7 @@ impl World {
                     return (format!(
                         "@avatar owner={} desc={} acl={} shortcuts={}",
                         avatar.owner,
-                        avatar.description_or_default("und"),
+                        avatar.description_or_default(),
                         avatar.acl.summary(),
                         avatar.object_shortcuts_summary()
                     ), room_name.to_string());
@@ -5133,7 +5274,7 @@ impl World {
                             room_name,
                             trimmed,
                             from,
-                            sender_language,
+                            sender_profile,
                             Some(caller_root_did.as_str()),
                         )
                         .await,
@@ -5148,7 +5289,7 @@ impl World {
         room_name: &str,
         _from: &str,
         from_did: &Did,
-        sender_language: &str,
+        _sender_profile: &str,
         command: &str,
     ) -> String {
         let normalized = command.trim();
@@ -5170,7 +5311,7 @@ impl World {
 
             let mut rows: Vec<(String, String)> = rooms
                 .iter()
-                .map(|(id, room)| (id.clone(), room.title_or_default("und")))
+                .map(|(id, room)| (id.clone(), room.title_or_default()))
                 .collect();
             rows.sort_by(|left, right| left.0.cmp(&right.0));
 
@@ -5278,7 +5419,7 @@ impl World {
             let Some(room) = rooms.get(&fragment) else {
                 return format!("@world room '{}' not found", fragment);
             };
-            return format!("@world {} — {}", room.name, room.description_or_default("und"));
+            return format!("@world {} — {}", room.name, room.description_or_default());
         }
 
         if verb == "private" {
@@ -5545,12 +5686,7 @@ impl World {
             }
             if let Some(room) = rooms.get_mut(room_name) {
                 if !room.exits.iter().any(|e| e.matches(&exit_name)) {
-                    room.exits.push(exit_for_language(
-                        exit_id,
-                        exit_name.clone(),
-                        exit_target.clone(),
-                        sender_language,
-                    ));
+                    room.exits.push(build_exit_entry(exit_id, exit_name.clone(), exit_target.clone()));
                 }
             }
             drop(rooms);
@@ -5671,7 +5807,7 @@ impl World {
         room_name: &str,
         command: &str,
         from: &str,
-        sender_language: &str,
+        _sender_profile: &str,
         caller_root_did: Option<&str>,
     ) -> String {
 
@@ -5683,7 +5819,7 @@ impl World {
                     room.avatars.keys().cloned().collect::<Vec<_>>(),
                     room.acl.owner.clone(),
                     room.acl.summary(),
-                    room.description_or_default("und"),
+                    room.description_or_default(),
                     Some(room.did.clone()),
                 )
             } else {
@@ -5783,7 +5919,7 @@ impl World {
                     room.avatars.remove(&handle);
                 }
             }
-            RoomActorAction::SetAttribute { key, value, language } => {
+            RoomActorAction::SetAttribute { key, value } => {
                 match key.as_str() {
                     "owner" => {
                         let did = match Did::try_from(value.as_str()) {
@@ -5802,32 +5938,26 @@ impl World {
                         }
                     }
                     "title" => {
-                        let _ = language;
-                        let _ = sender_language;
-                        let language_tag = "und".to_string();
                         let title_value = value.clone();
                         let mut rooms = self.rooms.write().await;
                         if let Some(room) = rooms.get_mut(room_name) {
-                            room.set_title(&language_tag, title_value);
+                            room.set_title(title_value);
                             changed_rooms.push(room_name.to_string());
                             room_update_announcement = Some(format!(
-                                "room title updated ({}) by {}",
-                                language_tag, from
+                                "room title updated by {}",
+                                from
                             ));
                         }
                     }
                     "description" => {
-                        let _ = language;
-                        let _ = sender_language;
-                        let language_tag = "und".to_string();
                         let description_value = value.clone();
                         let mut rooms = self.rooms.write().await;
                         if let Some(room) = rooms.get_mut(room_name) {
-                            room.set_description(&language_tag, description_value);
+                            room.set_description(description_value);
                             changed_rooms.push(room_name.to_string());
                             room_update_announcement = Some(format!(
-                                "room description updated ({}) by {}",
-                                language_tag, from
+                                "room description updated by {}",
+                                from
                             ));
                         }
                     }
@@ -5924,12 +6054,7 @@ impl World {
                 if let Some(room) = rooms.get_mut(room_name) {
                     let already_exists = room.exits.iter().any(|e| e.matches(&exit_name));
                     if !already_exists {
-                        room.exits.push(exit_for_language(
-                            exit_id,
-                            exit_name.clone(),
-                            exit_target,
-                            sender_language,
-                        ));
+                        room.exits.push(build_exit_entry(exit_id, exit_name.clone(), exit_target));
                     }
                 }
                 changed_rooms.push(room_name.to_string());
@@ -6059,8 +6184,8 @@ impl WorldProtocol {
 
         Ok((
             room.did.clone(),
-            room.title_or_default("und"),
-            room.description_or_default("und"),
+            room.title_or_default(),
+            room.description_or_default(),
             avatars,
             endpoints,
         ))
@@ -6312,6 +6437,7 @@ impl WorldProtocol {
                 } else {
                     TransportAckCode::Rejected
                 };
+
                 WorldResponse {
                     ok: false,
                     room: String::new(),
@@ -6527,7 +6653,7 @@ impl WorldProtocol {
         agent_endpoint: String,
         sender_root: &str,
     ) -> Result<WorldResponse> {
-        let sender_language = sender_language_from_document(&sender_document);
+        let sender_profile = sender_profile_from_document(&sender_document);
 
         match command {
             WorldCommand::Enter { room, preferred_handle } => {
@@ -6734,7 +6860,7 @@ impl WorldProtocol {
                 }
                 let (message, broadcasted, effective_room) = self
                     .world
-                    .send_message(&room, &actor_name, sender_did, &sender_language, envelope)
+                    .send_message(&room, &actor_name, sender_did, &sender_profile, envelope)
                     .await?;
                 if effective_room != room {
                     self.push_presence_snapshot(&room).await;
@@ -6989,6 +7115,7 @@ impl ProtocolHandler for ClosetProtocol {
                             &session_id,
                             &requester_endpoint,
                             &ipns_private_key_base64,
+                            None,
                         )
                         .await
                     {

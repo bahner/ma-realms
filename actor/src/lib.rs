@@ -94,6 +94,11 @@ struct WorldConnCache {
     target_id: String,
 }
 
+struct ClosetEndpointCache {
+    endpoint: Endpoint,
+    target_id: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorldTransportKind {
     World,
@@ -115,10 +120,43 @@ thread_local! {
     static WORLD_CONN_CACHE: RefCell<Option<WorldConnCache>> = RefCell::new(None);
     static CMD_CONN_CACHE: RefCell<Option<WorldConnCache>> = RefCell::new(None);
     static CHAT_CONN_CACHE: RefCell<Option<WorldConnCache>> = RefCell::new(None);
+    static CLOSET_ENDPOINT_CACHE: RefCell<Option<ClosetEndpointCache>> = RefCell::new(None);
     static ACL_COMPILED_CACHE: RefCell<HashMap<String, CompiledCapabilityAcl>> = RefCell::new(HashMap::new());
     static ROOM_DID_CACHE: RefCell<HashMap<String, CachedDidEntry>> = RefCell::new(HashMap::new());
     static ROOM_OBJECT_DID_CACHE: RefCell<HashMap<String, CachedDidEntry>> = RefCell::new(HashMap::new());
     static ACTIVE_ROOM_CACHE: RefCell<Option<String>> = RefCell::new(None);
+}
+
+fn take_closet_endpoint_cache() -> Option<ClosetEndpointCache> {
+    CLOSET_ENDPOINT_CACHE.with(|c| c.borrow_mut().take())
+}
+
+fn store_closet_endpoint_cache(cache: ClosetEndpointCache) {
+    CLOSET_ENDPOINT_CACHE.with(|c| *c.borrow_mut() = Some(cache));
+}
+
+async fn get_or_create_closet_endpoint(target_id_str: &str) -> Result<Endpoint, JsValue> {
+    if let Some(cached) = take_closet_endpoint_cache() {
+        if cached.target_id == target_id_str {
+            let endpoint = cached.endpoint.clone();
+            store_closet_endpoint_cache(cached);
+            return Ok(endpoint);
+        }
+        cached.endpoint.close().await;
+    }
+
+    let endpoint = Endpoint::builder(presets::N0)
+        .bind()
+        .await
+        .map_err(|e| js_err(format!("endpoint bind failed: {e}")))?;
+    let _ = endpoint.online().await;
+
+    store_closet_endpoint_cache(ClosetEndpointCache {
+        endpoint: endpoint.clone(),
+        target_id: target_id_str.to_string(),
+    });
+
+    Ok(endpoint)
 }
 
 #[derive(Clone, Debug)]
@@ -975,6 +1013,10 @@ pub async fn disconnect_world() {
         cached.endpoint.close().await;
     }
 
+    if let Some(cached) = take_closet_endpoint_cache() {
+        cached.endpoint.close().await;
+    }
+
     let state = INBOX_STATE.with(|slot| slot.borrow_mut().take());
     if let Some(listener) = state {
         let _ = listener.router.shutdown().await;
@@ -1532,21 +1574,6 @@ pub fn set_bundle_presence_hint(
     })
 }
 
-/// Update optional `ma:lang` and `ma:language` fields in the DID document and re-sign it.
-/// Returns JSON: `{ encrypted_bundle, did, ipns, document_json }`
-#[wasm_bindgen]
-pub fn set_bundle_language_preferences(
-    passphrase: &str,
-    encrypted_bundle_json: &str,
-    lang: &str,
-    language: &str,
-) -> Result<String, JsValue> {
-    update_bundle_document(passphrase, encrypted_bundle_json, |document| {
-        document.set_lang(lang).map_err(js_err)?;
-        document.set_language(language).map_err(js_err)
-    })
-}
-
 /// Update the optional `ma:world` field in the DID document and re-sign it.
 /// Returns JSON: `{ encrypted_bundle, did, ipns, document_json }`
 #[wasm_bindgen]
@@ -1578,20 +1605,6 @@ pub fn set_bundle_transports(
         document.set_ma_transports(transports);
         document.set_ma_current_inbox(&inbox_hint);
         document.set_presence_hint(&inbox_hint).map_err(js_err)?;
-        Ok(())
-    })
-}
-
-/// Remove optional `ma:lang` and `ma:language` fields from the DID document and re-sign it.
-/// Returns JSON: `{ encrypted_bundle, did, ipns, document_json }`
-#[wasm_bindgen]
-pub fn clear_bundle_language_preferences(
-    passphrase: &str,
-    encrypted_bundle_json: &str,
-) -> Result<String, JsValue> {
-    update_bundle_document(passphrase, encrypted_bundle_json, |document| {
-        document.clear_lang();
-        document.clear_language();
         Ok(())
     })
 }
@@ -1630,11 +1643,7 @@ async fn send_closet_request(endpoint_id: &str, request: ClosetRequest) -> Resul
         .parse()
         .map_err(|e| js_err(format!("invalid endpoint id: {e}")))?;
 
-    let endpoint = Endpoint::builder(presets::N0)
-        .bind()
-        .await
-        .map_err(|e| js_err(format!("endpoint bind failed: {e}")))?;
-    let _ = endpoint.online().await;
+    let endpoint = get_or_create_closet_endpoint(endpoint_id).await?;
 
     let relay_source = core_normalize_relay_url(DEFAULT_WORLD_RELAY_URL);
     let relay_url: RelayUrl = relay_source
@@ -1666,7 +1675,6 @@ async fn send_closet_request(endpoint_id: &str, request: ClosetRequest) -> Resul
 
     let _ = send.finish();
     connection.close(0u32.into(), b"ok");
-    endpoint.close().await;
 
     serde_json::from_slice::<ClosetResponse>(&bytes).map_err(js_err)
 }
@@ -1936,7 +1944,6 @@ pub async fn send_world_message(
     encrypted_bundle_json: &str,
     actor_name: &str,
     room: &str,
-    _language: &str,
     text: &str,
 ) -> Result<String, JsValue> {
     let timestamp_ms = js_sys::Date::now() as u64;
@@ -1975,7 +1982,6 @@ pub async fn send_world_cmd(
     encrypted_bundle_json: &str,
     actor_name: &str,
     room: &str,
-    _language: &str,
     text: &str,
 ) -> Result<String, JsValue> {
     let timestamp_ms = js_sys::Date::now() as u64;

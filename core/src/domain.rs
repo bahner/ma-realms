@@ -97,7 +97,7 @@ impl ExitData {
             || self.names.values().any(|n| n == input)
     }
 
-    pub fn name_for_language_preferences(&self, preferences: &[String]) -> String {
+    pub fn name_for_preferences(&self, preferences: &[String]) -> String {
         for candidate in preferences {
             let normalized = candidate.trim().replace('-', "_");
             if normalized.is_empty() {
@@ -129,7 +129,7 @@ impl ExitData {
         self.name.clone()
     }
 
-    pub fn matches_for_language_preferences(&self, input: &str, preferences: &[String]) -> bool {
+    pub fn matches_for_preferences(&self, input: &str, preferences: &[String]) -> bool {
         let token = input.trim();
         if token.is_empty() {
             return false;
@@ -137,7 +137,7 @@ impl ExitData {
         if self.matches(token) {
             return true;
         }
-        if self.name_for_language_preferences(preferences) == token {
+        if self.name_for_preferences(preferences) == token {
             return true;
         }
 
@@ -168,7 +168,7 @@ impl ExitData {
         self.acl.can_use(did_root)
     }
 
-    pub fn travel_text_for_language_preferences(&self, preferences: &[String]) -> Option<String> {
+    pub fn travel_text_for_preferences(&self, preferences: &[String]) -> Option<String> {
         for candidate in preferences {
             let normalized = candidate.trim().replace('-', "_");
             if normalized.is_empty() {
