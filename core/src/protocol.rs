@@ -236,3 +236,106 @@ pub struct ClosetResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_name: Option<String>,
 }
+
+impl ClosetResponse {
+    fn base(session_id: &str, ok: bool, message: impl Into<String>) -> Self {
+        Self {
+            ok,
+            message: message.into(),
+            session_id: Some(session_id.to_string()),
+            prompt: None,
+            lobby_events: Vec::new(),
+            latest_lobby_sequence: 0,
+            did: None,
+            fragment: None,
+            key_name: None,
+        }
+    }
+
+    pub fn ok(session_id: &str, message: impl Into<String>) -> Self {
+        Self::base(session_id, true, message)
+    }
+
+    pub fn ok_unscoped(message: impl Into<String>) -> Self {
+        let mut response = Self::base("_", true, message);
+        response.session_id = None;
+        response
+    }
+
+    pub fn err(session_id: &str, message: impl Into<String>) -> Self {
+        Self::base(session_id, false, message)
+    }
+
+    pub fn err_unscoped(message: impl Into<String>) -> Self {
+        let mut response = Self::base("_", false, message);
+        response.session_id = None;
+        response
+    }
+
+    pub fn with_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.prompt = Some(prompt.into());
+        self
+    }
+
+    pub fn with_lobby_events(mut self, events: Vec<RoomEvent>, latest_sequence: u64) -> Self {
+        self.lobby_events = events;
+        self.latest_lobby_sequence = latest_sequence;
+        self
+    }
+
+    pub fn with_latest_lobby_sequence(mut self, latest_sequence: u64) -> Self {
+        self.latest_lobby_sequence = latest_sequence;
+        self
+    }
+
+    pub fn with_did(mut self, did: impl Into<String>) -> Self {
+        self.did = Some(did.into());
+        self
+    }
+
+    pub fn with_fragment(mut self, fragment: impl Into<String>) -> Self {
+        self.fragment = Some(fragment.into());
+        self
+    }
+
+    pub fn with_key_name(mut self, key_name: impl Into<String>) -> Self {
+        self.key_name = Some(key_name.into());
+        self
+    }
+
+    pub fn with_did_opt(mut self, did: Option<String>) -> Self {
+        self.did = did;
+        self
+    }
+
+    pub fn with_fragment_opt(mut self, fragment: Option<String>) -> Self {
+        self.fragment = fragment;
+        self
+    }
+
+    pub fn with_session_id_opt(mut self, session_id: Option<String>) -> Self {
+        self.session_id = session_id;
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClosetResponse;
+
+    #[test]
+    fn scoped_builder_sets_session_and_flags() {
+        let response = ClosetResponse::ok("sess-1", "ready");
+        assert!(response.ok);
+        assert_eq!(response.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(response.message, "ready");
+    }
+
+    #[test]
+    fn unscoped_builder_omits_session() {
+        let response = ClosetResponse::err_unscoped("boom");
+        assert!(!response.ok);
+        assert!(response.session_id.is_none());
+        assert_eq!(response.message, "boom");
+    }
+}

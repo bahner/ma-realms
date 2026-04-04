@@ -29,6 +29,10 @@ use iroh::{
 use ma_core::{
     ActorCommand, BROADCAST_ALPN, CHAT_ALPN, CMD_ALPN, CONTENT_TYPE_CHAT, CONTENT_TYPE_CMD,
     CLOSET_ALPN, ClosetRequest, ClosetResponse,
+    CLOSET_EMPTY_MESSAGE, CLOSET_HELP_MESSAGE, CLOSET_HELP_PROMPT,
+    CLOSET_REQUIRED_FIELDS_MESSAGE, CLOSET_REQUIRED_FIELDS_PROMPT,
+    ClosetCommand, ClosetProfileField, ClosetRecoveryCommand,
+    ClosetDidPublishPlan, ensure_issued_document_root_match, ensure_session_document_root_match,
     CONTENT_TYPE_BROADCAST, CONTENT_TYPE_PRESENCE, CONTENT_TYPE_WORLD, CompiledCapabilityAcl,
     DEFAULT_WORLD_RELAY_URL,
     ExitData, LaneCapability, MessageEnvelope, ObjectDefinition, ObjectInboxMessage,
@@ -38,6 +42,7 @@ use ma_core::{
     RoomEvent, TransportAck, TransportAckCode, WORLD_ALPN, WorldCommand, WorldLane, WorldRequest,
     WorldResponse, compile_acl, evaluate_compiled_acl_with_owner, execute_room_actor_command,
     normalize_spoken_text, parse_capability_acl_text, parse_object_local_capability_acl,
+    parse_closet_command, plan_closet_did_publish, required_profile_fields_missing,
     LegacyRequirement, RequirementChecker, RequirementSet, RequirementValue,
 };
 use nanoid::nanoid;
@@ -1279,69 +1284,48 @@ impl World {
         let provided_key = ipns_private_key_base64.trim();
         let kubo_url = self.kubo_url.read().await.clone();
 
-        if let Some(session_did) = session.did.as_ref() {
-            let session_root = Did::try_from(session_did.as_str())
-                .map_err(|e| anyhow!("invalid session DID '{}': {}", session_did, e))?
-                .without_fragment()
-                .id();
-            if session_root != document_root {
-                return Err(anyhow!(
-                    "document DID root '{}' does not match session DID root '{}'",
-                    document_root,
-                    session_root
-                ));
-            }
-        }
+        ensure_session_document_root_match(session.did.as_deref(), &document_root)?;
 
-        let key_name = if !provided_key.is_empty() {
-            // If caller provides key material, import/apply citizenship for this publish.
-            let desired_alias = document_did.fragment.as_deref();
-            let (issued_did, _fragment, key_name) = self
-                .closet_submit_citizenship(session_id, endpoint, provided_key, desired_alias)
-                .await?;
-            let issued_root = Did::try_from(issued_did.as_str())
-                .map_err(|e| anyhow!("invalid issued DID '{}': {}", issued_did, e))?
-                .without_fragment()
-                .id();
-            if issued_root != document_root {
-                return Err(anyhow!(
-                    "document DID root '{}' does not match imported key DID root '{}'",
-                    document_root,
-                    issued_root
-                ));
-            }
-            key_name
+        let ipns_path = format!("/ipns/{}", document_ipns_id);
+        let was_published_before = if provided_key.is_empty() {
+            Some(kubo::name_resolve(&kubo_url, &ipns_path, true).await.is_ok())
         } else {
-            // No key provided: only allow if this DID has already been published
-            // and the same IPNS key is present on this node.
-            let ipns_path = format!("/ipns/{}", document_ipns_id);
-            let was_published_before = kubo::name_resolve(&kubo_url, &ipns_path, true).await.is_ok();
-            if !was_published_before {
-                return Err(anyhow!(
-                    "ipns_private_key_base64 is required for first DID publish in closet session"
-                ));
-            }
+            None
+        };
 
+        let local_key_name = if provided_key.is_empty() {
             let keys = list_kubo_keys(&kubo_url).await?;
-            let Some(existing) = keys
-                .into_iter()
+            keys.into_iter()
                 .find(|key| key.id.trim() == document_ipns_id)
-            else {
-                return Err(anyhow!(
-                    "no local IPNS key found for DID root '{}'; provide ipns_private_key_base64",
-                    document_root
-                ));
-            };
+                .map(|key| key.name)
+        } else {
+            None
+        };
 
-            {
+        let publish_plan = plan_closet_did_publish(
+            provided_key,
+            &document_root,
+            was_published_before,
+            local_key_name,
+        )?;
+
+        let key_name = match publish_plan {
+            ClosetDidPublishPlan::ImportProvidedKey => {
+                let desired_alias = document_did.fragment.as_deref();
+                let (issued_did, _fragment, key_name) = self
+                    .closet_submit_citizenship(session_id, endpoint, provided_key, desired_alias)
+                    .await?;
+                ensure_issued_document_root_match(&issued_did, &document_root)?;
+                key_name
+            }
+            ClosetDidPublishPlan::UseExistingLocalKey { key_name } => {
                 let mut sessions = self.closet_sessions.write().await;
                 if let Some(active) = sessions.get_mut(session_id) {
                     active.did = Some(document_root.clone());
-                    active.fragment = Some(existing.name.clone());
+                    active.fragment = Some(key_name.clone());
                 }
+                key_name
             }
-
-            existing.name
         };
 
         let document_cid = ipfs_add(&kubo_url, did_document_json.as_bytes().to_vec()).await?;
@@ -1365,40 +1349,20 @@ impl World {
         endpoint: &str,
         input: &str,
     ) -> Result<ClosetResponse> {
-        let trimmed = input.trim();
-        if trimmed.is_empty() {
-            return Ok(ClosetResponse {
-                ok: true,
-                message: "You are in the closet and have no avatar yet. Type 'help'.".to_string(),
-                session_id: Some(session_id.to_string()),
-                prompt: None,
-                lobby_events: Vec::new(),
-                latest_lobby_sequence: 0,
-                did: None,
-                fragment: None,
-                key_name: None,
-            });
+        let command = parse_closet_command(input);
+
+        if matches!(&command, ClosetCommand::Empty) {
+            return Ok(ClosetResponse::ok(session_id, CLOSET_EMPTY_MESSAGE));
         }
 
-        let mut parts = trimmed.split_whitespace();
-        let verb = parts.next().unwrap_or_default().to_ascii_lowercase();
-        let tail = trimmed[verb.len()..].trim();
-
-        if verb == "help" {
-            return Ok(ClosetResponse {
-                ok: true,
-                message: "Closet commands: help | show | hear | name <text> | description <text> | alias <text> | apply [ipns_key_base64] | citizen [ipns_key_base64] | recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>\nRequired fields: name, description, alias.\nAlias is your requested username/fragment and can be rejected if taken.\nWhen done: run apply, then type 'go lobby' in the actor UI to enter the world.".to_string(),
-                session_id: Some(session_id.to_string()),
-                prompt: Some("You are in the closet with no avatar yet. Required: name + description + alias. Then run apply. When done, type 'go lobby' in the actor UI.".to_string()),
-                lobby_events: Vec::new(),
-                latest_lobby_sequence: 0,
-                did: None,
-                fragment: None,
-                key_name: None,
-            });
+        if matches!(&command, ClosetCommand::Help) {
+            return Ok(
+                ClosetResponse::ok(session_id, CLOSET_HELP_MESSAGE)
+                    .with_prompt(CLOSET_HELP_PROMPT),
+            );
         }
 
-        if verb == "show" || verb == "status" || verb == "look" {
+        if matches!(&command, ClosetCommand::Show) {
             let session = self.closet_session_owned_by(session_id, endpoint).await?;
             let did = session.did.clone().unwrap_or_else(|| "(none)".to_string());
             let name = session.name.clone().unwrap_or_else(|| "(unset)".to_string());
@@ -1422,27 +1386,24 @@ impl World {
                 false
             };
 
-            return Ok(ClosetResponse {
-                ok: true,
-                message: format!(
-                    "closet profile: did={} name={} description={} alias={} recovery={}",
-                    did,
-                    name,
-                    description,
-                    alias,
-                    if recovery { "set" } else { "unset" }
-                ),
-                session_id: Some(session_id.to_string()),
-                prompt: None,
-                lobby_events: Vec::new(),
-                latest_lobby_sequence: 0,
-                did: session.did,
-                fragment: session.fragment,
-                key_name: None,
-            });
+            return Ok(
+                ClosetResponse::ok(
+                    session_id,
+                    format!(
+                        "closet profile: did={} name={} description={} alias={} recovery={}",
+                        did,
+                        name,
+                        description,
+                        alias,
+                        if recovery { "set" } else { "unset" }
+                    ),
+                )
+                .with_did_opt(session.did)
+                .with_fragment_opt(session.fragment),
+            );
         }
 
-        if verb == "hear" {
+        if matches!(&command, ClosetCommand::Hear) {
             let since = {
                 let sessions = self.closet_sessions.read().await;
                 let Some(session) = sessions.get(session_id) else {
@@ -1462,425 +1423,273 @@ impl World {
                 }
             }
 
-            return Ok(ClosetResponse {
-                ok: true,
-                message: if events.is_empty() {
-                    "No new lobby events.".to_string()
-                } else {
-                    format!("Heard {} lobby event(s).", events.len())
-                },
-                session_id: Some(session_id.to_string()),
-                prompt: None,
-                lobby_events: events,
-                latest_lobby_sequence,
-                did: None,
-                fragment: None,
-                key_name: None,
-            });
-        }
-
-        if verb == "name" || verb == "description" || verb == "alias" {
-            if tail.is_empty() {
-                return Err(anyhow!("usage: {} <value>", verb));
-            }
-            let msg = self.closet_answer(session_id, endpoint, &verb, tail).await?;
-
-            let session = self.closet_session_owned_by(session_id, endpoint).await?;
-            if let Some(did) = session.did.as_deref() {
-                self.upsert_closet_profile(
-                    did,
-                    session.name.clone(),
-                    session.description.clone(),
-                    session.alias.clone(),
-                )
-                    .await?;
-                if verb == "description" {
-                    let did_root = Did::try_from(did)
-                        .map_err(|e| anyhow!("invalid closet DID '{}': {}", did, e))?
-                        .without_fragment()
-                        .id();
-                    let _ = self
-                        .set_avatar_description_for_did(
-                            DEFAULT_ROOM,
-                            did_root.as_str(),
-                            tail.trim(),
-                        )
-                        .await;
-                }
-            }
-
-            return Ok(ClosetResponse {
-                ok: true,
-                message: msg,
-                session_id: Some(session_id.to_string()),
-                prompt: None,
-                lobby_events: Vec::new(),
-                latest_lobby_sequence: 0,
-                did: None,
-                fragment: None,
-                key_name: None,
-            });
-        }
-
-        if verb == "apply" || verb == "citizen" {
-            let session = self.closet_session_owned_by(session_id, endpoint).await?;
-            let required_missing = session
-                .name
-                .as_ref()
-                .map(|v| v.trim().is_empty())
-                .unwrap_or(true)
-                || session
-                    .description
-                    .as_ref()
-                    .map(|v| v.trim().is_empty())
-                    .unwrap_or(true)
-                || session
-                    .alias
-                    .as_ref()
-                    .map(|v| v.trim().is_empty())
-                    .unwrap_or(true);
-
-            if session.did.is_none() && required_missing {
-                return Ok(ClosetResponse {
-                    ok: false,
-                    message: "required fields are: name, description, alias".to_string(),
-                    session_id: Some(session_id.to_string()),
-                    prompt: Some("set name/description/alias, then run apply".to_string()),
-                    lobby_events: Vec::new(),
-                    latest_lobby_sequence: 0,
-                    did: None,
-                    fragment: None,
-                    key_name: None,
-                });
-            }
-
-            if let Some(existing_did) = session.did.as_deref() {
-                self.upsert_closet_profile(
-                    existing_did,
-                    session.name.clone(),
-                    session.description.clone(),
-                    session.alias.clone(),
-                )
-                .await?;
-                return Ok(ClosetResponse {
-                    ok: true,
-                    message: "changes applied. You can stay in the closet and keep editing; type 'go lobby' when ready.".to_string(),
-                    session_id: Some(session_id.to_string()),
-                    prompt: None,
-                    lobby_events: Vec::new(),
-                    latest_lobby_sequence: 0,
-                    did: Some(existing_did.to_string()),
-                    fragment: session.fragment,
-                    key_name: None,
-                });
-            }
-
-            let (did, fragment, key_name) = self
-                .closet_submit_citizenship(
+            return Ok(
+                ClosetResponse::ok(
                     session_id,
-                    endpoint,
-                    tail,
-                    session.alias.as_deref(),
-                )
-                .await?;
-            return Ok(ClosetResponse {
-                ok: true,
-                message: "application accepted. type 'go lobby' in the actor UI to enter the world.".to_string(),
-                session_id: Some(session_id.to_string()),
-                prompt: None,
-                lobby_events: Vec::new(),
-                latest_lobby_sequence: 0,
-                did: Some(did),
-                fragment: Some(fragment),
-                key_name: Some(key_name),
-            });
-        }
-
-        if verb == "recovery" {
-            let mut args = tail.split_whitespace();
-            let action = args.next().unwrap_or_default().to_ascii_lowercase();
-
-            if action.is_empty() {
-                return Ok(ClosetResponse {
-                    ok: false,
-                    message: "usage: recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>".to_string(),
-                    session_id: Some(session_id.to_string()),
-                    prompt: None,
-                    lobby_events: Vec::new(),
-                    latest_lobby_sequence: 0,
-                    did: None,
-                    fragment: None,
-                    key_name: None,
-                });
-            }
-
-            if action == "set" {
-                let passphrase = tail.strip_prefix("set").unwrap_or_default().trim();
-                if passphrase.len() < 8 {
-                    return Ok(ClosetResponse {
-                        ok: false,
-                        message: "recovery passphrase must be at least 8 characters".to_string(),
-                        session_id: Some(session_id.to_string()),
-                        prompt: None,
-                        lobby_events: Vec::new(),
-                        latest_lobby_sequence: 0,
-                        did: None,
-                        fragment: None,
-                        key_name: None,
-                    });
-                }
-
-                let session = self.closet_session_owned_by(session_id, endpoint).await?;
-                let did = if let Some(did) = session.did.clone() {
-                    did
-                } else if let Some(root) = self.did_root_by_endpoint(DEFAULT_ROOM, endpoint).await {
-                    root
-                } else {
-                    return Ok(ClosetResponse {
-                        ok: false,
-                        message: "recovery set requires a DID in this closet session (run apply first or open closet while logged in)".to_string(),
-                        session_id: Some(session_id.to_string()),
-                        prompt: None,
-                        lobby_events: Vec::new(),
-                        latest_lobby_sequence: 0,
-                        did: None,
-                        fragment: None,
-                        key_name: None,
-                    });
-                };
-
-                self.set_recovery_secret_for_did(&did, passphrase).await?;
-                return Ok(ClosetResponse {
-                    ok: true,
-                    message: "recovery checksum stored".to_string(),
-                    session_id: Some(session_id.to_string()),
-                    prompt: None,
-                    lobby_events: Vec::new(),
-                    latest_lobby_sequence: 0,
-                    did: None,
-                    fragment: None,
-                    key_name: None,
-                });
-            }
-
-            if action == "status" {
-                let session = self.closet_session_owned_by(session_id, endpoint).await?;
-                let did = if let Some(did) = session.did.clone() {
-                    Some(did)
-                } else {
-                    self.did_root_by_endpoint(DEFAULT_ROOM, endpoint).await
-                };
-                let Some(did) = did else {
-                    return Ok(ClosetResponse {
-                        ok: false,
-                        message: "no DID context for this closet session".to_string(),
-                        session_id: Some(session_id.to_string()),
-                        prompt: None,
-                        lobby_events: Vec::new(),
-                        latest_lobby_sequence: 0,
-                        did: None,
-                        fragment: None,
-                        key_name: None,
-                    });
-                };
-                let did_root = Did::try_from(did.as_str())
-                    .map_err(|e| anyhow!("invalid DID '{}': {}", did, e))?
-                    .without_fragment()
-                    .id();
-                let configured = self
-                    .closet_profiles
-                    .read()
-                    .await
-                    .get(&did_root)
-                    .and_then(|profile| profile.recovery_checksum.clone())
-                    .is_some();
-
-                return Ok(ClosetResponse {
-                    ok: true,
-                    message: if configured {
-                        "recovery is configured".to_string()
+                    if events.is_empty() {
+                        "No new lobby events.".to_string()
                     } else {
-                        "recovery is not configured".to_string()
+                        format!("Heard {} lobby event(s).", events.len())
                     },
-                    session_id: Some(session_id.to_string()),
-                    prompt: None,
-                    lobby_events: Vec::new(),
-                    latest_lobby_sequence: 0,
-                    did: None,
-                    fragment: None,
-                    key_name: None,
-                });
-            }
+                )
+                .with_lobby_events(events, latest_lobby_sequence),
+            );
+        }
 
-            if action == "rekey" {
-                let mut split = tail
-                    .strip_prefix("rekey")
-                    .unwrap_or_default()
-                    .trim()
-                    .splitn(2, char::is_whitespace);
-                let Some(handle) = split.next() else {
-                    return Ok(ClosetResponse {
-                        ok: false,
-                        message: "usage: recovery rekey <@handle> <passphrase>".to_string(),
-                        session_id: Some(session_id.to_string()),
-                        prompt: None,
-                        lobby_events: Vec::new(),
-                        latest_lobby_sequence: 0,
-                        did: None,
-                        fragment: None,
-                        key_name: None,
-                    });
-                };
-                let passphrase = split.next().unwrap_or_default().trim();
-                if passphrase.is_empty() {
-                    return Ok(ClosetResponse {
-                        ok: false,
-                        message: "usage: recovery rekey <@handle> <passphrase>".to_string(),
-                        session_id: Some(session_id.to_string()),
-                        prompt: None,
-                        lobby_events: Vec::new(),
-                        latest_lobby_sequence: 0,
-                        did: None,
-                        fragment: None,
-                        key_name: None,
-                    });
-                }
+        match command {
+            ClosetCommand::MissingFieldValue { field } => {
+                return Err(anyhow!("usage: {} <value>", field.as_str()));
+            }
+            ClosetCommand::SetField { field, value } => {
+                let msg = self
+                    .closet_answer(session_id, endpoint, field.as_str(), value.as_str())
+                    .await?;
 
                 let session = self.closet_session_owned_by(session_id, endpoint).await?;
-                let Some(new_did) = session.did.clone() else {
-                    return Ok(ClosetResponse {
-                        ok: false,
-                        message: "recovery rekey requires a new DID in this session (run citizen first)".to_string(),
-                        session_id: Some(session_id.to_string()),
-                        prompt: None,
-                        lobby_events: Vec::new(),
-                        latest_lobby_sequence: 0,
-                        did: None,
-                        fragment: None,
-                        key_name: None,
-                    });
-                };
-
-                let (handle, old_root, new_root) = self
-                    .rekey_identity_from_recovery(handle, passphrase, &new_did)
+                if let Some(did) = session.did.as_deref() {
+                    self.upsert_closet_profile(
+                        did,
+                        session.name.clone(),
+                        session.description.clone(),
+                        session.alias.clone(),
+                    )
                     .await?;
-                return Ok(ClosetResponse {
-                    ok: true,
-                    message: format!(
-                        "rekey complete for @{} ({} -> {})",
-                        handle, old_root, new_root
-                    ),
-                    session_id: Some(session_id.to_string()),
-                    prompt: None,
-                    lobby_events: Vec::new(),
-                    latest_lobby_sequence: 0,
-                    did: Some(new_did),
-                    fragment: None,
-                    key_name: None,
-                });
-            }
 
-            return Ok(ClosetResponse {
-                ok: false,
-                message: "usage: recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>".to_string(),
-                session_id: Some(session_id.to_string()),
-                prompt: None,
-                lobby_events: Vec::new(),
-                latest_lobby_sequence: 0,
-                did: None,
-                fragment: None,
-                key_name: None,
-            });
-        }
-
-        if verb == "enter" {
-            let (did, preferred_handle) = {
-                let sessions = self.closet_sessions.read().await;
-                let Some(session) = sessions.get(session_id) else {
-                    return Err(anyhow!("unknown closet session"));
-                };
-                if session.endpoint != endpoint {
-                    return Err(anyhow!("closet session endpoint mismatch"));
+                    if matches!(field, ClosetProfileField::Description) {
+                        let did_root = Did::try_from(did)
+                            .map_err(|e| anyhow!("invalid closet DID '{}': {}", did, e))?
+                            .without_fragment()
+                            .id();
+                        let _ = self
+                            .set_avatar_description_for_did(
+                                DEFAULT_ROOM,
+                                did_root.as_str(),
+                                value.trim(),
+                            )
+                            .await;
+                    }
                 }
-                let did = session
-                    .did
-                    .clone()
-                    .ok_or_else(|| anyhow!("no DID in session; run 'citizen' first"))?;
-                (did, session.name.clone())
-            };
 
-            let room = if tail.is_empty() {
-                DEFAULT_ROOM.to_string()
-            } else {
-                tail.trim().to_string()
-            };
-
-            let did_obj = Did::try_from(did.as_str())
-                .map_err(|e| anyhow!("invalid session DID '{}': {}", did, e))?;
-            let root_did = did_obj.without_fragment();
-
-            if !self.can_enter(&root_did).await {
-                let did_root = root_did.id();
-                let (knock_id, duplicate) = self
-                    .enqueue_knock(&room, &did_root, endpoint, preferred_handle)
-                    .await;
-                let detail = if duplicate {
-                    format!(
-                        "entry denied for {}; existing knock request id={} is pending",
-                        did_root, knock_id
-                    )
-                } else {
-                    format!(
-                        "entry denied for {}; knock request queued with id={}",
-                        did_root, knock_id
-                    )
-                };
-                return Ok(ClosetResponse {
-                    ok: false,
-                    message: detail,
-                    session_id: Some(session_id.to_string()),
-                    prompt: None,
-                    lobby_events: Vec::new(),
-                    latest_lobby_sequence: 0,
-                    did: Some(did_root),
-                    fragment: None,
-                    key_name: None,
-                });
+                return Ok(ClosetResponse::ok(session_id, msg));
             }
+            ClosetCommand::Apply {
+                ipns_private_key_base64,
+            } => {
+                let session = self.closet_session_owned_by(session_id, endpoint).await?;
+                let required_missing = required_profile_fields_missing(
+                    session.name.as_deref(),
+                    session.description.as_deref(),
+                    session.alias.as_deref(),
+                );
 
-            let inbox = resolve_avatar_inbox(&did_obj)?;
-            let avatar_req = AvatarRequest {
-                inbox,
-                did: root_did,
-                agent_endpoint: endpoint.to_string(),
-                language_order: "en_UK".to_string(),
-            };
-            let handle = self.join_room(&room, avatar_req, preferred_handle).await?;
+                if session.did.is_none() && required_missing {
+                    return Ok(
+                        ClosetResponse::err(session_id, CLOSET_REQUIRED_FIELDS_MESSAGE)
+                            .with_prompt(CLOSET_REQUIRED_FIELDS_PROMPT),
+                    );
+                }
 
-            return Ok(ClosetResponse {
-                ok: true,
-                message: format!("entered {} as @{}", room, handle),
-                session_id: Some(session_id.to_string()),
-                prompt: None,
-                lobby_events: Vec::new(),
-                latest_lobby_sequence: 0,
-                did: Some(did),
-                fragment: None,
-                key_name: None,
-            });
+                if let Some(existing_did) = session.did.as_deref() {
+                    self.upsert_closet_profile(
+                        existing_did,
+                        session.name.clone(),
+                        session.description.clone(),
+                        session.alias.clone(),
+                    )
+                    .await?;
+                    return Ok(
+                        ClosetResponse::ok(
+                            session_id,
+                            "changes applied. You can stay in the closet and keep editing; type 'go lobby' when ready.",
+                        )
+                        .with_did(existing_did.to_string())
+                        .with_fragment_opt(session.fragment),
+                    );
+                }
+
+                let (did, fragment, key_name) = self
+                    .closet_submit_citizenship(
+                        session_id,
+                        endpoint,
+                        ipns_private_key_base64.as_str(),
+                        session.alias.as_deref(),
+                    )
+                    .await?;
+                return Ok(
+                    ClosetResponse::ok(
+                        session_id,
+                        "application accepted. type 'go lobby' in the actor UI to enter the world.",
+                    )
+                    .with_did(did)
+                    .with_fragment(fragment)
+                    .with_key_name(key_name),
+                );
+            }
+            ClosetCommand::Recovery(recovery_command) => {
+                match recovery_command {
+                    ClosetRecoveryCommand::Usage => {
+                        return Ok(ClosetResponse::err(
+                            session_id,
+                            "usage: recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>",
+                        ));
+                    }
+                    ClosetRecoveryCommand::Set { passphrase } => {
+                        if passphrase.len() < 8 {
+                            return Ok(ClosetResponse::err(
+                                session_id,
+                                "recovery passphrase must be at least 8 characters",
+                            ));
+                        }
+
+                        let session = self.closet_session_owned_by(session_id, endpoint).await?;
+                        let did = if let Some(did) = session.did.clone() {
+                            did
+                        } else if let Some(root) = self.did_root_by_endpoint(DEFAULT_ROOM, endpoint).await {
+                            root
+                        } else {
+                            return Ok(ClosetResponse::err(
+                                session_id,
+                                "recovery set requires a DID in this closet session (run apply first or open closet while logged in)",
+                            ));
+                        };
+
+                        self.set_recovery_secret_for_did(&did, passphrase.as_str()).await?;
+                        return Ok(ClosetResponse::ok(session_id, "recovery checksum stored"));
+                    }
+                    ClosetRecoveryCommand::Status => {
+                        let session = self.closet_session_owned_by(session_id, endpoint).await?;
+                        let did = if let Some(did) = session.did.clone() {
+                            Some(did)
+                        } else {
+                            self.did_root_by_endpoint(DEFAULT_ROOM, endpoint).await
+                        };
+                        let Some(did) = did else {
+                            return Ok(ClosetResponse::err(
+                                session_id,
+                                "no DID context for this closet session",
+                            ));
+                        };
+                        let did_root = Did::try_from(did.as_str())
+                            .map_err(|e| anyhow!("invalid DID '{}': {}", did, e))?
+                            .without_fragment()
+                            .id();
+                        let configured = self
+                            .closet_profiles
+                            .read()
+                            .await
+                            .get(&did_root)
+                            .and_then(|profile| profile.recovery_checksum.clone())
+                            .is_some();
+
+                        return Ok(ClosetResponse::ok(
+                            session_id,
+                            if configured {
+                                "recovery is configured".to_string()
+                            } else {
+                                "recovery is not configured".to_string()
+                            },
+                        ));
+                    }
+                    ClosetRecoveryCommand::Rekey { handle, passphrase } => {
+                        if handle.is_empty() || passphrase.is_empty() {
+                            return Ok(ClosetResponse::err(
+                                session_id,
+                                "usage: recovery rekey <@handle> <passphrase>",
+                            ));
+                        }
+
+                        let session = self.closet_session_owned_by(session_id, endpoint).await?;
+                        let Some(new_did) = session.did.clone() else {
+                            return Ok(ClosetResponse::err(
+                                session_id,
+                                "recovery rekey requires a new DID in this session (run citizen first)",
+                            ));
+                        };
+
+                        let (resolved_handle, old_root, new_root) = self
+                            .rekey_identity_from_recovery(handle.as_str(), passphrase.as_str(), &new_did)
+                            .await?;
+                        return Ok(
+                            ClosetResponse::ok(
+                                session_id,
+                                format!(
+                                    "rekey complete for @{} ({} -> {})",
+                                    resolved_handle, old_root, new_root
+                                ),
+                            )
+                            .with_did(new_did),
+                        );
+                    }
+                }
+            }
+            ClosetCommand::Enter { room } => {
+                let (did, preferred_handle) = {
+                    let sessions = self.closet_sessions.read().await;
+                    let Some(session) = sessions.get(session_id) else {
+                        return Err(anyhow!("unknown closet session"));
+                    };
+                    if session.endpoint != endpoint {
+                        return Err(anyhow!("closet session endpoint mismatch"));
+                    }
+                    let did = session
+                        .did
+                        .clone()
+                        .ok_or_else(|| anyhow!("no DID in session; run 'citizen' first"))?;
+                    (did, session.name.clone())
+                };
+
+                let room = room.unwrap_or_else(|| DEFAULT_ROOM.to_string());
+
+                let did_obj = Did::try_from(did.as_str())
+                    .map_err(|e| anyhow!("invalid session DID '{}': {}", did, e))?;
+                let root_did = did_obj.without_fragment();
+
+                if !self.can_enter(&root_did).await {
+                    let did_root = root_did.id();
+                    let (knock_id, duplicate) = self
+                        .enqueue_knock(&room, &did_root, endpoint, preferred_handle)
+                        .await;
+                    let detail = if duplicate {
+                        format!(
+                            "entry denied for {}; existing knock request id={} is pending",
+                            did_root, knock_id
+                        )
+                    } else {
+                        format!(
+                            "entry denied for {}; knock request queued with id={}",
+                            did_root, knock_id
+                        )
+                    };
+                    return Ok(ClosetResponse::err(session_id, detail).with_did(did_root));
+                }
+
+                let inbox = resolve_avatar_inbox(&did_obj)?;
+                let avatar_req = AvatarRequest {
+                    inbox,
+                    did: root_did,
+                    agent_endpoint: endpoint.to_string(),
+                    language_order: "en_UK".to_string(),
+                };
+                let handle = self.join_room(&room, avatar_req, preferred_handle).await?;
+
+                return Ok(
+                    ClosetResponse::ok(session_id, format!("entered {} as @{}", room, handle))
+                        .with_did(did),
+                );
+            }
+            ClosetCommand::Unknown { verb } => {
+                return Ok(ClosetResponse::err(
+                    session_id,
+                    format!("Unknown closet command '{}'. Type 'help'.", verb),
+                ));
+            }
+            ClosetCommand::Empty
+            | ClosetCommand::Help
+            | ClosetCommand::Show
+            | ClosetCommand::Hear => {}
         }
 
-        Ok(ClosetResponse {
-            ok: false,
-            message: format!("Unknown closet command '{}'. Type 'help'.", verb),
-            session_id: Some(session_id.to_string()),
-            prompt: None,
-            lobby_events: Vec::new(),
-            latest_lobby_sequence: 0,
-            did: None,
-            fragment: None,
-            key_name: None,
-        })
+        unreachable!("closet command handling returned no response")
     }
 
     async fn issue_bootstrap_citizenship(
@@ -7559,28 +7368,13 @@ impl ProtocolHandler for ClosetProtocol {
             let response = match serde_json::from_slice::<ClosetRequest>(&bytes) {
                 Ok(ClosetRequest::Start) => {
                     match self.world.closet_start_session(&requester_endpoint).await {
-                        Ok((session_id, latest_lobby_sequence)) => ClosetResponse {
-                            ok: true,
-                            message: "closet session ready".to_string(),
-                            session_id: Some(session_id),
-                            prompt: Some("Answer profile questions while waiting; you can hear lobby events from here.".to_string()),
-                            lobby_events: Vec::new(),
-                            latest_lobby_sequence,
-                            did: None,
-                            fragment: None,
-                            key_name: None,
-                        },
-                        Err(err) => ClosetResponse {
-                            ok: false,
-                            message: err.to_string(),
-                            session_id: None,
-                            prompt: None,
-                            lobby_events: Vec::new(),
-                            latest_lobby_sequence: 0,
-                            did: None,
-                            fragment: None,
-                            key_name: None,
-                        },
+                        Ok((session_id, latest_lobby_sequence)) => ClosetResponse::ok(
+                            &session_id,
+                            "closet session ready",
+                        )
+                        .with_prompt("Answer profile questions while waiting; you can hear lobby events from here.")
+                        .with_latest_lobby_sequence(latest_lobby_sequence),
+                        Err(err) => ClosetResponse::err_unscoped(err.to_string()),
                     }
                 }
                 Ok(ClosetRequest::HearLobby {
@@ -7593,43 +7387,16 @@ impl ProtocolHandler for ClosetProtocol {
                         .await
                     {
                         Ok(session) => match self.world.room_events_since(DEFAULT_ROOM, since_sequence).await {
-                            Ok((events, latest_lobby_sequence)) => ClosetResponse {
-                                ok: true,
-                                message: format!(
-                                    "closet session active since {}",
-                                    session.created_at
-                                ),
-                                session_id: Some(session.id),
-                                prompt: None,
-                                lobby_events: events,
-                                latest_lobby_sequence,
-                                did: None,
-                                fragment: None,
-                                key_name: None,
-                            },
-                            Err(err) => ClosetResponse {
-                                ok: false,
-                                message: err.to_string(),
-                                session_id: None,
-                                prompt: None,
-                                lobby_events: Vec::new(),
-                                latest_lobby_sequence: since_sequence,
-                                did: None,
-                                fragment: None,
-                                key_name: None,
-                            },
+                            Ok((events, latest_lobby_sequence)) => ClosetResponse::ok(
+                                &session.id,
+                                format!("closet session active since {}", session.created_at),
+                            )
+                            .with_lobby_events(events, latest_lobby_sequence),
+                            Err(err) => ClosetResponse::err_unscoped(err.to_string())
+                                .with_latest_lobby_sequence(since_sequence),
                         },
-                        Err(err) => ClosetResponse {
-                            ok: false,
-                            message: err.to_string(),
-                            session_id: None,
-                            prompt: None,
-                            lobby_events: Vec::new(),
-                            latest_lobby_sequence: since_sequence,
-                            did: None,
-                            fragment: None,
-                            key_name: None,
-                        },
+                        Err(err) => ClosetResponse::err_unscoped(err.to_string())
+                            .with_latest_lobby_sequence(since_sequence),
                     }
                 }
                 Ok(ClosetRequest::Answer {
@@ -7642,28 +7409,8 @@ impl ProtocolHandler for ClosetProtocol {
                         .closet_answer(&session_id, &requester_endpoint, &field, &value)
                         .await
                     {
-                        Ok(message) => ClosetResponse {
-                            ok: true,
-                            message,
-                            session_id: Some(session_id),
-                            prompt: None,
-                            lobby_events: Vec::new(),
-                            latest_lobby_sequence: 0,
-                            did: None,
-                            fragment: None,
-                            key_name: None,
-                        },
-                        Err(err) => ClosetResponse {
-                            ok: false,
-                            message: err.to_string(),
-                            session_id: None,
-                            prompt: None,
-                            lobby_events: Vec::new(),
-                            latest_lobby_sequence: 0,
-                            did: None,
-                            fragment: None,
-                            key_name: None,
-                        },
+                        Ok(message) => ClosetResponse::ok(&session_id, message),
+                        Err(err) => ClosetResponse::err_unscoped(err.to_string()),
                     }
                 }
                 Ok(ClosetRequest::SubmitCitizenship {
@@ -7680,28 +7427,15 @@ impl ProtocolHandler for ClosetProtocol {
                         )
                         .await
                     {
-                        Ok((did, fragment, key_name)) => ClosetResponse {
-                            ok: true,
-                            message: "citizenship imported".to_string(),
-                            session_id: Some(session_id),
-                            prompt: Some("Citizenship granted. Rebind your local identity to the returned DID and enter the world.".to_string()),
-                            lobby_events: Vec::new(),
-                            latest_lobby_sequence: 0,
-                            did: Some(did),
-                            fragment: Some(fragment),
-                            key_name: Some(key_name),
-                        },
-                        Err(err) => ClosetResponse {
-                            ok: false,
-                            message: err.to_string(),
-                            session_id: None,
-                            prompt: None,
-                            lobby_events: Vec::new(),
-                            latest_lobby_sequence: 0,
-                            did: None,
-                            fragment: None,
-                            key_name: None,
-                        },
+                        Ok((did, fragment, key_name)) => ClosetResponse::ok(
+                            &session_id,
+                            "citizenship imported",
+                        )
+                        .with_prompt("Citizenship granted. Rebind your local identity to the returned DID and enter the world.")
+                        .with_did(did)
+                        .with_fragment(fragment)
+                        .with_key_name(key_name),
+                        Err(err) => ClosetResponse::err_unscoped(err.to_string()),
                     }
                 }
                 Ok(ClosetRequest::PublishDidDocument {
@@ -7719,28 +7453,14 @@ impl ProtocolHandler for ClosetProtocol {
                         )
                         .await
                     {
-                        Ok((did, _cid, key_name)) => ClosetResponse {
-                            ok: true,
-                            message: "did document published".to_string(),
-                            session_id: Some(session_id),
-                            prompt: None,
-                            lobby_events: Vec::new(),
-                            latest_lobby_sequence: 0,
-                            did: Some(did),
-                            fragment: Some(key_name.clone()),
-                            key_name: Some(key_name),
-                        },
-                        Err(err) => ClosetResponse {
-                            ok: false,
-                            message: err.to_string(),
-                            session_id: None,
-                            prompt: None,
-                            lobby_events: Vec::new(),
-                            latest_lobby_sequence: 0,
-                            did: None,
-                            fragment: None,
-                            key_name: None,
-                        },
+                        Ok((did, _cid, key_name)) => ClosetResponse::ok(
+                            &session_id,
+                            "did document published",
+                        )
+                        .with_did(did)
+                        .with_fragment(key_name.clone())
+                        .with_key_name(key_name),
+                        Err(err) => ClosetResponse::err_unscoped(err.to_string()),
                     }
                 }
                 Ok(ClosetRequest::Command { session_id, input }) => {
@@ -7750,30 +7470,13 @@ impl ProtocolHandler for ClosetProtocol {
                         .await
                     {
                         Ok(response) => response,
-                        Err(err) => ClosetResponse {
-                            ok: false,
-                            message: err.to_string(),
-                            session_id: None,
-                            prompt: None,
-                            lobby_events: Vec::new(),
-                            latest_lobby_sequence: 0,
-                            did: None,
-                            fragment: None,
-                            key_name: None,
-                        },
+                        Err(err) => ClosetResponse::err_unscoped(err.to_string()),
                     }
                 }
-                Err(err) => ClosetResponse {
-                    ok: false,
-                    message: format!("invalid closet request JSON: {}", err),
-                    session_id: None,
-                    prompt: None,
-                    lobby_events: Vec::new(),
-                    latest_lobby_sequence: 0,
-                    did: None,
-                    fragment: None,
-                    key_name: None,
-                },
+                Err(err) => ClosetResponse::err_unscoped(format!(
+                    "invalid closet request JSON: {}",
+                    err
+                )),
             };
 
             let payload = serde_json::to_vec(&response).map_err(AcceptError::from_err)?;

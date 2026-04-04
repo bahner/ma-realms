@@ -831,6 +831,7 @@ dependencies = [
  "ciborium",
  "cid",
  "ed25519-dalek 2.2.0",
+ "hex",
  "js-sys",
  "multibase",
  "nanoid",
@@ -2160,9 +2161,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "did-ma",
+ "iroh",
+ "libp2p-identity",
  "serde",
  "serde_json",
  "serde_yaml",
+ "tokio",
 ]
 
 [[package]]

@@ -1,4 +1,8 @@
 pub mod addressing;
+pub mod bootstrap_identity;
+pub mod closet_client;
+pub mod closet_domain;
+pub mod closet_policy;
 pub mod capability_acl;
 pub mod domain;
 pub mod interfaces;
@@ -13,12 +17,35 @@ pub use addressing::{
     normalize_endpoint_id, normalize_iroh_address, normalize_relay_url, resolve_alias_input,
     endpoint_id_from_address, endpoint_id_from_transport_value, resolve_inbox_endpoint_id,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use bootstrap_identity::{default_ma_config_root, ensure_local_ipns_key_file};
 pub use capability_acl::{
     CapabilityAcl, CompiledCapabilityAcl, CompiledSubjectAcl,
     capability_pattern_matches, compile_acl, compile_acl_from_text,
     evaluate_compiled_acl, evaluate_compiled_acl_with_owner,
     parse_capability_acl_text, parse_object_local_capability_acl,
     subject_has_capability, subject_has_capability_with_owner, validate_capability_acl,
+};
+pub use closet_client::{
+    closet_command, closet_start, closet_submit_citizenship, send_closet_request,
+};
+pub use closet_domain::{
+    CLOSET_EMPTY_MESSAGE,
+    CLOSET_HELP_MESSAGE,
+    CLOSET_HELP_PROMPT,
+    CLOSET_REQUIRED_FIELDS_MESSAGE,
+    CLOSET_REQUIRED_FIELDS_PROMPT,
+    ClosetCommand,
+    ClosetProfileField,
+    ClosetRecoveryCommand,
+    parse_closet_command,
+    required_profile_fields_missing,
+};
+pub use closet_policy::{
+    ClosetDidPublishPlan,
+    ensure_issued_document_root_match,
+    ensure_session_document_root_match,
+    plan_closet_did_publish,
 };
 pub use domain::{ActorType, AvatarActor, ExitData, ObjectData, RoomActor, WorldActor};
 pub use interfaces::{AclRuntime, DidPublisher, IpfsPublisher};

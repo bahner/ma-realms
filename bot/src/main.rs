@@ -1,20 +1,19 @@
-use std::{
-    env,
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{env, fs, path::PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use chrono::Utc;
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, RelayUrl};
-use libp2p_identity::Keypair;
 use ma_core::{
+    closet_command,
+    closet_start,
+    closet_submit_citizenship,
+    default_ma_config_root,
+    ensure_local_ipns_key_file,
     normalize_relay_url,
-    ClosetRequest, ClosetResponse, CLOSET_ALPN, DEFAULT_WORLD_RELAY_URL,
+    DEFAULT_WORLD_RELAY_URL,
 };
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug, Deserialize)]
 struct StatusResponse {
@@ -102,44 +101,8 @@ async fn discover_endpoint_id(status_url: &str) -> Result<String> {
     Ok(endpoint)
 }
 
-async fn send_closet_request(
-    endpoint: &Endpoint,
-    endpoint_addr: EndpointAddr,
-    request: ClosetRequest,
-) -> Result<ClosetResponse> {
-    let connection = endpoint
-        .connect(endpoint_addr, CLOSET_ALPN)
-        .await
-        .map_err(|e| anyhow!("closet endpoint.connect() failed: {e}"))?;
-
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .map_err(|e| anyhow!("closet connection.open_bi() failed: {e}"))?;
-
-    let payload = serde_json::to_vec(&request)?;
-    send.write_u32(payload.len() as u32).await?;
-    send.write_all(&payload).await?;
-    send.flush().await?;
-
-    let frame_len = recv.read_u32().await? as usize;
-    if frame_len > 512 * 1024 {
-        return Err(anyhow!("closet response frame too large: {frame_len}"));
-    }
-
-    let mut bytes = vec![0u8; frame_len];
-    recv.read_exact(&mut bytes).await?;
-
-    let _ = send.finish();
-    connection.close(0u32.into(), b"ok");
-
-    let response = serde_json::from_slice::<ClosetResponse>(&bytes)?;
-    Ok(response)
-}
-
 fn config_root() -> Result<PathBuf> {
-    let home = env::var("HOME").context("HOME env var is not set")?;
-    Ok(Path::new(&home).join(".config").join("ma"))
+    default_ma_config_root()
 }
 
 fn save_identity(record: &BotIdentityRecord) -> Result<PathBuf> {
@@ -155,34 +118,7 @@ fn save_identity(record: &BotIdentityRecord) -> Result<PathBuf> {
 
 fn ensure_local_ipns_key() -> Result<(Vec<u8>, PathBuf)> {
     let root = config_root()?;
-    let keys_dir = root.join("keys");
-    fs::create_dir_all(&keys_dir).context("failed to create ~/.config/ma/keys directory")?;
-
-    let key_path = keys_dir.join("bot_ipns.key");
-    if key_path.exists() {
-        let existing = fs::read(&key_path).context("failed to read local bot ipns key")?;
-        if !existing.is_empty() {
-            return Ok((existing, key_path));
-        }
-    }
-
-    let keypair = Keypair::generate_ed25519();
-    let encoded = keypair
-        .to_protobuf_encoding()
-        .map_err(|e| anyhow!("failed to encode local ipns key: {}", e))?;
-
-    fs::write(&key_path, &encoded).context("failed to write local bot ipns key")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&key_path)
-            .context("failed to read key permissions")?
-            .permissions();
-        perms.set_mode(0o600);
-        fs::set_permissions(&key_path, perms).context("failed setting key file permissions")?;
-    }
-
-    Ok((encoded, key_path))
+    ensure_local_ipns_key_file(&root, "bot_ipns.key")
 }
 
 #[tokio::main]
@@ -214,7 +150,7 @@ async fn main() -> Result<()> {
     println!("Using world endpoint: {endpoint_id}");
     println!("Bot endpoint: {}", endpoint.id());
 
-    let start = send_closet_request(&endpoint, endpoint_addr.clone(), ClosetRequest::Start).await?;
+    let start = closet_start(&endpoint, endpoint_addr.clone()).await?;
     if !start.ok {
         return Err(anyhow!("closet start failed: {}", start.message));
     }
@@ -227,13 +163,11 @@ async fn main() -> Result<()> {
     println!("Closet session started: {session_id}");
 
     if let Some(name) = args.name.as_ref() {
-        let response = send_closet_request(
+        let response = closet_command(
             &endpoint,
             endpoint_addr.clone(),
-            ClosetRequest::Command {
-                session_id: session_id.clone(),
-                input: format!("name {name}"),
-            },
+            session_id.clone(),
+            format!("name {name}"),
         )
         .await?;
         if !response.ok {
@@ -242,13 +176,11 @@ async fn main() -> Result<()> {
     }
 
     if let Some(description) = args.description.as_ref() {
-        let response = send_closet_request(
+        let response = closet_command(
             &endpoint,
             endpoint_addr.clone(),
-            ClosetRequest::Command {
-                session_id: session_id.clone(),
-                input: format!("description {description}"),
-            },
+            session_id.clone(),
+            format!("description {description}"),
         )
         .await?;
         if !response.ok {
@@ -256,13 +188,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    let citizen = send_closet_request(
+    let citizen = closet_submit_citizenship(
         &endpoint,
         endpoint_addr.clone(),
-        ClosetRequest::SubmitCitizenship {
-            session_id: session_id.clone(),
-            ipns_private_key_base64: base64::engine::general_purpose::STANDARD.encode(ipns_key_bytes),
-        },
+        session_id.clone(),
+        base64::engine::general_purpose::STANDARD.encode(ipns_key_bytes),
     )
     .await?;
 
@@ -292,13 +222,11 @@ async fn main() -> Result<()> {
 
     let saved_path = save_identity(&record)?;
 
-    let enter = send_closet_request(
+    let enter = closet_command(
         &endpoint,
         endpoint_addr,
-        ClosetRequest::Command {
-            session_id: session_id.clone(),
-            input: "enter".to_string(),
-        },
+        session_id.clone(),
+        "enter",
     )
     .await?;
 

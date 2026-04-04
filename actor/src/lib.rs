@@ -8,7 +8,7 @@ use chacha20poly1305::{
     Key, XChaCha20Poly1305, XNonce,
 };
 use did_ma::{
-    Did, Document, EncryptionKey, Message, SigningKey, VerificationMethod,
+    Did, Document, EncryptionKey, Message, SigningKey, generate_agent_identity,
 };
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey,
@@ -453,7 +453,7 @@ async fn exchange_on_stream(cache: &mut WorldConnCache, request: &WorldRequest) 
     serde_json::from_slice(&response_bytes).map_err(js_err)
 }
 use ma_core::{
-    CLOSET_ALPN,
+    send_closet_request as core_send_closet_request,
     ClosetRequest,
     ClosetResponse,
     CompiledCapabilityAcl,
@@ -1461,50 +1461,17 @@ where
 // ── Exported WASM functions ────────────────────────────────────────────────────
 
 fn create_identity_internal(passphrase: &str, ipns: &str) -> Result<String, JsValue> {
-    let root_did = Did::new_root(ipns).map_err(js_err)?;
-    let sign_did = Did::new(ipns, "sig").map_err(js_err)?;
-    let enc_did = Did::new(ipns, "enc").map_err(js_err)?;
-
-    let signing_key = SigningKey::generate(sign_did).map_err(js_err)?;
-    let encryption_key = EncryptionKey::generate(enc_did).map_err(js_err)?;
+    let generated = generate_agent_identity(ipns).map_err(js_err)?;
     let iroh_secret_key = SecretKey::from_bytes(&random_bytes::<32>().map_err(js_err)?);
-
-    let mut document = Document::new(&root_did, &root_did);
-
-    let assertion_vm = VerificationMethod::new(
-        root_did.base_id(),
-        root_did.base_id(),
-        signing_key.key_type.clone(),
-        "sig",
-        signing_key.public_key_multibase.clone(),
-    )
-    .map_err(js_err)?;
-
-    let key_agreement_vm = VerificationMethod::new(
-        root_did.base_id(),
-        root_did.base_id(),
-        encryption_key.key_type.clone(),
-        "enc",
-        encryption_key.public_key_multibase.clone(),
-    )
-    .map_err(js_err)?;
-
-    let assertion_vm_id = assertion_vm.id.clone();
-    document.add_verification_method(assertion_vm.clone()).map_err(js_err)?;
-    document.add_verification_method(key_agreement_vm.clone()).map_err(js_err)?;
-    document.assertion_method = assertion_vm_id;
-    document.key_agreement = key_agreement_vm.id.clone();
-    document.set_ma_type("agent");
-    document.sign(&signing_key, &assertion_vm).map_err(js_err)?;
 
     let plain = IdentityBundlePlain {
         version: 1,
         created_at: now_unix_secs(),
         ipns: ipns.to_string(),
-        signing_private_key_hex: hex::encode(signing_key.private_key_bytes()),
-        encryption_private_key_hex: hex::encode(encryption_key.private_key_bytes()),
+        signing_private_key_hex: generated.signing_private_key_hex,
+        encryption_private_key_hex: generated.encryption_private_key_hex,
         iroh_secret_key_hex: Some(hex::encode(iroh_secret_key.to_bytes())),
-        document,
+        document: generated.document,
     };
 
     let document_json = plain.document.marshal().map_err(js_err)?;
@@ -1513,7 +1480,7 @@ fn create_identity_internal(passphrase: &str, ipns: &str) -> Result<String, JsVa
 
     let result = CreateResult {
         encrypted_bundle: serde_json::to_string(&encrypted).map_err(js_err)?,
-        did: root_did.id(),
+        did: generated.root_did.id(),
         ipns: ipns.to_string(),
         document_json,
     };
@@ -1682,32 +1649,9 @@ async fn send_closet_request(endpoint_id: &str, request: ClosetRequest) -> Resul
         .map_err(|e| js_err(format!("relay URL parse failed for '{}': {}", relay_source, e)))?;
     let endpoint_addr = EndpointAddr::new(target).with_relay_url(relay_url);
 
-    let connection = endpoint
-        .connect(endpoint_addr, CLOSET_ALPN)
+    core_send_closet_request(&endpoint, endpoint_addr, request)
         .await
-        .map_err(|e| js_err(format!("closet endpoint.connect() failed: {}", e)))?;
-
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .map_err(|e| js_err(format!("closet connection.open_bi() failed: {}", e)))?;
-
-    let payload = serde_json::to_vec(&request).map_err(js_err)?;
-    send.write_u32(payload.len() as u32).await.map_err(js_err)?;
-    send.write_all(&payload).await.map_err(js_err)?;
-    send.flush().await.map_err(js_err)?;
-
-    let frame_len = recv.read_u32().await.map_err(js_err)? as usize;
-    if frame_len > 512 * 1024 {
-        return Err(js_err(format!("closet response frame too large: {}", frame_len)));
-    }
-    let mut bytes = vec![0u8; frame_len];
-    recv.read_exact(&mut bytes).await.map_err(js_err)?;
-
-    let _ = send.finish();
-    connection.close(0u32.into(), b"ok");
-
-    serde_json::from_slice::<ClosetResponse>(&bytes).map_err(js_err)
+        .map_err(|e| js_err(format!("closet request failed: {e}")))
 }
 
 #[wasm_bindgen]
