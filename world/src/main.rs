@@ -29,8 +29,6 @@ use iroh::{
 use ma_core::{
     ActorCommand, BROADCAST_ALPN, CHAT_ALPN, CMD_ALPN, CONTENT_TYPE_CHAT, CONTENT_TYPE_CMD,
     CLOSET_ALPN, ClosetRequest, ClosetResponse,
-    CLOSET_EMPTY_MESSAGE, CLOSET_HELP_MESSAGE, CLOSET_HELP_PROMPT,
-    CLOSET_REQUIRED_FIELDS_MESSAGE, CLOSET_REQUIRED_FIELDS_PROMPT,
     ClosetCommand, ClosetProfileField, ClosetRecoveryCommand,
     ClosetDidPublishPlan, ensure_issued_document_root_match, ensure_session_document_root_match,
     CONTENT_TYPE_BROADCAST, CONTENT_TYPE_PRESENCE, CONTENT_TYPE_WORLD, CompiledCapabilityAcl,
@@ -750,6 +748,35 @@ struct LegacyRoomYaml {
 }
 
 impl World {
+    async fn closet_lang_for_session(&self, session_id: &str, endpoint: &str) -> &'static str {
+        let session = {
+            let sessions = self.closet_sessions.read().await;
+            sessions.get(session_id).cloned()
+        };
+
+        if let Some(session) = session {
+            if let Some(session_did) = session.did.as_deref() {
+                if let Ok(did) = Did::try_from(session_did) {
+                    let did_root = did.without_fragment().id();
+                    if let Some(profile) = self.avatar_language_order_for_did(DEFAULT_ROOM, did_root.as_str()).await {
+                        return world_lang_from_profile(&profile);
+                    }
+                }
+            }
+        }
+
+        if let Some(did_root) = self.did_root_by_endpoint(DEFAULT_ROOM, endpoint).await {
+            if let Some(profile) = self
+                .avatar_language_order_for_did(DEFAULT_ROOM, did_root.as_str())
+                .await
+            {
+                return world_lang_from_profile(&profile);
+            }
+        }
+
+        world_lang_from_profile("nb_NO:en_UK")
+    }
+
     fn recovery_checksum(secret: &str) -> String {
         let normalized = secret.trim();
         let mut hasher = Sha256::new();
@@ -1349,16 +1376,23 @@ impl World {
         endpoint: &str,
         input: &str,
     ) -> Result<ClosetResponse> {
+        let active_lang = self.closet_lang_for_session(session_id, endpoint).await;
         let command = parse_closet_command(input);
 
         if matches!(&command, ClosetCommand::Empty) {
-            return Ok(ClosetResponse::ok(session_id, CLOSET_EMPTY_MESSAGE));
+            return Ok(ClosetResponse::ok(
+                session_id,
+                tr_world(active_lang, "closet.empty", "You are in the closet and have no avatar yet. Type 'help'."),
+            ));
         }
 
         if matches!(&command, ClosetCommand::Help) {
             return Ok(
-                ClosetResponse::ok(session_id, CLOSET_HELP_MESSAGE)
-                    .with_prompt(CLOSET_HELP_PROMPT),
+                ClosetResponse::ok(
+                    session_id,
+                    tr_world(active_lang, "closet.help", "Closet commands: help | show | hear | name <text> | description <text> | alias <text> | apply [ipns_key_base64] | citizen [ipns_key_base64] | recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>"),
+                )
+                .with_prompt(tr_world(active_lang, "closet.help.prompt", "You are in the closet with no avatar yet. Required: name + description + alias. Then run apply. When done, type 'go lobby' in the actor UI.")),
             );
         }
 
@@ -1427,9 +1461,14 @@ impl World {
                 ClosetResponse::ok(
                     session_id,
                     if events.is_empty() {
-                        "No new lobby events.".to_string()
+                        tr_world(active_lang, "closet.hear.none", "No new lobby events.")
                     } else {
-                        format!("Heard {} lobby event(s).", events.len())
+                        tr_world_vars(
+                            active_lang,
+                            "closet.hear.count",
+                            &[("count", events.len().to_string())],
+                            &format!("Heard {} lobby event(s).", events.len()),
+                        )
                     },
                 )
                 .with_lobby_events(events, latest_lobby_sequence),
@@ -1484,8 +1523,19 @@ impl World {
 
                 if session.did.is_none() && required_missing {
                     return Ok(
-                        ClosetResponse::err(session_id, CLOSET_REQUIRED_FIELDS_MESSAGE)
-                            .with_prompt(CLOSET_REQUIRED_FIELDS_PROMPT),
+                        ClosetResponse::err(
+                            session_id,
+                            tr_world(
+                                active_lang,
+                                "closet.required_fields",
+                                "required fields are: name, description, alias",
+                            ),
+                        )
+                        .with_prompt(tr_world(
+                            active_lang,
+                            "closet.required_fields.prompt",
+                            "set name/description/alias, then run apply",
+                        )),
                     );
                 }
 
@@ -1500,7 +1550,11 @@ impl World {
                     return Ok(
                         ClosetResponse::ok(
                             session_id,
-                            "changes applied. You can stay in the closet and keep editing; type 'go lobby' when ready.",
+                            tr_world(
+                                active_lang,
+                                "closet.apply.updated",
+                                "changes applied. You can stay in the closet and keep editing; type 'go lobby' when ready.",
+                            ),
                         )
                         .with_did(existing_did.to_string())
                         .with_fragment_opt(session.fragment),
@@ -1518,7 +1572,11 @@ impl World {
                 return Ok(
                     ClosetResponse::ok(
                         session_id,
-                        "application accepted. type 'go lobby' in the actor UI to enter the world.",
+                        tr_world(
+                            active_lang,
+                            "closet.apply.accepted",
+                            "application accepted. type 'go lobby' in the actor UI to enter the world.",
+                        ),
                     )
                     .with_did(did)
                     .with_fragment(fragment)
@@ -1530,14 +1588,22 @@ impl World {
                     ClosetRecoveryCommand::Usage => {
                         return Ok(ClosetResponse::err(
                             session_id,
-                            "usage: recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>",
+                            tr_world(
+                                active_lang,
+                                "closet.recovery.usage",
+                                "usage: recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>",
+                            ),
                         ));
                     }
                     ClosetRecoveryCommand::Set { passphrase } => {
                         if passphrase.len() < 8 {
                             return Ok(ClosetResponse::err(
                                 session_id,
-                                "recovery passphrase must be at least 8 characters",
+                                tr_world(
+                                    active_lang,
+                                    "closet.recovery.passphrase.short",
+                                    "recovery passphrase must be at least 8 characters",
+                                ),
                             ));
                         }
 
@@ -1549,12 +1615,23 @@ impl World {
                         } else {
                             return Ok(ClosetResponse::err(
                                 session_id,
-                                "recovery set requires a DID in this closet session (run apply first or open closet while logged in)",
+                                tr_world(
+                                    active_lang,
+                                    "closet.recovery.set.requires_did",
+                                    "recovery set requires a DID in this closet session (run apply first or open closet while logged in)",
+                                ),
                             ));
                         };
 
                         self.set_recovery_secret_for_did(&did, passphrase.as_str()).await?;
-                        return Ok(ClosetResponse::ok(session_id, "recovery checksum stored"));
+                        return Ok(ClosetResponse::ok(
+                            session_id,
+                            tr_world(
+                                active_lang,
+                                "closet.recovery.set.stored",
+                                "recovery checksum stored",
+                            ),
+                        ));
                     }
                     ClosetRecoveryCommand::Status => {
                         let session = self.closet_session_owned_by(session_id, endpoint).await?;
@@ -1566,7 +1643,11 @@ impl World {
                         let Some(did) = did else {
                             return Ok(ClosetResponse::err(
                                 session_id,
-                                "no DID context for this closet session",
+                                tr_world(
+                                    active_lang,
+                                    "closet.recovery.status.no_context",
+                                    "no DID context for this closet session",
+                                ),
                             ));
                         };
                         let did_root = Did::try_from(did.as_str())
@@ -1584,9 +1665,17 @@ impl World {
                         return Ok(ClosetResponse::ok(
                             session_id,
                             if configured {
-                                "recovery is configured".to_string()
+                                tr_world(
+                                    active_lang,
+                                    "closet.recovery.status.configured",
+                                    "recovery is configured",
+                                )
                             } else {
-                                "recovery is not configured".to_string()
+                                tr_world(
+                                    active_lang,
+                                    "closet.recovery.status.not_configured",
+                                    "recovery is not configured",
+                                )
                             },
                         ));
                     }
@@ -1594,7 +1683,11 @@ impl World {
                         if handle.is_empty() || passphrase.is_empty() {
                             return Ok(ClosetResponse::err(
                                 session_id,
-                                "usage: recovery rekey <@handle> <passphrase>",
+                                tr_world(
+                                    active_lang,
+                                    "closet.recovery.rekey.usage",
+                                    "usage: recovery rekey <@handle> <passphrase>",
+                                ),
                             ));
                         }
 
@@ -1602,7 +1695,11 @@ impl World {
                         let Some(new_did) = session.did.clone() else {
                             return Ok(ClosetResponse::err(
                                 session_id,
-                                "recovery rekey requires a new DID in this session (run citizen first)",
+                                tr_world(
+                                    active_lang,
+                                    "closet.recovery.rekey.requires_new_did",
+                                    "recovery rekey requires a new DID in this session (run citizen first)",
+                                ),
                             ));
                         };
 
@@ -1612,9 +1709,18 @@ impl World {
                         return Ok(
                             ClosetResponse::ok(
                                 session_id,
-                                format!(
-                                    "rekey complete for @{} ({} -> {})",
-                                    resolved_handle, old_root, new_root
+                                tr_world_vars(
+                                    active_lang,
+                                    "closet.recovery.rekey.done",
+                                    &[
+                                        ("handle", resolved_handle.clone()),
+                                        ("old", old_root.clone()),
+                                        ("new", new_root.clone()),
+                                    ],
+                                    &format!(
+                                        "rekey complete for @{} ({} -> {})",
+                                        resolved_handle, old_root, new_root
+                                    ),
                                 ),
                             )
                             .with_did(new_did),
@@ -1668,19 +1774,32 @@ impl World {
                     inbox,
                     did: root_did,
                     agent_endpoint: endpoint.to_string(),
-                    language_order: "en_UK".to_string(),
+                    language_order: "nb_NO:en_UK".to_string(),
                 };
                 let handle = self.join_room(&room, avatar_req, preferred_handle).await?;
 
                 return Ok(
-                    ClosetResponse::ok(session_id, format!("entered {} as @{}", room, handle))
-                        .with_did(did),
+                    ClosetResponse::ok(
+                        session_id,
+                        tr_world_vars(
+                            active_lang,
+                            "closet.entered",
+                            &[("room", room.clone()), ("handle", handle.clone())],
+                            &format!("entered {} as @{}", room, handle),
+                        ),
+                    )
+                    .with_did(did),
                 );
             }
             ClosetCommand::Unknown { verb } => {
                 return Ok(ClosetResponse::err(
                     session_id,
-                    format!("Unknown closet command '{}'. Type 'help'.", verb),
+                    tr_world_vars(
+                        active_lang,
+                        "closet.command.unknown",
+                        &[("verb", verb.clone())],
+                        &format!("Unknown closet command '{}'. Type 'help'.", verb),
+                    ),
                 ));
             }
             ClosetCommand::Empty
@@ -7197,7 +7316,7 @@ impl WorldProtocol {
                     .world
                     .avatar_language_order_for_did(&room, sender_root)
                     .await
-                    .unwrap_or_else(|| "en_UK".to_string());
+                    .unwrap_or_else(|| "nb_NO:en_UK".to_string());
                 let is_world_admin = matches!(
                     &envelope,
                     MessageEnvelope::ActorCommand { target, .. } if target.eq_ignore_ascii_case("world")
@@ -7368,12 +7487,26 @@ impl ProtocolHandler for ClosetProtocol {
             let response = match serde_json::from_slice::<ClosetRequest>(&bytes) {
                 Ok(ClosetRequest::Start) => {
                     match self.world.closet_start_session(&requester_endpoint).await {
-                        Ok((session_id, latest_lobby_sequence)) => ClosetResponse::ok(
-                            &session_id,
-                            "closet session ready",
-                        )
-                        .with_prompt("Answer profile questions while waiting; you can hear lobby events from here.")
-                        .with_latest_lobby_sequence(latest_lobby_sequence),
+                        Ok((session_id, latest_lobby_sequence)) => {
+                            let active_lang = self
+                                .world
+                                .closet_lang_for_session(&session_id, &requester_endpoint)
+                                .await;
+                            ClosetResponse::ok(
+                                &session_id,
+                                tr_world(
+                                    active_lang,
+                                    "closet.session.ready",
+                                    "closet session ready",
+                                ),
+                            )
+                            .with_prompt(tr_world(
+                                active_lang,
+                                "closet.session.ready.prompt",
+                                "Answer profile questions while waiting; you can hear lobby events from here.",
+                            ))
+                            .with_latest_lobby_sequence(latest_lobby_sequence)
+                        }
                         Err(err) => ClosetResponse::err_unscoped(err.to_string()),
                     }
                 }
@@ -7387,11 +7520,22 @@ impl ProtocolHandler for ClosetProtocol {
                         .await
                     {
                         Ok(session) => match self.world.room_events_since(DEFAULT_ROOM, since_sequence).await {
-                            Ok((events, latest_lobby_sequence)) => ClosetResponse::ok(
-                                &session.id,
-                                format!("closet session active since {}", session.created_at),
-                            )
-                            .with_lobby_events(events, latest_lobby_sequence),
+                            Ok((events, latest_lobby_sequence)) => {
+                                let active_lang = self
+                                    .world
+                                    .closet_lang_for_session(&session.id, &requester_endpoint)
+                                    .await;
+                                ClosetResponse::ok(
+                                    &session.id,
+                                    tr_world_vars(
+                                        active_lang,
+                                        "closet.session.active_since",
+                                        &[("created_at", session.created_at.clone())],
+                                        &format!("closet session active since {}", session.created_at),
+                                    ),
+                                )
+                                .with_lobby_events(events, latest_lobby_sequence)
+                            }
                             Err(err) => ClosetResponse::err_unscoped(err.to_string())
                                 .with_latest_lobby_sequence(since_sequence),
                         },
@@ -7427,14 +7571,28 @@ impl ProtocolHandler for ClosetProtocol {
                         )
                         .await
                     {
-                        Ok((did, fragment, key_name)) => ClosetResponse::ok(
-                            &session_id,
-                            "citizenship imported",
-                        )
-                        .with_prompt("Citizenship granted. Rebind your local identity to the returned DID and enter the world.")
-                        .with_did(did)
-                        .with_fragment(fragment)
-                        .with_key_name(key_name),
+                        Ok((did, fragment, key_name)) => {
+                            let active_lang = self
+                                .world
+                                .closet_lang_for_session(&session_id, &requester_endpoint)
+                                .await;
+                            ClosetResponse::ok(
+                                &session_id,
+                                tr_world(
+                                    active_lang,
+                                    "closet.citizenship.imported",
+                                    "citizenship imported",
+                                ),
+                            )
+                            .with_prompt(tr_world(
+                                active_lang,
+                                "closet.citizenship.prompt",
+                                "Citizenship granted. Rebind your local identity to the returned DID and enter the world.",
+                            ))
+                            .with_did(did)
+                            .with_fragment(fragment)
+                            .with_key_name(key_name)
+                        }
                         Err(err) => ClosetResponse::err_unscoped(err.to_string()),
                     }
                 }
@@ -7453,13 +7611,23 @@ impl ProtocolHandler for ClosetProtocol {
                         )
                         .await
                     {
-                        Ok((did, _cid, key_name)) => ClosetResponse::ok(
-                            &session_id,
-                            "did document published",
-                        )
-                        .with_did(did)
-                        .with_fragment(key_name.clone())
-                        .with_key_name(key_name),
+                        Ok((did, _cid, key_name)) => {
+                            let active_lang = self
+                                .world
+                                .closet_lang_for_session(&session_id, &requester_endpoint)
+                                .await;
+                            ClosetResponse::ok(
+                                &session_id,
+                                tr_world(
+                                    active_lang,
+                                    "closet.did.published",
+                                    "did document published",
+                                ),
+                            )
+                            .with_did(did)
+                            .with_fragment(key_name.clone())
+                            .with_key_name(key_name)
+                        }
                         Err(err) => ClosetResponse::err_unscoped(err.to_string()),
                     }
                 }

@@ -3,6 +3,7 @@
 WORLD_SLUG ?= ma
 WORLD_LISTEN ?=
 WORLD_KUBO_URL ?=
+MA_WORLD_VERSION ?=
 
 help:
 	@echo "ma-realms targets:"
@@ -20,7 +21,7 @@ core-build:
 	$(MAKE) -C core build
 
 actor-build:
-	$(MAKE) -C actor build
+	$(MAKE) -C actor build MA_WORLD_VERSION="$(MA_WORLD_VERSION)"
 
 world-build:
 	$(MAKE) -C world build

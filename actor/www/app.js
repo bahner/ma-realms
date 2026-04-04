@@ -107,7 +107,7 @@ const LAST_PUBLISHED_IPNS_KEY = `${STORAGE_PREFIX}.lastPublishedIpns`;
 const LAST_PUBLISHED_CID_KEY = `${STORAGE_PREFIX}.lastPublishedCid`;
 const LEGACY_ALIAS_KEY = 'ma.identity.v2.alias';
 const DEFAULT_UI_LANG = 'en';
-const DEFAULT_LANGUAGE_ORDER = 'en_UK:en_US';
+const DEFAULT_LANGUAGE_ORDER = 'nb_NO:en_UK';
 const IPFS_GATEWAY_FALLBACKS = [
   'http://localhost:8080',
   'https://ipfs.io',
@@ -143,40 +143,11 @@ async function ipfsRpcPost(path, query = {}, body = null) {
 }
 
 
-async function fetchWorldActorWebInfo() {
-  try {
-    const response = await fetch('/actor/web/info', { cache: 'no-store' });
-    if (!response.ok) return null;
-    const payload = await response.json();
-    if (!payload || payload.enabled !== true) return null;
-    return {
-      version: String(payload.version || '').trim(),
-      cid: String(payload.cid || '').trim(),
-    };
-  } catch {
-    return null;
-  }
-}
-
 async function updateAppVersionFooter() {
   const versionEl = byId('app-version');
   if (!versionEl) return;
   const localVersion = await resolveAppVersionLabel();
-  const worldWeb = await fetchWorldActorWebInfo();
-
-  let label = `Version: ${localVersion}`;
-  if (worldWeb) {
-    const localCore = semverCore(localVersion);
-    const worldCore = semverCore(worldWeb.version);
-    const mismatch = worldCore && localCore && worldCore !== localCore;
-    const cid = worldWeb.cid ? ` | cid: ${worldWeb.cid}` : '';
-    label += ` | world: ${worldWeb.version || 'unknown'}${cid}`;
-    if (mismatch) {
-      label += ' | mismatch';
-    }
-  }
-
-  versionEl.textContent = label;
+  versionEl.textContent = `Version: ${localVersion}`;
 }
 
 const state = {
@@ -224,6 +195,45 @@ const state = {
 
 let worldDispatchFlow = null;
 let didDocFlow = null;
+
+const aliasFlowBridge = {
+  saveAliasBook: (book) => book,
+  loadAliasBook: () => ({}),
+  setActiveAlias: () => {},
+  resolveInitialAlias: () => '',
+  loadAliasDraft: () => '',
+  roomDidLookupCacheKey: (value) => String(value || '').trim(),
+  getCachedRoomDidLookup: () => '',
+  cacheRoomDidLookup: () => {},
+  dropCachedRoomDidLookup: () => {},
+  normalizeEndpointId: (value) => String(value || '').trim(),
+  findDidByEndpoint: () => '',
+  findAliasForAddress: () => '',
+  resolveAliasInput: (value) => String(value || '').trim(),
+  humanizeIdentifier: (value) => String(value || ''),
+  humanizeText: (value) => String(value || ''),
+};
+
+function saveAliasBook(aliasBook) { return aliasFlowBridge.saveAliasBook(aliasBook); }
+function loadAliasBook() { return aliasFlowBridge.loadAliasBook(); }
+function setActiveAlias(aliasName) { return aliasFlowBridge.setActiveAlias(aliasName); }
+function resolveInitialAlias() { return aliasFlowBridge.resolveInitialAlias(); }
+function loadAliasDraft() { return aliasFlowBridge.loadAliasDraft(); }
+function roomDidLookupCacheKey(value) { return aliasFlowBridge.roomDidLookupCacheKey(value); }
+function getCachedRoomDidLookup(value) { return aliasFlowBridge.getCachedRoomDidLookup(value); }
+function cacheRoomDidLookup(key, did) { return aliasFlowBridge.cacheRoomDidLookup(key, did); }
+function dropCachedRoomDidLookup(key) { return aliasFlowBridge.dropCachedRoomDidLookup(key); }
+function normalizeEndpointId(value) { return aliasFlowBridge.normalizeEndpointId(value); }
+function findDidByEndpoint(value) { return aliasFlowBridge.findDidByEndpoint(value); }
+function findAliasForAddress(value) { return aliasFlowBridge.findAliasForAddress(value); }
+function resolveAliasInput(value) { return aliasFlowBridge.resolveAliasInput(value); }
+function humanizeIdentifier(value) { return aliasFlowBridge.humanizeIdentifier(value); }
+function humanizeText(value) { return aliasFlowBridge.humanizeText(value); }
+
+let updateIdentityLineImpl = () => {};
+function updateIdentityLine(...args) {
+  return updateIdentityLineImpl(...args);
+}
 
 const RECONNECT_DELAY_MS = 3000;
 const ROOM_DID_CACHE_TTL_MS = 30000;
@@ -471,17 +481,6 @@ function normalizeEditTarget(rawTarget) {
   return target;
 }
 
-
-const { fetchCurrentRoomInspectData, inspectExitByQuery } = createRoomInspectFlow({
-  state,
-  sendWorldCommandQuery,
-  parseRoomShowMeta,
-  extractRoomCidFromShowResponse,
-  fetchGatewayTextByPath,
-  asIpfsGatewayPath,
-  uiText,
-  appendMessage,
-});
 
 async function appendAmbientProseAfterSpeech() {
   if (!state.currentHome) {
@@ -1261,6 +1260,30 @@ function setSetupStatus(message) {
   byId('setup-status').textContent = message;
 }
 
+function displayActor(senderDid, senderHandle) {
+  const handle = String(senderHandle || '').trim();
+  if (handle) {
+    return handle.startsWith('@') ? handle : `@${handle}`;
+  }
+
+  const did = String(senderDid || '').trim();
+  if (did) {
+    return humanizeIdentifier(did);
+  }
+
+  return '@unknown';
+}
+
+function renderLocalBroadcastMessage(text) {
+  const payload = String(text || '').trim();
+  if (!payload) return;
+  const actor = displayActor(
+    state.identity?.did,
+    state.currentHome?.handle || state.aliasName || '@you'
+  );
+  appendMessage('world', humanizeText(`${actor}: ${payload}`));
+}
+
 const {
   hideLockOverlay,
   showLockOverlay,
@@ -1276,6 +1299,17 @@ const {
 
 const dialogWriter = createDialogWriter({ byId, displayActor });
 const { appendMessage } = dialogWriter;
+
+const { fetchCurrentRoomInspectData, inspectExitByQuery } = createRoomInspectFlow({
+  state,
+  sendWorldCommandQuery,
+  parseRoomShowMeta,
+  extractRoomCidFromShowResponse,
+  fetchGatewayTextByPath,
+  asIpfsGatewayPath,
+  uiText,
+  appendMessage,
+});
 
 const closetFlow = createClosetFlow({
   state,
@@ -1544,7 +1578,8 @@ function startHomeEventPolling() {
   }, ROOM_POLL_INTERVAL_MS);
 }
 
-const { updateIdentityLine } = createIdentityLineFlow({ updateLocationContext });
+const { updateIdentityLine: updateIdentityLineFromFlow } = createIdentityLineFlow({ updateLocationContext });
+updateIdentityLineImpl = updateIdentityLineFromFlow;
 
 function showChat() {
   byId('setup-view').classList.add('hidden');
@@ -1707,24 +1742,23 @@ const aliasFlow = createAliasFlow({
   aliasHumanizeText: alias_humanize_text,
   roomDidCacheTtlMs: ROOM_DID_CACHE_TTL_MS,
 });
-
-const {
-  saveAliasBook,
-  loadAliasBook,
-  setActiveAlias,
-  resolveInitialAlias,
-  loadAliasDraft,
-  roomDidLookupCacheKey,
-  getCachedRoomDidLookup,
-  cacheRoomDidLookup,
-  dropCachedRoomDidLookup,
-  normalizeEndpointId,
-  findDidByEndpoint,
-  findAliasForAddress,
-  resolveAliasInput,
-  humanizeIdentifier,
-  humanizeText,
-} = aliasFlow;
+Object.assign(aliasFlowBridge, {
+  saveAliasBook: aliasFlow.saveAliasBook,
+  loadAliasBook: aliasFlow.loadAliasBook,
+  setActiveAlias: aliasFlow.setActiveAlias,
+  resolveInitialAlias: aliasFlow.resolveInitialAlias,
+  loadAliasDraft: aliasFlow.loadAliasDraft,
+  roomDidLookupCacheKey: aliasFlow.roomDidLookupCacheKey,
+  getCachedRoomDidLookup: aliasFlow.getCachedRoomDidLookup,
+  cacheRoomDidLookup: aliasFlow.cacheRoomDidLookup,
+  dropCachedRoomDidLookup: aliasFlow.dropCachedRoomDidLookup,
+  normalizeEndpointId: aliasFlow.normalizeEndpointId,
+  findDidByEndpoint: aliasFlow.findDidByEndpoint,
+  findAliasForAddress: aliasFlow.findAliasForAddress,
+  resolveAliasInput: aliasFlow.resolveAliasInput,
+  humanizeIdentifier: aliasFlow.humanizeIdentifier,
+  humanizeText: aliasFlow.humanizeText,
+});
 
 const {
   saveBlockedDidRoots,
@@ -1933,6 +1967,58 @@ function refillCommandInputWithActiveTarget() {
   }
   inputEl.value = `${alias} `;
   inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
+}
+
+function normalizeUseRequirement(value) {
+  const normalized = String(value || 'none').trim().toLowerCase();
+  return normalized === 'held' ? 'held' : 'none';
+}
+
+function setActiveObjectTarget(aliasOrDid, explicitDid = '', requirement = 'none') {
+  let alias = String(aliasOrDid || '').trim();
+  let did = String(explicitDid || '').trim();
+
+  if (!did && isMaDid(alias)) {
+    did = alias;
+    alias = '';
+  }
+
+  if (!did && alias) {
+    const resolved = String(resolveAliasInput(alias) || '').trim();
+    const mappedDid = String(findDidByEndpoint(resolved) || '').trim();
+    if (isMaDid(mappedDid)) {
+      did = mappedDid;
+    } else if (isMaDid(resolved)) {
+      did = resolved;
+    }
+  }
+
+  if (alias && !alias.startsWith('@')) {
+    alias = `@${alias.replace(/^@+/, '')}`;
+  }
+
+  state.activeObjectTargetAlias = alias;
+  state.activeObjectTargetDid = isMaDid(did) ? did : '';
+  state.activeObjectTargetRequirement = normalizeUseRequirement(requirement);
+  updateLocationContext();
+}
+
+function clearActiveObjectTarget(expectedAlias = '') {
+  const currentAlias = String(state.activeObjectTargetAlias || '').trim();
+  const normalizedExpected = String(expectedAlias || '').trim();
+  if (normalizedExpected) {
+    const normalizedAt = normalizedExpected.startsWith('@')
+      ? normalizedExpected
+      : `@${normalizedExpected.replace(/^@+/, '')}`;
+    if (currentAlias && currentAlias !== normalizedAt) {
+      return;
+    }
+  }
+
+  state.activeObjectTargetAlias = '';
+  state.activeObjectTargetDid = '';
+  state.activeObjectTargetRequirement = 'none';
+  updateLocationContext();
 }
 
 function shouldAutoPrefixActiveTarget(text) {

@@ -16,6 +16,7 @@ build: $(STAMP)
 
 $(STAMP): Cargo.toml src/*.rs ../../ma/src/*.rs ../core/src/*.rs
 	cargo build
+	@mkdir -p $(dir $(STAMP))
 	@touch $(STAMP)
 
 release: Cargo.toml src/*.rs ../../ma/src/*.rs ../core/src/*.rs
