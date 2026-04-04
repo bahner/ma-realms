@@ -239,22 +239,22 @@ button.primary {
   color: var(--muted);
 }
 
-.kubo-install-note {
+.gateway-install-note {
   margin-top: 0.35rem;
   margin-bottom: 0;
   color: var(--warn);
   font-size: 0.92rem;
 }
 
-.kubo-install-note a {
+.gateway-install-note a {
   color: var(--accent);
 }
 
-.kubo-install-note p {
+.gateway-install-note p {
   margin: 0.18rem 0;
 }
 
-.kubo-install-note code {
+.gateway-install-note code {
   background: rgba(18, 18, 18, 0.06);
   border: 1px solid rgba(18, 18, 18, 0.1);
   border-radius: 6px;
@@ -262,7 +262,7 @@ button.primary {
   font-size: 0.85rem;
 }
 
-.kubo-install-note pre {
+.gateway-install-note pre {
   margin: 0.35rem 0;
   padding: 0.52rem 0.62rem;
   border: 1px solid rgba(18, 18, 18, 0.12);
@@ -275,7 +275,7 @@ button.primary {
   word-break: break-word;
 }
 
-.kubo-install-note .copy-origin {
+.gateway-install-note .copy-origin {
   display: inline-block;
   width: auto;
   min-width: 0;
@@ -431,6 +431,36 @@ button.primary {
   font-family: "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
   font-size: 0.92rem;
   line-height: 1.42;
+}
+
+.yaml-editor-text.hidden-by-cm {
+  display: none;
+}
+
+.yaml-editor-cm {
+  min-height: 280px;
+  max-height: 62vh;
+  width: 100%;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: #fffdf8;
+  overflow: auto;
+}
+
+.yaml-editor-cm .cm-editor {
+  min-height: 278px;
+  max-height: 62vh;
+}
+
+.yaml-editor-cm .cm-scroller {
+  font-family: "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.92rem;
+  line-height: 1.42;
+}
+
+.yaml-editor-cm.disabled {
+  opacity: 0.65;
+  pointer-events: none;
 }
 
 .yaml-editor-status {

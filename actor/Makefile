@@ -69,7 +69,7 @@ release:
 	echo "  IPNS: /ipns/$$key_id"; \
 	echo "  CID: /ipfs/$$cid"; \
 	echo "  Published gateway URL: http://127.0.0.1:8080/ipns/$$key_id/"; \
-	echo "  Runtime URL (required for Kubo API features): http://127.0.0.1:8081"
+	echo "  Runtime URL (required for IPFS API features): http://127.0.0.1:8081"
 
 publish:
 	$(MAKE) --no-print-directory -B build-dev
@@ -92,7 +92,7 @@ publish:
 	echo "  IPNS: /ipns/$$key_id"; \
 	echo "  CID: /ipfs/$$cid"; \
 	echo "  Published gateway URL: http://127.0.0.1:8080/ipns/$$key_id/"; \
-	echo "  Runtime URL (required for Kubo API features): http://127.0.0.1:8081"
+	echo "  Runtime URL (required for IPFS API features): http://127.0.0.1:8081"
 
 clean:
 	rm -rf www/pkg

@@ -9,7 +9,7 @@ pub enum RoomActorAction {
     /// If `None`, the world auto-names the destination.
     Dig { exit_name: String, destination: Option<String> },
     /// Set room attribute using a key/value pair.
-    /// Supported keys: owner, title, description, cid.
+    /// Supported keys: owner, title, description, cid, content-b64, exit-content-b64.
     SetAttribute { key: String, value: String },
 }
 
@@ -82,7 +82,7 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "help", "who", "l", "acl", "describe", "show",
     "invite <did>", "deny <did>", "kick <handle>",
     "dig <direction> [to|til <#dest|did:ma:...#room>]",
-    "set <owner|title|description|cid> <value>",
+    "set <owner|title|description|cid|content-b64|exit-content-b64> <value>",
 ];
 
 fn cmd_help(_ctx: &RoomActorContext<'_>) -> RoomActorResult {
@@ -195,7 +195,7 @@ fn cmd_set(arg: &str, ctx: &RoomActorContext<'_>) -> RoomActorResult {
     let value = unquote(&value_raw);
 
     if key.is_empty() || value.is_empty() {
-        return none_result("@here usage: @here set <owner|title|description|cid> <value>".to_string());
+        return none_result("@here usage: @here set <owner|title|description|cid|content-b64|exit-content-b64> <value>".to_string());
     }
 
     match key.as_str() {
@@ -226,7 +226,25 @@ fn cmd_set(arg: &str, ctx: &RoomActorContext<'_>) -> RoomActorResult {
                 action: RoomActorAction::SetAttribute { key, value },
             }
         }
-        _ => none_result(format!("@here unknown set attribute '{}'. Supported: owner, title, description, cid", key)),
+        "content" | "content-b64" => {
+            if !is_owner_or_unclaimed(ctx) {
+                return none_result(format!("@here only the room owner can replace room content for '{}'", ctx.room_name));
+            }
+            RoomActorResult {
+                response: format!("@here publishing room '{}' from inline content", ctx.room_name),
+                action: RoomActorAction::SetAttribute { key, value },
+            }
+        }
+        "exit-content-b64" => {
+            if !is_owner_or_unclaimed(ctx) {
+                return none_result(format!("@here only the room owner can replace exit content for '{}'", ctx.room_name));
+            }
+            RoomActorResult {
+                response: format!("@here publishing exit content for '{}'", ctx.room_name),
+                action: RoomActorAction::SetAttribute { key, value },
+            }
+        }
+        _ => none_result(format!("@here unknown set attribute '{}'. Supported: owner, title, description, cid, content-b64, exit-content-b64", key)),
     }
 }
 

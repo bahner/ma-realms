@@ -1529,8 +1529,8 @@ pub fn create_identity(passphrase: &str) -> Result<String, JsValue> {
     create_identity_internal(passphrase, &ipns)
 }
 
-/// Generate a new identity bound to an existing IPNS identifier from Kubo.
-/// Use this when you already have a Kubo key and want DID/IPNS to match exactly.
+/// Generate a new identity bound to an existing IPNS identifier from an IPFS key.
+/// Use this when you already have an IPFS key and want DID/IPNS to match exactly.
 #[wasm_bindgen]
 pub fn create_identity_with_ipns(passphrase: &str, ipns: &str) -> Result<String, JsValue> {
     let ipns = ipns.trim();
@@ -1597,11 +1597,11 @@ pub fn set_bundle_language(
     language_order: &str,
 ) -> Result<String, JsValue> {
     let normalized = language_order
-        .split(';')
+        .split(':')
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>()
-        .join(";");
+        .join(":");
 
     if normalized.is_empty() {
         return update_bundle_document(passphrase, encrypted_bundle_json, |document| {
@@ -1791,12 +1791,14 @@ pub async fn closet_publish_did_document(
     endpoint_id: &str,
     session_id: &str,
     did_document_json: &str,
+    ipns_private_key_base64: &str,
 ) -> Result<String, JsValue> {
     let response = send_closet_request(
         endpoint_id,
         ClosetRequest::PublishDidDocument {
             session_id: session_id.trim().to_string(),
             did_document_json: did_document_json.to_string(),
+            ipns_private_key_base64: ipns_private_key_base64.trim().to_string(),
         },
     )
     .await?;
@@ -2094,7 +2096,7 @@ pub async fn poll_world_events(
     .map_err(js_err)
 }
 
-/// Build an IPNS pointer record (JSON) for publishing via Kubo or w3s.
+/// Build an IPNS pointer record (JSON) for publishing via IPFS API or w3s.
 /// `sequence` should be the last published sequence; this increments it.
 /// Returns pretty-printed JSON of the pointer record.
 #[wasm_bindgen]

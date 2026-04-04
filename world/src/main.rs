@@ -817,7 +817,7 @@ impl World {
             }
             if existing_names.iter().any(|name| name == normalized) {
                 return Err(anyhow!(
-                    "alias '{}' is already taken (username/fragment in use); choose another alias and run apply again",
+                    "fragment '{}' exists already; choose another alias/fragment and try again",
                     normalized
                 ));
             }
@@ -1259,17 +1259,9 @@ impl World {
         session_id: &str,
         endpoint: &str,
         did_document_json: &str,
+        ipns_private_key_base64: &str,
     ) -> Result<(String, String, String)> {
         let session = self.closet_session_owned_by(session_id, endpoint).await?;
-        let did_root = session
-            .did
-            .clone()
-            .ok_or_else(|| anyhow!("no DID in closet session; run apply/citizen first"))?;
-        let key_name = session
-            .fragment
-            .clone()
-            .ok_or_else(|| anyhow!("no fragment in closet session; run apply/citizen first"))?;
-
         let document = Document::unmarshal(did_document_json)
             .map_err(|e| anyhow!("invalid DID document JSON: {}", e))?;
         document
@@ -1279,23 +1271,79 @@ impl World {
             .verify()
             .map_err(|e| anyhow!("DID document signature verification failed: {}", e))?;
 
-        let expected_root = Did::try_from(did_root.as_str())
-            .map_err(|e| anyhow!("invalid session DID '{}': {}", did_root, e))?
-            .without_fragment()
-            .id();
-        let document_root = Did::try_from(document.id.as_str())
+        let document_did = Did::try_from(document.id.as_str())
             .map_err(|e| anyhow!("invalid document DID '{}': {}", document.id, e))?
-            .without_fragment()
-            .id();
-        if document_root != expected_root {
-            return Err(anyhow!(
-                "document DID root '{}' does not match session DID root '{}'",
-                document_root,
-                expected_root
-            ));
+            ;
+        let document_root = document_did.without_fragment().id();
+        let document_ipns_id = document_did.ipns.clone();
+        let provided_key = ipns_private_key_base64.trim();
+        let kubo_url = self.kubo_url.read().await.clone();
+
+        if let Some(session_did) = session.did.as_ref() {
+            let session_root = Did::try_from(session_did.as_str())
+                .map_err(|e| anyhow!("invalid session DID '{}': {}", session_did, e))?
+                .without_fragment()
+                .id();
+            if session_root != document_root {
+                return Err(anyhow!(
+                    "document DID root '{}' does not match session DID root '{}'",
+                    document_root,
+                    session_root
+                ));
+            }
         }
 
-        let kubo_url = self.kubo_url.read().await.clone();
+        let key_name = if !provided_key.is_empty() {
+            // If caller provides key material, import/apply citizenship for this publish.
+            let desired_alias = document_did.fragment.as_deref();
+            let (issued_did, _fragment, key_name) = self
+                .closet_submit_citizenship(session_id, endpoint, provided_key, desired_alias)
+                .await?;
+            let issued_root = Did::try_from(issued_did.as_str())
+                .map_err(|e| anyhow!("invalid issued DID '{}': {}", issued_did, e))?
+                .without_fragment()
+                .id();
+            if issued_root != document_root {
+                return Err(anyhow!(
+                    "document DID root '{}' does not match imported key DID root '{}'",
+                    document_root,
+                    issued_root
+                ));
+            }
+            key_name
+        } else {
+            // No key provided: only allow if this DID has already been published
+            // and the same IPNS key is present on this node.
+            let ipns_path = format!("/ipns/{}", document_ipns_id);
+            let was_published_before = kubo::name_resolve(&kubo_url, &ipns_path, true).await.is_ok();
+            if !was_published_before {
+                return Err(anyhow!(
+                    "ipns_private_key_base64 is required for first DID publish in closet session"
+                ));
+            }
+
+            let keys = list_kubo_keys(&kubo_url).await?;
+            let Some(existing) = keys
+                .into_iter()
+                .find(|key| key.id.trim() == document_ipns_id)
+            else {
+                return Err(anyhow!(
+                    "no local IPNS key found for DID root '{}'; provide ipns_private_key_base64",
+                    document_root
+                ));
+            };
+
+            {
+                let mut sessions = self.closet_sessions.write().await;
+                if let Some(active) = sessions.get_mut(session_id) {
+                    active.did = Some(document_root.clone());
+                    active.fragment = Some(existing.name.clone());
+                }
+            }
+
+            existing.name
+        };
+
         let document_cid = ipfs_add(&kubo_url, did_document_json.as_bytes().to_vec()).await?;
         let ipns_options = IpnsPublishOptions::default();
         ipns_publish_with_retry(
@@ -1308,7 +1356,7 @@ impl World {
         )
         .await?;
 
-        Ok((expected_root, document_cid, key_name))
+        Ok((document_root, document_cid, key_name))
     }
 
     async fn closet_command(
@@ -2677,6 +2725,70 @@ impl World {
         let raw = kubo::cat_cid(&kubo_url, cid).await
             .map_err(|e| anyhow!("failed to load object definition {}: {}", cid, e))?;
         Self::parse_object_definition_text(&raw, cid)
+    }
+
+    async fn resolve_object_cid_or_yaml_input(
+        &self,
+        value: &str,
+    ) -> Result<(String, ObjectDefinition, bool)> {
+        let input = value.trim();
+        if input.is_empty() {
+            return Err(anyhow!("missing object definition payload"));
+        }
+
+        match self.load_object_definition_from_cid(input).await {
+            Ok(definition) => Ok((input.to_string(), definition, false)),
+            Err(cid_err) => {
+                let decoded = B64.decode(input.as_bytes()).map_err(|b64_err| {
+                    anyhow!(
+                        "not a valid CID ({}) and not valid base64 YAML ({})",
+                        cid_err,
+                        b64_err
+                    )
+                })?;
+                let yaml = String::from_utf8(decoded)
+                    .map_err(|utf8_err| anyhow!("invalid UTF-8 YAML payload: {}", utf8_err))?;
+
+                let definition = Self::parse_object_definition_text(&yaml, "inline-content")
+                    .map_err(|err| anyhow!("invalid object definition content: {}", err))?;
+
+                let kubo_url = self.kubo_url().await;
+                let cid = ipfs_add(&kubo_url, yaml.into_bytes())
+                    .await
+                    .map_err(|err| anyhow!("failed to publish object definition: {}", err))?;
+
+                Ok((cid, definition, true))
+            }
+        }
+    }
+
+    async fn resolve_room_cid_or_yaml_input(&self, value: &str) -> Result<(String, String, bool)> {
+        let input = value.trim();
+        if input.is_empty() {
+            return Err(anyhow!("missing room payload"));
+        }
+
+        let kubo_url = self.kubo_url().await;
+        match kubo::cat_cid(&kubo_url, input).await {
+            Ok(yaml_text) => Ok((input.to_string(), yaml_text, false)),
+            Err(cid_err) => {
+                let decoded = B64.decode(input.as_bytes()).map_err(|b64_err| {
+                    anyhow!(
+                        "not a valid CID ({}) and not valid base64 YAML ({})",
+                        cid_err,
+                        b64_err
+                    )
+                })?;
+                let yaml_text = String::from_utf8(decoded)
+                    .map_err(|utf8_err| anyhow!("invalid UTF-8 room YAML payload: {}", utf8_err))?;
+
+                let published_cid = ipfs_add(&kubo_url, yaml_text.as_bytes().to_vec())
+                    .await
+                    .map_err(|err| anyhow!("failed to publish room YAML: {}", err))?;
+
+                Ok((published_cid, yaml_text, true))
+            }
+        }
     }
 
     async fn hydrate_object_definition_by_cid(
@@ -4606,17 +4718,16 @@ impl World {
             if sub == "cid" {
                 if value.is_empty() {
                     return Some((
-                        format!("usage: {} set cid <cid>", object_label),
+                        format!("usage: {} set cid <cid|base64-yaml>", object_label),
                         room_name.to_string(),
                     ));
                 }
 
-                let cid = value.to_string();
-                let definition = match self.load_object_definition_from_cid(&cid).await {
-                    Ok(def) => def,
+                let (cid, definition, published_from_yaml) = match self.resolve_object_cid_or_yaml_input(value).await {
+                    Ok(tuple) => tuple,
                     Err(err) => {
                         return Some((
-                            format!("invalid object definition at {}: {}", cid, err),
+                            format!("invalid object definition payload: {}", err),
                             room_name.to_string(),
                         ));
                     }
@@ -4629,6 +4740,12 @@ impl World {
                 object.definition = Some(definition);
                 object.meta_dirty = true;
 
+                if published_from_yaml {
+                    return Some((
+                        format!("@{} cid published and set to {}", object.name, cid),
+                        room_name.to_string(),
+                    ));
+                }
                 return Some((
                     format!("@{} cid set to {}", object.name, cid),
                     room_name.to_string(),
@@ -4697,7 +4814,7 @@ impl World {
             }
 
             return Some((
-                format!("usage: {} set cid <cid> | {} set content-b64 <base64-yaml>", object_label, object_label),
+                format!("usage: {} set cid <cid|base64-yaml> | {} set content-b64 <base64-yaml>", object_label, object_label),
                 room_name.to_string(),
             ));
         }
@@ -5464,7 +5581,7 @@ impl World {
             return tr_world(
                 active_lang,
                 "world.help.commands",
-                "@world commands: help | list | show [did] | describe [did] | lang [show|set <cid>|clear] | private [on|off|status] | knock list [all] | knock accept <id> | knock reject <id> [note] | knock delete <id> | invite <did> [note] | room <name> acl show|open|close|allow <did>|deny <did> | migrate-index | save | load <cid> | dig <direction> [to|til <#dest|did>]",
+                "@world commands: help | list | show [did] | describe [did] | claim | lang [show|set <cid>|clear] | private [on|off|status] | knock list [all] | knock accept <id> | knock reject <id> [note] | knock delete <id> | invite <did> [note] | room <name> acl show|open|close|allow <did>|deny <did> | migrate-index | save | load <cid> | dig <direction> [to|til <#dest|did>]",
             );
         }
 
@@ -5612,6 +5729,25 @@ impl World {
                     "@world private=off (open entry)",
                 );
             }
+        }
+
+        // @@claim — set world owner to caller DID if unclaimed.
+        if verb == "claim" {
+            let current_owner = self.owner_did.read().await.clone();
+            if let Some(owner) = current_owner {
+                if owner == caller_root_did {
+                    return format!("@world already claimed by {}", owner);
+                }
+                return format!("@world already claimed by {}", owner);
+            }
+
+            {
+                let mut owner = self.owner_did.write().await;
+                *owner = Some(caller_root_did.clone());
+            }
+            self.allow_entry_did(&caller_root_did).await;
+            info!("World claimed by {}", caller_root_did);
+            return format!("@world claimed by {}", caller_root_did);
         }
 
         // All remaining commands require world-owner privilege.
@@ -6194,16 +6330,17 @@ impl World {
                         }
                     }
                     "cid" => {
-                        let cid = value;
-                        let kubo_url = self.kubo_url().await;
-                        match kubo::cat_cid(&kubo_url, &cid).await {
-                    Err(e) => {
-                        response = format!("@here failed to fetch CID {}: {}", cid, e);
-                    }
-                    Ok(yaml_text) => {
+                        let (cid, yaml_text, published_from_yaml) = match self.resolve_room_cid_or_yaml_input(&value).await {
+                            Ok(tuple) => tuple,
+                            Err(err) => {
+                                response = format!("@here invalid room payload: {}", err);
+                                return response;
+                            }
+                        };
+
                         match self.materialize_room_from_yaml(room_name, &yaml_text).await {
                             Err(e) => {
-                                response = format!("@here invalid room YAML at {}: {}", cid, e);
+                                response = format!("@here invalid room YAML payload: {}", e);
                             }
                             Ok((mut loaded, _needs_rewrite)) => {
                                 {
@@ -6212,21 +6349,181 @@ impl World {
                                     if let Some(existing) = rooms.get(room_name) {
                                         loaded.avatars = existing.avatars.clone();
                                     }
-                                    // IPFS data is king — owner from loaded YAML replaces current.
                                     let new_owner = loaded.acl.owner.clone().unwrap_or_else(|| "(none)".to_string());
-                                    response = format!("@here room '{}' replaced from {} (owner: {})", room_name, cid, new_owner);
+                                    if published_from_yaml {
+                                        response = format!(
+                                            "@here room '{}' content published and applied as {} (owner: {})",
+                                            room_name,
+                                            cid,
+                                            new_owner
+                                        );
+                                    } else {
+                                        response = format!("@here room '{}' replaced from {} (owner: {})", room_name, cid, new_owner);
+                                    }
                                     rooms.insert(room_name.to_string(), loaded);
                                 }
-                                // Record CID and republish world root index.
                                 self.room_cids.write().await.insert(room_name.to_string(), cid.clone());
                                 if let Err(e) = self.save_world_index().await {
-                                    warn!("Failed to save world index after set cid: {}", e);
+                                    warn!("Failed to save world index after set cid/content: {}", e);
                                 }
                             }
                         }
                     }
-                }
+                    "content" | "content-b64" => {
+                        let (cid, yaml_text, _published_from_yaml) = match self.resolve_room_cid_or_yaml_input(&value).await {
+                            Ok(tuple) => tuple,
+                            Err(err) => {
+                                response = format!("@here invalid room payload: {}", err);
+                                return response;
+                            }
+                        };
+
+                        match self.materialize_room_from_yaml(room_name, &yaml_text).await {
+                            Err(err) => {
+                                response = format!("@here invalid room YAML payload: {}", err);
+                            }
+                            Ok((mut loaded, _needs_rewrite)) => {
+                                {
+                                    let mut rooms = self.rooms.write().await;
+                                    if let Some(existing) = rooms.get(room_name) {
+                                        loaded.avatars = existing.avatars.clone();
+                                    }
+                                    rooms.insert(room_name.to_string(), loaded);
+                                }
+                                self.room_cids
+                                    .write()
+                                    .await
+                                    .insert(room_name.to_string(), cid.clone());
+                                if let Err(e) = self.save_world_index().await {
+                                    warn!("Failed to save world index after set content-b64: {}", e);
+                                }
+                                response = format!(
+                                    "@here room '{}' content published and applied as {}",
+                                    room_name,
+                                    cid
+                                );
+                            }
+                        }
                     }
+                        "exit-content-b64" => {
+                            let mut parts = value.splitn(2, char::is_whitespace);
+                            let exit_id = parts.next().unwrap_or_default().trim();
+                            let encoded = parts.next().unwrap_or_default().trim();
+                            if exit_id.is_empty() || encoded.is_empty() {
+                                response = "@here usage: @here set exit-content-b64 <exit-id> <base64-yaml>".to_string();
+                                return response;
+                            }
+
+                            let decoded = match B64.decode(encoded.as_bytes()) {
+                                Ok(bytes) => bytes,
+                                Err(err) => {
+                                    response = format!("@here invalid base64 exit content: {}", err);
+                                    return response;
+                                }
+                            };
+                            let exit_yaml = match String::from_utf8(decoded) {
+                                Ok(text) => text,
+                                Err(err) => {
+                                    response = format!("@here invalid UTF-8 exit YAML payload: {}", err);
+                                    return response;
+                                }
+                            };
+
+                            if let Err(err) = serde_yaml::from_str::<ExitYamlDoc>(&exit_yaml) {
+                                response = format!("@here invalid exit YAML payload: {}", err);
+                                return response;
+                            }
+
+                            let kubo_url = self.kubo_url().await;
+                            let new_exit_cid = match ipfs_add(&kubo_url, exit_yaml.into_bytes()).await {
+                                Ok(cid) => cid,
+                                Err(err) => {
+                                    response = format!("@here failed to publish exit YAML: {}", err);
+                                    return response;
+                                }
+                            };
+
+                            let current_room_cid = {
+                                let room_cids = self.room_cids.read().await;
+                                room_cids.get(room_name).cloned()
+                            };
+                            let Some(current_room_cid) = current_room_cid else {
+                                response = "@here room has no published CID yet; use @here set content-b64 for full room YAML first".to_string();
+                                return response;
+                            };
+
+                            let current_room_yaml = match kubo::cat_cid(&kubo_url, &current_room_cid).await {
+                                Ok(text) => text,
+                                Err(err) => {
+                                    response = format!(
+                                        "@here failed to load current room CID {}: {}",
+                                        current_room_cid,
+                                        err
+                                    );
+                                    return response;
+                                }
+                            };
+
+                            let mut room_doc = match serde_yaml::from_str::<RoomYamlDocV2>(&current_room_yaml) {
+                                Ok(doc) => doc,
+                                Err(err) => {
+                                    response = format!(
+                                        "@here current room YAML at {} is not editable as v2 content: {}",
+                                        current_room_cid,
+                                        err
+                                    );
+                                    return response;
+                                }
+                            };
+
+                            room_doc.exit_cids.insert(exit_id.to_string(), new_exit_cid.clone());
+                            room_doc.exits.clear();
+
+                            let updated_room_yaml = match serde_yaml::to_string(&room_doc) {
+                                Ok(text) => text,
+                                Err(err) => {
+                                    response = format!("@here failed to encode updated room YAML: {}", err);
+                                    return response;
+                                }
+                            };
+
+                            let updated_room_cid = match ipfs_add(&kubo_url, updated_room_yaml.as_bytes().to_vec()).await {
+                                Ok(cid) => cid,
+                                Err(err) => {
+                                    response = format!("@here failed to publish updated room YAML: {}", err);
+                                    return response;
+                                }
+                            };
+
+                            match self.materialize_room_from_yaml(room_name, &updated_room_yaml).await {
+                                Err(err) => {
+                                    response = format!("@here invalid updated room YAML payload: {}", err);
+                                }
+                                Ok((mut loaded, _needs_rewrite)) => {
+                                    {
+                                        let mut rooms = self.rooms.write().await;
+                                        if let Some(existing) = rooms.get(room_name) {
+                                            loaded.avatars = existing.avatars.clone();
+                                        }
+                                        rooms.insert(room_name.to_string(), loaded);
+                                    }
+                                    self.room_cids
+                                        .write()
+                                        .await
+                                        .insert(room_name.to_string(), updated_room_cid.clone());
+                                    if let Err(e) = self.save_world_index().await {
+                                        warn!("Failed to save world index after set exit-content-b64: {}", e);
+                                    }
+                                    response = format!(
+                                        "@here exit '{}' published as {} and room '{}' updated to {}",
+                                        exit_id,
+                                        new_exit_cid,
+                                        room_name,
+                                        updated_room_cid
+                                    );
+                                }
+                            }
+                        }
                     _ => {
                         response = format!("@here unknown set attribute '{}'.", key);
                     }
@@ -7410,6 +7707,7 @@ impl ProtocolHandler for ClosetProtocol {
                 Ok(ClosetRequest::PublishDidDocument {
                     session_id,
                     did_document_json,
+                    ipns_private_key_base64,
                 }) => {
                     match self
                         .world
@@ -7417,6 +7715,7 @@ impl ProtocolHandler for ClosetProtocol {
                             &session_id,
                             &requester_endpoint,
                             &did_document_json,
+                            &ipns_private_key_base64,
                         )
                         .await
                     {

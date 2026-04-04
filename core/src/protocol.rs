@@ -212,6 +212,7 @@ pub enum ClosetRequest {
     PublishDidDocument {
         session_id: String,
         did_document_json: String,
+        ipns_private_key_base64: String,
     },
 }
 

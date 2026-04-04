@@ -2,7 +2,7 @@
 
 A WebAssembly home client built on top of `did-ma`.
 
-It creates/unlocks local encrypted identity bundles, publishes DID documents to IPNS via Kubo, and provides a command-driven browser UI.
+It creates/unlocks local encrypted identity bundles, publishes DID documents to IPNS via IPFS API, and provides a command-driven browser UI.
 
 ## Features
 
@@ -13,7 +13,7 @@ It creates/unlocks local encrypted identity bundles, publishes DID documents to 
 - Passphrase-based local encryption (`argon2id` + `XChaCha20Poly1305`)
 - BIP39 recovery phrase generation/normalization
 - Browser UI with slash commands
-- Kubo API integration for key management and IPNS publish
+- IPFS API integration for key management and IPNS publish
 
 ## Repository Layout
 
@@ -28,7 +28,7 @@ It creates/unlocks local encrypted identity bundles, publishes DID documents to 
 - Rust toolchain
 - `wasm-pack`
 - Python 3 (for local static server)
-- Kubo/IPFS API reachable at `http://127.0.0.1:5001`
+- IPFS API reachable at `http://127.0.0.1:5001`
 
 ## Build and Run
 
@@ -64,20 +64,10 @@ The build can be published to IPFS + IPNS with a stable URL:
 
 Important runtime note:
 
-- This app requires local Kubo API access at runtime (key lookup and DID publish).
-- Preferred runtime: install `ma-extension` and run from published IPNS/gateway URL.
-- Fallback runtime without extension: use `http://127.0.0.1:8081`.
-- `http://127.0.0.1:8080/ipns/<key>/` is the published gateway URL, but Kubo API calls from that origin can be blocked by Kubo security policy.
-- Public gateways (for example `ipfs.io`) are not suitable for this app's local-Kubo API workflow.
-
-## Optional Browser Extension (recommended)
-
-The `ma-extension` folder contains a local extension that proxies app Kubo API calls to `http://127.0.0.1:5001`.
-
-Install from filesystem (no store publishing required):
-
-- Chromium/Chrome/Brave/Edge: open `chrome://extensions`, enable Developer Mode, click Load unpacked, choose `ma-extension`.
-- Firefox: open `about:debugging#/runtime/this-firefox`, click Load Temporary Add-on, choose `ma-extension/manifest.json`.
+- This app requires local IPFS API access at runtime (key lookup and DID publish).
+- Preferred runtime: use `http://127.0.0.1:8081`.
+- `http://127.0.0.1:8080/ipns/<key>/` is the published gateway URL, but IPFS API calls from that origin can be blocked by browser/API-origin policy.
+- Public gateways (for example `ipfs.io`) are not suitable for this app's local API workflow.
 
 ### CID consistency notes
 
@@ -176,9 +166,9 @@ Navigation is gameplay — the server resolves exits and directs the client to n
 - Browser storage is namespaced per alias, so one browser profile can keep multiple local homes
 - The currently active alias is remembered per browser tab, which allows concurrent homes in separate tabs/windows on the same origin
 
-## Kubo CORS
+## IPFS API CORS
 
-Browser calls require Kubo API CORS headers allowing your app origin (for example `http://127.0.0.1:8081`).
+Browser calls require IPFS API CORS headers allowing your app origin (for example `http://127.0.0.1:8081`).
 
 ## Protocol & Transport
 
@@ -192,9 +182,9 @@ An inbox listener registers protocol handlers for the `ma/inbox/1`,
 browser can receive inbound signed messages (presence snapshots, whispers,
 broadcasts) from the world and other actors.
 
-If `/publish` or Kubo check fails in-browser, verify:
+If `/publish` or IPFS API check fails in-browser, verify:
 
-1. Kubo daemon is running
+1. IPFS daemon is running
 2. API endpoint is correct
 3. CORS origins include your host/port
 
@@ -202,7 +192,7 @@ The setup screen also shows:
 
 - current published IPNS path
 - current published CID path
-- a Kubo install hint with a link to docs when Kubo is not reachable
+- an IPFS install hint with a link to docs when IPFS API is not reachable
 
 Local serving on `http://127.0.0.1:8081` remains the recommended runtime origin.
 Use `make publish` for fast iteration, and `make release` when you want an optimized published build.

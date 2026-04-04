@@ -1,3 +1,5 @@
+import { isMaDid, isMaDidTarget } from './did.js';
+
 export function createDidTargetMetaPollHandler(deps) {
   const {
     state,
@@ -31,7 +33,7 @@ export function createDidTargetMetaPollHandler(deps) {
     }
 
     const resolved = String(resolveAliasInput(targetToken) || targetToken || '').trim();
-    if (!resolved.startsWith('did:ma:') || !resolved.includes('#')) {
+    if (!isMaDidTarget(resolved)) {
       return false;
     }
 
@@ -54,7 +56,7 @@ export function createDidTargetMetaPollHandler(deps) {
 
     const showResponse = await sendWorldCommandQuery(`@world show #${roomFragment}`);
     const meta = parseRoomShowMeta(showResponse);
-    if (meta.did && meta.did.startsWith('did:ma:')) {
+    if (meta.did && isMaDid(meta.did)) {
       cacheRoomDidLookup(roomFragment, meta.did);
     } else {
       cacheRoomDidLookup(roomFragment, resolved);

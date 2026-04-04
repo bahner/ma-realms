@@ -67,21 +67,58 @@ pub async fn pin_update(kubo_url: &str, from_cid: &str, to_cid: &str) -> Result<
 }
 
 pub async fn fetch_did_document(kubo_url: &str, did: &Did) -> Result<Document> {
-    let base = kubo_url.trim_end_matches('/');
-    let url = format!("{base}/api/v0/cat");
-    let arg = format!("/ipns/{}", did.ipns);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(6))
-        .build()?;
+    let ipns_path = format!("/ipns/{}", did.ipns);
+    let mut backoff = Duration::from_millis(150);
+    let mut last_err: Option<anyhow::Error> = None;
+    let mut body = String::new();
 
-    let body = client
-        .post(url)
-        .query(&[("arg", arg)])
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
+    for attempt in 1..=4 {
+        match name_resolve(kubo_url, &ipns_path, true).await {
+            Ok(resolved_path) => {
+                if !resolved_path.starts_with("/ipfs/") {
+                    last_err = Some(anyhow!(
+                        "name/resolve returned non-ipfs path for {}: {}",
+                        ipns_path,
+                        resolved_path
+                    ));
+                } else {
+                    match cat_cid(kubo_url, &resolved_path).await {
+                        Ok(text) => {
+                            body = text;
+                            break;
+                        }
+                        Err(err) => {
+                            last_err = Some(anyhow!(
+                                "cat failed for resolved DID path {}: {}",
+                                resolved_path,
+                                err
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                last_err = Some(anyhow!("name/resolve failed for {}: {}", ipns_path, err));
+            }
+        }
+
+        if attempt < 4 {
+            sleep(backoff).await;
+            let doubled = backoff.as_millis().saturating_mul(2);
+            backoff = Duration::from_millis(std::cmp::min(doubled, 2_000) as u64);
+        }
+    }
+
+    if body.is_empty() {
+        return Err(anyhow!(
+            "failed to fetch DID document for {} via {} after retries: {}",
+            did.id(),
+            ipns_path,
+            last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown error".to_string())
+        ));
+    }
 
     let document = Document::unmarshal(&body)
         .map_err(|err| anyhow!("failed to decode DID document from IPNS {}: {}", did.ipns, err))?;

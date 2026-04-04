@@ -28,8 +28,8 @@
 
       <div class="grid-2">
         <div>
-          <label for="kubo-api">IPFS Gateway Endpoint</label>
-          <input id="kubo-api" type="text" value="http://localhost:8080" autocomplete="off">
+          <label for="gateway-api">IPFS Gateway Endpoint</label>
+          <input id="gateway-api" type="text" value="http://localhost:8080" autocomplete="off">
         </div>
         <div>
           <label for="alias-name">Local Alias</label>
@@ -44,7 +44,7 @@
         </div>
         <div>
           <label for="language-order">Language Preference Order</label>
-          <input id="language-order" type="text" value="en_UK;en_US" placeholder="nb_NO;en_UK;en_US" autocomplete="off">
+          <input id="language-order" type="text" value="en_UK:en_US" placeholder="nb_NO:en_UK:en:no:da:se" autocomplete="off">
         </div>
       </div>
 
@@ -63,13 +63,13 @@
       <textarea id="bundle-text" placeholder="Paste a saved encrypted bundle to unlock, or leave empty when creating."></textarea>
 
       <div class="setup-actions">
-        <button id="btn-kubo-check" type="button">Test IPFS Connection</button>
+        <button id="btn-gateway-check" type="button">Test IPFS Connection</button>
         <button id="btn-create" class="primary" type="button">Create Local Identity</button>
         <button id="btn-unlock" type="button">Unlock Bundle</button>
       </div>
 
-      <p id="kubo-status" class="status idle">IPFS not checked yet.</p>
-      <div id="kubo-install-note" class="kubo-install-note hidden"></div>
+      <p id="gateway-status" class="status idle">IPFS not checked yet.</p>
+      <div id="gateway-install-note" class="gateway-install-note hidden"></div>
       <section id="publish-info" class="publish-info" aria-live="polite">
         <p class="publish-line">Current IPNS Pointer: <a id="current-ipns-link" href="#">(not published yet)</a></p>
         <p class="publish-line">Current IPFS Content: <a id="current-cid-link" href="#">(not published yet)</a></p>
