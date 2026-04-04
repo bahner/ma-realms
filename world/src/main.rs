@@ -816,7 +816,10 @@ impl World {
                 ));
             }
             if existing_names.iter().any(|name| name == normalized) {
-                return Err(anyhow!("alias '{}' is already in use in kubo", normalized));
+                return Err(anyhow!(
+                    "alias '{}' is already taken (username/fragment in use); choose another alias and run apply again",
+                    normalized
+                ));
             }
             normalized.to_string()
         } else {
@@ -1251,6 +1254,63 @@ impl World {
         Ok((did, fragment, key_name))
     }
 
+    async fn closet_publish_did_document(
+        &self,
+        session_id: &str,
+        endpoint: &str,
+        did_document_json: &str,
+    ) -> Result<(String, String, String)> {
+        let session = self.closet_session_owned_by(session_id, endpoint).await?;
+        let did_root = session
+            .did
+            .clone()
+            .ok_or_else(|| anyhow!("no DID in closet session; run apply/citizen first"))?;
+        let key_name = session
+            .fragment
+            .clone()
+            .ok_or_else(|| anyhow!("no fragment in closet session; run apply/citizen first"))?;
+
+        let document = Document::unmarshal(did_document_json)
+            .map_err(|e| anyhow!("invalid DID document JSON: {}", e))?;
+        document
+            .validate()
+            .map_err(|e| anyhow!("invalid DID document: {}", e))?;
+        document
+            .verify()
+            .map_err(|e| anyhow!("DID document signature verification failed: {}", e))?;
+
+        let expected_root = Did::try_from(did_root.as_str())
+            .map_err(|e| anyhow!("invalid session DID '{}': {}", did_root, e))?
+            .without_fragment()
+            .id();
+        let document_root = Did::try_from(document.id.as_str())
+            .map_err(|e| anyhow!("invalid document DID '{}': {}", document.id, e))?
+            .without_fragment()
+            .id();
+        if document_root != expected_root {
+            return Err(anyhow!(
+                "document DID root '{}' does not match session DID root '{}'",
+                document_root,
+                expected_root
+            ));
+        }
+
+        let kubo_url = self.kubo_url.read().await.clone();
+        let document_cid = ipfs_add(&kubo_url, did_document_json.as_bytes().to_vec()).await?;
+        let ipns_options = IpnsPublishOptions::default();
+        ipns_publish_with_retry(
+            &kubo_url,
+            &key_name,
+            &format!("/ipfs/{}", document_cid),
+            &ipns_options,
+            3,
+            Duration::from_millis(1_000),
+        )
+        .await?;
+
+        Ok((expected_root, document_cid, key_name))
+    }
+
     async fn closet_command(
         &self,
         session_id: &str,
@@ -1279,7 +1339,7 @@ impl World {
         if verb == "help" {
             return Ok(ClosetResponse {
                 ok: true,
-                message: "Closet commands: help | show | hear | name <text> | description <text> | alias <text> | apply [ipns_key_base64] | citizen [ipns_key_base64] | recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>\nRequired fields: name, description, alias.\nWhen done: run apply, then type 'go lobby' in the actor UI to enter the world.".to_string(),
+                message: "Closet commands: help | show | hear | name <text> | description <text> | alias <text> | apply [ipns_key_base64] | citizen [ipns_key_base64] | recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>\nRequired fields: name, description, alias.\nAlias is your requested username/fragment and can be rejected if taken.\nWhen done: run apply, then type 'go lobby' in the actor UI to enter the world.".to_string(),
                 session_id: Some(session_id.to_string()),
                 prompt: Some("You are in the closet with no avatar yet. Required: name + description + alias. Then run apply. When done, type 'go lobby' in the actor UI.".to_string()),
                 lobby_events: Vec::new(),
@@ -1796,7 +1856,10 @@ impl World {
                 ));
             }
             if existing_names.iter().any(|name| name == normalized) {
-                return Err(anyhow!("alias '{}' is already in use in kubo", normalized));
+                return Err(anyhow!(
+                    "alias '{}' is already taken (username/fragment in use); choose another alias and run apply again",
+                    normalized
+                ));
             }
             normalized.to_string()
         } else {
@@ -7329,6 +7392,43 @@ impl ProtocolHandler for ClosetProtocol {
                             latest_lobby_sequence: 0,
                             did: Some(did),
                             fragment: Some(fragment),
+                            key_name: Some(key_name),
+                        },
+                        Err(err) => ClosetResponse {
+                            ok: false,
+                            message: err.to_string(),
+                            session_id: None,
+                            prompt: None,
+                            lobby_events: Vec::new(),
+                            latest_lobby_sequence: 0,
+                            did: None,
+                            fragment: None,
+                            key_name: None,
+                        },
+                    }
+                }
+                Ok(ClosetRequest::PublishDidDocument {
+                    session_id,
+                    did_document_json,
+                }) => {
+                    match self
+                        .world
+                        .closet_publish_did_document(
+                            &session_id,
+                            &requester_endpoint,
+                            &did_document_json,
+                        )
+                        .await
+                    {
+                        Ok((did, _cid, key_name)) => ClosetResponse {
+                            ok: true,
+                            message: "did document published".to_string(),
+                            session_id: Some(session_id),
+                            prompt: None,
+                            lobby_events: Vec::new(),
+                            latest_lobby_sequence: 0,
+                            did: Some(did),
+                            fragment: Some(key_name.clone()),
                             key_name: Some(key_name),
                         },
                         Err(err) => ClosetResponse {

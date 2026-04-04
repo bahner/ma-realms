@@ -29,6 +29,7 @@ import init, {
   alias_humanize_text,
   closet_start,
   closet_command,
+  closet_publish_did_document,
   disconnect_world
 } from './pkg/ma_actor.js';
 import { createInboundDispatcher } from './inbox-dispatcher.js';
@@ -56,6 +57,12 @@ const LEGACY_API_KEY = 'ma.identity.v2.kuboApi';
 const LEGACY_ALIAS_KEY = 'ma.identity.v2.alias';
 const DEFAULT_UI_LANG = 'en';
 const DEFAULT_LANGUAGE_ORDER = 'en_UK;en_US';
+const IPFS_GATEWAY_FALLBACKS = [
+  'http://localhost:8080',
+  'https://ipfs.io',
+  'https://dweb.link',
+  'https://w3s.link',
+];
 const LOCAL_EDIT_SCRIPT_KEY = `${STORAGE_PREFIX}.localEditScript`;
 const LOCAL_EDIT_SCRIPT_CID_KEY = `${STORAGE_PREFIX}.localEditScriptCid`;
 
@@ -2460,6 +2467,15 @@ function setKuboInstallNoteVisible(visible, mode = 'install') {
       (ipnsPathGatewayUrl
         ? `<p>Workaround: open the same app via localhost path gateway, which Kubo accepts better for CORS:<br><a href="${ipnsPathGatewayUrl}"><code>${ipnsPathGatewayUrl}</code></a></p>`
         : '');
+  } else if (mode === 'gateway-fallback') {
+    const options = IPFS_GATEWAY_FALLBACKS
+      .map((entry) => `<code>${entry}</code>`)
+      .join(', ');
+    note.innerHTML =
+      `<p>Could not reach the configured IPFS gateway from this browser tab.</p>` +
+      `<p>Try one of these gateway endpoints:</p>` +
+      `<p>${options}</p>` +
+      `<p>Recommended: keep <code>http://localhost:8080</code> as primary when available.</p>`;
   } else {
     note.innerHTML = '<p>Kubo not available. If you have not installed it yet, download from <a href="https://docs.ipfs.tech/install/" target="_blank" rel="noreferrer">IPFS/Kubo install docs</a>.</p>';
   }
@@ -3011,7 +3027,16 @@ function exportBundle() {
 }
 
 function getApiBase() {
-  return (byId('kubo-api').value.trim() || 'http://localhost:8080').replace(/\/$/, '');
+  return normalizeKuboApiBase(byId('kubo-api').value);
+}
+
+function normalizeKuboApiBase(value) {
+  const raw = String(value || '').trim().replace(/\/$/, '') || 'http://localhost:8080';
+  const mapped = raw.replace(
+    /^https?:\/\/(localhost|127\.0\.0\.1):5001$/i,
+    'http://localhost:8080'
+  );
+  return mapped;
 }
 
 function nextBridgeRequestId() {
@@ -3251,61 +3276,66 @@ async function kuboPostText(path, query = {}, body = null) {
 }
 
 async function checkKubo() {
-  setKuboStatus('checking...', 'working');
-  try {
-    const payload = await kuboPost('/api/v0/key/list', { l: 'true' });
-    const keys = Array.isArray(payload?.Keys) ? payload.Keys : [];
-    setKuboStatus(`Connected (${keys.length} entries available).`, 'ok');
+  const configuredBase = getApiBase();
+  setKuboStatus(`Checking IPFS gateway (${configuredBase})...`, 'working');
+
+  const applyGatewaySelection = (base) => {
+    const normalized = normalizeKuboApiBase(base);
+    const input = byId('kubo-api');
+    if (input) {
+      input.value = normalized;
+    }
+    try {
+      localStorage.setItem(API_KEY, normalized);
+      localStorage.removeItem(LEGACY_API_KEY);
+    } catch (_) {}
+    return normalized;
+  };
+
+  const probeGateway = async (base) => {
+    const normalized = normalizeKuboApiBase(base);
+    const probeUrl = `${normalized}/ipfs/`;
+    try {
+      const response = await fetch(probeUrl, {
+        method: 'GET',
+        mode: 'no-cors',
+        cache: 'no-store',
+      });
+      return response.type === 'opaque' || response.ok || response.status < 500;
+    } catch {
+      return false;
+    }
+  };
+
+  if (await probeGateway(configuredBase)) {
+    const activeBase = applyGatewaySelection(configuredBase);
+    setKuboStatus(`Gateway reachable (${activeBase}).`, 'ok');
     setSetupActionsEnabled(true);
     setKuboInstallNoteVisible(false);
-    await refreshHomePublishInfoFromKubo(keys);
-    setSetupStatus('Kubo API reachable. You can now create or unlock an identity bundle.');
-    return keys;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const isLocalGatewayOrigin = isGatewayViewOrigin();
-    if (isLocalGatewayOrigin && message.startsWith('Kubo API 403')) {
-      setKuboStatus('blocked by Kubo gateway policy', 'warn');
-      setSetupActionsEnabled(false);
-      setKuboInstallNoteVisible(true, 'gateway-api-blocked');
-      setSetupStatus('Kubo API is required, but blocked on gateway origin (:8080). Open local runtime URL on :8081.');
-      throw error;
-    }
-    if (error && error.kuboReason === 'bridge-unavailable') {
-      setKuboStatus('extension bridge missing', 'warn');
-      setSetupActionsEnabled(false);
-      setKuboInstallNoteVisible(true, 'gateway-api-blocked');
-      const detail = error.bridgeDetail ? ` (${error.bridgeDetail})` : '';
-      setSetupStatus(`ma-extension is not active in this tab${detail}. Install/enable extension (also in private mode), then reload.`);
-      throw error;
-    }
-    if (error && error.kuboReason === 'remote-localhost-block') {
-      setKuboStatus('blocked from this origin', 'warn');
-      setSetupActionsEnabled(false);
-      setKuboInstallNoteVisible(true, 'origin-blocked');
-      setSetupStatus('This browser tab cannot call local Kubo from the current origin.');
-      throw error;
-    }
-    if (error && error.kuboReason === 'localhost-cors-or-network') {
-      if (isLocalGatewayOrigin) {
-        setKuboStatus('blocked by Kubo gateway policy', 'warn');
-        setSetupActionsEnabled(false);
-        setKuboInstallNoteVisible(true, 'gateway-api-blocked');
-        setSetupStatus('Kubo API is required, but blocked on gateway origin (:8080). Open local runtime URL on :8081.');
-        throw error;
-      }
-      setKuboStatus('blocked by CORS/network', 'warn');
-      setSetupActionsEnabled(false);
-      setKuboInstallNoteVisible(true, 'cors-blocked');
-      setSetupStatus(`Kubo API call failed from localhost-like origin. Add ${window.location.origin} to Kubo CORS allow-origin.`);
-      throw error;
-    }
-    setKuboStatus('not reachable from browser', 'error');
-    setSetupActionsEnabled(false);
-    setKuboInstallNoteVisible(true, 'install');
-    setSetupStatus(message);
-    throw error;
+    setSetupStatus('IPFS gateway reachable. You can create or unlock an identity bundle.');
+    return [];
   }
+
+  const fallbacks = IPFS_GATEWAY_FALLBACKS
+    .map((entry) => normalizeKuboApiBase(entry))
+    .filter((entry, idx, list) => list.indexOf(entry) === idx && entry !== configuredBase);
+
+  for (const fallback of fallbacks) {
+    if (await probeGateway(fallback)) {
+      const activeBase = applyGatewaySelection(fallback);
+      setKuboStatus(`Configured gateway failed. Switched to ${activeBase}.`, 'ok');
+      setSetupActionsEnabled(true);
+      setKuboInstallNoteVisible(true, 'gateway-fallback');
+      setSetupStatus(`Configured gateway is not reachable. Switched to working fallback: ${activeBase}`);
+      return [];
+    }
+  }
+
+  setKuboStatus('No tested gateway reachable from browser.', 'error');
+  setSetupActionsEnabled(false);
+  setKuboInstallNoteVisible(true, 'gateway-fallback');
+  setSetupStatus('Could not reach localhost gateway or public fallbacks. Check network/local node, then try again.');
+  throw new Error('IPFS gateway connectivity test failed');
 }
 
 async function ensureKuboAliasKey(aliasName) {
@@ -3394,7 +3424,7 @@ async function onCreateIdentity() {
   setSetupStatus('Creating identity...');
   try {
     const { aliasName, passphrase, languageOrder } = validateSetupInputs(false);
-    localStorage.setItem(API_KEY, getApiBase());
+    localStorage.setItem(API_KEY, normalizeKuboApiBase(getApiBase()));
     setActiveAlias(aliasName);
 
     const created = JSON.parse(create_identity(passphrase));
@@ -3429,7 +3459,7 @@ async function onUnlockIdentity() {
   setSetupStatus('Unlocking bundle...');
   try {
     const { aliasName, passphrase, bundle, languageOrder } = validateSetupInputs(true);
-    localStorage.setItem(API_KEY, getApiBase());
+    localStorage.setItem(API_KEY, normalizeKuboApiBase(getApiBase()));
     setActiveAlias(aliasName);
 
     const unlocked = JSON.parse(unlock_identity(passphrase, bundle));
@@ -3598,16 +3628,30 @@ async function fetchDidDocumentJsonByDid(did) {
 
   logger.log('did.cache', `miss for ${rootDid}`);
   const ipns = didToIpnsName(rootDid);
-  const resolved = await kuboPost('/api/v0/name/resolve', {
-    arg: `/ipns/${ipns}`,
-    recursive: 'true'
-  });
-  const path = String(resolved?.Path || '').trim();
-  if (!path.startsWith('/ipfs/')) {
-    throw new Error(`name/resolve did not return /ipfs path for ${rootDid}`);
+  let documentJson = '';
+  const candidates = [
+    `/ipns/${ipns}`,
+    `http://localhost:8080/ipns/${ipns}`,
+  ];
+
+  let lastError = '';
+  for (const url of candidates) {
+    try {
+      const response = await fetch(url, { cache: 'no-store' });
+      if (!response.ok) {
+        lastError = `HTTP ${response.status} from ${url}`;
+        continue;
+      }
+      documentJson = await response.text();
+      break;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+  }
+  if (!documentJson) {
+    throw new Error(`failed to fetch DID document for ${rootDid}: ${lastError}`);
   }
 
-  const documentJson = await kuboPostText('/api/v0/cat', { arg: path });
   state.didDocCache.set(rootDid, {
     fetchedAt: Date.now(),
     documentJson
@@ -4427,6 +4471,16 @@ async function sendCurrentWorldMessage(text) {
 
     if (!state.currentHome) {
       if (state.closetSessionId && state.closetEndpointId) {
+        const goMatch = trimmedText.match(/^go\s+(.+)$/i);
+        if (goMatch) {
+          const room = String(goMatch[1] || '').trim();
+          if (room) {
+            const response = await closetCommandForCurrentWorld(`enter ${room}`);
+            renderClosetResponse(response);
+            return;
+          }
+        }
+
         if (closetInput) {
           const response = await closetCommandForCurrentWorld(closetInput);
           renderClosetResponse(response);
@@ -4712,14 +4766,14 @@ function renderClosetResponse(response) {
   }
   if (response?.did) {
     appendMessage('system', `Assigned DID: ${response.did}`);
-    adoptClosetAssignedDid(String(response.did));
+    adoptClosetAssignedDid(String(response.did), String(response?.fragment || ''));
   }
   if (response?.fragment) {
     appendMessage('system', `Assigned fragment: ${response.fragment}`);
   }
 }
 
-function adoptClosetAssignedDid(assignedDid) {
+function adoptClosetAssignedDid(assignedDid, assignedFragment = '') {
   const did = String(assignedDid || '').trim();
   const root = didRoot(did);
   const ipns = root.startsWith('did:ma:') ? root.slice('did:ma:'.length) : '';
@@ -4744,6 +4798,25 @@ function adoptClosetAssignedDid(assignedDid) {
       saveIdentityRecord(state.aliasName, updated.encrypted_bundle);
     }
     appendMessage('system', `Identity rebound to ${root}.`);
+    Promise.resolve()
+      .then(async () => {
+        const endpointId = String(state.closetEndpointId || '').trim();
+        const sessionId = String(state.closetSessionId || '').trim();
+        if (!endpointId || !sessionId) {
+          throw new Error('No active closet session for DID publish.');
+        }
+        const published = parseClosetResponse(
+          await closet_publish_did_document(endpointId, sessionId, updated.document_json)
+        );
+        if (!published.ok) {
+          throw new Error(published.message || 'Closet DID publish failed.');
+        }
+        state.didDocCache.delete(root);
+        appendMessage('system', `Published DID document to /ipns/${ipns} (key: ${assignedFragment || '(session key)'}).`);
+      })
+      .catch((error) => {
+        appendMessage('system', `Warning: DID document not published yet (${error instanceof Error ? error.message : String(error)}).`);
+      });
     updateIdentityLine();
   } catch (error) {
     appendMessage('system', `Warning: could not rebind local identity (${error instanceof Error ? error.message : String(error)}).`);
@@ -5302,10 +5375,17 @@ function onCommandKeyDown(event) {
 function restoreSavedValues() {
   scrubStoredRecoveryPhrases();
 
-  const savedApi = localStorage.getItem(API_KEY) || localStorage.getItem(LEGACY_API_KEY);
+  const rawSavedApi = localStorage.getItem(API_KEY) || localStorage.getItem(LEGACY_API_KEY);
+  const savedApi = normalizeKuboApiBase(rawSavedApi);
   const savedAlias = resolveInitialAlias();
 
-  if (savedApi) byId('kubo-api').value = savedApi;
+  if (savedApi) {
+    byId('kubo-api').value = savedApi;
+    try {
+      localStorage.setItem(API_KEY, savedApi);
+      localStorage.removeItem(LEGACY_API_KEY);
+    } catch (_) {}
+  }
 
   if (savedAlias) {
     byId('alias-name').value = savedAlias;
@@ -5342,7 +5422,7 @@ async function main() {
     checkKubo().catch(() => {});
   } else {
     setKuboStatus('not checked (remote origin)', 'idle');
-    setSetupStatus('Local Kubo API is optional for create/unlock, but required for IPNS publish and edit publish flows.');
+    setSetupStatus('Gateway is not auto-checked on this origin. Use Test IPFS Connection.');
   }
 
   byId('btn-kubo-check').addEventListener('click', () => {

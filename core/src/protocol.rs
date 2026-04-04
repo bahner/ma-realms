@@ -209,6 +209,10 @@ pub enum ClosetRequest {
         session_id: String,
         ipns_private_key_base64: String,
     },
+    PublishDidDocument {
+        session_id: String,
+        did_document_json: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -1786,6 +1786,23 @@ pub async fn closet_submit_citizenship(
     serde_json::to_string(&response).map_err(js_err)
 }
 
+#[wasm_bindgen]
+pub async fn closet_publish_did_document(
+    endpoint_id: &str,
+    session_id: &str,
+    did_document_json: &str,
+) -> Result<String, JsValue> {
+    let response = send_closet_request(
+        endpoint_id,
+        ClosetRequest::PublishDidDocument {
+            session_id: session_id.trim().to_string(),
+            did_document_json: did_document_json.to_string(),
+        },
+    )
+    .await?;
+    serde_json::to_string(&response).map_err(js_err)
+}
+
 /// Enter a world over iroh using the world protocol.
 #[wasm_bindgen]
 pub async fn enter_world(
