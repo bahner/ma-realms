@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
@@ -42,6 +44,7 @@ use ma_core::{
     normalize_spoken_text, parse_capability_acl_text, parse_object_local_capability_acl,
     parse_closet_command, plan_closet_did_publish,
     LegacyRequirement, RequirementChecker, RequirementSet, RequirementValue,
+    pin_update_add_rm,
 };
 use nanoid::nanoid;
 use rand::RngCore;
@@ -76,7 +79,7 @@ use lang::{
 use kubo::{
     IpnsPublishOptions, dag_get_dag_cbor, dag_put_dag_cbor, generate_kubo_key, ipfs_add,
     import_kubo_key, ipns_publish_with_retry, list_kubo_key_names, list_kubo_keys, name_resolve, pin_add_named,
-    pin_rm, pin_update, wait_for_kubo_api,
+    pin_rm, wait_for_kubo_api,
     remove_kubo_key,
 };
 use room::{Room, RoomAcl};
@@ -3171,23 +3174,26 @@ impl World {
         let new_cid = kubo::dag_put_dag_cbor(&kubo_url, &index).await?;
 
         // Keep exactly one named recursive pin for the world root index.
-        if let Some(old_cid) = previous_world_cid.as_deref() {
-            if old_cid != new_cid {
-                if let Err(update_err) = pin_update(&kubo_url, old_cid, &new_cid).await {
-                    warn!(
-                        "pin/update failed for world root ({} -> {}): {}. Falling back to add+rm.",
-                        old_cid,
-                        new_cid,
-                        update_err
-                    );
-                    pin_add_named(&kubo_url, &new_cid, &pin_name).await?;
-                    if let Err(rm_err) = pin_rm(&kubo_url, old_cid).await {
-                        warn!("pin/rm failed for previous world root {}: {}", old_cid, rm_err);
-                    }
-                }
+        let kubo_url_for_pin = kubo_url.clone();
+        let kubo_url_for_unpin = kubo_url.clone();
+        let pin_outcome = pin_update_add_rm(
+            previous_world_cid.as_deref(),
+            &new_cid,
+            &pin_name,
+            |cid, name| {
+                let kubo_url = kubo_url_for_pin.clone();
+                async move { pin_add_named(&kubo_url, &cid, &name).await }
+            },
+            |cid| {
+                let kubo_url = kubo_url_for_unpin.clone();
+                async move { pin_rm(&kubo_url, &cid).await }
+            },
+        )
+        .await?;
+        if let Some(rm_err) = pin_outcome.previous_unpin_error {
+            if let Some(old_cid) = previous_world_cid.as_deref() {
+                warn!("pin/rm failed for previous world root {}: {}", old_cid, rm_err);
             }
-        } else {
-            pin_add_named(&kubo_url, &new_cid, &pin_name).await?;
         }
 
         *self.world_cid.write().await = Some(new_cid.clone());

@@ -5,8 +5,6 @@ DID_MA_RS := $(shell find ../../ma/src -type f -name '*.rs')
 MA_CORE_RS := $(shell find ../core/src -type f -name '*.rs')
 BUILD_INPUTS := Makefile Cargo.toml Cargo.lock ../../ma/Cargo.toml ../../ma/Cargo.lock ../core/Cargo.toml $(HOME_RS) $(DID_MA_RS) $(MA_CORE_RS)
 
-PKG_STAMP := .build/pkg.stamp
-PKG_DEV_STAMP := .build/pkg-dev.stamp
 CID_FILE := .cid
 IPNS_ALIAS := ma-actor
 SOURCE_DATE_EPOCH ?= $(shell git log -1 --format=%ct 2>/dev/null || date +%s)
@@ -15,6 +13,9 @@ MA_ACTOR_VERSION_EFFECTIVE := $(strip $(MA_ACTOR_VERSION))
 ifeq ($(MA_ACTOR_VERSION_EFFECTIVE),)
 MA_ACTOR_VERSION_EFFECTIVE := $(shell printf 'dev-%s' "$$(date +%s)")
 endif
+STAMP_VERSION := $(shell printf '%s' "$(MA_ACTOR_VERSION_EFFECTIVE)" | tr -c 'A-Za-z0-9._-' '_')
+PKG_STAMP := .build/pkg.$(STAMP_VERSION).stamp
+PKG_DEV_STAMP := .build/pkg-dev.$(STAMP_VERSION).stamp
 VERSION_FILE := www/pkg/build-version.js
 
 

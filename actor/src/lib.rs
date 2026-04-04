@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;

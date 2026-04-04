@@ -48,31 +48,6 @@ pub async fn pin_rm(kubo_url: &str, cid: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn pin_update(kubo_url: &str, from_cid: &str, to_cid: &str) -> Result<()> {
-    let base = kubo_url.trim_end_matches('/');
-    let url = format!("{base}/api/v0/pin/update");
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
-
-    let from_arg = normalize_ipfs_publish_arg(from_cid);
-    let to_arg = normalize_ipfs_publish_arg(to_cid);
-
-    client
-        .post(url)
-        .query(&[
-            ("arg", from_arg.as_str()),
-            ("arg", to_arg.as_str()),
-            ("unpin", "true"),
-        ])
-        .send()
-        .await?
-        .error_for_status()?;
-
-    Ok(())
-}
-
 pub async fn fetch_did_document(kubo_url: &str, did: &Did) -> Result<Document> {
     let ipns_path = format!("/ipns/{}", did.ipns);
     let mut backoff = Duration::from_millis(150);

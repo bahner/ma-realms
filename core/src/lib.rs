@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 pub mod addressing;
 pub mod bootstrap_identity;
 pub mod closet_client;
@@ -8,6 +10,7 @@ pub mod domain;
 pub mod interfaces;
 pub mod object_runtime;
 pub mod parser;
+pub mod pinning;
 pub mod protocol;
 pub mod requirements;
 pub mod room_actor;
@@ -56,6 +59,7 @@ pub use object_runtime::{
 pub use parser::{
     ActorCommand, MessageEnvelope, normalize_spoken_text, parse_actor_command, parse_message,
 };
+pub use pinning::{PinUpdateOutcome, pin_update_add_rm};
 pub use protocol::{
     ClosetRequest, ClosetResponse,
     LaneCapability, PresenceAvatar, RoomEvent, TransportAck, TransportAckCode, WorldCommand,
