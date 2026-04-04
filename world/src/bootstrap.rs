@@ -105,10 +105,21 @@ pub fn runtime_iroh_secret_default_path(world_slug: &str) -> PathBuf {
 }
 
 fn default_workspace_actor_web_dir() -> Option<PathBuf> {
-    let candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(|p| p.join("ma-actor").join("www"));
-    candidate.filter(|dir| dir.exists() && dir.is_dir())
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().map(PathBuf::from)?;
+
+    // Current monorepo layout: ma-realms/world + ma-realms/actor/www
+    let current_layout = base.join("actor").join("www");
+    if current_layout.exists() && current_layout.is_dir() {
+        return Some(current_layout);
+    }
+
+    // Legacy layout fallback: ma-realms/world + ma-actor/www
+    let legacy_layout = base.join("ma-actor").join("www");
+    if legacy_layout.exists() && legacy_layout.is_dir() {
+        return Some(legacy_layout);
+    }
+
+    None
 }
 
 pub fn resolve_actor_web_source_dir(runtime_cfg: &RuntimeFileConfig) -> Option<PathBuf> {

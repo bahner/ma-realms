@@ -148,17 +148,19 @@ export function createDidDocFlow({
   enterHome,
   didDocCacheTtlMs,
 }) {
-  async function fetchDidDocumentJsonByDid(did) {
+  async function fetchDidDocumentJsonByDid(did, options = {}) {
+    const forceRefresh = Boolean(options && options.forceRefresh);
+    const localOnly = Boolean(options && options.localOnly);
     const rootDid = didRoot(did);
-    const cached = state.didDocCache.get(rootDid);
+    const cached = forceRefresh ? null : state.didDocCache.get(rootDid);
     if (cached && Date.now() - cached.fetchedAt < didDocCacheTtlMs) {
       logger.log('did.cache', `hit for ${rootDid}`);
       return cached.documentJson;
     }
 
-    logger.log('did.cache', `miss for ${rootDid}`);
+    logger.log('did.cache', `${forceRefresh ? 'refresh' : 'miss'} for ${rootDid}`);
     const ipns = didToIpnsName(rootDid, didRoot);
-    const documentJson = await fetchGatewayTextByPath(`/ipns/${ipns}`);
+    const documentJson = await fetchGatewayTextByPath(`/ipns/${ipns}`, { localOnly });
 
     state.didDocCache.set(rootDid, {
       fetchedAt: Date.now(),

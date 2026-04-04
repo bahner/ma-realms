@@ -2,6 +2,7 @@ import {
   create_identity_with_ipns,
   set_bundle_language,
   set_bundle_transports,
+  set_bundle_updated_for_send,
   start_inbox_listener,
   closet_start,
   closet_command,
@@ -321,6 +322,24 @@ export function createClosetFlow({
     return desiredFragmentFromIdentityDid();
   }
 
+  function stampBundleLifecycleForClosetSend() {
+    if (!state.passphrase || !state.encryptedBundle) {
+      return;
+    }
+    const updated = JSON.parse(
+      set_bundle_updated_for_send(state.passphrase, state.encryptedBundle)
+    );
+    state.identity = updated;
+    state.encryptedBundle = updated.encrypted_bundle;
+    const bundleEl = byId('bundle-text');
+    if (bundleEl) {
+      bundleEl.value = updated.encrypted_bundle;
+    }
+    if (isValidAliasName(state.aliasName || '')) {
+      saveIdentityRecord(state.aliasName, updated.encrypted_bundle);
+    }
+  }
+
   function adoptClosetAssignedDid(assignedDid, assignedFragment = '') {
     const did = String(assignedDid || '').trim();
     const root = didRoot(did);
@@ -395,6 +414,9 @@ export function createClosetFlow({
             );
           }
         }
+
+        stampBundleLifecycleForClosetSend();
+        updated = state.identity || updated;
 
         const published = parseClosetResponse(
           await closet_publish_did_document(
@@ -570,6 +592,7 @@ export function createClosetFlow({
       throw new Error('No world endpoint available for closet command.');
     }
     if (applyMatch && !String(state.closetSessionDid || '').trim()) {
+      stampBundleLifecycleForClosetSend();
       const response = parseClosetResponse(
         await closet_submit_citizenship(
           endpointId,
@@ -646,6 +669,8 @@ export function createClosetFlow({
       }
 
       const providedKey = String(resourceApplyMatch[2] || '').trim();
+      stampBundleLifecycleForClosetSend();
+      updated = state.identity || updated;
       const response = parseClosetResponse(
         await closet_publish_did_document(
           endpointId,

@@ -133,10 +133,11 @@ function getApiBase() {
   return normalizeIpfsGatewayBase(byId('gateway-api').value);
 }
 
-async function fetchGatewayTextByPath(contentPath) {
+async function fetchGatewayTextByPath(contentPath, options = {}) {
+  const localOnly = Boolean(options && options.localOnly);
   return await fetchGatewayTextByPathRaw(contentPath, {
     getApiBase,
-    fallbackBases: IPFS_GATEWAY_FALLBACKS,
+    fallbackBases: localOnly ? [] : IPFS_GATEWAY_FALLBACKS,
   });
 }
 
@@ -1974,11 +1975,11 @@ async function checkGateway() {
   throw new Error('IPFS gateway connectivity test failed');
 }
 
-async function fetchDidDocumentJsonByDid(did) {
+async function fetchDidDocumentJsonByDid(did, options) {
   if (!didDocFlow) {
     throw new Error('DID document flow is not initialized yet.');
   }
-  return await didDocFlow.fetchDidDocumentJsonByDid(did);
+  return await didDocFlow.fetchDidDocumentJsonByDid(did, options);
 }
 
 async function autoFollowEnterDirective(message) {
@@ -2334,6 +2335,22 @@ async function enterHome(target, preferredRoom = null) {
     throw new Error(
       `Alias ${alias} is not a valid endpoint id (expected 64 hex chars, got ${endpointId.length}).`
     );
+  }
+
+  const localDidRoot = didRoot(String(state.identity?.did || '').trim());
+  if (localDidRoot) {
+    try {
+      await fetchDidDocumentJsonByDid(localDidRoot, { forceRefresh: true, localOnly: true });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (isClosetBootstrapFailureMessage(message) || /name\/resolve failed|failed to fetch did document|\/ipns\//i.test(message)) {
+        const closet = await closetStartSessionForEndpoint(endpointId);
+        appendMessage('system', `Actor DID document is not reachable yet (${message}). Entering closet onboarding.`);
+        appendMessage('system', `Closet session: ${closet.session_id || state.closetSessionId}`);
+        renderClosetResponse(closet);
+        return;
+      }
+    }
   }
 
   if (!silent) {

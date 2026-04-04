@@ -794,6 +794,11 @@ fn render_unlocked_html(world: &WorldInfo, snapshot: &WorldSnapshot, runtime: &R
         let direct_addrs = render_list(&world.direct_addresses, "No direct addresses published yet.");
         let multiaddrs = render_list(&world.multiaddrs, "No multiaddrs derived yet.");
         let relay_urls = render_list(&world.relay_urls, "No relay URLs available yet.");
+    let actor_web_version = world
+        .actor_web
+        .as_ref()
+        .and_then(|info| info.version.as_deref())
+        .unwrap_or("(none)");
         let world_cid_input = runtime.world_cid.as_deref().unwrap_or("");
         let state_cid_input = runtime.state_cid.as_deref().unwrap_or("");
         let lang_cid = runtime.lang_cid.as_deref().unwrap_or("(none)");
@@ -866,6 +871,8 @@ fn render_unlocked_html(world: &WorldInfo, snapshot: &WorldSnapshot, runtime: &R
             <div class=\"metrics\">
                 <div class=\"metric\"><span>World Pin Alias</span><code id=\"world-alias-metric\" data-cid=\"{world_cid}\">{world_root_pin_name} -&gt; {world_cid}</code></div>
                 <div class=\"metric\"><span>World DID</span><code id=\"world-did-metric\">{world_did}</code></div>
+                <div class=\"metric\"><span>Iroh Endpoint ID</span><code>{endpoint_id}</code></div>
+                <div class=\"metric\"><span>Actor Web Version</span><code>{actor_web_version}</code></div>
                 <div class=\"metric\"><span>World Owner DID</span><code id=\"owner-did-metric\">{owner_did}</code></div>
                 <div class=\"metric\"><span>Encrypted State CID</span><code id=\"state-cid-metric\">{state_cid}</code></div>
                 <div class=\"metric\"><span>Language Pack CID</span><code id=\"lang-cid-metric\">{lang_cid}</code></div>
@@ -1190,6 +1197,8 @@ fn render_unlocked_html(world: &WorldInfo, snapshot: &WorldSnapshot, runtime: &R
                 title = escape_html(&world.name),
                 world_root_pin_name = escape_html(&runtime.world_root_pin_name),
                 world_did = escape_html(&world.world_did),
+                endpoint_id = escape_html(&world.endpoint_id),
+                actor_web_version = escape_html(actor_web_version),
                 owner_did = escape_html(runtime.owner_did.as_deref().unwrap_or("(none)")),
                 owner_did_input = escape_html(runtime.owner_did.as_deref().unwrap_or("")),
                 world_cid = escape_html(runtime.world_cid.as_deref().unwrap_or("(none)")),

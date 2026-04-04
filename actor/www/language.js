@@ -1,6 +1,6 @@
 export function normalizeLanguageOrder(value, fallback = 'nb_NO:en_UK') {
   const normalized = String(value || '')
-    .split(':')
+    .split(/[:;,]+/)
     .map((entry) => String(entry || '').trim())
     .filter(Boolean)
     .join(':');

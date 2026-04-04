@@ -1423,6 +1423,7 @@ fn update_bundle_document<F>(
     passphrase: &str,
     encrypted_bundle_json: &str,
     update: F,
+    stamp_for_send: bool,
 ) -> Result<String, JsValue>
 where
     F: FnOnce(&mut Document) -> Result<(), JsValue>,
@@ -1435,7 +1436,9 @@ where
         .map_err(|e| js_err(format!("bundle corrupted: {e}")))?;
 
     update(&mut plain.document)?;
-    bump_document_lifecycle_metadata(&mut plain.document);
+    if stamp_for_send {
+        bump_document_lifecycle_metadata(&mut plain.document, plain.created_at);
+    }
 
     let signing_key = restore_signing_key(&plain.ipns, &plain.signing_private_key_hex)?;
     let assertion_method = plain
@@ -1466,6 +1469,14 @@ fn now_iso_utc() -> String {
         .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string())
 }
 
+fn iso_utc_from_unix_secs(unix_secs: u64) -> String {
+    let millis = (unix_secs as f64) * 1000.0;
+    js_sys::Date::new(&JsValue::from_f64(millis))
+        .to_iso_string()
+        .as_string()
+        .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string())
+}
+
 fn actor_version_id() -> String {
     let compile_time = option_env!("MA_ACTOR_VERSION")
         .or(option_env!("MA_WORLD_VERSION"))
@@ -1478,14 +1489,14 @@ fn actor_version_id() -> String {
     }
 }
 
-fn initialize_document_lifecycle_metadata(document: &mut Document) {
-    let now = now_iso_utc();
-    document.set_ma_created(now.clone());
-    document.set_ma_updated(now);
+fn initialize_document_lifecycle_metadata(document: &mut Document, bundle_created_at_secs: u64) {
+    let created = iso_utc_from_unix_secs(bundle_created_at_secs);
+    document.set_ma_created(created.clone());
+    document.set_ma_updated(created);
     document.set_ma_version_id(actor_version_id());
 }
 
-fn bump_document_lifecycle_metadata(document: &mut Document) {
+fn bump_document_lifecycle_metadata(document: &mut Document, bundle_created_at_secs: u64) {
     let now = now_iso_utc();
     if document
         .ma
@@ -1493,7 +1504,7 @@ fn bump_document_lifecycle_metadata(document: &mut Document) {
         .and_then(|ma| ma.created.as_ref())
         .is_none()
     {
-        document.set_ma_created(now.clone());
+        document.set_ma_created(iso_utc_from_unix_secs(bundle_created_at_secs));
     }
     document.set_ma_updated(now);
     document.set_ma_version_id(actor_version_id());
@@ -1503,7 +1514,8 @@ fn bump_document_lifecycle_metadata(document: &mut Document) {
 
 fn create_identity_internal(passphrase: &str, ipns: &str) -> Result<String, JsValue> {
     let mut generated = generate_agent_identity(ipns).map_err(js_err)?;
-    initialize_document_lifecycle_metadata(&mut generated.document);
+    let created_at = now_unix_secs();
+    initialize_document_lifecycle_metadata(&mut generated.document, created_at);
     let signing_key = restore_signing_key(ipns, &generated.signing_private_key_hex)?;
     let assertion_method = generated
         .document
@@ -1518,7 +1530,7 @@ fn create_identity_internal(passphrase: &str, ipns: &str) -> Result<String, JsVa
 
     let plain = IdentityBundlePlain {
         version: 1,
-        created_at: now_unix_secs(),
+        created_at,
         ipns: ipns.to_string(),
         signing_private_key_hex: generated.signing_private_key_hex,
         encryption_private_key_hex: generated.encryption_private_key_hex,
@@ -1590,7 +1602,7 @@ pub fn set_bundle_presence_hint(
 ) -> Result<String, JsValue> {
     update_bundle_document(passphrase, encrypted_bundle_json, |document| {
         document.set_presence_hint(hint).map_err(js_err)
-    })
+    }, false)
 }
 
 /// Update the optional `ma:world` field in the DID document and re-sign it.
@@ -1604,7 +1616,7 @@ pub fn set_bundle_world(
     update_bundle_document(passphrase, encrypted_bundle_json, |document| {
         document.set_ma_world(world_did);
         Ok(())
-    })
+    }, false)
 }
 
 /// Update `ma:language` (priority list) in the DID document and re-sign it.
@@ -1627,7 +1639,7 @@ pub fn set_bundle_language(
             document.clear_language();
             document.clear_lang();
             Ok(())
-        });
+        }, false);
     }
 
     update_bundle_document(passphrase, encrypted_bundle_json, move |document| {
@@ -1635,7 +1647,7 @@ pub fn set_bundle_language(
         // Keep clearing ma.lang until we explicitly support it again.
         document.clear_lang();
         Ok(())
-    })
+    }, false)
 }
 
 /// Update the `ma:transports` field in the DID document with the agent's live
@@ -1656,7 +1668,7 @@ pub fn set_bundle_transports(
         document.set_ma_current_inbox(&inbox_hint);
         document.set_presence_hint(&inbox_hint).map_err(js_err)?;
         Ok(())
-    })
+    }, false)
 }
 
 /// Remove the optional `ma:presenceHint` field from the DID document and re-sign it.
@@ -1669,7 +1681,19 @@ pub fn clear_bundle_presence_hint(
     update_bundle_document(passphrase, encrypted_bundle_json, |document| {
         document.clear_presence_hint();
         Ok(())
-    })
+    }, false)
+}
+
+/// Stamp DID lifecycle metadata immediately before explicit closet send/publish.
+/// Returns JSON: `{ encrypted_bundle, did, ipns, document_json }`
+#[wasm_bindgen]
+pub fn set_bundle_updated_for_send(
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+) -> Result<String, JsValue> {
+    update_bundle_document(passphrase, encrypted_bundle_json, |_document| {
+        Ok(())
+    }, true)
 }
 
 /// Enter a world over iroh using the world protocol.

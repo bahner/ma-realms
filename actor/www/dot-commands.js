@@ -92,7 +92,7 @@ export function createDotCommands({
     if (verb === 'help') {
       appendSystemUi('Dot commands:', 'Punktkommandoer:');
       appendSystemUi('  .help                      - this message', '  .help                      - denne meldingen');
-      appendSystemUi('  .identity                  - show current identity details', '  .identity                  - vis detaljer for aktiv identitet');
+      appendSystemUi('  .identity                  - show local pre-publish DID document as raw JSON', '  .identity                  - vis lokalt DID-dokument (før publisering) som rå JSON');
       appendSystemUi('  .alias <name> <address>    - save an address alias', '  .alias <name> <address>    - lagre adressealias');
       appendSystemUi('  .alias <name> #fragment    - resolve fragment in room and save DID alias', '  .alias <name> #fragment    - slå opp fragment i rommet og lagre DID-alias');
       appendSystemUi('  .alias #fragment <name>    - same as above, reversed order', '  .alias #fragment <navn>    - samme som over, omvendt rekkefølge');
@@ -131,20 +131,19 @@ export function createDotCommands({
         appendSystemUi('No identity loaded. Create or unlock an identity first.', 'Ingen identitet lastet. Opprett eller lås opp en identitet først.');
         return true;
       }
-      const { did, ipns } = state.identity;
-      appendMessage('system', `DID:             ${humanizeIdentifier(did)}`);
-      appendMessage('system', `IPNS key:        ${ipns}`);
-      appendMessage('system', uiText(
-        `Alias:           ${state.aliasName || '(none)'}`,
-        `Alias:           ${state.aliasName || '(ingen)'}`
-      ));
-      appendMessage('system', uiText(`UI language:     ${state.uiLang}`, `UI-språk:        ${state.uiLang}`));
-      appendMessage('system', uiText(`Language order:  ${state.languageOrder}`, `Språk-rekkefølge: ${state.languageOrder}`));
-      appendMessage('system', uiText(`DID document at: https://ipfs.io/ipns/${ipns}`, `DID-dokument på: https://ipfs.io/ipns/${ipns}`));
-      appendMessage('system', uiText(
-        `Current world:   ${state.currentHome ? `${humanizeIdentifier(state.currentHome.endpointId)} (${state.currentHome.room})` : '(none)'}`,
-        `Nåværende world: ${state.currentHome ? `${humanizeIdentifier(state.currentHome.endpointId)} (${state.currentHome.room})` : '(ingen)'}`
-      ));
+
+      const documentJson = String(state.identity?.document_json || '').trim();
+      if (!documentJson) {
+        appendMessage('system', 'No local DID document available in identity bundle yet.');
+        return true;
+      }
+
+      try {
+        const parsed = JSON.parse(documentJson);
+        appendMessage('system', JSON.stringify(parsed, null, 2));
+      } catch {
+        appendMessage('system', documentJson);
+      }
       return true;
     }
 
