@@ -2163,6 +2163,7 @@ dependencies = [
  "did-ma",
  "iroh",
  "libp2p-identity",
+ "moka",
  "serde",
  "serde_json",
  "serde_yaml",

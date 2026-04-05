@@ -46,7 +46,7 @@ pub enum ClosetRecoveryCommand {
     Rekey { handle: String, passphrase: String },
 }
 
-pub const CLOSET_HELP_MESSAGE: &str = "Closet commands: help | show | hear | apply [ipns_key_base64] | citizen [ipns_key_base64] | name <text> | description <text> | recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>\nIf actor DID does not exist yet: run apply first. After actor is created, set avatar name/description.\nFragment is requested by the actor during DID publish; if occupied, retry with another fragment.\nWhen done: type 'go out' in the actor UI to leave the closet.";
+pub const CLOSET_HELP_MESSAGE: &str = "Closet commands: help | show | hear | apply [ipns_key_base64] | citizen [ipns_key_base64] | avatar apply [ipns_key_base64] | avatar peek | avatar name <text> | avatar description <text> | avatar name peek | avatar description peek | actor apply [ipns_key_base64] | actor peek | actor id peek | actor ma.transports peek | actor publish [ipns_key_base64] | actor republish [ipns_key_base64] | recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>\nIf actor DID does not exist yet: run apply first. After actor is created, set avatar name/description.\nFragment is requested by the actor during DID publish; if occupied, retry with another fragment.\nWhen done: type 'go out' in the actor UI to leave the closet.";
 
 pub const CLOSET_HELP_PROMPT: &str = "If actor DID does not exist yet: run apply first. After actor is created, set avatar name/description. Then type 'go out' in the actor UI.";
 

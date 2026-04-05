@@ -17,6 +17,7 @@ STAMP_VERSION := $(shell printf '%s' "$(MA_ACTOR_VERSION_EFFECTIVE)" | tr -c 'A-
 PKG_STAMP := .build/pkg.$(STAMP_VERSION).stamp
 PKG_DEV_STAMP := .build/pkg-dev.$(STAMP_VERSION).stamp
 VERSION_FILE := www/pkg/build-version.js
+VERSION_JSON_FILE := www/pkg/build-version.json
 
 
 build: $(PKG_DEV_STAMP) cid
@@ -33,6 +34,7 @@ $(PKG_STAMP): $(BUILD_INPUTS)
 	RUSTFLAGS="--remap-path-prefix=$(CURDIR)=." \
 	wasm-pack build --release --target web --out-dir www/pkg
 	@printf "globalThis.MA_ACTOR_VERSION = '%s';\n" "$(MA_ACTOR_VERSION_EFFECTIVE)" > $(VERSION_FILE)
+	@printf '{\n  "ma_actor_version": "%s"\n}\n' "$(MA_ACTOR_VERSION_EFFECTIVE)" > $(VERSION_JSON_FILE)
 	touch $(PKG_STAMP)
 
 cid: $(PKG_DEV_STAMP)
@@ -53,6 +55,7 @@ $(PKG_DEV_STAMP): $(BUILD_INPUTS)
 	mkdir -p .build
 	MA_ACTOR_VERSION=$(MA_ACTOR_VERSION_EFFECTIVE) wasm-pack build --dev --target web --out-dir www/pkg
 	@printf "globalThis.MA_ACTOR_VERSION = '%s';\n" "$(MA_ACTOR_VERSION_EFFECTIVE)" > $(VERSION_FILE)
+	@printf '{\n  "ma_actor_version": "%s"\n}\n' "$(MA_ACTOR_VERSION_EFFECTIVE)" > $(VERSION_JSON_FILE)
 	touch $(PKG_DEV_STAMP)
 
 serve: build

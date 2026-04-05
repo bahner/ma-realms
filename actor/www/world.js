@@ -250,6 +250,13 @@ export function createWorldDispatchFlow({
   isNotRegisteredInRoomMessage,
   performTransparentReentry,
 }) {
+  function activeActorName() {
+    if (state.currentHome) {
+      return String(state.currentHome.handle || state.aliasName || '').trim();
+    }
+    return String(state.aliasName || '').trim();
+  }
+
   async function sendWorldCommandQuery(commandText) {
     if (!state.identity || !state.currentHome) {
       throw new Error('Join a home before sending commands.');
@@ -260,7 +267,7 @@ export function createWorldDispatchFlow({
         state.currentHome.endpointId,
         state.passphrase,
         state.encryptedBundle,
-        state.aliasName,
+        activeActorName(),
         state.currentHome.room,
         commandText
       )
@@ -307,7 +314,10 @@ export function createWorldDispatchFlow({
               const response = await closetCommandForCurrentWorld(`enter ${room}`);
               renderClosetResponse(response);
               const reconnectRoom = room.toLowerCase() === 'out' ? 'lobby' : room;
-              await enterHome(state.closetEndpointId, reconnectRoom, { silent: true });
+              await enterHome(state.closetEndpointId, reconnectRoom, {
+                silent: true,
+                skipLocalDidProbe: true,
+              });
               return;
             }
           }
@@ -389,14 +399,14 @@ export function createWorldDispatchFlow({
       if (trimmedText.startsWith("'")) {
         const payload = trimmedText.substring(1);
         const sendStart = Date.now();
-        logger.log('send.chat', `room=${state.currentHome.room} actor=${state.aliasName} msg_len=${payload.length}`);
+        logger.log('send.chat', `room=${state.currentHome.room} actor=${activeActorName()} msg_len=${payload.length}`);
 
         const result = JSON.parse(
           await sendWorldChat(
             state.currentHome.endpointId,
             state.passphrase,
             state.encryptedBundle,
-            state.aliasName,
+            activeActorName(),
             state.currentHome.room,
             payload
           )
@@ -418,14 +428,14 @@ export function createWorldDispatchFlow({
 
       if (trimmedText.startsWith('@@')) {
         const sendStart = Date.now();
-        logger.log('send.command', `room=${state.currentHome.room} actor=${state.aliasName} msg_len=${trimmedText.length}`);
+        logger.log('send.command', `room=${state.currentHome.room} actor=${activeActorName()} msg_len=${trimmedText.length}`);
 
         const result = JSON.parse(
           await sendWorldMessage(
             state.currentHome.endpointId,
             state.passphrase,
             state.encryptedBundle,
-            state.aliasName,
+            activeActorName(),
             state.currentHome.room,
             trimmedText
           )
@@ -467,19 +477,67 @@ export function createWorldDispatchFlow({
         }
 
         const spaceIdx = trimmed.indexOf(' ');
+        const rawTarget = (spaceIdx === -1
+          ? trimmed.substring(1)
+          : trimmed.substring(1, spaceIdx)).trim();
+        const remainder = (spaceIdx === -1
+          ? ''
+          : trimmed.substring(spaceIdx + 1)).trim();
 
-        if (spaceIdx === -1) {
+        if (!rawTarget) {
           appendMessage('system', '?');
           return;
         }
 
-        const target = trimmed.substring(1, spaceIdx);
-        const remainder = trimmed.substring(spaceIdx + 1);
+        const baseTarget = String(rawTarget.split('.')[0] || '').trim().toLowerCase();
+        const isBuiltinPathTarget = baseTarget === 'world'
+          || baseTarget === 'avatar'
+          || baseTarget === 'me'
+          || baseTarget === 'self'
+          || baseTarget === 'here'
+          || baseTarget === 'room';
 
-        if (!remainder.trim()) {
+        const hasDottedPath = rawTarget.includes('.');
+        const canSendAsIs = isBuiltinPathTarget && (hasDottedPath || !remainder);
+
+        if (canSendAsIs) {
+          const normalizedInput = remainder
+            ? `@${rawTarget} ${remainder}`
+            : `@${rawTarget}`;
+          const sendStart = Date.now();
+          logger.log('send.command', `room=${state.currentHome.room} actor=${activeActorName()} msg_len=${normalizedInput.length}`);
+          const result = JSON.parse(
+            await sendWorldCmd(
+              state.currentHome.endpointId,
+              state.passphrase,
+              state.encryptedBundle,
+              activeActorName(),
+              state.currentHome.room,
+              normalizedInput
+            )
+          );
+          const elapsed = Date.now() - sendStart;
+          logger.log('send.command', `response ok=${result.ok} broadcasted=${result.broadcasted} latest_seq=${result.latest_event_sequence || 0} in ${elapsed}ms`);
+
+          if (!result.ok) {
+            throw new Error(result.message || 'send failed');
+          }
+
+          if (!result.broadcasted) {
+            applyWorldResponse(result);
+            return;
+          }
+
+          await pollCurrentHomeEvents();
+          return;
+        }
+
+        if (!remainder) {
           appendMessage('system', '?');
           return;
         }
+
+        const target = rawTarget;
 
         if (await tryHandleDidTargetMetaPoll(target, remainder)) {
           return;
@@ -489,13 +547,13 @@ export function createWorldDispatchFlow({
         const normalized = `@${resolvedTarget} ${remainder}`;
 
         const sendStart = Date.now();
-        logger.log('send.command', `room=${state.currentHome.room} actor=${state.aliasName} msg_len=${trimmed.length}`);
+        logger.log('send.command', `room=${state.currentHome.room} actor=${activeActorName()} msg_len=${trimmed.length}`);
         const result = JSON.parse(
           await sendWorldCmd(
             state.currentHome.endpointId,
             state.passphrase,
             state.encryptedBundle,
-            state.aliasName,
+            activeActorName(),
             state.currentHome.room,
             normalized
           )
@@ -517,14 +575,14 @@ export function createWorldDispatchFlow({
       }
 
       const sendStart = Date.now();
-      logger.log('send.command', `room=${state.currentHome.room} actor=${state.aliasName} msg_len=${trimmedText.length}`);
+      logger.log('send.command', `room=${state.currentHome.room} actor=${activeActorName()} msg_len=${trimmedText.length}`);
 
       const result = JSON.parse(
         await sendWorldCmd(
           state.currentHome.endpointId,
           state.passphrase,
           state.encryptedBundle,
-          state.aliasName,
+          activeActorName(),
           state.currentHome.room,
           trimmedText
         )

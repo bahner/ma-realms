@@ -17,6 +17,7 @@ export function createClosetFlow({
   appendMessage,
   didRoot,
   didPublishPendingTtlMs = 5 * 60 * 1000,
+  closetRpcTimeoutMs = 8000,
   isValidAliasName,
   saveIdentityRecord,
   updateIdentityLine,
@@ -121,14 +122,20 @@ export function createClosetFlow({
       return null;
     }
 
-    const scoped = raw.match(/^([A-Za-z][A-Za-z0-9_-]*)(?:\.|\s+)(.+)$/);
+    // Dot-scoped forms (for example avatar.apply) are intentionally not supported.
+    if (/^[A-Za-z][A-Za-z0-9_-]*\./.test(raw)) {
+      return raw;
+    }
+
+    const scoped = raw.match(/^([A-Za-z][A-Za-z0-9_-]*)\s+(.+)$/);
     if (!scoped) {
       return raw;
     }
 
     const scope = String(scoped[1] || '').trim().toLowerCase();
+    const resolvedScope = scope === 'actor' ? 'document' : scope;
     const rest = String(scoped[2] || '').trim();
-    if (!scope || !rest) {
+    if (!resolvedScope || !rest) {
       return raw;
     }
 
@@ -136,7 +143,7 @@ export function createClosetFlow({
     if (pathPeek) {
       const path = String(pathPeek[1] || '').trim();
       const mode = String(pathPeek[2] || 'peek').toLowerCase();
-      return `__resource_show_path__ ${scope} ${mode} ${path}`;
+      return `__resource_show_path__ ${resolvedScope} ${mode} ${path}`;
     }
 
     const opMatch = rest.match(/^([A-Za-z][A-Za-z0-9_-]*)(?:\s*:?\s*(.*))?$/);
@@ -156,16 +163,16 @@ export function createClosetFlow({
         description: () => (args ? `description ${args}` : 'description'),
       },
       document: {
-        help: () => `__resource_help__ ${scope}`,
-        show: () => `__resource_show__ ${scope} show`,
-        peek: () => `__resource_show__ ${scope} peek`,
-        apply: () => (args ? `__resource_apply__ ${scope} ${args}` : `__resource_apply__ ${scope}`),
-        publish: () => (args ? `__resource_apply__ ${scope} ${args}` : `__resource_apply__ ${scope}`),
-        republish: () => (args ? `__resource_apply__ ${scope} ${args}` : `__resource_apply__ ${scope}`),
+        help: () => `__resource_help__ ${resolvedScope}`,
+        show: () => `__resource_show__ ${resolvedScope} show`,
+        peek: () => `__resource_show__ ${resolvedScope} peek`,
+        apply: () => (args ? `__resource_apply__ ${resolvedScope} ${args}` : `__resource_apply__ ${resolvedScope}`),
+        publish: () => (args ? `__resource_apply__ ${resolvedScope} ${args}` : `__resource_apply__ ${resolvedScope}`),
+        republish: () => (args ? `__resource_apply__ ${resolvedScope} ${args}` : `__resource_apply__ ${resolvedScope}`),
       },
     };
 
-    const resolver = table?.[scope]?.[op];
+    const resolver = table?.[resolvedScope]?.[op];
     if (typeof resolver === 'function') {
       return resolver();
     }
@@ -249,7 +256,9 @@ export function createClosetFlow({
 
   async function fetchClosetProfileSnapshot(endpointId) {
     const response = parseClosetResponse(
-      await closet_command(endpointId, state.closetSessionId, 'show')
+      await invokeClosetRpc('closet show', () =>
+        closet_command(endpointId, state.closetSessionId, 'show')
+      )
     );
     if (!response.ok) {
       throw new Error(response.message || 'Closet show failed.');
@@ -262,9 +271,11 @@ export function createClosetFlow({
   }
 
   async function renderAvatarPeekMessage(path = '', endpointId = '') {
-    let snapshot = state.closetProfile || null;
-    if (!snapshot && endpointId) {
+    let snapshot = null;
+    if (endpointId) {
       snapshot = await fetchClosetProfileSnapshot(endpointId);
+    } else {
+      snapshot = state.closetProfile || null;
     }
     if (!snapshot) {
       throw new Error('No closet avatar profile is available. Run avatar.show first.');
@@ -295,6 +306,58 @@ export function createClosetFlow({
       throw new Error('Invalid closet response.');
     }
     return parsed;
+  }
+
+  function isClosetTransportConnectionLost(message) {
+    const text = String(message || '').toLowerCase();
+    return (
+      text.includes('closet request failed') && text.includes('connection lost')
+      || text.includes('connection lost')
+      || text.includes('endpoint.connect() failed')
+      || text.includes('connection.open_bi() failed')
+      || text.includes('broken pipe')
+      || text.includes('timed out') && text.includes('closet')
+    );
+  }
+
+  function resetClosetSessionState() {
+    state.closetSessionId = '';
+    state.closetSessionDid = '';
+    state.closetLobbySeq = 0;
+    state.closetSessionFragment = '';
+    state.closetProfile = null;
+  }
+
+  async function invokeClosetRpc(operationName, invoke) {
+    let timeoutId = null;
+    try {
+      const timeoutMs = Math.max(1000, Number(closetRpcTimeoutMs || 0));
+      const timeoutPromise = new Promise((_, reject) => {
+        timeoutId = setTimeout(() => {
+          reject(new Error(`closet rpc timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+      });
+
+      const result = await Promise.race([
+        invoke(),
+        timeoutPromise,
+      ]);
+
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (isClosetTransportConnectionLost(message)) {
+        resetClosetSessionState();
+        throw new Error(
+          `Lost closet transport while running ${operationName} (${message}). The world service is likely stopped/restarted. Run go <world> to reconnect.`
+        );
+      }
+      throw error;
+    } finally {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+    }
   }
 
   function normalizeDesiredFragment(raw) {
@@ -419,12 +482,14 @@ export function createClosetFlow({
         updated = state.identity || updated;
 
         const published = parseClosetResponse(
-          await closet_publish_did_document(
-            endpointId,
-            sessionId,
-            updated.document_json,
-            ipnsPrivateKeyBase64,
-            desiredFragmentForCloset()
+          await invokeClosetRpc('document publish', () =>
+            closet_publish_did_document(
+              endpointId,
+              sessionId,
+              updated.document_json,
+              ipnsPrivateKeyBase64,
+              desiredFragmentForCloset()
+            )
           )
         );
         if (!published.ok) {
@@ -480,7 +545,14 @@ export function createClosetFlow({
       appendMessage('system', `Assigned DID: ${assignedDid}`);
       markDidPublishPending(assignedDid);
 
-      if (assignedDid && assignedDid !== previousSessionDid) {
+      const assignedRoot = didRoot(assignedDid);
+      const localRoot = didRoot(String(state.identity?.did || '').trim());
+      const localAlreadyMatchesAssigned = Boolean(
+        assignedRoot && localRoot && assignedRoot === localRoot
+      );
+
+      // Rebind only when the assigned DID root differs from the currently loaded local DID root.
+      if (assignedDid && assignedDid !== previousSessionDid && !localAlreadyMatchesAssigned) {
         adoptClosetAssignedDid(assignedDid, String(response?.fragment || ''));
       }
     }
@@ -499,7 +571,9 @@ export function createClosetFlow({
     if (!normalizedEndpoint) {
       throw new Error('Missing world endpoint for closet session.');
     }
-    const response = parseClosetResponse(await closet_start(normalizedEndpoint));
+    const response = parseClosetResponse(
+      await invokeClosetRpc('closet start', () => closet_start(normalizedEndpoint))
+    );
     if (!response.ok) {
       throw new Error(response.message || 'Closet session failed to start.');
     }
@@ -592,13 +666,74 @@ export function createClosetFlow({
       throw new Error('No world endpoint available for closet command.');
     }
     if (applyMatch && !String(state.closetSessionDid || '').trim()) {
+      // Idempotent apply: if local DID doc exists, try publish/update first.
+      if (state.passphrase && state.encryptedBundle && state.identity?.document_json) {
+        try {
+          let updated = state.identity;
+          if (!state.inboxEndpointId) {
+            state.inboxEndpointId = await start_inbox_listener(state.passphrase, state.encryptedBundle);
+          }
+          if (state.inboxEndpointId) {
+            updated = JSON.parse(
+              set_bundle_transports(state.passphrase, state.encryptedBundle, state.inboxEndpointId)
+            );
+            const preferredLanguageOrder = String(state.languageOrder || '').trim();
+            if (preferredLanguageOrder) {
+              updated = JSON.parse(
+                set_bundle_language(state.passphrase, updated.encrypted_bundle, preferredLanguageOrder)
+              );
+            }
+            state.identity = updated;
+            state.encryptedBundle = updated.encrypted_bundle;
+            const bundleEl = byId('bundle-text');
+            if (bundleEl) {
+              bundleEl.value = updated.encrypted_bundle;
+            }
+            if (isValidAliasName(state.aliasName || '')) {
+              saveIdentityRecord(state.aliasName, updated.encrypted_bundle);
+            }
+          }
+
+          stampBundleLifecycleForClosetSend();
+          updated = state.identity || updated;
+
+          const publishResponse = parseClosetResponse(
+            await invokeClosetRpc('closet apply publish-existing', () =>
+              closet_publish_did_document(
+                endpointId,
+                state.closetSessionId,
+                updated.document_json,
+                state.closetPendingIpnsPrivateKeyB64,
+                desiredFragmentForCloset()
+              )
+            )
+          );
+
+          if (publishResponse.ok) {
+            const didForCache = didRoot(String(publishResponse.did || state.identity?.did || ''));
+            if (didForCache) {
+              state.didDocCache.delete(didForCache);
+              clearDidPublishPending(didForCache);
+            }
+            return publishResponse;
+          }
+        } catch (publishErr) {
+          const detail = publishErr instanceof Error ? publishErr.message : String(publishErr);
+          throw new Error(
+            `Existing DID publish/update failed (${detail}). Not issuing a new DID. Provide the matching ipns_private_key_base64 for this DID if required, or run document.apply with the key.`
+          );
+        }
+      }
+
       stampBundleLifecycleForClosetSend();
       const response = parseClosetResponse(
-        await closet_submit_citizenship(
-          endpointId,
-          state.closetSessionId,
-          state.closetPendingIpnsPrivateKeyB64,
-          desiredFragmentForCloset()
+        await invokeClosetRpc('closet apply', () =>
+          closet_submit_citizenship(
+            endpointId,
+            state.closetSessionId,
+            state.closetPendingIpnsPrivateKeyB64,
+            desiredFragmentForCloset()
+          )
         )
       );
       if (!response.ok) {
@@ -610,7 +745,9 @@ export function createClosetFlow({
 
     if (applyMatch && String(state.closetSessionDid || '').trim()) {
       const response = parseClosetResponse(
-        await closet_command(endpointId, state.closetSessionId, normalizedInput)
+        await invokeClosetRpc('closet apply update', () =>
+          closet_command(endpointId, state.closetSessionId, normalizedInput)
+        )
       );
       if (!response.ok) {
         const message = String(response.message || '').trim();
@@ -635,9 +772,6 @@ export function createClosetFlow({
       const resource = String(resourceApplyMatch[1] || '').trim().toLowerCase();
       if (resource !== 'document') {
         throw new Error(`unsupported apply resource: ${resource}`);
-      }
-      if (!String(state.closetSessionDid || '').trim()) {
-        throw new Error('actor identity does not exist in this world yet; run apply first');
       }
       if (!state.passphrase || !state.encryptedBundle || !state.identity?.document_json) {
         throw new Error('No local DID document is available to publish. Unlock identity first.');
@@ -672,12 +806,14 @@ export function createClosetFlow({
       stampBundleLifecycleForClosetSend();
       updated = state.identity || updated;
       const response = parseClosetResponse(
-        await closet_publish_did_document(
-          endpointId,
-          state.closetSessionId,
-          updated.document_json,
-          providedKey,
-          desiredFragmentForCloset()
+        await invokeClosetRpc('document apply', () =>
+          closet_publish_did_document(
+            endpointId,
+            state.closetSessionId,
+            updated.document_json,
+            providedKey,
+            desiredFragmentForCloset()
+          )
         )
       );
       if (!response.ok) {
@@ -704,7 +840,9 @@ export function createClosetFlow({
     }
 
     const response = parseClosetResponse(
-      await closet_command(endpointId, state.closetSessionId, normalizedInput)
+      await invokeClosetRpc('closet command', () =>
+        closet_command(endpointId, state.closetSessionId, normalizedInput)
+      )
     );
     if (!response.ok) {
       throw new Error(response.message || 'Closet command failed.');

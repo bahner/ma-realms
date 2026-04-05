@@ -4,7 +4,7 @@ import init, {
   ensure_bundle_iroh_secret,
   set_bundle_language,
   set_bundle_transports,
-  set_bundle_world,
+  set_bundle_updated_for_send,
   generate_bip39_phrase,
   normalize_bip39_phrase,
   connect_world,
@@ -59,6 +59,7 @@ import {
   isMaDid,
   isUnconfiguredDidTarget,
   parseDidDocument as parseDidDocumentUtil,
+  resolveEndpointWithTypePolicy,
 } from './did.js';
 import { createDotCommands } from './dot-commands.js';
 import { createWhisperFlow } from './whisper-flow.js';
@@ -104,6 +105,8 @@ const ALIAS_BOOK_KEY = `${STORAGE_PREFIX}.aliasBook`;
 const LAST_ALIAS_KEY = `${STORAGE_PREFIX}.lastAlias`;
 const TAB_ALIAS_KEY = `${STORAGE_PREFIX}.tabAlias`;
 const DEBUG_KEY = `${STORAGE_PREFIX}.debug`;
+const LOG_ENABLED_KEY = `${STORAGE_PREFIX}.logEnabled`;
+const LOG_LEVEL_KEY = `${STORAGE_PREFIX}.logLevel`;
 const LEGACY_BUNDLE_KEY = 'ma.identity.v2.bundle';
 const LAST_ROOM_KEY_PREFIX = `${STORAGE_PREFIX}.lastRoom`;
 const LAST_ACTIVE_HOME_KEY_PREFIX = `${STORAGE_PREFIX}.lastActiveHome`;
@@ -135,9 +138,11 @@ function getApiBase() {
 
 async function fetchGatewayTextByPath(contentPath, options = {}) {
   const localOnly = Boolean(options && options.localOnly);
+  const timeoutMs = Number(options && options.timeoutMs);
   return await fetchGatewayTextByPathRaw(contentPath, {
     getApiBase,
     fallbackBases: localOnly ? [] : IPFS_GATEWAY_FALLBACKS,
+    timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : undefined,
   });
 }
 
@@ -156,6 +161,8 @@ const state = {
   languageOrder: DEFAULT_LANGUAGE_ORDER,
   uiLang: DEFAULT_UI_LANG,
   debug: false,
+  logEnabled: true,
+  logLevel: 'info',
   aliasBook: {},
   currentHome: null,
   roomPollTimer: null,
@@ -397,11 +404,45 @@ function readStoredDebugFlag() {
   return value === '1' || value === 'true' || value === 'on';
 }
 
+function normalizeLogLevel(value) {
+  const level = String(value || '').trim().toLowerCase();
+  if (level === 'error' || level === 'warn' || level === 'info' || level === 'debug') {
+    return level;
+  }
+  return 'info';
+}
+
+function readStoredLogEnabledFlag() {
+  const raw = String(localStorage.getItem(LOG_ENABLED_KEY) || '').trim().toLowerCase();
+  if (!raw) return true;
+  return raw === '1' || raw === 'true' || raw === 'on';
+}
+
+function readStoredLogLevel() {
+  return normalizeLogLevel(localStorage.getItem(LOG_LEVEL_KEY));
+}
+
 function setDebugMode(enabled, announce = true) {
   state.debug = Boolean(enabled);
   localStorage.setItem(DEBUG_KEY, state.debug ? '1' : '0');
   if (announce) {
     appendMessage('system', `Debug mode: ${state.debug ? 'on' : 'off'}`);
+  }
+}
+
+function setLogEnabled(enabled, announce = true) {
+  state.logEnabled = Boolean(enabled);
+  localStorage.setItem(LOG_ENABLED_KEY, state.logEnabled ? '1' : '0');
+  if (announce) {
+    appendMessage('system', `Log enabled: ${state.logEnabled ? 'true' : 'false'}`);
+  }
+}
+
+function setLogLevel(level, announce = true) {
+  state.logLevel = normalizeLogLevel(level);
+  localStorage.setItem(LOG_LEVEL_KEY, state.logLevel);
+  if (announce) {
+    appendMessage('system', `Log level: ${state.logLevel}`);
   }
 }
 
@@ -1389,10 +1430,17 @@ const {
   closetCommandForCurrentWorld,
 } = closetFlow;
 
-// Logging system: logs are shown when debug mode is enabled
+// Logging system: always visible in browser console; mirrored in chat when debug mode is enabled.
 const logger = {
+  shouldLog(level) {
+    if (!state.logEnabled) return false;
+    const rank = { debug: 10, info: 20, warn: 30, error: 40 };
+    const configured = rank[normalizeLogLevel(state.logLevel)] || rank.info;
+    const incoming = rank[normalizeLogLevel(level)] || rank.info;
+    return incoming >= configured;
+  },
   log(scope, ...args) {
-    if (!state.debug) return;
+    if (!this.shouldLog('info')) return;
     const message = args
       .map(arg => {
         if (typeof arg === 'object') {
@@ -1405,7 +1453,27 @@ const logger = {
         return String(arg);
       })
       .join(' ');
-    appendMessage('system', `[${scope}] ${message}`);
+    const line = `[${scope}] ${message}`;
+    console.info(`[ma] ${line}`);
+    if (state.debug) {
+      appendMessage('system', line);
+    }
+  },
+  warn(scope, ...args) {
+    if (!this.shouldLog('warn')) return;
+    const message = args.map(arg => String(arg)).join(' ');
+    console.warn(`[ma] [${scope}] ${message}`);
+    if (state.debug) {
+      appendMessage('system', `[${scope}] ${message}`);
+    }
+  },
+  error(scope, ...args) {
+    if (!this.shouldLog('error')) return;
+    const message = args.map(arg => String(arg)).join(' ');
+    console.error(`[ma] [${scope}] ${message}`);
+    if (state.debug) {
+      appendMessage('system', `[${scope}] ${message}`);
+    }
   }
 };
 
@@ -1512,7 +1580,7 @@ async function pollCurrentHomeEvents() {
         home.endpointId,
         state.passphrase,
         state.encryptedBundle,
-        state.aliasName,
+        String(home.handle || state.aliasName || '').trim(),
         home.room,
         toSequenceBigInt(home.lastEventSequence || 0)
       )
@@ -1679,7 +1747,7 @@ async function runSmokeTest(targetAlias) {
         state.currentHome.endpointId,
         state.passphrase,
         state.encryptedBundle,
-        state.aliasName,
+        String(state.currentHome?.handle || state.aliasName || '').trim(),
         state.currentHome.room,
         marker
       ),
@@ -1745,6 +1813,17 @@ function uiText(enText, nbText) {
 
 function appendSystemUi(enText, nbText) {
   appendMessage('system', uiText(enText, nbText));
+}
+
+function updateRoomHeading(title, description) {
+  const headingEl = byId('room-heading');
+  const descriptionEl = byId('room-description');
+  if (headingEl) {
+    headingEl.textContent = String(title || '').trim() || 'Welcome';
+  }
+  if (descriptionEl) {
+    descriptionEl.textContent = String(description || '').trim();
+  }
 }
 
 const identityStore = createIdentityStore({
@@ -1816,6 +1895,8 @@ const { parseDot } = createDotCommands({
   saveAliasBook,
   resolveCurrentPositionTarget,
   setDebugMode,
+  setLogEnabled,
+  setLogLevel,
   didRoot,
   resolveTargetDidRoot,
   saveBlockedDidRoots,
@@ -1831,9 +1912,42 @@ const { parseDot } = createDotCommands({
   clearActiveObjectTarget,
   pollDirectInbox,
   pollCurrentHomeEvents,
+  prepareIdentityDocumentForSend,
   sendWhisperToDid,
   runSmokeTest,
 });
+
+async function prepareIdentityDocumentForSend() {
+  if (!state.passphrase || !state.encryptedBundle) {
+    return;
+  }
+
+  if (!state.inboxEndpointId) {
+    state.inboxEndpointId = await start_inbox_listener(state.passphrase, state.encryptedBundle);
+  }
+
+  if (state.inboxEndpointId) {
+    const withTransports = JSON.parse(
+      set_bundle_transports(state.passphrase, state.encryptedBundle, state.inboxEndpointId)
+    );
+    state.identity = withTransports;
+    state.encryptedBundle = withTransports.encrypted_bundle;
+  }
+
+  const updated = JSON.parse(
+    set_bundle_updated_for_send(state.passphrase, state.encryptedBundle)
+  );
+  state.identity = updated;
+  state.encryptedBundle = updated.encrypted_bundle;
+
+  const bundleEl = byId('bundle-text');
+  if (bundleEl) {
+    bundleEl.value = updated.encrypted_bundle;
+  }
+  if (isValidAliasName(state.aliasName || '')) {
+    saveIdentityRecord(state.aliasName, updated.encrypted_bundle);
+  }
+}
 
 function saveIdentityRecord(aliasName, encryptedBundle) {
   identityStore.saveIdentityRecord(aliasName, encryptedBundle, state.languageOrder);
@@ -2189,21 +2303,21 @@ async function enterWorldWithRetry(endpointId, actorName, room) {
   const maxAttempts = 3;
   let lastError = null;
   let announcedConnectivity = false;
-  logger.log('enter.world', `starting enter sequence for endpoint=${endpointId.slice(0, 8)}... actor=${actorName} room=${room}`);
+  logger.log('connect.world', `starting connect sequence for endpoint=${endpointId.slice(0, 8)}... actor=${actorName} room=${room}`);
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const attemptStart = Date.now();
-    logger.log(`enter.attempt.${attempt}`, `starting attempt`);
+    logger.log(`connect.attempt.${attempt}`, `starting attempt`);
     
     try {
       // Phase 1: Relay discovery and connection
-      logger.log(`enter.attempt.${attempt}`, `phase 1/2: relay discovery and connect`);
+      logger.log(`connect.attempt.${attempt}`, `phase 1/2: relay discovery and connect`);
       const relayHint = await lookupWorldRelayHint(endpointId);
       
       if (relayHint) {
-        logger.log(`enter.attempt.${attempt}`, `using relay hint: ${relayHint}`);
+        logger.log(`connect.attempt.${attempt}`, `using relay hint: ${relayHint}`);
       } else {
-        logger.log(`enter.attempt.${attempt}`, `no relay hint found, falling back to discovery-only`);
+        logger.log(`connect.attempt.${attempt}`, `no relay hint found, falling back to discovery-only`);
       }
 
       const connectStart = Date.now();
@@ -2215,14 +2329,14 @@ async function enterWorldWithRetry(endpointId, actorName, room) {
         'connect phase timed out'
       );
       const connectElapsed = Date.now() - connectStart;
-      logger.log(`enter.attempt.${attempt}`, `connected in ${connectElapsed}ms`);
+      logger.log(`connect.attempt.${attempt}`, `connected in ${connectElapsed}ms`);
       if (!announcedConnectivity) {
         appendMessage('system', `iroh node discovered at ${humanizeIdentifier(endpointId)}. Requesting avatar/session state...`);
         announcedConnectivity = true;
       }
 
       // Phase 2: World enter request
-      logger.log(`enter.attempt.${attempt}`, `phase 2/2: sending enter request`);
+      logger.log(`connect.attempt.${attempt}`, `phase 2/2: sending enter request`);
       const requestStart = Date.now();
       const response = await withTimeout(
         enter_world(endpointId, state.passphrase, state.encryptedBundle, actorName, room),
@@ -2230,11 +2344,11 @@ async function enterWorldWithRetry(endpointId, actorName, room) {
         'enter request timed out'
       );
       const requestElapsed = Date.now() - requestStart;
-      logger.log(`enter.attempt.${attempt}`, `enter request succeeded in ${requestElapsed}ms`);
+      logger.log(`connect.attempt.${attempt}`, `enter request succeeded in ${requestElapsed}ms`);
       
       const result = JSON.parse(response);
-      logger.log(`enter.attempt.${attempt}`, `response: ok=${result.ok} room=${result.room} latest_seq=${result.latest_event_sequence || 0} endpoint=${result.endpoint_id?.slice(0, 8)}...`);
-      logger.log(`enter.world`, `success after ${Date.now() - attemptStart}ms total on attempt ${attempt}/${maxAttempts}`);
+      logger.log(`connect.attempt.${attempt}`, `response: ok=${result.ok} room=${result.room} latest_seq=${result.latest_event_sequence || 0} endpoint=${result.endpoint_id?.slice(0, 8)}...`);
+      logger.log(`connect.world`, `success after ${Date.now() - attemptStart}ms total on attempt ${attempt}/${maxAttempts}`);
       
       return response;
     } catch (error) {
@@ -2245,10 +2359,10 @@ async function enterWorldWithRetry(endpointId, actorName, room) {
       const isConnectionLost = message.includes('connection lost');
       const isRetryable = isTimeout || isConnectionLost;
       
-      logger.log(`enter.attempt.${attempt}`, `failed after ${elapsedTotal}ms: ${message} (retryable=${isRetryable})`);
+      logger.log(`connect.attempt.${attempt}`, `failed after ${elapsedTotal}ms: ${message} (retryable=${isRetryable})`);
 
       if (!isRetryable || attempt === maxAttempts) {
-        logger.log('enter.world', `giving up after attempt ${attempt}/${maxAttempts}: ${message}`);
+        logger.log('connect.world', `giving up after attempt ${attempt}/${maxAttempts}: ${message}`);
         throw error;
       }
 
@@ -2257,79 +2371,100 @@ async function enterWorldWithRetry(endpointId, actorName, room) {
         'system',
         `iroh attempt ${attempt}/${maxAttempts} failed (${message}). Retrying...`
       );
-      logger.log(`enter.attempt.${attempt}`, `waiting ${backoffMs}ms before attempt ${attempt + 1}`);
+      logger.log(`connect.attempt.${attempt}`, `waiting ${backoffMs}ms before attempt ${attempt + 1}`);
       await delay(backoffMs);
     }
   }
 
-  logger.log('enter.world', `failed: all ${maxAttempts} attempts exhausted`);
+  logger.log('connect.world', `failed: all ${maxAttempts} attempts exhausted`);
   throw lastError || new Error('iroh connect failed');
 }
 
 async function enterHome(target, preferredRoom = null) {
   const options = (typeof arguments[2] === 'object' && arguments[2] !== null) ? arguments[2] : {};
   const silent = Boolean(options.silent);
+  const skipLocalDidProbe = Boolean(options.skipLocalDidProbe);
   if (!state.identity) {
     throw new Error('Load or create an identity before entering a home.');
   }
 
   if (state.didPublishPromise) {
-    appendMessage('system', 'DID publish is still running in background. Continuing world enter attempt.');
+    appendMessage('system', 'DID publish is still running in background. Continuing world connect attempt.');
   } else if (state.didPublishError) {
-    appendMessage('system', `DID publish is pending/retrying in background (${state.didPublishError}). Continuing world enter attempt.`);
+    appendMessage('system', `DID publish is pending/retrying in background (${state.didPublishError}). Continuing world connect attempt.`);
   }
 
   const alias = String(target || '').trim();
   if (!alias) {
-    throw new Error('enterHome() requires a target (did:ma:world[#room] or alias).');
+    throw new Error('go requires a target (did:ma:<world>#<room> or alias).');
   }
 
   const resolvedInput = resolveAliasInput(alias);
   const resolvedDidRoot = isMaDid(String(resolvedInput)) ? didRoot(resolvedInput) : '';
   const resolvedDidFragment = String(resolvedInput).includes('#') ? String(resolvedInput).split('#')[1] : '';
-  let worldDidForBundle = '';
   let endpointId = '';
   if (!isMaDid(String(resolvedInput))) {
     endpointId = normalizeIrohAddress(resolvedInput);
   }
 
   if (resolvedDidRoot) {
-    const targetDocJson = await fetchDidDocumentJsonByDid(resolvedDidRoot);
-    const targetDoc = parseDidDocumentUtil(targetDocJson);
-    const hintedWorldDid = typeof targetDoc?.ma?.world === 'string'
-      ? targetDoc.ma.world
-      : '';
-    const worldDid = hintedWorldDid ? didRoot(hintedWorldDid) : resolvedDidRoot;
-    worldDidForBundle = worldDid;
-    const worldDocJson = await fetchDidDocumentJsonByDid(worldDid);
-    const worldDoc = parseDidDocumentUtil(worldDocJson);
-    endpointId = extractWorldEndpointFromDidDoc(worldDoc);
-  }
+    if (!silent) {
+      appendMessage('system', `Resolving DID target ${resolvedDidRoot}...`);
+    }
 
-  if (worldDidForBundle && state.passphrase && state.encryptedBundle) {
+    let targetDocJson = '';
+    let localResolveError = '';
     try {
-      const updated = JSON.parse(set_bundle_world(state.passphrase, state.encryptedBundle, worldDidForBundle));
-      state.identity = updated;
-      state.encryptedBundle = updated.encrypted_bundle;
-      const bundleEl = byId('bundle-text');
-      if (bundleEl) {
-        bundleEl.value = updated.encrypted_bundle;
-      }
-      if (isValidAliasName(state.aliasName || '')) {
-        saveIdentityRecord(state.aliasName, updated.encrypted_bundle);
-      }
-    } catch (err) {
-      logger.log('enter.home', `warning: could not persist ma.world=${worldDidForBundle}: ${err instanceof Error ? err.message : String(err)}`);
+      targetDocJson = await withTimeout(
+        fetchDidDocumentJsonByDid(resolvedDidRoot, {
+          localOnly: true,
+          timeoutMs: 2500,
+        }),
+        3000,
+        `local DID resolve timed out for ${resolvedDidRoot}`
+      );
+    } catch (localError) {
+      localResolveError = localError instanceof Error ? localError.message : String(localError);
+      targetDocJson = await withTimeout(
+        fetchDidDocumentJsonByDid(resolvedDidRoot, {
+          forceRefresh: true,
+          timeoutMs: 3500,
+        }),
+        4500,
+        `gateway DID resolve timed out for ${resolvedDidRoot}`
+      );
+    }
+
+    const targetDoc = parseDidDocumentUtil(targetDocJson);
+    if (!targetDoc || typeof targetDoc !== 'object') {
+      throw new Error(`Resolved DID document is invalid JSON for ${resolvedDidRoot}.`);
+    }
+
+    endpointId = await withTimeout(
+      resolveEndpointWithTypePolicy({
+        targetRoot: resolvedDidRoot,
+        targetDoc,
+        fetchDidDocumentJsonByDid,
+        didRoot,
+        parseDidDocument: parseDidDocumentUtil,
+        extractWorldEndpointFromDidDoc,
+      }),
+      4000,
+      `endpoint extraction timed out for ${resolvedDidRoot}`
+    );
+
+    if (!endpointId && localResolveError) {
+      appendMessage('system', `DID resolve note: local gateway lookup failed first (${localResolveError}).`);
     }
   }
 
   const effectivePreferredRoom = String(preferredRoom || '').trim() || resolvedDidFragment;
-  logger.log('enter.home', `alias=${alias} resolved=${resolvedInput} endpoint=${endpointId.slice(0, 8)}...`);
+  logger.log('connect.home', `alias=${alias} resolved=${resolvedInput} endpoint=${endpointId.slice(0, 8)}...`);
   
   if (!isLikelyIrohAddress(endpointId)) {
     if (resolvedDidRoot) {
       throw new Error(
-        `DID ${resolvedDidRoot} did not resolve to a valid iroh endpoint. Ensure its DID document has ma.transports, ma.currentInbox, or ma.presenceHint with /iroh/<endpoint-id>.`
+        `DID ${resolvedDidRoot} did not resolve to a valid iroh endpoint. Ensure its DID document has ma.transports, ma.currentInbox, or ma.presenceHint with /ma-iroh/<endpoint-id>/... or /iroh/<endpoint-id>.`
       );
     }
     throw new Error(
@@ -2338,24 +2473,65 @@ async function enterHome(target, preferredRoom = null) {
   }
 
   const localDidRoot = didRoot(String(state.identity?.did || '').trim());
-  if (localDidRoot) {
-    try {
-      await fetchDidDocumentJsonByDid(localDidRoot, { forceRefresh: true, localOnly: true });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (isClosetBootstrapFailureMessage(message) || /name\/resolve failed|failed to fetch did document|\/ipns\//i.test(message)) {
-        const closet = await closetStartSessionForEndpoint(endpointId);
-        appendMessage('system', `Actor DID document is not reachable yet (${message}). Entering closet onboarding.`);
-        appendMessage('system', `Closet session: ${closet.session_id || state.closetSessionId}`);
-        renderClosetResponse(closet);
-        return;
-      }
-    }
+  const hasActiveClosetForEndpoint = Boolean(
+    String(state.closetSessionId || '').trim()
+    && String(state.closetEndpointId || '').trim() === endpointId
+  );
+  if (localDidRoot && !hasActiveClosetForEndpoint && !skipLocalDidProbe) {
+    fetchDidDocumentJsonByDid(localDidRoot, {
+      forceRefresh: true,
+      localOnly: true,
+      timeoutMs: 2000,
+    }).catch((error) => {
+      logger.log(
+        'connect.home',
+        `local DID preflight ignored (non-blocking): ${error instanceof Error ? error.message : String(error)}`
+      );
+    });
+  } else if (localDidRoot && hasActiveClosetForEndpoint) {
+    logger.log('connect.home', 'skipping local DID probe during active closet reconnect flow');
   }
 
   if (!silent) {
     appendMessage('system', `Connecting to ${humanizeIdentifier(endpointId)}...`);
   }
+
+  async function enterClosetOnboardingFallback(reasonText) {
+    const reason = String(reasonText || '').trim();
+    if (reason) {
+      appendMessage('system', reason);
+    }
+
+    const tryStart = async (attempt) => {
+      try {
+        const closet = await closetStartSessionForEndpoint(endpointId);
+        logger.log(
+          'connect.home',
+          `closet onboarding session started (attempt ${attempt}): ${closet.session_id || state.closetSessionId || '(missing session id)'}`
+        );
+        appendMessage('system', `Closet session: ${closet.session_id || state.closetSessionId}`);
+        renderClosetResponse(closet);
+        return true;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logger.warn('connect.home', `closet onboarding start failed (attempt ${attempt}): ${message}`);
+        return false;
+      }
+    };
+
+    if (await tryStart(1)) {
+      return true;
+    }
+
+    await delay(250);
+    if (await tryStart(2)) {
+      return true;
+    }
+
+    appendMessage('system', 'Could not start closet onboarding session right now. Try go <world> again.');
+    return false;
+  }
+
   const requestedRoom = effectivePreferredRoom;
   const savedRoom = requestedRoom || loadLastRoom(endpointId);
   let result;
@@ -2364,7 +2540,7 @@ async function enterHome(target, preferredRoom = null) {
       try {
         result = JSON.parse(await enterWorldWithRetry(endpointId, state.aliasName, savedRoom));
         if (!result.ok) {
-          logger.log('enter.home', `last room '${savedRoom}' denied (${result.message}), falling back to lobby`);
+          logger.log('connect.home', `last room '${savedRoom}' denied (${result.message}), falling back to lobby`);
           result = JSON.parse(await enterWorldWithRetry(endpointId, state.aliasName, 'lobby'));
         }
       } catch (_) {
@@ -2376,22 +2552,22 @@ async function enterHome(target, preferredRoom = null) {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (isClosetBootstrapFailureMessage(message)) {
-      const closet = await closetStartSessionForEndpoint(endpointId);
-      appendMessage('system', 'No avatar available for this DID yet, or DID publish is not ready. Entering closet onboarding.');
-      appendMessage('system', `Closet session: ${closet.session_id || state.closetSessionId}`);
-      renderClosetResponse(closet);
+      await enterClosetOnboardingFallback(
+        'No avatar available for this DID yet, or DID publish is not ready. Entering closet onboarding.'
+      );
       return;
     }
     throw error;
   }
-  logger.log('enter.home', `result ok=${result.ok} room=${result.room} endpoint=${result.endpoint_id?.slice(0, 8)}... latest_seq=${result.latest_event_sequence || 0}`);
+  logger.log('connect.home', `result ok=${result.ok} room=${result.room} endpoint=${result.endpoint_id?.slice(0, 8)}... latest_seq=${result.latest_event_sequence || 0}`);
 
   if (!result.ok) {
+    logger.warn('connect.home', `world enter returned ok=false: ${String(result.message || '(empty message)')}`);
     if (isClosetRequiredMessage(result.message) || isClosetBootstrapFailureMessage(result.message)) {
-      const closet = await closetStartSessionForEndpoint(endpointId);
-      appendMessage('system', result.message || 'No avatar profile is ready yet. Closet onboarding is required first.');
-      appendMessage('system', `Closet session: ${closet.session_id || state.closetSessionId}`);
-      renderClosetResponse(closet);
+      logger.log('connect.home', 'starting closet onboarding fallback after world rejection');
+      await enterClosetOnboardingFallback(
+        result.message || 'No avatar profile is ready yet. Closet onboarding is required first.'
+      );
       return;
     }
     throw new Error(result.message || 'enter failed');
@@ -2525,6 +2701,7 @@ function enqueueCommandText(text) {
     })
     .catch((err) => {
       const message = err instanceof Error ? err.message : String(err);
+      logger.error('command.send', message);
       appendMessage('system', `Send failed: ${message}`);
       if (state.activeObjectTargetAlias && isActiveTargetGoneMessage(message)) {
         const alias = String(state.activeObjectTargetAlias || '').trim();
@@ -2646,6 +2823,8 @@ async function main() {
   await updateAppVersionFooter();
   applyProperName();
   restoreSavedValues();
+  state.logEnabled = readStoredLogEnabledFlag();
+  state.logLevel = readStoredLogLevel();
   hideLockOverlay();
 
   if (shouldAutoCheckIpfsRpc()) {
@@ -2768,5 +2947,6 @@ async function main() {
 }
 
 main().catch((error) => {
+  logger.error('app.main', error instanceof Error ? error.stack || error.message : String(error));
   setSetupStatus(`Fatal error: ${error instanceof Error ? error.message : String(error)}`);
 });

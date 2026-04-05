@@ -40,6 +40,7 @@ fn recipient_inbox_endpoint_id(document: &Document) -> Result<String, JsValue> {
 }
 
 async fn send_whisper_signed_message(target_endpoint_id: &str, message_cbor: Vec<u8>) -> Result<InboxResponse, JsValue> {
+    let requested_alpn = String::from_utf8_lossy(WHISPER_ALPN).to_string();
     let target: EndpointId = target_endpoint_id
         .trim()
         .parse()
@@ -60,12 +61,18 @@ async fn send_whisper_signed_message(target_endpoint_id: &str, message_cbor: Vec
     let connection = endpoint
         .connect(endpoint_addr, WHISPER_ALPN)
         .await
-        .map_err(|e| js_err(format!("whisper endpoint.connect() failed: {}", e)))?;
+        .map_err(|e| js_err(format!(
+            "whisper endpoint.connect() failed: {} (requested_alpn={})",
+            e, requested_alpn
+        )))?;
 
     let (mut send, mut recv) = connection
         .open_bi()
         .await
-        .map_err(|e| js_err(format!("whisper connection.open_bi() failed: {}", e)))?;
+        .map_err(|e| js_err(format!(
+            "whisper connection.open_bi() failed: {} (requested_alpn={})",
+            e, requested_alpn
+        )))?;
 
     let request = InboxRequest::Signed { message_cbor };
     let payload = serde_json::to_vec(&request).map_err(js_err)?;
@@ -357,6 +364,7 @@ async fn create_stream_cache(
     relay_hint: Option<&str>,
     kind: WorldTransportKind,
 ) -> Result<WorldConnCache, JsValue> {
+    let requested_alpn = String::from_utf8_lossy(kind.alpn()).to_string();
     let target: EndpointId = target_id_str
         .trim()
         .parse()
@@ -384,11 +392,17 @@ async fn create_stream_cache(
 
     let connection = endpoint.connect(endpoint_addr, kind.alpn())
         .await
-        .map_err(|e| js_err(format!("endpoint.connect() failed: {}", e)))?;
+        .map_err(|e| js_err(format!(
+            "endpoint.connect() failed: {} (requested_alpn={} target={})",
+            e, requested_alpn, target_id_str
+        )))?;
     
     let (send_stream, recv_stream) = connection.open_bi()
         .await
-        .map_err(|e| js_err(format!("connection.open_bi() failed: {}", e)))?;
+        .map_err(|e| js_err(format!(
+            "connection.open_bi() failed: {} (requested_alpn={} target={})",
+            e, requested_alpn, target_id_str
+        )))?;
 
     Ok(WorldConnCache {
         endpoint,
@@ -1606,20 +1620,6 @@ pub fn set_bundle_presence_hint(
     }, false)
 }
 
-/// Update the optional `ma:world` field in the DID document and re-sign it.
-/// Returns JSON: `{ encrypted_bundle, did, ipns, document_json }`
-#[wasm_bindgen]
-pub fn set_bundle_world(
-    passphrase: &str,
-    encrypted_bundle_json: &str,
-    world_did: &str,
-) -> Result<String, JsValue> {
-    update_bundle_document(passphrase, encrypted_bundle_json, |document| {
-        document.set_ma_world(world_did);
-        Ok(())
-    }, false)
-}
-
 /// Update `ma:language` (priority list) in the DID document and re-sign it.
 /// Returns JSON: `{ encrypted_bundle, did, ipns, document_json }`
 #[wasm_bindgen]
@@ -1692,7 +1692,8 @@ pub fn set_bundle_updated_for_send(
     passphrase: &str,
     encrypted_bundle_json: &str,
 ) -> Result<String, JsValue> {
-    update_bundle_document(passphrase, encrypted_bundle_json, |_document| {
+    update_bundle_document(passphrase, encrypted_bundle_json, |document| {
+        document.clear_ma_world();
         Ok(())
     }, true)
 }

@@ -10,6 +10,8 @@ export function createDotCommands({
   saveAliasBook,
   resolveCurrentPositionTarget,
   setDebugMode,
+  setLogEnabled,
+  setLogLevel,
   didRoot,
   resolveTargetDidRoot,
   saveBlockedDidRoots,
@@ -25,6 +27,7 @@ export function createDotCommands({
   clearActiveObjectTarget,
   pollDirectInbox,
   pollCurrentHomeEvents,
+  prepareIdentityDocumentForSend,
   sendWhisperToDid,
   runSmokeTest,
 }) {
@@ -86,19 +89,20 @@ export function createDotCommands({
     }
 
     const [verbRaw, ...args] = rest.split(/\s+/);
-    const verb = String(verbRaw || '').toLowerCase();
+    const verbToken = String(verbRaw || '').trim();
+    const verb = verbToken.toLowerCase();
     const tail = args.join(' ').trim();
 
     if (verb === 'help') {
       appendSystemUi('Dot commands:', 'Punktkommandoer:');
       appendSystemUi('  .help                      - this message', '  .help                      - denne meldingen');
       appendSystemUi('  .identity                  - show local pre-publish DID document as raw JSON', '  .identity                  - vis lokalt DID-dokument (før publisering) som rå JSON');
-      appendSystemUi('  .alias <name> <address>    - save an address alias', '  .alias <name> <address>    - lagre adressealias');
-      appendSystemUi('  .alias <name> #fragment    - resolve fragment in room and save DID alias', '  .alias <name> #fragment    - slå opp fragment i rommet og lagre DID-alias');
-      appendSystemUi('  .alias #fragment <name>    - same as above, reversed order', '  .alias #fragment <navn>    - samme som over, omvendt rekkefølge');
+      appendSystemUi('  .aliases add <name> <address|#fragment> - add/update alias', '  .aliases add <navn> <adresse|#fragment> - legg til/oppdater alias');
+      appendSystemUi('  .aliases add #fragment <name> - same as above, reversed order', '  .aliases add #fragment <navn> - samme som over, omvendt rekkefølge');
       appendSystemUi('  .set home [did:ma:...#room]- set home target (or current position)', '  .set home [did:ma:...#room]- sett home-mål (eller nåværende posisjon)');
-      appendSystemUi('  .unalias <name>            - remove a saved alias', '  .unalias <name>            - fjern et lagret alias');
-      appendSystemUi('  .aliases                   - list saved aliases', '  .aliases                   - list lagrede alias');
+      appendSystemUi('  .aliases del <name>        - remove alias', '  .aliases del <navn>        - fjern alias');
+      appendSystemUi('  .aliases                   - list aliases', '  .aliases                   - list alias');
+      appendSystemUi('  .aliases.<name>            - show address for one alias', '  .aliases.<navn>            - vis adresse for ett alias');
       appendSystemUi('  .inspect @here|@me|@exit <name>|<object>- inspect room/me/exit/object and discover DID/CIDs', '  .inspect @here|@me|@exit <navn>|<objekt>- inspiser rom/meg/utgang/objekt og finn DID/CID');
       appendSystemUi('  .use <object|did> [as alias] - set local default target', '  .use <objekt|did> [as alias] - sett lokal standardtarget');
       appendSystemUi('  .unuse @alias              - clear local default target', '  .unuse @alias              - fjern lokal standardtarget');
@@ -112,6 +116,9 @@ export function createDotCommands({
       appendSystemUi('  .unblock <did|alias|handle>- remove sender from block list', '  .unblock <did|alias|handle>- fjern avsender fra blokkeringslisten');
       appendSystemUi('  .blocks                    - list blocked sender DID roots', '  .blocks                    - list blokkerte avsender-DID-rooter');
       appendSystemUi('  .debug [on|off]            - toggle debug logs', '  .debug [on|off]            - slå debuglogger av/på');
+      appendSystemUi('  .log                       - show log settings', '  .log                       - vis logginnstillinger');
+      appendSystemUi('  .log.enabled [true|false]  - get/set console logging enabled', '  .log.enabled [true|false]  - hent/sett om konsoll-logging er aktiv');
+      appendSystemUi('  .log.level [warn|info|debug|error] - get/set console log level', '  .log.level [warn|info|debug|error] - hent/sett loggnivå i konsoll');
       appendSystemUi('Gameplay (bare, no prefix):', 'Gameplay (bart, uten prefiks):');
       appendSystemUi('  go did:ma:<world>#<room>   - connect when currently disconnected', '  go did:ma:<world>#<room>   - koble til når du er frakoblet');
       appendMessage('system', '  pick up <object>           - pick up object before open/list/accept actions');
@@ -132,44 +139,76 @@ export function createDotCommands({
         return true;
       }
 
-      const documentJson = String(state.identity?.document_json || '').trim();
-      if (!documentJson) {
-        appendMessage('system', 'No local DID document available in identity bundle yet.');
-        return true;
-      }
+      Promise.resolve()
+        .then(async () => {
+          if (typeof prepareIdentityDocumentForSend === 'function') {
+            await prepareIdentityDocumentForSend();
+          }
 
-      try {
-        const parsed = JSON.parse(documentJson);
-        appendMessage('system', JSON.stringify(parsed, null, 2));
-      } catch {
-        appendMessage('system', documentJson);
-      }
+          const documentJson = String(state.identity?.document_json || '').trim();
+          if (!documentJson) {
+            appendMessage('system', 'No local DID document available in identity bundle yet.');
+            return;
+          }
+
+          try {
+            const parsed = JSON.parse(documentJson);
+            appendMessage('system', JSON.stringify(parsed, null, 2));
+          } catch {
+            appendMessage('system', documentJson);
+          }
+        })
+        .catch((error) => {
+          appendMessage('system', `Identity prepare failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
       return true;
     }
 
     if (verb === 'aliases') {
-      const entries = Object.entries(state.aliasBook);
-      if (entries.length === 0) {
-        appendMessage('system', 'No aliases saved yet.');
-        return true;
-      }
-      for (const [name, address] of entries) {
-        appendMessage('system', `${name} => ${address}`);
-      }
-      return true;
-    }
-
-    if (verb === 'alias') {
-      if (args.length < 2) {
-        appendMessage('system', 'Usage: .alias <name> <address|#fragment> | .alias #fragment <name>');
+      if (args.length === 0) {
+        const entries = Object.entries(state.aliasBook);
+        if (entries.length === 0) {
+          appendMessage('system', 'No aliases saved yet.');
+          return true;
+        }
+        for (const [name, address] of entries) {
+          appendMessage('system', `.aliases.${name} ${address}`);
+        }
         return true;
       }
 
-      let name = String(args[0] || '').trim();
-      let address = String(args.slice(1).join(' ') || '').trim();
-      if (name.startsWith('#') && args.length === 2) {
+      const sub = String(args[0] || '').trim().toLowerCase();
+      if (sub !== 'add' && sub !== 'del') {
+        appendMessage('system', 'Usage: .aliases | .aliases add <name> <address|#fragment> | .aliases del <name> | .aliases.<name>');
+        return true;
+      }
+
+      if (sub === 'del') {
+        if (args.length !== 2) {
+          appendMessage('system', 'Usage: .aliases del <name>');
+          return true;
+        }
+        const name = String(args[1] || '').trim();
+        if (!Object.prototype.hasOwnProperty.call(state.aliasBook, name)) {
+          appendMessage('system', `Alias not found: ${name}`);
+          return true;
+        }
+        delete state.aliasBook[name];
+        saveAliasBook();
+        appendMessage('system', `Alias removed: ${name}`);
+        return true;
+      }
+
+      if (args.length < 3) {
+        appendMessage('system', 'Usage: .aliases add <name> <address|#fragment> | .aliases add #fragment <name>');
+        return true;
+      }
+
+      let name = String(args[1] || '').trim();
+      let address = String(args.slice(2).join(' ') || '').trim();
+      if (name.startsWith('#') && args.length === 3) {
         address = name;
-        name = String(args[1] || '').trim();
+        name = String(args[2] || '').trim();
       }
 
       if (!isPrintableAliasLabel(name)) {
@@ -191,6 +230,20 @@ export function createDotCommands({
         .catch((error) => {
           appendMessage('system', `Alias failed: ${error instanceof Error ? error.message : String(error)}`);
         });
+      return true;
+    }
+
+    if (verb.startsWith('aliases.')) {
+      const aliasName = verbToken.slice('aliases.'.length).trim();
+      if (!aliasName) {
+        appendMessage('system', 'Usage: .aliases.<name>');
+        return true;
+      }
+      if (!Object.prototype.hasOwnProperty.call(state.aliasBook, aliasName)) {
+        appendMessage('system', `Alias not found: ${aliasName}`);
+        return true;
+      }
+      appendMessage('system', `${state.aliasBook[aliasName]}`);
       return true;
     }
 
@@ -221,22 +274,6 @@ export function createDotCommands({
       return true;
     }
 
-    if (verb === 'unalias') {
-      if (args.length !== 1) {
-        appendMessage('system', 'Usage: .unalias <name>');
-        return true;
-      }
-      const [name] = args;
-      if (!Object.prototype.hasOwnProperty.call(state.aliasBook, name)) {
-        appendMessage('system', `Alias not found: ${name}`);
-        return true;
-      }
-      delete state.aliasBook[name];
-      saveAliasBook();
-      appendMessage('system', `Alias removed: ${name}`);
-      return true;
-    }
-
     if (verb === 'debug') {
       if (args.length === 0) {
         setDebugMode(!state.debug);
@@ -251,6 +288,56 @@ export function createDotCommands({
           return true;
         }
       }
+      return true;
+    }
+
+    if (verb === 'log') {
+      if (args.length !== 0) {
+        appendMessage('system', 'Usage: .log');
+        return true;
+      }
+      appendMessage('system', `.log.enabled ${state.logEnabled ? 'true' : 'false'}`);
+      appendMessage('system', `.log.level ${state.logLevel}`);
+      return true;
+    }
+
+    if (verb === 'log.enabled') {
+      if (args.length === 0) {
+        appendMessage('system', `${state.logEnabled ? 'true' : 'false'}`);
+        return true;
+      }
+      if (args.length !== 1) {
+        appendMessage('system', 'Usage: .log.enabled [true|false]');
+        return true;
+      }
+      const mode = String(args[0] || '').trim().toLowerCase();
+      if (mode === 'true' || mode === '1' || mode === 'on') {
+        setLogEnabled(true);
+        return true;
+      }
+      if (mode === 'false' || mode === '0' || mode === 'off') {
+        setLogEnabled(false);
+        return true;
+      }
+      appendMessage('system', 'Usage: .log.enabled [true|false]');
+      return true;
+    }
+
+    if (verb === 'log.level') {
+      if (args.length === 0) {
+        appendMessage('system', `${state.logLevel}`);
+        return true;
+      }
+      if (args.length !== 1) {
+        appendMessage('system', 'Usage: .log.level [warn|info|debug|error]');
+        return true;
+      }
+      const level = String(args[0] || '').trim().toLowerCase();
+      if (level !== 'warn' && level !== 'info' && level !== 'debug' && level !== 'error') {
+        appendMessage('system', 'Usage: .log.level [warn|info|debug|error]');
+        return true;
+      }
+      setLogLevel(level);
       return true;
     }
 

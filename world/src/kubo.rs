@@ -63,7 +63,19 @@ pub async fn fetch_did_document(kubo_url: &str, did: &Did) -> Result<Document> {
                         ipns_path,
                         resolved_path
                     ));
-                    break;
+                    match cat_cid(kubo_url, &ipns_path).await {
+                        Ok(text) => {
+                            body = text;
+                            break;
+                        }
+                        Err(cat_err) => {
+                            last_err = Some(anyhow!(
+                                "name/resolve returned non-ipfs path and direct cat failed for {}: {}",
+                                ipns_path,
+                                cat_err
+                            ));
+                        }
+                    }
                 } else {
                     match cat_cid(kubo_url, &resolved_path).await {
                         Ok(text) => {
@@ -82,6 +94,21 @@ pub async fn fetch_did_document(kubo_url: &str, did: &Did) -> Result<Document> {
             }
             Err(err) => {
                 last_err = Some(anyhow!("name/resolve failed for {}: {}", ipns_path, err));
+                // Fallback: cat supports /ipns/<name> and can succeed even when name/resolve flaps.
+                match cat_cid(kubo_url, &ipns_path).await {
+                    Ok(text) => {
+                        body = text;
+                        break;
+                    }
+                    Err(cat_err) => {
+                        last_err = Some(anyhow!(
+                            "name/resolve failed and direct cat failed for {}: resolve_err={} cat_err={}",
+                            ipns_path,
+                            err,
+                            cat_err
+                        ));
+                    }
+                }
                 if !should_retry_name_resolve_error(&err) {
                     break;
                 }
@@ -125,7 +152,7 @@ pub async fn fetch_did_document(kubo_url: &str, did: &Did) -> Result<Document> {
 
 fn should_retry_name_resolve_error(err: &anyhow::Error) -> bool {
     let text = err.to_string().to_ascii_lowercase();
-    if text.contains("http status client error") || text.contains("http status server error") {
+    if text.contains("http status client error") {
         return false;
     }
     if text.contains("missing path in name/resolve response") {
@@ -140,11 +167,19 @@ mod tests {
     use anyhow::anyhow;
 
     #[test]
-    fn does_not_retry_http_status_errors() {
+    fn does_not_retry_http_client_status_errors() {
+        let err = anyhow!(
+            "HTTP status client error (404 Not Found) for url (http://127.0.0.1:5001/api/v0/name/resolve)"
+        );
+        assert!(!should_retry_name_resolve_error(&err));
+    }
+
+    #[test]
+    fn retries_http_server_status_errors() {
         let err = anyhow!(
             "HTTP status server error (500 Internal Server Error) for url (http://127.0.0.1:5001/api/v0/name/resolve)"
         );
-        assert!(!should_retry_name_resolve_error(&err));
+        assert!(should_retry_name_resolve_error(&err));
     }
 
     #[test]

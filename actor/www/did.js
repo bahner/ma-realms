@@ -46,6 +46,74 @@ export function parseDidDocument(jsonText) {
   }
 }
 
+function normalizeMaType(document) {
+  const kind = String(document?.ma?.type || document?.ma?.kind || '').trim().toLowerCase();
+  return kind;
+}
+
+export async function resolveEndpointWithTypePolicy({
+  targetRoot,
+  targetDoc,
+  fetchDidDocumentJsonByDid,
+  didRoot,
+  parseDidDocument,
+  extractWorldEndpointFromDidDoc,
+}) {
+  const kind = normalizeMaType(targetDoc);
+  const worldHintRaw = String(targetDoc?.ma?.world || '').trim();
+  const worldHintRoot = worldHintRaw ? didRoot(worldHintRaw) : '';
+  const localEndpoint = extractWorldEndpointFromDidDoc(targetDoc);
+
+  const transportKinds = new Set(['world', 'agent', 'bot', 'object']);
+  const worldPointerKinds = new Set(['avatar', 'room', 'exit']);
+  const knownType = Boolean(kind);
+
+  if (transportKinds.has(kind) && localEndpoint) {
+    return localEndpoint;
+  }
+
+  if (worldPointerKinds.has(kind) && worldHintRoot) {
+    try {
+      const worldDocJson = await fetchDidDocumentJsonByDid(worldHintRoot);
+      const worldDoc = parseDidDocument(worldDocJson);
+      const endpoint = extractWorldEndpointFromDidDoc(worldDoc);
+      if (endpoint) {
+        return endpoint;
+      }
+    } catch {
+      // Fall through to local endpoint fallback.
+    }
+    return localEndpoint;
+  }
+
+  // Unknown type: prefer world pointer first (common case), then transports.
+  if (!knownType && worldHintRoot) {
+    try {
+      const worldDocJson = await fetchDidDocumentJsonByDid(worldHintRoot);
+      const worldDoc = parseDidDocument(worldDocJson);
+      const endpoint = extractWorldEndpointFromDidDoc(worldDoc);
+      if (endpoint) {
+        return endpoint;
+      }
+    } catch {
+      // Fall through to local endpoint fallback.
+    }
+  }
+
+  if (localEndpoint) {
+    return localEndpoint;
+  }
+
+  // If we have a world hint and local endpoint did not resolve, try world once more.
+  if (worldHintRoot) {
+    const worldDocJson = await fetchDidDocumentJsonByDid(worldHintRoot);
+    const worldDoc = parseDidDocument(worldDocJson);
+    return extractWorldEndpointFromDidDoc(worldDoc);
+  }
+
+  return '';
+}
+
 export function createDidRuntimeHelpers({
   state,
   didRoot,
@@ -151,6 +219,7 @@ export function createDidDocFlow({
   async function fetchDidDocumentJsonByDid(did, options = {}) {
     const forceRefresh = Boolean(options && options.forceRefresh);
     const localOnly = Boolean(options && options.localOnly);
+    const timeoutMs = Number(options && options.timeoutMs);
     const rootDid = didRoot(did);
     const cached = forceRefresh ? null : state.didDocCache.get(rootDid);
     if (cached && Date.now() - cached.fetchedAt < didDocCacheTtlMs) {
@@ -160,7 +229,10 @@ export function createDidDocFlow({
 
     logger.log('did.cache', `${forceRefresh ? 'refresh' : 'miss'} for ${rootDid}`);
     const ipns = didToIpnsName(rootDid, didRoot);
-    const documentJson = await fetchGatewayTextByPath(`/ipns/${ipns}`, { localOnly });
+    const documentJson = await fetchGatewayTextByPath(`/ipns/${ipns}`, {
+      localOnly,
+      timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : undefined,
+    });
 
     state.didDocCache.set(rootDid, {
       fetchedAt: Date.now(),
@@ -180,16 +252,16 @@ export function createDidDocFlow({
 
     const targetDocJson = await fetchDidDocumentJsonByDid(targetRoot);
     const targetDoc = parseDidDocument(targetDocJson);
-    const hintedWorldDid = typeof targetDoc?.ma?.world === 'string'
-      ? targetDoc.ma.world
-      : '';
-    const worldDid = hintedWorldDid ? didRoot(hintedWorldDid) : targetRoot;
-
-    const worldDocJson = await fetchDidDocumentJsonByDid(worldDid);
-    const worldDoc = parseDidDocument(worldDocJson);
-    const endpointId = extractWorldEndpointFromDidDoc(worldDoc);
+    const endpointId = await resolveEndpointWithTypePolicy({
+      targetRoot,
+      targetDoc,
+      fetchDidDocumentJsonByDid,
+      didRoot,
+      parseDidDocument,
+      extractWorldEndpointFromDidDoc,
+    });
     if (!endpointId) {
-      throw new Error(`No iroh endpoint found in world DID document for ${worldDid}`);
+      throw new Error(`No iroh endpoint found in DID document for ${targetRoot}`);
     }
 
     appendMessage('system', `Following traveler route to ${targetDid}...`);

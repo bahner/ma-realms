@@ -25,7 +25,7 @@ release: Cargo.toml src/*.rs ../../ma/src/*.rs ../core/src/*.rs
 	@echo "🏗️  Release binary at $(RELEASE_BINARY)"
 
 run: build
-	MA_WORLD_VERSION="$(MA_WORLD_VERSION)" RUST_LOG=ma_world=debug ./$(BINARY)
+	MA_WORLD_VERSION="$(MA_WORLD_VERSION)" ./$(BINARY)
 
 clean:
 	rm -f $(STAMP)

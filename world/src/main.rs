@@ -45,6 +45,7 @@ use ma_core::{
     parse_closet_command, plan_closet_did_publish,
     LegacyRequirement, RequirementChecker, RequirementSet, RequirementValue,
     pin_update_add_rm,
+    TtlCache,
 };
 use nanoid::nanoid;
 use rand::RngCore;
@@ -94,6 +95,10 @@ const WORLD_ENTRY_ACL_ENV: &str = "MA_WORLD_ENTRY_ACL";
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:5002";
 const MAX_EVENTS: usize = 200;
 const MAX_KNOCK_INBOX: usize = 512;
+const MAX_CLOSET_SESSIONS: usize = 512;
+const KNOCK_PENDING_TTL_SECS: i64 = 24 * 60 * 60;
+const KNOCK_DECIDED_TTL_SECS: i64 = 60 * 60;
+const CLOSET_SESSION_TTL_SECS: i64 = 30 * 60;
 #[allow(dead_code)]
 const MAX_OBJECT_INBOX: usize = 512;
 const MAILBOX_LOCK_SECS: u64 = 600;
@@ -241,6 +246,7 @@ struct ClosetSession {
     id: String,
     endpoint: String,
     created_at: String,
+    last_seen_at: String,
     last_lobby_sequence: u64,
     announced_listening: bool,
     name: Option<String>,
@@ -271,6 +277,12 @@ struct ObjectRequirementRuntime {
     location: String,
     opened_by: Option<String>,
     world_owner: Option<String>,
+}
+
+fn parse_rfc3339_unix(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.timestamp())
 }
 
 impl RequirementChecker for ObjectRequirementRuntime {
@@ -417,11 +429,11 @@ pub struct World {
     /// Room-local interactable objects keyed by room then object id.
     room_objects: Arc<RwLock<HashMap<String, HashMap<String, ObjectRuntimeState>>>>,
     /// Inbox of async knock requests for private worlds.
-    knock_inbox: Arc<RwLock<VecDeque<KnockMessage>>>,
+    knock_inbox: Arc<RwLock<TtlCache<u64, KnockMessage>>>,
     /// Monotonic knock id sequence.
     next_knock_id: Arc<RwLock<u64>>,
     /// Ephemeral pre-DID onboarding sessions keyed by session id.
-    closet_sessions: Arc<RwLock<HashMap<String, ClosetSession>>>,
+    closet_sessions: Arc<RwLock<TtlCache<String, ClosetSession>>>,
     /// DID-root keyed profile data established via closet onboarding.
     closet_profiles: Arc<RwLock<HashMap<String, ClosetProfile>>>,
 }
@@ -754,7 +766,8 @@ impl World {
     async fn closet_lang_for_session(&self, session_id: &str, endpoint: &str) -> &'static str {
         let session = {
             let sessions = self.closet_sessions.read().await;
-            sessions.get(session_id).cloned()
+            let key = session_id.to_string();
+            sessions.get_any(&key).cloned()
         };
 
         if let Some(session) = session {
@@ -820,9 +833,15 @@ impl World {
             last_pointer_publish_root_cid: Arc::new(RwLock::new(None)),
             last_pointer_publish_error: Arc::new(RwLock::new(None)),
             room_objects: Arc::new(RwLock::new(HashMap::new())),
-            knock_inbox: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_KNOCK_INBOX))),
+            knock_inbox: Arc::new(RwLock::new(TtlCache::with_capacity(
+                Duration::from_secs(KNOCK_PENDING_TTL_SECS as u64),
+                MAX_KNOCK_INBOX,
+            ))),
             next_knock_id: Arc::new(RwLock::new(0)),
-            closet_sessions: Arc::new(RwLock::new(HashMap::new())),
+            closet_sessions: Arc::new(RwLock::new(TtlCache::with_capacity(
+                Duration::from_secs(CLOSET_SESSION_TTL_SECS as u64),
+                MAX_CLOSET_SESSIONS,
+            ))),
             closet_profiles: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -908,6 +927,7 @@ impl World {
     }
 
     async fn closet_start_session(&self, endpoint: &str) -> Result<(String, u64)> {
+        self.prune_closet_sessions().await;
         let session_id = nanoid!();
         let latest_lobby_sequence = self.latest_room_event_sequence(DEFAULT_ROOM).await?;
         let mut profile_name: Option<String> = None;
@@ -930,10 +950,12 @@ impl World {
             }
         }
 
+        let now = Utc::now().to_rfc3339();
         let session = ClosetSession {
             id: session_id.clone(),
             endpoint: endpoint.to_string(),
-            created_at: Utc::now().to_rfc3339(),
+            created_at: now.clone(),
+            last_seen_at: now,
             last_lobby_sequence: latest_lobby_sequence,
             announced_listening: false,
             name: profile_name,
@@ -943,24 +965,59 @@ impl World {
             fragment: None,
         };
         let mut sessions = self.closet_sessions.write().await;
-        sessions.retain(|_, existing| existing.endpoint != endpoint);
+        let stale_for_endpoint = sessions
+            .items_any()
+            .into_iter()
+            .filter_map(|(id, existing)| {
+                if existing.endpoint == endpoint {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        for key in stale_for_endpoint {
+            let _ = sessions.remove(&key);
+        }
+
+        while sessions.len_any() >= MAX_CLOSET_SESSIONS {
+            let _ = sessions.pop_first_any();
+        }
+
         sessions.insert(session_id.clone(), session);
+        drop(sessions);
         self.announce_closet_listener(session_id.as_str(), endpoint).await?;
         Ok((session_id, latest_lobby_sequence))
     }
 
+    async fn prune_closet_sessions(&self) -> usize {
+        let mut sessions = self.closet_sessions.write().await;
+        sessions.flush()
+    }
+
+    async fn flush_closet_sessions(&self) -> usize {
+        let mut sessions = self.closet_sessions.write().await;
+        let removed = sessions.len_any();
+        sessions.clear();
+        removed
+    }
+
     async fn announce_closet_listener(&self, session_id: &str, endpoint: &str) -> Result<()> {
         let mut sessions = self.closet_sessions.write().await;
-        let Some(session) = sessions.get_mut(session_id) else {
-            return Err(anyhow!("unknown closet session"));
-        };
-        if session.endpoint != endpoint {
-            return Err(anyhow!("closet session endpoint mismatch"));
+        let key = session_id.to_string();
+        {
+            let Some(session) = sessions.get_mut_any(&key) else {
+                return Err(anyhow!("unknown closet session"));
+            };
+            if session.endpoint != endpoint {
+                return Err(anyhow!("closet session endpoint mismatch"));
+            }
+            if session.announced_listening {
+                return Ok(());
+            }
+            session.announced_listening = true;
         }
-        if session.announced_listening {
-            return Ok(());
-        }
-        session.announced_listening = true;
+        let _ = sessions.touch(&key);
         drop(sessions);
 
         self.record_room_event(
@@ -980,14 +1037,20 @@ impl World {
         session_id: &str,
         endpoint: &str,
     ) -> Result<ClosetSession> {
-        let sessions = self.closet_sessions.read().await;
-        let session = sessions
-            .get(session_id)
-            .ok_or_else(|| anyhow!("unknown closet session"))?;
-        if session.endpoint != endpoint {
-            return Err(anyhow!("closet session endpoint mismatch"));
-        }
-        Ok(session.clone())
+        let mut sessions = self.closet_sessions.write().await;
+        let key = session_id.to_string();
+        let session = {
+            let session = sessions
+                .get_mut_any(&key)
+                .ok_or_else(|| anyhow!("unknown closet session"))?;
+            if session.endpoint != endpoint {
+                return Err(anyhow!("closet session endpoint mismatch"));
+            }
+            session.last_seen_at = Utc::now().to_rfc3339();
+            session.clone()
+        };
+        let _ = sessions.touch(&key);
+        Ok(session)
     }
 
     async fn closet_answer(
@@ -998,16 +1061,19 @@ impl World {
         value: &str,
     ) -> Result<String> {
         let mut sessions = self.closet_sessions.write().await;
-        let Some(session) = sessions.get_mut(session_id) else {
-            return Err(anyhow!("unknown closet session"));
-        };
-        if session.endpoint != endpoint {
-            return Err(anyhow!("closet session endpoint mismatch"));
-        }
-
+        let key = session_id.to_string();
         let normalized_field = field.trim().to_ascii_lowercase();
         let normalized_value = value.trim().to_string();
-        match normalized_field.as_str() {
+        let result = {
+            let Some(session) = sessions.get_mut_any(&key) else {
+                return Err(anyhow!("unknown closet session"));
+            };
+            if session.endpoint != endpoint {
+                return Err(anyhow!("closet session endpoint mismatch"));
+            }
+            session.last_seen_at = Utc::now().to_rfc3339();
+
+            match normalized_field.as_str() {
             "name" => {
                 if normalized_value.is_empty() {
                     return Err(anyhow!("name cannot be empty"));
@@ -1023,7 +1089,11 @@ impl World {
                 Ok("avatar description stored".to_string())
             }
             _ => Err(anyhow!("unknown closet field '{}': use name|description", field)),
-        }
+            }
+        };
+
+        let _ = sessions.touch(&key);
+        result
     }
 
     async fn upsert_closet_profile(
@@ -1266,10 +1336,12 @@ impl World {
 
         {
             let mut sessions = self.closet_sessions.write().await;
-            if let Some(active) = sessions.get_mut(session_id) {
+            let key = session_id.to_string();
+            if let Some(active) = sessions.get_mut_any(&key) {
                 active.did = Some(did.clone());
                 active.fragment = Some(fragment.clone());
             }
+            let _ = sessions.touch(&key);
         }
 
         Ok((did, fragment, key_name))
@@ -1340,10 +1412,12 @@ impl World {
             }
             ClosetDidPublishPlan::UseExistingLocalKey { key_name } => {
                 let mut sessions = self.closet_sessions.write().await;
-                if let Some(active) = sessions.get_mut(session_id) {
+                let key = session_id.to_string();
+                if let Some(active) = sessions.get_mut_any(&key) {
                     active.did = Some(document_root.clone());
                     active.fragment = Some(key_name.clone());
                 }
+                let _ = sessions.touch(&key);
                 key_name
             }
         };
@@ -1383,7 +1457,7 @@ impl World {
             return Ok(
                 ClosetResponse::ok(
                     session_id,
-                    tr_world(active_lang, "closet.help", "Closet commands: help | show | hear | apply [ipns_key_base64] | citizen [ipns_key_base64] | avatar.help | avatar.peek | avatar.apply [ipns_key_base64] | avatar.name: <text> | avatar.description: <text> | avatar.name peek | avatar.description peek | document.help | document.peek | document.id peek | document.ma.transports peek | document.publish [ipns_key_base64] | document.republish [ipns_key_base64] | document.apply [ipns_key_base64] | recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>"),
+                    tr_world(active_lang, "closet.help", "Closet commands: help | show | hear | apply [ipns_key_base64] | citizen [ipns_key_base64] | avatar apply [ipns_key_base64] | avatar peek | avatar name <text> | avatar description <text> | avatar name peek | avatar description peek | actor apply [ipns_key_base64] | actor peek | actor id peek | actor ma.transports peek | actor publish [ipns_key_base64] | actor republish [ipns_key_base64] | recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>"),
                 )
                 .with_prompt(tr_world(active_lang, "closet.help.prompt", "If actor DID does not exist yet: run apply first. After actor is created, set avatar name/description. Then type 'go out' in the actor UI.")),
             );
@@ -1431,7 +1505,8 @@ impl World {
         if matches!(&command, ClosetCommand::Hear) {
             let since = {
                 let sessions = self.closet_sessions.read().await;
-                let Some(session) = sessions.get(session_id) else {
+                let key = session_id.to_string();
+                let Some(session) = sessions.get_any(&key) else {
                     return Err(anyhow!("unknown closet session"));
                 };
                 if session.endpoint != endpoint {
@@ -1443,9 +1518,12 @@ impl World {
             let (events, latest_lobby_sequence) = self.room_events_since(DEFAULT_ROOM, since).await?;
             {
                 let mut sessions = self.closet_sessions.write().await;
-                if let Some(session) = sessions.get_mut(session_id) {
+                let key = session_id.to_string();
+                if let Some(session) = sessions.get_mut_any(&key) {
                     session.last_lobby_sequence = latest_lobby_sequence;
+                    session.last_seen_at = Utc::now().to_rfc3339();
                 }
+                let _ = sessions.touch(&key);
             }
 
             return Ok(
@@ -1717,7 +1795,8 @@ impl World {
             ClosetCommand::Enter { room } => {
                 let (did, preferred_handle, session_fragment) = {
                     let sessions = self.closet_sessions.read().await;
-                    let Some(session) = sessions.get(session_id) else {
+                    let key = session_id.to_string();
+                    let Some(session) = sessions.get_any(&key) else {
                         return Err(anyhow!("unknown closet session"));
                     };
                     if session.endpoint != endpoint {
@@ -2539,21 +2618,6 @@ impl World {
         )
     }
 
-    pub async fn is_private_world(&self) -> bool {
-        !self.entry_acl.read().await.allow_all
-    }
-
-    pub async fn set_private_world(&self, enabled: bool) {
-        let mut acl = self.entry_acl.write().await;
-        acl.allow_all = !enabled;
-        acl.allow_owner = true;
-        if enabled {
-            acl.source = "runtime:private".to_string();
-        } else {
-            acl.source = "runtime:public".to_string();
-        }
-    }
-
     pub async fn allow_entry_did(&self, did_root: &str) {
         let mut acl = self.entry_acl.write().await;
         acl.allowed_dids.insert(did_root.to_string());
@@ -2761,9 +2825,12 @@ impl World {
         requester_endpoint: &str,
         preferred_handle: Option<String>,
     ) -> (u64, bool) {
+        self.prune_knock_inbox().await;
         let mut inbox = self.knock_inbox.write().await;
         if let Some(existing) = inbox
-            .iter()
+            .items_any()
+            .into_iter()
+            .map(|(_, item)| item)
             .find(|item| {
                 item.status == KnockStatus::Pending
                     && item.requester_did == requester_did
@@ -2779,8 +2846,8 @@ impl World {
         let id = *next;
         drop(next);
 
-        if inbox.len() >= MAX_KNOCK_INBOX {
-            inbox.pop_front();
+        while inbox.len_any() >= MAX_KNOCK_INBOX {
+            let _ = inbox.pop_first_any();
         }
 
         let knock = KnockMessage {
@@ -2795,7 +2862,7 @@ impl World {
             decided_at: None,
         };
 
-        inbox.push_back(knock.clone());
+        inbox.insert(id, knock.clone());
         drop(inbox);
 
         let mailbox_message = ObjectInboxMessage {
@@ -2823,19 +2890,63 @@ impl World {
         (id, false)
     }
 
+    async fn prune_knock_inbox(&self) -> usize {
+        let now = Utc::now().timestamp();
+        let mut inbox = self.knock_inbox.write().await;
+        let stale_ids = inbox
+            .items_any()
+            .into_iter()
+            .filter_map(|(id, item)| {
+                let requested_ts = parse_rfc3339_unix(&item.requested_at).unwrap_or(now);
+                let keep = if item.status == KnockStatus::Pending {
+                    now.saturating_sub(requested_ts) <= KNOCK_PENDING_TTL_SECS
+                } else {
+                    let decided_ts = item
+                        .decided_at
+                        .as_deref()
+                        .and_then(parse_rfc3339_unix)
+                        .unwrap_or(requested_ts);
+                    now.saturating_sub(decided_ts) <= KNOCK_DECIDED_TTL_SECS
+                };
+                if keep {
+                    None
+                } else {
+                    Some(*id)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let removed = stale_ids.len();
+        for id in stale_ids {
+            let _ = inbox.remove(&id);
+        }
+        removed
+    }
+
+    async fn flush_knock_inbox(&self) -> usize {
+        let mut inbox = self.knock_inbox.write().await;
+        let removed = inbox.len_any();
+        inbox.clear();
+        removed
+    }
+
     async fn list_knocks(&self, pending_only: bool) -> Vec<KnockMessage> {
+        self.prune_knock_inbox().await;
         let inbox = self.knock_inbox.read().await;
         inbox
-            .iter()
+            .items_any()
+            .into_iter()
+            .map(|(_, item)| item)
             .filter(|item| !pending_only || item.status == KnockStatus::Pending)
             .cloned()
             .collect()
     }
 
     async fn accept_knock(&self, id: u64) -> Result<KnockMessage> {
+        self.prune_knock_inbox().await;
         let (accepted, requester_did) = {
             let mut inbox = self.knock_inbox.write().await;
-            let Some(item) = inbox.iter_mut().find(|item| item.id == id) else {
+            let Some(item) = inbox.get_mut_any(&id) else {
                 return Err(anyhow!("knock id {} not found", id));
             };
             if item.status != KnockStatus::Pending {
@@ -2852,8 +2963,9 @@ impl World {
     }
 
     async fn reject_knock(&self, id: u64, note: Option<String>) -> Result<KnockMessage> {
+        self.prune_knock_inbox().await;
         let mut inbox = self.knock_inbox.write().await;
-        let Some(item) = inbox.iter_mut().find(|item| item.id == id) else {
+        let Some(item) = inbox.get_mut_any(&id) else {
             return Err(anyhow!("knock id {} not found", id));
         };
         if item.status != KnockStatus::Pending {
@@ -2867,10 +2979,9 @@ impl World {
     }
 
     async fn delete_knock(&self, id: u64) -> Result<()> {
+        self.prune_knock_inbox().await;
         let mut inbox = self.knock_inbox.write().await;
-        let before = inbox.len();
-        inbox.retain(|item| item.id != id);
-        if inbox.len() == before {
+        if inbox.remove(&id).is_none() {
             return Err(anyhow!("knock id {} not found", id));
         }
         Ok(())
@@ -4459,7 +4570,7 @@ impl World {
             }
 
             if matches!(verb.as_str(), "show" | "status" | "look") {
-                let listeners = self.closet_sessions.read().await.len();
+                let listeners = self.closet_sessions.read().await.len_any();
                 return Some((
                     format!(
                         "{} is fixed in the lobby. active_closet_sessions={} notice='{}'",
@@ -5151,6 +5262,27 @@ impl World {
         sender_profile: &str,
         command: ActorCommand,
     ) -> (String, String) {
+        fn split_prop_args(input: &str) -> (String, String) {
+            let mut parts = input.trim().splitn(2, char::is_whitespace);
+            let path = parts.next().unwrap_or_default().trim().to_string();
+            let value = parts.next().unwrap_or_default().trim().to_string();
+            (path, value)
+        }
+
+        fn split_selector_key(path: &str) -> (Option<String>, String) {
+            let raw = path.trim();
+            if let Some(rest) = raw.strip_prefix('#') {
+                if let Some((selector, key)) = rest.split_once('.') {
+                    return (
+                        Some(selector.trim().to_ascii_lowercase()),
+                        key.trim().to_ascii_lowercase(),
+                    );
+                }
+                return (Some(rest.trim().to_ascii_lowercase()), String::new());
+            }
+            (None, raw.to_ascii_lowercase())
+        }
+
         match command {
             ActorCommand::Say { payload } => {
                 // ' / say: broadcast speech to the room, formatted identically to Chatter.
@@ -5159,6 +5291,166 @@ impl World {
             }
             ActorCommand::Raw { command } => {
                 let trimmed = command.trim();
+
+                if let Some(rest) = trimmed.strip_prefix("prop ") {
+                    let (path, value) = split_prop_args(rest);
+                    if path.is_empty() {
+                        return (
+                            "@avatar usage: @avatar.<name|description|owner|fragment|lang> [value] | @avatar.#<selector>.<name|description|owner|fragment|lang>".to_string(),
+                            room_name.to_string(),
+                        );
+                    }
+
+                    let (selector, key) = split_selector_key(&path);
+                    if key.is_empty() {
+                        return (
+                            "@avatar usage: @avatar.<name|description|owner|fragment|lang> [value] | @avatar.#<selector>.<name|description|owner|fragment|lang>".to_string(),
+                            room_name.to_string(),
+                        );
+                    }
+
+                    let caller_fragment = from_did
+                        .fragment
+                        .as_ref()
+                        .map(|value| value.to_ascii_lowercase())
+                        .unwrap_or_default();
+
+                    let target_handle = if let Some(selector_token) = selector.as_ref() {
+                        let rooms = self.rooms.read().await;
+                        let Some(room) = rooms.get(room_name) else {
+                            return (format!("@here room '{}' not found", room_name), room_name.to_string());
+                        };
+                        let mut selected: Option<String> = None;
+                        for (handle, avatar) in room.avatars.iter() {
+                            if handle.trim().eq_ignore_ascii_case(selector_token.as_str()) {
+                                selected = Some(handle.clone());
+                                break;
+                            }
+                            let avatar_fragment = avatar
+                                .agent_did
+                                .fragment
+                                .as_ref()
+                                .map(|value| value.to_ascii_lowercase())
+                                .unwrap_or_default();
+                            if !avatar_fragment.is_empty() && avatar_fragment == *selector_token {
+                                selected = Some(handle.clone());
+                                break;
+                            }
+                        }
+                        let Some(found) = selected else {
+                            return (
+                                format!("@avatar selector '#{}' not found in room", selector_token),
+                                room_name.to_string(),
+                            );
+                        };
+                        found
+                    } else {
+                        from.to_string()
+                    };
+
+                    let mut rooms = self.rooms.write().await;
+                    let Some(room) = rooms.get_mut(room_name) else {
+                        return (format!("@here room '{}' not found", room_name), room_name.to_string());
+                    };
+                    let Some(target_avatar) = room.avatars.get_mut(&target_handle) else {
+                        return (format!("@avatar '{}' not found", target_handle), room_name.to_string());
+                    };
+
+                    let target_fragment = target_avatar
+                        .agent_did
+                        .fragment
+                        .clone()
+                        .unwrap_or_default();
+                    let target_fragment_display = if target_fragment.trim().is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        format!("#{}", target_fragment)
+                    };
+
+                    if key == "_list" {
+                        return (
+                            format!(
+                                "@ .avatar.name {}\n@ .avatar.description {}\n@ .avatar.owner {}\n@ .avatar.fragment {}\n@ .avatar.lang {}\n@ .avatar.acl {}\n@ .avatar.shortcuts {}",
+                                target_avatar.inbox,
+                                target_avatar.description_or_default(),
+                                target_avatar.owner,
+                                target_fragment_display,
+                                target_avatar.language_order,
+                                target_avatar.acl.summary(),
+                                target_avatar.object_shortcuts_summary()
+                            ),
+                            room_name.to_string(),
+                        );
+                    }
+
+                    if value.is_empty() {
+                        return match key.as_str() {
+                            "name" => (target_avatar.inbox.clone(), room_name.to_string()),
+                            "description" => (target_avatar.description_or_default(), room_name.to_string()),
+                            "owner" => (target_avatar.owner.clone(), room_name.to_string()),
+                            "fragment" => (target_fragment_display, room_name.to_string()),
+                            "lang" | "language" => (target_avatar.language_order.clone(), room_name.to_string()),
+                            _ => (
+                                format!("@avatar unknown property '{}'. Allowed: name, description, owner, fragment, lang", key),
+                                room_name.to_string(),
+                            ),
+                        };
+                    }
+
+                    let caller_root = from_did.without_fragment().id();
+                    let can_mutate = target_avatar.owner == caller_root;
+                    if !can_mutate {
+                        return (
+                            "You don't have access to this.".to_string(),
+                            room_name.to_string(),
+                        );
+                    }
+
+                    match key.as_str() {
+                        "description" => {
+                            target_avatar.set_description(value.clone());
+                            return (format!("@avatar.description {}", value), room_name.to_string());
+                        }
+                        "lang" | "language" => {
+                            let Some(collapsed) = collapse_world_language_order_strict(&value) else {
+                                return (
+                                    format!(
+                                        "@avatar language rejected. supported={}. Set language in closet, or leave.",
+                                        supported_world_languages_text()
+                                    ),
+                                    room_name.to_string(),
+                                );
+                            };
+                            target_avatar.language_order = collapsed.clone();
+                            return (collapsed, room_name.to_string());
+                        }
+                        "name" => {
+                            if selector.is_some() {
+                                return (
+                                    "@avatar.name update requires self target (@avatar.name <value>)".to_string(),
+                                    room_name.to_string(),
+                                );
+                            }
+                            let _ = caller_fragment;
+                            return (
+                                "@avatar.name is read-only in runtime; set alias/fragment in closet profile.".to_string(),
+                                room_name.to_string(),
+                            );
+                        }
+                        "owner" | "fragment" => {
+                            return (
+                                format!("@avatar.{} is read-only", key),
+                                room_name.to_string(),
+                            );
+                        }
+                        _ => {
+                            return (
+                                format!("@avatar unknown property '{}'. Allowed: name, description, owner, fragment, lang", key),
+                                room_name.to_string(),
+                            );
+                        }
+                    }
+                }
 
                 if let Some(rest) = trimmed.strip_prefix("use ") {
                     let Some((target_raw, alias_raw)) = rest.split_once(" as ") else {
@@ -5419,10 +5711,17 @@ impl World {
                     let Some(avatar) = room.avatars.get(from) else {
                         return (format!("@avatar '{}' not found", from), room_name.to_string());
                     };
+                    let fragment = from_did
+                        .fragment
+                        .clone()
+                        .map(|value| format!("#{}", value))
+                        .unwrap_or_else(|| "(none)".to_string());
                     return (format!(
-                        "@avatar owner={} desc={} acl={} shortcuts={}",
-                        avatar.owner,
+                        "@ .avatar.name {}\n@ .avatar.description {}\n@ .avatar.owner {}\n@ .avatar.fragment {}\n@ .avatar.acl {}\n@ .avatar.shortcuts {}",
+                        avatar.inbox,
                         avatar.description_or_default(),
+                        avatar.owner,
+                        fragment,
                         avatar.acl.summary(),
                         avatar.object_shortcuts_summary()
                     ), room_name.to_string());
@@ -5501,6 +5800,13 @@ impl World {
         sender_profile: &str,
         command: &str,
     ) -> String {
+        fn split_prop_args(input: &str) -> (String, String) {
+            let mut parts = input.trim().splitn(2, char::is_whitespace);
+            let path = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+            let value = parts.next().unwrap_or_default().trim().to_string();
+            (path, value)
+        }
+
         let normalized = command.trim();
         let active_lang = world_lang_from_profile(sender_profile);
 
@@ -5508,13 +5814,113 @@ impl World {
             return tr_world(
                 active_lang,
                 "world.help.commands",
-                "@world commands: help | list | show [did] | describe [did] | claim | lang [show|set <cid>|clear] | private [on|off|status] | knock list [all] | knock accept <id> | knock reject <id> [note] | knock delete <id> | invite <did> [note] | room <name> acl show|open|close|allow <did>|deny <did> | migrate-index | save | load <cid> | dig <direction> [to|til <#dest|did>]",
+                "@world commands: help | list | claim | knock list [all] | knock accept <id> | knock reject <id> [note] | knock delete <id> | invite <did> [note] | room <name> acl show|open|close|allow <did>|deny <did> | flush [knock|closet|all] | migrate-index | save | load <cid> | dig <direction> [to|til <#dest|did>]",
             );
         }
 
         let mut parts = normalized.splitn(2, char::is_whitespace);
         let verb = parts.next().unwrap_or_default().to_ascii_lowercase();
         let arg = parts.next().unwrap_or_default().trim().to_string();
+
+        if verb == "prop" {
+            let (path, value) = split_prop_args(&arg);
+            if path.is_empty() {
+                return "@world usage: @world.<owner|did|rooms|lang_cid> [value]".to_string();
+            }
+
+            let caller_root_did = from_did.without_fragment().id();
+
+            if value.is_empty() {
+                match path.as_str() {
+                    "_list" => {
+                        let owner = self
+                            .owner_did
+                            .read()
+                            .await
+                            .clone()
+                            .unwrap_or_else(|| "(none)".to_string());
+                        let did = self
+                            .local_world_did_root()
+                            .await
+                            .unwrap_or_else(|| "did:ma:unconfigured".to_string());
+                        let rooms = self.rooms.read().await.len();
+                        let lang_cid = self
+                            .lang_cid
+                            .read()
+                            .await
+                            .clone()
+                            .unwrap_or_else(|| "(none)".to_string());
+                        return format!(
+                            "@ .world.owner {}\n@ .world.did {}\n@ .world.rooms {}\n@ .world.lang_cid {}",
+                            owner, did, rooms, lang_cid
+                        );
+                    }
+                    "owner" => {
+                        return self
+                            .owner_did
+                            .read()
+                            .await
+                            .clone()
+                            .unwrap_or_else(|| "(none)".to_string())
+                    }
+                    "did" => {
+                        return self
+                            .local_world_did_root()
+                            .await
+                            .unwrap_or_else(|| "did:ma:unconfigured".to_string())
+                    }
+                    "rooms" => return self.rooms.read().await.len().to_string(),
+                    "lang_cid" => {
+                        return self
+                            .lang_cid
+                            .read()
+                            .await
+                            .clone()
+                            .unwrap_or_else(|| "(none)".to_string())
+                    }
+                    _ => {
+                        return format!(
+                            "@world unknown property '{}'. Allowed: owner, did, rooms, lang_cid",
+                            path
+                        )
+                    }
+                }
+            }
+
+            let owner_did = self.owner_did.read().await.clone();
+            let is_owner = owner_did
+                .as_ref()
+                .map(|owner| owner == &caller_root_did)
+                .unwrap_or(false);
+
+            match path.as_str() {
+                "owner" => {
+                    if owner_did.is_some() && !is_owner {
+                        return "You don't have access to this.".to_string();
+                    }
+                    return match self.set_owner_did(value.as_str()).await {
+                        Ok(root) => root,
+                        Err(err) => format!("@world invalid owner DID '{}': {}", value, err),
+                    };
+                }
+                "lang_cid" => {
+                    if !is_owner {
+                        return "You don't have access to this.".to_string();
+                    }
+                    self.set_lang_cid(Some(value.clone())).await;
+                    return value;
+                }
+                "did" | "rooms" => {
+                    return format!("@world.{} is read-only", path);
+                }
+                _ => {
+                    return format!(
+                        "@world unknown property '{}'. Allowed: owner, did, rooms, lang_cid",
+                        path
+                    )
+                }
+            }
+        }
 
         // Command tokens are world/realm-defined and intentionally invariant.
         // Localized input aliases (e.g. "grave" -> "dig") belong in actor/client.
@@ -5541,122 +5947,6 @@ impl World {
 
         // Caller's root DID is directly available from from_did
         let caller_root_did = from_did.without_fragment().id();
-
-        // @@show [did] — world metadata by default, room metadata when room DID is passed.
-        if verb == "show" {
-            let world_did_root = self
-                .local_world_did_root()
-                .await
-                .unwrap_or_else(|| "(unconfigured)".to_string());
-            if arg.is_empty() {
-                let owner = self.owner_did.read().await.clone().unwrap_or_else(|| "(none)".to_string());
-                let room_count = self.rooms.read().await.len();
-                let lang_cid = self.lang_cid.read().await.clone().unwrap_or_else(|| "(none)".to_string());
-                return format!("@world did={} owner={} rooms={} lang_cid={}", world_did_root, owner, room_count, lang_cid);
-            }
-
-            let target_fragment = match Did::try_from(arg.as_str()) {
-                Ok(did) => {
-                    if !self.is_local_world_root(&did.without_fragment().id()).await {
-                        return format!("@world unknown DID root: {}", did.without_fragment().id());
-                    }
-                    did.fragment.clone()
-                }
-                Err(e) => {
-                    if arg.contains(':') {
-                        return format!("@world invalid DID '{}': {}", arg, e);
-                    }
-                    let fragment = arg.trim().trim_start_matches('#');
-                    if fragment.is_empty() {
-                        return "@world usage: @@show [did:ma:<world>#fragment|fragment]".to_string();
-                    }
-                    Some(fragment.to_string())
-                }
-            };
-
-            let Some(fragment) = target_fragment else {
-                let owner = self.owner_did.read().await.clone().unwrap_or_else(|| "(none)".to_string());
-                let room_count = self.rooms.read().await.len();
-                let lang_cid = self.lang_cid.read().await.clone().unwrap_or_else(|| "(none)".to_string());
-                return format!("@world did={} owner={} rooms={} lang_cid={}", world_did_root, owner, room_count, lang_cid);
-            };
-
-            let rooms = self.rooms.read().await;
-            let Some(room) = rooms.get(&fragment) else {
-                return format!("@world room '{}' not found", fragment);
-            };
-            let owner = room.acl.owner.clone().unwrap_or_else(|| "(none)".to_string());
-            let room_cid = self
-                .room_cids
-                .read()
-                .await
-                .get(&fragment)
-                .cloned()
-                .unwrap_or_else(|| "(unknown)".to_string());
-            return format!(
-                "@world room='{}' did={} owner={} cid={} avatars={} exits={}",
-                room.name,
-                room.did,
-                owner,
-                room_cid,
-                room.avatars.len(),
-                room.exits.len()
-            );
-        }
-
-        // @@describe [did] — world description by default, room description when room DID is passed.
-        if verb == "describe" {
-            if arg.is_empty() {
-                return "@world (no description)".to_string();
-            }
-
-            let target_fragment = match Did::try_from(arg.as_str()) {
-                Ok(did) => {
-                    if !self.is_local_world_root(&did.without_fragment().id()).await {
-                        return format!("@world unknown DID root: {}", did.without_fragment().id());
-                    }
-                    did.fragment.clone()
-                }
-                Err(e) => {
-                    if arg.contains(':') {
-                        return format!("@world invalid DID '{}': {}", arg, e);
-                    }
-                    let fragment = arg.trim().trim_start_matches('#');
-                    if fragment.is_empty() {
-                        return "@world usage: @@describe [did:ma:<world>#fragment|fragment]".to_string();
-                    }
-                    Some(fragment.to_string())
-                }
-            };
-
-            let Some(fragment) = target_fragment else {
-                return "@world (no description)".to_string();
-            };
-
-            let rooms = self.rooms.read().await;
-            let Some(room) = rooms.get(&fragment) else {
-                return format!("@world room '{}' not found", fragment);
-            };
-            return format!("@world {} — {}", room.name, room.description_or_default());
-        }
-
-        if verb == "private" {
-            let mode = arg.to_ascii_lowercase();
-            if mode.is_empty() || mode == "status" {
-                if self.is_private_world().await {
-                    return tr_world(
-                        active_lang,
-                        "world.private.status.on",
-                        "@world private=on (new entrants must knock)",
-                    );
-                }
-                return tr_world(
-                    active_lang,
-                    "world.private.status.off",
-                    "@world private=off (open entry)",
-                );
-            }
-        }
 
         // @@claim — set world owner to caller DID if unclaimed.
         if verb == "claim" {
@@ -5689,65 +5979,6 @@ impl World {
                 active_lang,
                 "world.owner.required",
                 "@world only the world owner can run that command.",
-            );
-        }
-
-        if verb == "lang" {
-            let trimmed = arg.trim();
-            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("show") {
-                let value = self.lang_cid.read().await.clone().unwrap_or_else(|| "(none)".to_string());
-                return tr_world_vars(active_lang, "world.lang.show", &[("cid", value.clone())], &format!("@world lang_cid={}", value));
-            }
-            if trimmed.eq_ignore_ascii_case("clear") {
-                self.set_lang_cid(None).await;
-                return tr_world(
-                    active_lang,
-                    "world.lang.cleared",
-                    "@world lang_cid cleared (save world to persist)",
-                );
-            }
-            if let Some(cid) = trimmed.strip_prefix("set ") {
-                let candidate = cid.trim();
-                if candidate.is_empty() {
-                    return tr_world(active_lang, "world.lang.usage.set", "@world usage: @@lang set <cid>");
-                }
-                self.set_lang_cid(Some(candidate.to_string())).await;
-                return tr_world_vars(
-                    active_lang,
-                    "world.lang.set",
-                    &[("cid", candidate.to_string())],
-                    &format!("@world lang_cid set to {} (save world to persist)", candidate),
-                );
-            }
-            return tr_world(
-                active_lang,
-                "world.lang.usage",
-                "@world usage: @@lang [show|set <cid>|clear]",
-            );
-        }
-
-        if verb == "private" {
-            let mode = arg.to_ascii_lowercase();
-            if mode == "on" || mode == "true" {
-                self.set_private_world(true).await;
-                return tr_world(
-                    active_lang,
-                    "world.private.on",
-                    "@world private mode enabled; new entrants must knock",
-                );
-            }
-            if mode == "off" || mode == "false" {
-                self.set_private_world(false).await;
-                return tr_world(
-                    active_lang,
-                    "world.private.off",
-                    "@world private mode disabled; entry is now open",
-                );
-            }
-            return tr_world(
-                active_lang,
-                "world.private.usage",
-                "@world usage: @@private [on|off|status]",
             );
         }
 
@@ -5860,6 +6091,24 @@ impl World {
                 target_root,
                 invite_note
             );
+        }
+
+        if verb == "flush" {
+            let scope = arg.trim().to_ascii_lowercase();
+            if scope.is_empty() || scope == "all" {
+                let knocks = self.flush_knock_inbox().await;
+                let closet = self.flush_closet_sessions().await;
+                return format!("@world flush all: knocks={} closet_sessions={}", knocks, closet);
+            }
+            if scope == "knock" || scope == "knocks" {
+                let removed = self.flush_knock_inbox().await;
+                return format!("@world flush knock: removed={}", removed);
+            }
+            if scope == "closet" || scope == "closet_sessions" {
+                let removed = self.flush_closet_sessions().await;
+                return format!("@world flush closet: removed={}", removed);
+            }
+            return "@world usage: @@flush [knock|closet|all]".to_string();
         }
 
         if verb == "migrate-index" {
@@ -6961,11 +7210,29 @@ impl WorldProtocol {
         let sender_did = Did::try_from(message.from.as_str())?;
         let sender_root = sender_did.without_fragment();
 
+        let as_onboarding_did_error = |source: &anyhow::Error| {
+            let detail = source.to_string();
+            let lowered = detail.to_ascii_lowercase();
+            if lowered.contains("failed to fetch did document")
+                || lowered.contains("name/resolve failed")
+                || lowered.contains("/ipns/")
+                || lowered.contains("did document") && lowered.contains("not found")
+            {
+                anyhow!(
+                    "did document is not published yet for {} (closet onboarding required): {}",
+                    sender_root.id(),
+                    detail
+                )
+            } else {
+                anyhow!(detail)
+            }
+        };
+
         let t0 = std::time::Instant::now();
         let (sender_document, fetched_from_kubo, is_dirty) = self.get_sender_document(&sender_root, false).await
             .map_err(|e| {
                 warn!("DID doc fetch failed for {} after {:?}: {}", sender_root.id(), t0.elapsed(), e);
-                e
+                as_onboarding_did_error(&e)
             })?;
         if fetched_from_kubo {
             info!("DID doc for {} fetched via Kubo in {:?}", sender_root.id(), t0.elapsed());
@@ -7001,7 +7268,7 @@ impl WorldProtocol {
                         refresh_t0.elapsed(),
                         e
                     );
-                    return Err(e);
+                    return Err(as_onboarding_did_error(&e));
                 }
             };
         if refreshed_from_kubo {
@@ -8746,10 +9013,25 @@ async fn main() -> Result<()> {
         ));
     }
 
-    // Initialize logging with configurable level and optional file output
-    let directive = format!("ma_world={}", log_level);
-    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
-        .add_directive(directive.parse()?);
+    // Initialize logging with configurable level and optional file output.
+    // Default filters keep normal runs readable while allowing richer transport traces in debug mode.
+    let normalized_level = log_level.trim().to_lowercase();
+    let iroh_level = if normalized_level == "debug" || normalized_level == "trace" {
+        normalized_level.as_str()
+    } else {
+        "info"
+    };
+    let directives = [
+        format!("ma_world={}", normalized_level),
+        format!("ma_core={}", normalized_level),
+        format!("iroh={}", iroh_level),
+        format!("iroh_net={}", iroh_level),
+        format!("iroh_relay={}", iroh_level),
+    ];
+    let mut env_filter = tracing_subscriber::EnvFilter::from_default_env();
+    for directive in directives {
+        env_filter = env_filter.add_directive(directive.parse()?);
+    }
 
     if let Some(log_file_path) = &log_file {
         // Create parent directory if it doesn't exist

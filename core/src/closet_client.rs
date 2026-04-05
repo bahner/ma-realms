@@ -11,15 +11,16 @@ pub async fn send_closet_request(
     endpoint_addr: EndpointAddr,
     request: ClosetRequest,
 ) -> Result<ClosetResponse> {
+    let requested_alpn = String::from_utf8_lossy(CLOSET_ALPN).to_string();
     let connection = endpoint
         .connect(endpoint_addr, CLOSET_ALPN)
         .await
-        .map_err(|e| anyhow!("closet endpoint.connect() failed: {e}"))?;
+        .map_err(|e| anyhow!("closet endpoint.connect() failed: {e} (requested_alpn={requested_alpn})"))?;
 
     let (mut send, mut recv) = connection
         .open_bi()
         .await
-        .map_err(|e| anyhow!("closet connection.open_bi() failed: {e}"))?;
+        .map_err(|e| anyhow!("closet connection.open_bi() failed: {e} (requested_alpn={requested_alpn})"))?;
 
     let payload = serde_json::to_vec(&request)?;
     send.write_u32(payload.len() as u32).await?;

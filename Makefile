@@ -54,6 +54,7 @@ run-world: core-build actor-build world-build
 	echo "MA_REALMS_VERSION=$(MA_REALMS_VERSION)"; \
 	echo "MA_WORLD_VERSION=$(MA_WORLD_VERSION)"; \
 	echo "MA_ACTOR_VERSION=$(MA_ACTOR_VERSION)"; \
+	if [ -n "$$RUST_LOG" ]; then echo "RUST_LOG=$$RUST_LOG"; else echo "RUST_LOG=(unset; controlled by --log-level/MA_LOG_LEVEL)"; fi; \
 	echo "Command: cargo run --manifest-path world/Cargo.toml -- $$args"; \
 	MA_WORLD_VERSION="$(MA_WORLD_VERSION)" cargo run --manifest-path world/Cargo.toml -- $$args
 

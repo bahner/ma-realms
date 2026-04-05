@@ -3,10 +3,26 @@ use serde::{Deserialize, Serialize};
 fn canonical_target(target: &str) -> String {
     let normalized = target.trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "here" | "room" | "world" => "here".to_string(),
+        "here" | "room" => "here".to_string(),
+        "world" => "world".to_string(),
         "avatar" | "me" | "self" => "avatar".to_string(),
         _ => target.trim().to_string(),
     }
+}
+
+fn split_target_path(target_token: &str) -> (String, Option<String>) {
+    let token = target_token.trim();
+    if token.is_empty() {
+        return (String::new(), None);
+    }
+    if let Some((base, tail)) = token.split_once('.') {
+        let path = tail.trim();
+        if !path.is_empty() {
+            return (base.trim().to_string(), Some(path.to_string()));
+        }
+        return (base.trim().to_string(), None);
+    }
+    (token.to_string(), None)
 }
 
 fn canonical_room_command(command: &str) -> String {
@@ -68,19 +84,42 @@ pub fn parse_message(input: &str) -> MessageEnvelope {
         }
 
         let mut parts = rest.splitn(2, char::is_whitespace);
-        let target = parts.next().unwrap_or_default().trim();
+        let target_token = parts.next().unwrap_or_default().trim();
         let command = parts.next().unwrap_or_default().trim().to_string();
 
-        if target.is_empty() {
+        if target_token.is_empty() {
             return MessageEnvelope::RoomCommand { command };
         }
 
-        let target = canonical_target(target);
+        let (target_base, target_path) = split_target_path(target_token);
+        let target = canonical_target(&target_base);
+
+        if let Some(path) = target_path {
+            let prop_cmd = if command.is_empty() {
+                format!("prop {}", path)
+            } else {
+                format!("prop {} {}", path, command)
+            };
+            return MessageEnvelope::ActorCommand {
+                target,
+                command: ActorCommand::Raw { command: prop_cmd },
+            };
+        }
+
         if target == "here" {
             return MessageEnvelope::ActorCommand {
                 target,
                 command: ActorCommand::Raw {
                     command: canonical_room_command(&command),
+                },
+            };
+        }
+
+        if command.is_empty() && (target == "world" || target == "avatar") {
+            return MessageEnvelope::ActorCommand {
+                target,
+                command: ActorCommand::Raw {
+                    command: "prop _list".to_string(),
                 },
             };
         }

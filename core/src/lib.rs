@@ -14,6 +14,7 @@ pub mod pinning;
 pub mod protocol;
 pub mod requirements;
 pub mod room_actor;
+pub mod ttl_cache;
 
 pub use addressing::{
     did_root, find_alias_for_address, find_did_by_endpoint, humanize_identifier, humanize_text,
@@ -80,6 +81,7 @@ pub use requirements::{
 pub use room_actor::{
     execute_room_actor_command, RoomActorAction, RoomActorContext, RoomActorResult,
 };
+pub use ttl_cache::TtlCache;
 
 #[cfg(test)]
 mod tests {
