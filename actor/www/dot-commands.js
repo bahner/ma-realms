@@ -90,10 +90,10 @@ export function createDotCommands({
 
     const [verbRaw, ...args] = rest.split(/\s+/);
     const verbToken = String(verbRaw || '').trim();
-    const verb = verbToken.toLowerCase();
+    const dotCommand = verbToken.toLowerCase();
     const tail = args.join(' ').trim();
 
-    if (verb === 'help') {
+    if (dotCommand === 'help') {
       appendSystemUi('Dot commands:', 'Punktkommandoer:');
       appendSystemUi('  .help                      - this message', '  .help                      - denne meldingen');
       appendSystemUi('  .identity                  - show local pre-publish DID document as raw JSON', '  .identity                  - vis lokalt DID-dokument (før publisering) som rå JSON');
@@ -124,7 +124,7 @@ export function createDotCommands({
       appendMessage('system', '  pick up <object>           - pick up object before open/list/accept actions');
       appendSystemUi('  go north                   - navigate (server resolves exit)', '  go north                   - naviger (server løser utgang)');
       appendSystemUi('  look                       - describe current room', '  look                       - beskriv naverende rom');
-      appendSystemUi('  attack goblin              - gameplay verb sent to world', '  attack goblin              - gameplay-verb sendt til world');
+      appendSystemUi('  attack goblin              - gameplay command sent to world', '  attack goblin              - gameplay-kommando sendt til world');
       appendSystemUi('  @did:ma:<world>#<room> poll - refresh room metadata on demand', '  @did:ma:<world>#<room> poll - oppdater rommetadata ved behov');
       appendMessage('system', "  'Hello world               - shorthand for @me say Hello world");
       appendSystemUi('  @target command args       - send command to actor', '  @target command args       - send kommando til actor');
@@ -133,7 +133,7 @@ export function createDotCommands({
       return true;
     }
 
-    if (verb === 'identity') {
+    if (dotCommand === 'identity') {
       if (!state.identity) {
         appendSystemUi('No identity loaded. Create or unlock an identity first.', 'Ingen identitet lastet. Opprett eller lås opp en identitet først.');
         return true;
@@ -164,7 +164,7 @@ export function createDotCommands({
       return true;
     }
 
-    if (verb === 'aliases') {
+    if (dotCommand === 'aliases') {
       if (args.length === 0) {
         const entries = Object.entries(state.aliasBook);
         if (entries.length === 0) {
@@ -233,7 +233,7 @@ export function createDotCommands({
       return true;
     }
 
-    if (verb.startsWith('aliases.')) {
+    if (dotCommand.startsWith('aliases.')) {
       const aliasName = verbToken.slice('aliases.'.length).trim();
       if (!aliasName) {
         appendMessage('system', 'Usage: .aliases.<name>');
@@ -247,7 +247,7 @@ export function createDotCommands({
       return true;
     }
 
-    if (verb === 'set') {
+    if (dotCommand === 'set') {
       const key = String(args[0] || '').toLowerCase();
       if (key !== 'home') {
         appendMessage('system', 'Usage: .set home [did:ma:<world>#<room>]');
@@ -274,7 +274,7 @@ export function createDotCommands({
       return true;
     }
 
-    if (verb === 'debug') {
+    if (dotCommand === 'debug') {
       if (args.length === 0) {
         setDebugMode(!state.debug);
       } else {
@@ -291,7 +291,7 @@ export function createDotCommands({
       return true;
     }
 
-    if (verb === 'log') {
+    if (dotCommand === 'log') {
       if (args.length !== 0) {
         appendMessage('system', 'Usage: .log');
         return true;
@@ -301,7 +301,7 @@ export function createDotCommands({
       return true;
     }
 
-    if (verb === 'log.enabled') {
+    if (dotCommand === 'log.enabled') {
       if (args.length === 0) {
         appendMessage('system', `${state.logEnabled ? 'true' : 'false'}`);
         return true;
@@ -323,7 +323,7 @@ export function createDotCommands({
       return true;
     }
 
-    if (verb === 'log.level') {
+    if (dotCommand === 'log.level') {
       if (args.length === 0) {
         appendMessage('system', `${state.logLevel}`);
         return true;
@@ -341,7 +341,7 @@ export function createDotCommands({
       return true;
     }
 
-    if (verb === 'blocks') {
+    if (dotCommand === 'blocks') {
       const blocked = Array.from(state.blockedDidRoots || []).sort();
       if (!blocked.length) {
         appendMessage('system', 'No blocked senders.');
@@ -354,7 +354,7 @@ export function createDotCommands({
       return true;
     }
 
-    if (verb === 'block') {
+    if (dotCommand === 'block') {
       if (args.length !== 1) {
         appendMessage('system', 'Usage: .block <did|alias|handle>');
         return true;
@@ -377,7 +377,7 @@ export function createDotCommands({
       return true;
     }
 
-    if (verb === 'unblock') {
+    if (dotCommand === 'unblock') {
       if (args.length !== 1) {
         appendMessage('system', 'Usage: .unblock <did|alias|handle>');
         return true;
@@ -397,22 +397,22 @@ export function createDotCommands({
       return true;
     }
 
-    if (verb === 'edit') {
+    if (dotCommand === 'edit') {
       onDotEdit(tail);
       return true;
     }
 
-    if (verb === 'eval') {
+    if (dotCommand === 'eval') {
       onDotEval(tail);
       return true;
     }
 
-    if (verb === 'inspect') {
+    if (dotCommand === 'inspect') {
       onDotInspect(tail);
       return true;
     }
 
-    if (verb === 'use') {
+    if (dotCommand === 'use') {
       const requirement = 'none';
       const useTail = String(tail || '').trim();
       const didMatch = useTail.match(/^(\S+)(?:\s+as\s+(@?[A-Za-z0-9_-]+))?$/i);
@@ -454,7 +454,7 @@ export function createDotCommands({
       return true;
     }
 
-    if (verb === 'unuse') {
+    if (dotCommand === 'unuse') {
       const alias = String(args[0] || '').trim();
       if (!alias || !alias.startsWith('@')) {
         appendMessage('system', uiText('Usage: .unuse @alias', 'Bruk: .unuse @alias'));
@@ -467,7 +467,7 @@ export function createDotCommands({
       return true;
     }
 
-    if (verb === 'refresh') {
+    if (dotCommand === 'refresh') {
       if (!state.currentHome) {
         appendSystemUi('Not connected to a world.', 'Ikke koblet til en world.');
         return true;
@@ -485,7 +485,7 @@ export function createDotCommands({
       return true;
     }
 
-    if (verb === 'mail' || verb === 'mailbox') {
+    if (dotCommand === 'mail' || dotCommand === 'mailbox') {
       const sub = String(args[0] || 'list').toLowerCase();
       const list = Array.isArray(state.mailbox) ? state.mailbox : [];
 
@@ -583,7 +583,7 @@ export function createDotCommands({
       return true;
     }
 
-    if (verb === 'invite') {
+    if (dotCommand === 'invite') {
       if (args.length < 1) {
         appendMessage('system', 'Usage: .invite <did|alias|handle> [note]');
         return true;
@@ -612,7 +612,7 @@ export function createDotCommands({
       return true;
     }
 
-    if (verb === 'smoke') {
+    if (dotCommand === 'smoke') {
       if (args.length > 1) {
         appendMessage('system', 'Usage: .smoke [alias]');
         return true;
@@ -624,8 +624,8 @@ export function createDotCommands({
     }
 
     appendMessage('system', uiText(
-      `Unknown command: .${verb}. Try .help.`,
-      `Ukjent kommando: .${verb}. Prøv .help.`
+      `Unknown command: .${dotCommand}. Try .help.`,
+      `Ukjent kommando: .${dotCommand}. Prøv .help.`
     ));
     return true;
   }

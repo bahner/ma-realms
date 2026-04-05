@@ -907,16 +907,16 @@ async function executeScriptLine(line) {
   if (text.startsWith('.')) {
     const dot = text.slice(1).trim();
     const [verbRaw] = dot.split(/\s+/);
-    const verb = String(verbRaw || '').toLowerCase();
+    const dotCommand = String(verbRaw || '').toLowerCase();
 
-    if (!verb) {
+    if (!dotCommand) {
       return;
     }
 
-    if (verb === 'edit' || verb === 'eval') {
+    if (dotCommand === 'edit' || dotCommand === 'eval') {
       throw new Error(`Script line '${text}' is not allowed inside .eval script`);
     }
-    if (verb === 'help') {
+    if (dotCommand === 'help') {
       return;
     }
 

@@ -122,59 +122,58 @@ export function createClosetFlow({
       return null;
     }
 
-    // Dot-scoped forms (for example avatar.apply) are intentionally not supported.
-    if (/^[A-Za-z][A-Za-z0-9_-]*\./.test(raw)) {
-      return raw;
+    if (/^avatar$/i.test(raw)) {
+      return '__resource_show__ avatar peek';
     }
 
-    const scoped = raw.match(/^([A-Za-z][A-Za-z0-9_-]*)\s+(.+)$/);
-    if (!scoped) {
-      return raw;
+    if (/^actor$/i.test(raw)) {
+      return '__resource_show__ document peek';
     }
 
-    const scope = String(scoped[1] || '').trim().toLowerCase();
-    const resolvedScope = scope === 'actor' ? 'document' : scope;
-    const rest = String(scoped[2] || '').trim();
-    if (!resolvedScope || !rest) {
-      return raw;
-    }
-
-    const pathPeek = rest.match(/^([A-Za-z0-9_.-]+)\s+(show|peek)$/i);
-    if (pathPeek) {
-      const path = String(pathPeek[1] || '').trim();
-      const mode = String(pathPeek[2] || 'peek').toLowerCase();
+    // Dot-only scoped syntax, for example avatar.name bahner and actor.apply <key>.
+    // Space-scoped compatibility forms (like "avatar apply") are intentionally removed.
+    const dottedPathPeek = raw.match(/^([A-Za-z][A-Za-z0-9_-]*)\.([A-Za-z0-9_.-]+)\.(show|peek)$/i);
+    if (dottedPathPeek) {
+      const scope = String(dottedPathPeek[1] || '').trim().toLowerCase();
+      const path = String(dottedPathPeek[2] || '').trim();
+      const mode = String(dottedPathPeek[3] || 'peek').toLowerCase();
+      const resolvedScope = scope === 'actor' ? 'document' : scope;
       return `__resource_show_path__ ${resolvedScope} ${mode} ${path}`;
     }
 
-    const opMatch = rest.match(/^([A-Za-z][A-Za-z0-9_-]*)(?:\s*:?\s*(.*))?$/);
-    if (!opMatch) {
-      return raw;
-    }
-    const op = String(opMatch[1] || '').trim().toLowerCase();
-    const args = String(opMatch[2] || '').trim();
+    const dotted = raw.match(/^([A-Za-z][A-Za-z0-9_-]*)\.([A-Za-z][A-Za-z0-9_-]*)(?:\s+(.*))?$/);
+    if (dotted) {
+      const scope = String(dotted[1] || '').trim().toLowerCase();
+      const op = String(dotted[2] || '').trim().toLowerCase();
+      const args = String(dotted[3] || '').trim();
+      const resolvedScope = scope === 'actor' ? 'document' : scope;
 
-    const table = {
-      avatar: {
-        help: () => 'help',
-        show: () => 'show',
-        peek: () => '__resource_show__ avatar peek',
-        apply: () => (args ? `apply ${args}` : 'apply'),
-        name: () => (args ? `name ${args}` : 'name'),
-        description: () => (args ? `description ${args}` : 'description'),
-      },
-      document: {
-        help: () => `__resource_help__ ${resolvedScope}`,
-        show: () => `__resource_show__ ${resolvedScope} show`,
-        peek: () => `__resource_show__ ${resolvedScope} peek`,
-        apply: () => (args ? `__resource_apply__ ${resolvedScope} ${args}` : `__resource_apply__ ${resolvedScope}`),
-        publish: () => (args ? `__resource_apply__ ${resolvedScope} ${args}` : `__resource_apply__ ${resolvedScope}`),
-        republish: () => (args ? `__resource_apply__ ${resolvedScope} ${args}` : `__resource_apply__ ${resolvedScope}`),
-      },
-    };
+      const dotTable = {
+        avatar: {
+          help: () => 'help',
+          show: () => '__resource_show__ avatar peek',
+          peek: () => '__resource_show__ avatar peek',
+          apply: () => (args ? `apply ${args}` : 'apply'),
+          name: () => (args ? `name ${args}` : 'name'),
+          description: () => (args ? `description ${args}` : 'description'),
+        },
+        document: {
+          help: () => `__resource_help__ ${resolvedScope}`,
+          show: () => `__resource_show__ ${resolvedScope} show`,
+          peek: () => `__resource_show__ ${resolvedScope} peek`,
+          apply: () => (args ? `__resource_apply__ ${resolvedScope} ${args}` : `__resource_apply__ ${resolvedScope}`),
+          publish: () => (args ? `__resource_apply__ ${resolvedScope} ${args}` : `__resource_apply__ ${resolvedScope}`),
+          republish: () => (args ? `__resource_apply__ ${resolvedScope} ${args}` : `__resource_apply__ ${resolvedScope}`),
+          id: () => `__resource_show_path__ ${resolvedScope} peek id`,
+        },
+      };
 
-    const resolver = table?.[resolvedScope]?.[op];
-    if (typeof resolver === 'function') {
-      return resolver();
+      const resolver = dotTable?.[resolvedScope]?.[op];
+      if (typeof resolver === 'function') {
+        return resolver();
+      }
+
+      return null;
     }
 
     return raw;

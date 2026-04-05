@@ -115,7 +115,7 @@ All client commands use dot prefix (`.`). Bare text is gameplay sent to the worl
 
 - `go north` — navigate via server-resolved exits
 - `look` — describe current room
-- `attack goblin` — gameplay verb sent to world
+- `attack goblin` — gameplay command sent to world
 - `'Hello world` — shorthand for @me say Hello world
 
 ### Actor Targeting

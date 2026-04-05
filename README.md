@@ -28,6 +28,16 @@ The syntax and document style are inspired by W3C DID conventions, while remaini
 - [actor](actor): WASM browser client for humans and bots
 - [world](world): world runtime/server
 
+## Command Terminology
+
+To keep scripting predictable across actor/world/core layers, this repo uses:
+
+- `method`: command/action token (for example `show`, `apply`, `invite`)
+- `attribute`: dotted member on a target (for example `avatar.name`)
+- `path`: dotted nested selector (for example `document.ma.transports`)
+
+`verb` is reserved for natural-language interpretation layers and should not be used as the primary name for scripted dotted command segments.
+
 ## Quick Start
 
 Prerequisites:

@@ -1457,7 +1457,7 @@ impl World {
             return Ok(
                 ClosetResponse::ok(
                     session_id,
-                    tr_world(active_lang, "closet.help", "Closet commands: help | show | hear | apply [ipns_key_base64] | citizen [ipns_key_base64] | avatar apply [ipns_key_base64] | avatar peek | avatar name <text> | avatar description <text> | avatar name peek | avatar description peek | actor apply [ipns_key_base64] | actor peek | actor id peek | actor ma.transports peek | actor publish [ipns_key_base64] | actor republish [ipns_key_base64] | recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>"),
+                    tr_world(active_lang, "closet.help", "Closet commands: help | show | hear | apply [ipns_key_base64] | citizen [ipns_key_base64] | avatar.apply [ipns_key_base64] | avatar.peek | avatar.name <text> | avatar.description <text> | avatar.name.peek | avatar.description.peek | actor.apply [ipns_key_base64] | actor.peek | actor.id.peek | actor.ma.transports.peek | actor.publish [ipns_key_base64] | actor.republish [ipns_key_base64] | recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>"),
                 )
                 .with_prompt(tr_world(active_lang, "closet.help.prompt", "If actor DID does not exist yet: run apply first. After actor is created, set avatar name/description. Then type 'go out' in the actor UI.")),
             );
@@ -1866,14 +1866,14 @@ impl World {
                     .with_did(did),
                 );
             }
-            ClosetCommand::Unknown { verb } => {
+            ClosetCommand::Unknown { method } => {
                 return Ok(ClosetResponse::err(
                     session_id,
                     tr_world_vars(
                         active_lang,
                         "closet.command.unknown",
-                        &[("verb", verb.clone())],
-                        &format!("Unknown closet command '{}'. Type 'help'.", verb),
+                        &[("verb", method.clone()), ("method", method.clone())],
+                        &format!("Unknown closet command '{}'. Type 'help'.", method),
                     ),
                 ));
             }
@@ -2640,14 +2640,14 @@ impl World {
             .map_err(|err| format!("invalid DID '{}': {}", target_did_raw, err))
     }
 
-    fn lookup_object_print_verb(
+    fn lookup_object_print_method(
         object: &ObjectRuntimeState,
-        verb: &str,
+        method: &str,
         _sender_profile: &str,
     ) -> Option<String> {
         let verbs = object.definition.as_ref().map(|def| &def.verbs)?;
 
-        let needle = verb.trim().to_ascii_lowercase();
+        let needle = method.trim().to_ascii_lowercase();
         if needle.is_empty() {
             return None;
         }
@@ -2682,12 +2682,12 @@ impl World {
         None
     }
 
-    fn lookup_object_verb_definition(
+    fn lookup_object_method_definition(
         object: &ObjectRuntimeState,
-        verb: &str,
+        method: &str,
     ) -> Option<ma_core::ObjectVerbDefinition> {
         let verbs = object.definition.as_ref().map(|def| &def.verbs)?;
-        let needle = verb.trim().to_ascii_lowercase();
+        let needle = method.trim().to_ascii_lowercase();
         if needle.is_empty() {
             return None;
         }
@@ -4552,24 +4552,24 @@ impl World {
         };
 
         let mut parts = trimmed.split_whitespace();
-        let verb = parts.next().unwrap_or("help").to_ascii_lowercase();
+        let method = parts.next().unwrap_or("help").to_ascii_lowercase();
 
         if object_id == "closet" {
-            if matches!(verb.as_str(), "take" | "pickup" | "hold" | "drop" | "open" | "close") {
+            if matches!(method.as_str(), "take" | "pickup" | "hold" | "drop" | "open" | "close") {
                 return Some((
                     "@closet is fixed in the lobby and cannot be moved.".to_string(),
                     room_name.to_string(),
                 ));
             }
 
-            if matches!(verb.as_str(), "help" | "hjelp") {
+            if matches!(method.as_str(), "help" | "hjelp") {
                 return Some((
                     format!("{} commands: {}", object_label, CLOSET_COMMANDS_INLINE),
                     room_name.to_string(),
                 ));
             }
 
-            if matches!(verb.as_str(), "show" | "status" | "look") {
+            if matches!(method.as_str(), "show" | "status" | "look") {
                 let listeners = self.closet_sessions.read().await.len_any();
                 return Some((
                     format!(
@@ -4590,12 +4590,12 @@ impl World {
             let objects = self.room_objects.read().await;
             let room_map = objects.get(room_name)?;
             let object = room_map.get(&object_id)?;
-            Self::lookup_object_verb_definition(object, &verb)
+            Self::lookup_object_method_definition(object, &method)
                 .map(|entry| entry.requirements)
                 .unwrap_or_default()
         };
 
-        let cap_verb = match verb.as_str() {
+        let cap_verb = match method.as_str() {
             "pickup" | "hold" => "take",
             "status" | "look" => "show",
             other => other,
@@ -4709,20 +4709,20 @@ impl World {
             let objects = self.room_objects.read().await;
             let room_map = objects.get(room_name)?;
             let object = room_map.get(&object_id)?;
-            Self::lookup_object_print_verb(object, &verb, sender_profile)
+            Self::lookup_object_print_method(object, &method, sender_profile)
         };
         if let Some(output) = declarative {
             return Some((output, room_name.to_string()));
         }
 
-        if verb == "help" {
+        if method == "help" {
             return Some((
                 format!("{} commands: {}", object_label, MAILBOX_COMMANDS_INLINE),
                 room_name.to_string(),
             ));
         }
 
-        if verb == "set" {
+        if method == "set" {
             let sub = parts.next().unwrap_or_default().to_ascii_lowercase();
             let rest = parts.collect::<Vec<_>>().join(" ");
             let value = rest.trim();
@@ -4857,7 +4857,7 @@ impl World {
             ));
         }
 
-        if verb == "show" || verb == "status" || verb == "look" {
+        if method == "show" || method == "status" || method == "look" {
             let (device_name, device_kind, object_did, cid, holder, opened_by, durable, persistence, durable_inbox_messages, ephemeral_inbox_messages, outbound_messages) = {
                 let objects = self.room_objects.read().await;
                 let room_map = objects.get(room_name)?;
@@ -4893,7 +4893,7 @@ impl World {
             ));
         }
 
-        if verb == "take" || verb == "pickup" || verb == "hold" {
+        if method == "take" || method == "pickup" || method == "hold" {
             let mut objects = self.room_objects.write().await;
             let room_map = objects.get_mut(room_name)?;
             let device = room_map.get_mut(&object_id)?;
@@ -4907,7 +4907,7 @@ impl World {
             return Some((format!("You pick up @{}.", device.name), room_name.to_string()));
         }
 
-        if verb == "drop" {
+        if method == "drop" {
             let mut objects = self.room_objects.write().await;
             let room_map = objects.get_mut(room_name)?;
             let device = room_map.get_mut(&object_id)?;
@@ -4924,7 +4924,7 @@ impl World {
             return Some((format!("You drop @{}.", device.name), room_name.to_string()));
         }
 
-        if verb == "open" {
+        if method == "open" {
             let mut objects = self.room_objects.write().await;
             let room_map = objects.get_mut(room_name)?;
             let device = room_map.get_mut(&object_id)?;
@@ -4943,7 +4943,7 @@ impl World {
             return Some((format!("@{} opened for {}", device.name, caller_root), room_name.to_string()));
         }
 
-        if verb == "close" {
+        if method == "close" {
             let mut objects = self.room_objects.write().await;
             let room_map = objects.get_mut(room_name)?;
             let device = room_map.get_mut(&object_id)?;
@@ -4957,7 +4957,7 @@ impl World {
             return Some((format!("@{} closed.", device.name), room_name.to_string()));
         }
 
-        if verb == "flush" {
+        if method == "flush" {
             let object_name = {
                 let objects = self.room_objects.read().await;
                 let room_map = objects.get(room_name)?;
@@ -4986,7 +4986,7 @@ impl World {
             });
         }
 
-        if verb == "list" {
+        if method == "list" {
             let items = self.list_knocks(true).await;
             if items.is_empty() {
                 return Some((format!("{} has no pending knock requests", object_label), room_name.to_string()));
@@ -5001,7 +5001,7 @@ impl World {
             return Some((format!("{} pending:\n{}", object_label, lines.join("\n")), room_name.to_string()));
         }
 
-        if verb == "pop" {
+        if method == "pop" {
             let popped = self.pop_object_inbox_message(room_name, &object_id).await;
             return Some(match popped {
                 Some(message) => {
@@ -5031,7 +5031,7 @@ impl World {
             });
         }
 
-        if verb == "ask" {
+        if method == "ask" {
             let args = trimmed
                 .strip_prefix("ask")
                 .map(str::trim)
@@ -5080,7 +5080,7 @@ impl World {
             ));
         }
 
-        if verb == "retry" {
+        if method == "retry" {
             let Some(request_id) = parts.next() else {
                 return Some((format!("usage: {} retry <request_id>", object_label), room_name.to_string()));
             };
@@ -5102,7 +5102,7 @@ impl World {
             });
         }
 
-        if verb == "reply" {
+        if method == "reply" {
             let args = trimmed
                 .strip_prefix("reply")
                 .map(str::trim)
@@ -5154,7 +5154,7 @@ impl World {
             ));
         }
 
-        if verb == "pending" {
+        if method == "pending" {
             let summary = {
                 let mut objects = self.room_objects.write().await;
                 let room_map = objects.get_mut(room_name)?;
@@ -5195,7 +5195,7 @@ impl World {
             return Some((summary, room_name.to_string()));
         }
 
-        if verb == "accept" {
+        if method == "accept" {
             let Some(id_raw) = parts.next() else {
                 return Some((format!("usage: {} accept <id>", object_label), room_name.to_string()));
             };
@@ -5212,7 +5212,7 @@ impl World {
             ));
         }
 
-        if verb == "reject" {
+        if method == "reject" {
             let Some(id_raw) = parts.next() else {
                 return Some((format!("usage: {} reject <id> [note]", object_label), room_name.to_string()));
             };
@@ -5233,7 +5233,7 @@ impl World {
             ));
         }
 
-        if verb == "invite" {
+        if method == "invite" {
             let Some(target_did_raw) = parts.next() else {
                 return Some((format!("usage: {} invite <did> [note]", object_label), room_name.to_string()));
             };
@@ -5391,7 +5391,7 @@ impl World {
                             "fragment" => (target_fragment_display, room_name.to_string()),
                             "lang" | "language" => (target_avatar.language_order.clone(), room_name.to_string()),
                             _ => (
-                                format!("@avatar unknown property '{}'. Allowed: name, description, owner, fragment, lang", key),
+                                format!("@avatar unknown attribute '{}'. Allowed: name, description, owner, fragment, lang", key),
                                 room_name.to_string(),
                             ),
                         };
@@ -5445,7 +5445,7 @@ impl World {
                         }
                         _ => {
                             return (
-                                format!("@avatar unknown property '{}'. Allowed: name, description, owner, fragment, lang", key),
+                                format!("@avatar unknown attribute '{}'. Allowed: name, description, owner, fragment, lang", key),
                                 room_name.to_string(),
                             );
                         }
@@ -5819,10 +5819,10 @@ impl World {
         }
 
         let mut parts = normalized.splitn(2, char::is_whitespace);
-        let verb = parts.next().unwrap_or_default().to_ascii_lowercase();
+        let method = parts.next().unwrap_or_default().to_ascii_lowercase();
         let arg = parts.next().unwrap_or_default().trim().to_string();
 
-        if verb == "prop" {
+        if method == "prop" {
             let (path, value) = split_prop_args(&arg);
             if path.is_empty() {
                 return "@world usage: @world.<owner|did|rooms|lang_cid> [value]".to_string();
@@ -5880,7 +5880,7 @@ impl World {
                     }
                     _ => {
                         return format!(
-                            "@world unknown property '{}'. Allowed: owner, did, rooms, lang_cid",
+                            "@world unknown attribute '{}'. Allowed: owner, did, rooms, lang_cid",
                             path
                         )
                     }
@@ -5915,7 +5915,7 @@ impl World {
                 }
                 _ => {
                     return format!(
-                        "@world unknown property '{}'. Allowed: owner, did, rooms, lang_cid",
+                        "@world unknown attribute '{}'. Allowed: owner, did, rooms, lang_cid",
                         path
                     )
                 }
@@ -5925,7 +5925,7 @@ impl World {
         // Command tokens are world/realm-defined and intentionally invariant.
         // Localized input aliases (e.g. "grave" -> "dig") belong in actor/client.
 
-        if verb == "list" {
+        if method == "list" {
             let rooms = self.rooms.read().await;
             if rooms.is_empty() {
                 return tr_world(active_lang, "world.list.empty", "@world objects: (none)");
@@ -5949,7 +5949,7 @@ impl World {
         let caller_root_did = from_did.without_fragment().id();
 
         // @@claim — set world owner to caller DID if unclaimed.
-        if verb == "claim" {
+        if method == "claim" {
             let current_owner = self.owner_did.read().await.clone();
             if let Some(owner) = current_owner {
                 if owner == caller_root_did {
@@ -5982,7 +5982,7 @@ impl World {
             );
         }
 
-        if verb == "knock" {
+        if method == "knock" {
             let mut parts = arg.split_whitespace();
             let sub = parts.next().unwrap_or("list").to_ascii_lowercase();
             if sub == "list" {
@@ -6065,7 +6065,7 @@ impl World {
                 .to_string();
         }
 
-        if verb == "invite" {
+        if method == "invite" {
             let mut parts = arg.split_whitespace();
             let Some(target_did_raw) = parts.next() else {
                 return "@world usage: @@invite <did> [note]".to_string();
@@ -6093,7 +6093,7 @@ impl World {
             );
         }
 
-        if verb == "flush" {
+        if method == "flush" {
             let scope = arg.trim().to_ascii_lowercase();
             if scope.is_empty() || scope == "all" {
                 let knocks = self.flush_knock_inbox().await;
@@ -6111,7 +6111,7 @@ impl World {
             return "@world usage: @@flush [knock|closet|all]".to_string();
         }
 
-        if verb == "migrate-index" {
+        if method == "migrate-index" {
             let room_names = {
                 let rooms = self.rooms.read().await;
                 let mut names = rooms.keys().cloned().collect::<Vec<_>>();
@@ -6137,7 +6137,7 @@ impl World {
             }
         }
 
-        if verb == "save" {
+        if method == "save" {
             match self.save_encrypted_state().await {
                 Ok((state_cid, root_cid)) => {
                     return format!(
@@ -6151,7 +6151,7 @@ impl World {
             }
         }
 
-        if verb == "load" {
+        if method == "load" {
             if arg.is_empty() {
                 return "@world usage: @@load <cid>".to_string();
             }
@@ -6168,7 +6168,7 @@ impl World {
             }
         }
 
-        if verb == "dig" {
+        if method == "dig" {
             if arg.is_empty() {
                 return "@world usage: @@dig <direction> [to|til <#dest|did:ma:...#room>]".to_string();
             }
@@ -6245,7 +6245,7 @@ impl World {
             return format!("@world exit '{}' dug from '{}' → '{}'", exit_name, room_name, exit_target);
         }
 
-        if verb == "room" {
+        if method == "room" {
             // @@room <name> acl show|open|close|allow <did>|deny <did>
             // World-owner admin override for room-level ACLs.
             // Does NOT automatically bypass the ACL — caller must change it explicitly.

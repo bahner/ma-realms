@@ -326,7 +326,7 @@ export function createWorldDispatchFlow({
             const response = await closetCommandForCurrentWorld(closetInput);
             renderClosetResponse(response);
           } else {
-            appendMessage('system', 'Active closet session. Use closet <command> (for example: closet help).');
+            appendMessage('system', 'Active closet session. Use dot commands (for example: avatar.peek, avatar.name bahner, actor.peek, actor.apply).');
           }
           return;
         }

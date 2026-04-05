@@ -69,11 +69,11 @@ fn unquote(s: &str) -> String {
     }
 }
 
-fn split_verb_arg(input: &str) -> (String, String) {
+fn split_method_arg(input: &str) -> (String, String) {
     let mut parts = input.splitn(2, char::is_whitespace);
-    let verb = parts.next().unwrap_or_default().to_ascii_lowercase();
+    let method = parts.next().unwrap_or_default().to_ascii_lowercase();
     let arg = parts.next().unwrap_or_default().trim().to_string();
-    (verb, arg)
+    (method, arg)
 }
 
 // ─── Built-in commands ──────────────────────────────────────────────────────
@@ -131,16 +131,16 @@ fn cmd_show(ctx: &RoomActorContext<'_>) -> RoomActorResult {
     none_result(format!("@here '{}': did={} owner={}", ctx.room_name, did, owner))
 }
 
-fn cmd_invite_deny_kick(verb: &str, arg: &str, ctx: &RoomActorContext<'_>) -> RoomActorResult {
+fn cmd_invite_deny_kick(method: &str, arg: &str, ctx: &RoomActorContext<'_>) -> RoomActorResult {
     if !ctx.room_exists { return room_not_found(ctx); }
     if !is_owner(ctx) {
-        return none_result(format!("@here only the room owner can run /{} in '{}'", verb, ctx.room_name));
+        return none_result(format!("@here only the room owner can run /{} in '{}'", method, ctx.room_name));
     }
     if arg.is_empty() {
-        let usage = if verb == "kick" { "kick <handle>" } else { "invite <did> | deny <did>" };
+        let usage = if method == "kick" { "kick <handle>" } else { "invite <did> | deny <did>" };
         return none_result(format!("@here usage: @here {}", usage));
     }
-    match verb {
+    match method {
         "invite" => RoomActorResult {
             response: format!("@here {} invited to '{}'", arg, ctx.room_name),
             action: RoomActorAction::Invite { did: arg.to_string() },
@@ -153,7 +153,7 @@ fn cmd_invite_deny_kick(verb: &str, arg: &str, ctx: &RoomActorContext<'_>) -> Ro
             response: format!("@here {} was kicked from '{}'", arg, ctx.room_name),
             action: RoomActorAction::Kick { handle: arg.to_string() },
         },
-        _ => none_result(format!("@here unknown command: {}", verb)),
+        _ => none_result(format!("@here unknown command: {}", method)),
     }
 }
 
@@ -257,10 +257,10 @@ pub fn execute_room_actor_command(command: &str, ctx: &RoomActorContext<'_>) -> 
         return cmd_help(ctx);
     }
 
-    let (verb, arg) = split_verb_arg(normalized);
+    let (method, arg) = split_method_arg(normalized);
 
     // Query commands (read-only, no permissions beyond room existence).
-    match verb.as_str() {
+    match method.as_str() {
         "who" | "actors" => return cmd_who(ctx),
         "l" | "list"     => return cmd_list(ctx),
         "acl"            => return cmd_acl(ctx),
@@ -270,8 +270,8 @@ pub fn execute_room_actor_command(command: &str, ctx: &RoomActorContext<'_>) -> 
     }
 
     // Mutation commands (require owner).
-    match verb.as_str() {
-        "invite" | "deny" | "kick" => return cmd_invite_deny_kick(&verb, &arg, ctx),
+    match method.as_str() {
+        "invite" | "deny" | "kick" => return cmd_invite_deny_kick(&method, &arg, ctx),
         "dig"                      => return cmd_dig(&arg, ctx),
         "set"                      => return cmd_set(&arg, ctx),
         _ => {}
@@ -281,7 +281,7 @@ pub fn execute_room_actor_command(command: &str, ctx: &RoomActorContext<'_>) -> 
     // When Lua/Guile evaluators are integrated, this is where user-defined
     // verbs would be dispatched, e.g.:
     //
-    //   if let Some(result) = ctx.try_evaluator_command(&verb, &arg) {
+    //   if let Some(result) = ctx.try_evaluator_command(&method, &arg) {
     //       return result;
     //   }
 

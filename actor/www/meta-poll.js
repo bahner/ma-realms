@@ -13,8 +13,8 @@ export function createDidTargetMetaPollHandler(deps) {
   } = deps;
 
   function normalizeMetaPollVerb(input) {
-    const verb = String(input || '').trim().toLowerCase();
-    if (verb === 'poll') {
+    const token = String(input || '').trim().toLowerCase();
+    if (token === 'poll') {
       return 'poll';
     }
     return '';
@@ -27,8 +27,8 @@ export function createDidTargetMetaPollHandler(deps) {
     }
 
     const [verbRaw] = trimmedRemainder.split(/\s+/, 1);
-    const verb = normalizeMetaPollVerb(verbRaw);
-    if (!verb) {
+    const metaCommand = normalizeMetaPollVerb(verbRaw);
+    if (!metaCommand) {
       return false;
     }
 

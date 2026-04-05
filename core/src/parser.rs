@@ -95,14 +95,17 @@ pub fn parse_message(input: &str) -> MessageEnvelope {
         let target = canonical_target(&target_base);
 
         if let Some(path) = target_path {
-            let prop_cmd = if command.is_empty() {
+            // Dotted target paths map to attribute access on the target actor.
+            let attribute_cmd = if command.is_empty() {
                 format!("prop {}", path)
             } else {
                 format!("prop {} {}", path, command)
             };
             return MessageEnvelope::ActorCommand {
                 target,
-                command: ActorCommand::Raw { command: prop_cmd },
+                command: ActorCommand::Raw {
+                    command: attribute_cmd,
+                },
             };
         }
 

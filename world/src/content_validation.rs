@@ -76,9 +76,9 @@ pub fn validate_object_definition(definition: &ObjectDefinition, cid: &str) -> R
         return Ok(());
     }
 
-    let has_help = definition.verbs.iter().any(|verb| {
-        verb.name.trim().eq_ignore_ascii_case("help")
-            || verb
+    let has_help = definition.verbs.iter().any(|method_entry| {
+        method_entry.name.trim().eq_ignore_ascii_case("help")
+            || method_entry
                 .aliases
                 .iter()
                 .any(|alias| alias.trim().eq_ignore_ascii_case("help"))
@@ -86,20 +86,20 @@ pub fn validate_object_definition(definition: &ObjectDefinition, cid: &str) -> R
 
     if !has_help {
         return Err(anyhow!(
-            "object definition at CID {} declares methods but no help verb/alias",
+            "object definition at CID {} declares methods but no help method/alias",
             cid
         ));
     }
 
-    for verb in &definition.verbs {
-        if verb.requirements.is_empty() {
+    for method_entry in &definition.verbs {
+        if method_entry.requirements.is_empty() {
             continue;
         }
-        let set = RequirementSet::parse_many(&verb.requirements).map_err(|e| {
+        let set = RequirementSet::parse_many(&method_entry.requirements).map_err(|e| {
             anyhow!(
-                "invalid requirements in object definition {} for verb '{}': {}",
+                "invalid requirements in object definition {} for method '{}': {}",
                 cid,
-                verb.name,
+                method_entry.name,
                 e
             )
         })?;
@@ -111,9 +111,9 @@ pub fn validate_object_definition(definition: &ObjectDefinition, cid: &str) -> R
                 .map(|issue| issue.message.clone())
                 .unwrap_or_else(|| "unknown requirements validation error".to_string());
             return Err(anyhow!(
-                "invalid requirements in object definition {} for verb '{}': {}",
+                "invalid requirements in object definition {} for method '{}': {}",
                 cid,
-                verb.name,
+                method_entry.name,
                 first
             ));
         }

@@ -6,9 +6,16 @@ Shared actor library for the ma stack — message parsing, protocol types, room 
 
 ### Message Parsing (`parser`)
 
-- `MessageEnvelope`: normalized representation of user input (verb, target, body, raw text)
+- `MessageEnvelope`: normalized representation of user input (method token, target, payload, raw text)
 - `parse_message()`: top-level parser that classifies input as room commands, actor messages, or spoken text
 - Canonical command parsing without hardcoded per-language alias tables
+
+Terminology used in parser/docs:
+
+- `method` = command token/action name after routing (for example `show`, `apply`, `invite`)
+- `attribute` = dotted field/member on a target actor/object (for example `avatar.name`)
+- `path` = multi-segment dotted selector for nested data access (for example `document.ma.transports`)
+- `verb` = reserved for natural-language interpretation layers; avoid using it for scripted command paths
 
 ### Protocol Types (`protocol`)
 
