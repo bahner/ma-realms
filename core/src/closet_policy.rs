@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Result};
 use did_ma::Did;
 
+const CANT_PUBLISH_SECRET_KEY_MISSING: &str = "Can't publish. Secret key missing.";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClosetDidPublishPlan {
     ImportProvidedKey,
@@ -50,7 +52,7 @@ pub fn ensure_issued_document_root_match(issued_did: &str, document_root: &str) 
 
 pub fn plan_closet_did_publish(
     provided_key: &str,
-    document_root: &str,
+    _document_root: &str,
     was_published_before: Option<bool>,
     local_key_name: Option<String>,
 ) -> Result<ClosetDidPublishPlan> {
@@ -64,15 +66,10 @@ pub fn plan_closet_did_publish(
 
     match was_published_before {
         Some(true) => {
-            return Err(anyhow!(
-                "DID appears previously published, but no matching local IPNS key found for DID root '{}'; provide ipns_private_key_base64",
-                document_root
-            ));
+            return Err(anyhow!(CANT_PUBLISH_SECRET_KEY_MISSING));
         }
         _ => {
-            return Err(anyhow!(
-                "ipns_private_key_base64 is required for first DID publish in closet session"
-            ));
+            return Err(anyhow!(CANT_PUBLISH_SECRET_KEY_MISSING));
         }
     }
 }
@@ -104,8 +101,7 @@ mod tests {
         let err = plan_closet_did_publish("", "did:ma:k51qzi5uqu5example", Some(false), None)
             .expect_err("expected missing key error");
         assert!(
-            err.to_string()
-                .contains("ipns_private_key_base64 is required for first DID publish"),
+            err.to_string().contains("Can't publish. Secret key missing."),
             "unexpected error: {}",
             err
         );

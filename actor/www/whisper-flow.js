@@ -6,8 +6,10 @@ export function createWhisperFlow({
   findDidByEndpoint,
   fetchDidDocumentJsonByDid,
   sendWorldWhisper,
+  sendWorldWhisperWithTtl,
+  getMessageTtl,
 }) {
-  async function sendWhisperToDid(targetDidOrAlias, text) {
+  async function sendWhisperToDid(targetDidOrAlias, text, options = {}) {
     if (!state.identity || !state.currentHome) {
       throw new Error('Join a home before sending chat.');
     }
@@ -31,14 +33,24 @@ export function createWhisperFlow({
     }
 
     const recipientDocumentJson = await fetchDidDocumentJsonByDid(targetDid);
+    const temporaryOverride = Number(state.temporaryMessageTtlOverride);
+    const ttlOverride = options && Object.prototype.hasOwnProperty.call(options, 'ttlSeconds')
+      ? Number(options.ttlSeconds)
+      : null;
+    const ttlSeconds = Number.isFinite(ttlOverride) && ttlOverride >= 0
+      ? Math.floor(ttlOverride)
+      : Number.isFinite(temporaryOverride) && temporaryOverride >= 0
+        ? Math.floor(temporaryOverride)
+      : Number(getMessageTtl('whisper'));
     const result = JSON.parse(
-      await sendWorldWhisper(
+      await sendWorldWhisperWithTtl(
         state.currentHome.endpointId,
         state.passphrase,
         state.encryptedBundle,
         state.aliasName,
         recipientDocumentJson,
-        text
+        text,
+        BigInt(ttlSeconds)
       )
     );
 

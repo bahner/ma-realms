@@ -868,9 +868,7 @@ export function createClosetFlow({
           }
         } catch (publishErr) {
           const detail = publishErr instanceof Error ? publishErr.message : String(publishErr);
-          throw new Error(
-            `Existing DID publish/update failed (${detail}). Not issuing a new DID. Provide the matching ipns_private_key_base64 for this DID if required, or run document.apply with the key.`
-          );
+          throw new Error(detail || 'Closet apply failed.');
         }
       }
 
@@ -947,9 +945,7 @@ export function createClosetFlow({
               message: `${message}\nBackground publish is still pending (TTL ${secondsLeft}s). You can continue and use go out.`
             };
           }
-          throw new Error(
-            `${message || 'Closet apply failed.'} Provide the matching ipns_private_key_base64 for this DID if required, or run document.apply with the key.`
-          );
+          throw new Error(message || 'Closet apply failed.');
         }
         const didForCache = didRoot(String(response.did || state.identity?.did || state.closetSessionDid || ''));
         if (didForCache) {

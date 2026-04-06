@@ -14,6 +14,15 @@ export function createDotCommands({
   setLogLevel,
   setDialogIdStyle,
   setAliasRewriteEnabled,
+  setMessageTtl,
+  getMessageTtl,
+  setTemporaryMessageTtlOverride,
+  clearTemporaryMessageTtlOverride,
+  getTemporaryMessageTtlOverride,
+  setBatchTimeoutSeconds,
+  setBatchRetryCount,
+  runBatchCommands,
+  batchStatusLine,
   onAliasBookChanged,
   didRoot,
   resolveTargetDidRoot,
@@ -106,6 +115,13 @@ export function createDotCommands({
       appendSystemUi('  .log.enabled [true|false]  - get/set console logging enabled', '  .log.enabled [true|false]  - hent/sett om konsoll-logging er aktiv');
       appendSystemUi('  .log.level [warn|info|debug|error] - get/set console log level', '  .log.level [warn|info|debug|error] - hent/sett loggnivå i konsoll');
       appendSystemUi('  .dialog.id [alias|fragment|did] - get/set DID rendering in dialog', '  .dialog.id [alias|fragment|did] - hent/sett DID-visning i dialog');
+      appendSystemUi('  .msg.ttl                    - show actor message TTL defaults', '  .msg.ttl                    - vis standard TTL for actor-meldinger');
+      appendSystemUi('  .msg.ttl <chat|cmd|whisper> <seconds> - set default TTL per message type', '  .msg.ttl <chat|cmd|whisper> <sekunder> - sett standard TTL per meldingstype');
+      appendSystemUi('  .ttl [seconds]              - show/set temporary TTL override for outgoing messages', '  .ttl [sekunder]             - vis/sett midlertidig TTL-override for utgående meldinger');
+      appendSystemUi('  .ttl.unset                  - clear temporary TTL override and use defaults', '  .ttl.unset                  - fjern midlertidig TTL-override og bruk standardverdier');
+      appendSystemUi('  .batch.start <seconds>      - start collecting a local batch with per-command timeout', '  .batch.start <sekunder>     - start innsamling av lokal batch med timeout per kommando');
+      appendSystemUi('  .batch.retry <count>        - set retries per batch command', '  .batch.retry <antall>       - sett retry per batch-kommando');
+      appendSystemUi('  .batch                      - run collected batch (fail-fast)', '  .batch                      - kjør innsamlet batch (stopp ved feil)');
       appendSystemUi('Gameplay (bare, no prefix):', 'Gameplay (bart, uten prefiks):');
       appendSystemUi('  go did:ma:<world>#<room>   - connect when currently disconnected', '  go did:ma:<world>#<room>   - koble til når du er frakoblet');
       appendMessage('system', '  pick up <object>           - pick up object before open/list/accept actions');
@@ -344,6 +360,99 @@ export function createDotCommands({
         return true;
       }
       setLogLevel(level);
+      return true;
+    }
+
+    if (dotCommand === 'msg.ttl') {
+      if (args.length === 0) {
+        appendMessage('system', `actor.msg.chat.ttl ${getMessageTtl('chat')}`);
+        appendMessage('system', `actor.msg.cmd.ttl ${getMessageTtl('cmd')}`);
+        appendMessage('system', `actor.msg.whisper.ttl ${getMessageTtl('whisper')}`);
+        return true;
+      }
+
+      if (args.length !== 2) {
+        appendMessage('system', 'Usage: .msg.ttl <chat|cmd|whisper> <seconds>');
+        return true;
+      }
+
+      const kind = String(args[0] || '').trim().toLowerCase();
+      const ttlRaw = String(args[1] || '').trim();
+      if (!/^\d+$/.test(ttlRaw)) {
+        appendMessage('system', 'Usage: .msg.ttl <chat|cmd|whisper> <seconds>');
+        return true;
+      }
+
+      const ok = setMessageTtl(kind, Number(ttlRaw));
+      if (!ok) {
+        appendMessage('system', 'Usage: .msg.ttl <chat|cmd|whisper> <seconds>');
+      }
+      return true;
+    }
+
+    if (dotCommand === 'ttl') {
+      if (args.length === 0) {
+        const current = getTemporaryMessageTtlOverride();
+        appendMessage('system', current === null ? '.ttl unset' : `.ttl ${current}`);
+        return true;
+      }
+
+      if (args.length !== 1) {
+        appendMessage('system', 'Usage: .ttl [seconds] | .ttl.unset');
+        return true;
+      }
+
+      const ttlRaw = String(args[0] || '').trim();
+      if (!/^\d+$/.test(ttlRaw)) {
+        appendMessage('system', 'Usage: .ttl [seconds] | .ttl.unset');
+        return true;
+      }
+
+      const ok = setTemporaryMessageTtlOverride(Number(ttlRaw));
+      if (!ok) {
+        appendMessage('system', 'Usage: .ttl [seconds] | .ttl.unset');
+      }
+      return true;
+    }
+
+    if (dotCommand === 'ttl.unset') {
+      clearTemporaryMessageTtlOverride();
+      return true;
+    }
+
+    if (dotCommand === 'batch.start') {
+      if (args.length !== 1 || !/^\d+$/.test(String(args[0] || '').trim())) {
+        appendMessage('system', 'Usage: .batch.start <seconds>');
+        return true;
+      }
+      const ok = setBatchTimeoutSeconds(Number(args[0]));
+      if (!ok) {
+        appendMessage('system', 'Usage: .batch.start <seconds>');
+      }
+      return true;
+    }
+
+    if (dotCommand === 'batch.retry') {
+      if (args.length !== 1 || !/^\d+$/.test(String(args[0] || '').trim())) {
+        appendMessage('system', 'Usage: .batch.retry <count>');
+        return true;
+      }
+      const ok = setBatchRetryCount(Number(args[0]));
+      if (!ok) {
+        appendMessage('system', 'Usage: .batch.retry <count>');
+      }
+      return true;
+    }
+
+    if (dotCommand === 'batch') {
+      if (args.length !== 0) {
+        appendMessage('system', 'Usage: .batch');
+        return true;
+      }
+      appendMessage('system', batchStatusLine());
+      Promise.resolve(runBatchCommands()).catch((error) => {
+        appendMessage('system', error instanceof Error ? error.message : String(error));
+      });
       return true;
     }
 

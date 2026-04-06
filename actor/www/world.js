@@ -273,7 +273,10 @@ export function createWorldDispatchFlow({
   resolveCommandTargetDidOrToken,
   logger,
   sendWorldChat,
+  sendWorldChatWithTtl,
   sendWorldCmd,
+  sendWorldCmdWithTtl,
+  getMessageTtl,
   pollCurrentHomeEvents,
   appendAmbientProseAfterSpeech,
   renderLocalBroadcastMessage,
@@ -283,6 +286,18 @@ export function createWorldDispatchFlow({
   isNotRegisteredInRoomMessage,
   performTransparentReentry,
 }) {
+  function resolveTtlSeconds(kind) {
+    const temporary = Number(state.temporaryMessageTtlOverride);
+    if (Number.isFinite(temporary) && temporary >= 0) {
+      return Math.floor(temporary);
+    }
+    const configured = Number(getMessageTtl(kind));
+    if (Number.isFinite(configured) && configured >= 0) {
+      return Math.floor(configured);
+    }
+    return 60;
+  }
+
   function resolveWorldConnectTarget(rawTarget) {
     const target = String(rawTarget || '').trim();
     if (!target) {
@@ -422,13 +437,14 @@ export function createWorldDispatchFlow({
     }
 
     const result = JSON.parse(
-      await sendWorldCmd(
+      await sendWorldCmdWithTtl(
         state.currentHome.endpointId,
         state.passphrase,
         state.encryptedBundle,
         activeActorName(),
         state.currentHome.room,
-        commandText
+        commandText,
+        BigInt(resolveTtlSeconds('cmd'))
       )
     );
 
@@ -574,7 +590,7 @@ export function createWorldDispatchFlow({
           if (!isMaDid(String(targetDid))) {
             throw new Error(`Fragment target must resolve to did:ma, got: ${targetDid}`);
           }
-          await sendWhisperToDid(targetDid, payload);
+          await sendWhisperToDid(targetDid, payload, { ttlSeconds: resolveTtlSeconds('whisper') });
           appendMessage('system', `Chat sent to ${targetDid}.`);
           return;
         } catch (err) {
@@ -589,13 +605,14 @@ export function createWorldDispatchFlow({
         logger.log('send.chat', `room=${state.currentHome.room} actor=${activeActorName()} msg_len=${payload.length}`);
 
         const result = JSON.parse(
-          await sendWorldChat(
+          await sendWorldChatWithTtl(
             state.currentHome.endpointId,
             state.passphrase,
             state.encryptedBundle,
             activeActorName(),
             state.currentHome.room,
-            payload
+            payload,
+            BigInt(resolveTtlSeconds('chat'))
           )
         );
         const elapsed = Date.now() - sendStart;
@@ -624,7 +641,7 @@ export function createWorldDispatchFlow({
             if (!isMaDid(String(targetDid))) {
               throw new Error(`Whisper target must resolve to did:ma, got: ${targetDid}`);
             }
-            await sendWhisperToDid(targetDid, payload);
+            await sendWhisperToDid(targetDid, payload, { ttlSeconds: resolveTtlSeconds('whisper') });
             appendMessage('system', `Chat sent to ${targetDid}.`);
             return;
           } catch (err) {
@@ -664,13 +681,14 @@ export function createWorldDispatchFlow({
           const sendStart = Date.now();
           logger.log('send.command', `room=${state.currentHome.room} actor=${activeActorName()} msg_len=${normalizedInput.length}`);
           const result = JSON.parse(
-            await sendWorldCmd(
+            await sendWorldCmdWithTtl(
               state.currentHome.endpointId,
               state.passphrase,
               state.encryptedBundle,
               activeActorName(),
               state.currentHome.room,
-              normalizedInput
+              normalizedInput,
+              BigInt(resolveTtlSeconds('cmd'))
             )
           );
           const elapsed = Date.now() - sendStart;
@@ -706,13 +724,14 @@ export function createWorldDispatchFlow({
         const sendStart = Date.now();
         logger.log('send.command', `room=${state.currentHome.room} actor=${activeActorName()} msg_len=${trimmed.length}`);
         const result = JSON.parse(
-          await sendWorldCmd(
+          await sendWorldCmdWithTtl(
             state.currentHome.endpointId,
             state.passphrase,
             state.encryptedBundle,
             activeActorName(),
             state.currentHome.room,
-            normalized
+            normalized,
+            BigInt(resolveTtlSeconds('cmd'))
           )
         );
         const elapsed = Date.now() - sendStart;
@@ -735,13 +754,14 @@ export function createWorldDispatchFlow({
       logger.log('send.command', `room=${state.currentHome.room} actor=${activeActorName()} msg_len=${trimmedText.length}`);
 
       const result = JSON.parse(
-        await sendWorldCmd(
+        await sendWorldCmdWithTtl(
           state.currentHome.endpointId,
           state.passphrase,
           state.encryptedBundle,
           activeActorName(),
           state.currentHome.room,
-          trimmedText
+          trimmedText,
+          BigInt(resolveTtlSeconds('cmd'))
         )
       );
       const elapsed = Date.now() - sendStart;

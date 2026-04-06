@@ -40,3 +40,4 @@ closet.session.active_since = closet session active since {$created_at}
 closet.citizenship.imported = citizenship imported
 closet.citizenship.prompt = Citizenship granted. Rebind your local identity to the returned DID and enter the world.
 closet.did.published = did document published at /ipfs/{$cid}
+closet.publish.secret_key_missing = Can't publish. Secret key missing.

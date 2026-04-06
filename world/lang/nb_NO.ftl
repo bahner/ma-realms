@@ -40,3 +40,4 @@ closet.session.active_since = skap-sesjon aktiv siden {$created_at}
 closet.citizenship.imported = borgerskap importert
 closet.citizenship.prompt = Borgerskap innvilget. Knytt lokal identitet til returnert DID og gå inn i verden.
 closet.did.published = DID-dokument publisert på /ipfs/{$cid}
+closet.publish.secret_key_missing = Kan ikke publisere. Hemmelig nøkkel mangler.

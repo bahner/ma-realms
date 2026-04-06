@@ -7976,7 +7976,25 @@ impl ProtocolHandler for ClosetProtocol {
                             .with_fragment(key_name.clone())
                             .with_key_name(key_name)
                         }
-                        Err(err) => ClosetResponse::err_unscoped(err.to_string()),
+                        Err(err) => {
+                            let detail = err.to_string();
+                            if detail == "Can't publish. Secret key missing." {
+                                let active_lang = self
+                                    .world
+                                    .closet_lang_for_session(&session_id, &requester_endpoint)
+                                    .await;
+                                ClosetResponse::err(
+                                    &session_id,
+                                    tr_world(
+                                        active_lang,
+                                        "closet.publish.secret_key_missing",
+                                        "Can't publish. Secret key missing.",
+                                    ),
+                                )
+                            } else {
+                                ClosetResponse::err_unscoped(detail)
+                            }
+                        }
                     }
                 }
                 Ok(ClosetRequest::Command { session_id, input }) => {

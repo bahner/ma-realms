@@ -12,8 +12,11 @@ import init, {
   enter_world,
   poll_world_events,
   send_world_chat,
+  send_world_chat_with_ttl,
   send_world_whisper,
+  send_world_whisper_with_ttl,
   send_world_cmd,
+  send_world_cmd_with_ttl,
   decode_chat_event_message,
   decode_whisper_event_message,
   start_inbox_listener,
@@ -109,6 +112,9 @@ const LOG_LEVEL_KEY = `${STORAGE_PREFIX}.logLevel`;
 const DIALOG_ID_STYLE_KEY = `${STORAGE_PREFIX}.dialogIdStyle`;
 const ALIAS_REWRITE_ENABLED_KEY = `${STORAGE_PREFIX}.aliasRewriteEnabled`;
 const ALIAS_RENDER_ENABLED_KEY = `${STORAGE_PREFIX}.aliasRenderEnabled`;
+const MSG_CHAT_TTL_KEY = `${STORAGE_PREFIX}.actor.msg.chat.ttl`;
+const MSG_CMD_TTL_KEY = `${STORAGE_PREFIX}.actor.msg.cmd.ttl`;
+const MSG_WHISPER_TTL_KEY = `${STORAGE_PREFIX}.actor.msg.whisper.ttl`;
 const LEGACY_BUNDLE_KEY = 'ma.identity.v2.bundle';
 const LAST_ROOM_KEY_PREFIX = `${STORAGE_PREFIX}.lastRoom`;
 const LAST_ACTIVE_HOME_KEY_PREFIX = `${STORAGE_PREFIX}.lastActiveHome`;
@@ -131,6 +137,9 @@ const LEGACY_LOCAL_EDIT_SCRIPT_CID_KEY = `${STORAGE_PREFIX}.localEditScriptCid`;
 
 const ROOM_POLL_INTERVAL_MS = 1500;
 const DID_DOC_CACHE_TTL_MS = 60_000;
+const DEFAULT_CHAT_TTL_SECONDS = 60;
+const DEFAULT_CMD_TTL_SECONDS = 60;
+const DEFAULT_WHISPER_TTL_SECONDS = 3660;
 
 const didRoot = createDidRoot(alias_did_root);
 
@@ -168,6 +177,19 @@ const state = {
   dialogIdStyle: 'alias',
   aliasRewriteEnabled: true,
   aliasRenderEnabled: true,
+  messageTtl: {
+    chat: DEFAULT_CHAT_TTL_SECONDS,
+    cmd: DEFAULT_CMD_TTL_SECONDS,
+    whisper: DEFAULT_WHISPER_TTL_SECONDS,
+  },
+  temporaryMessageTtlOverride: null,
+  batch: {
+    collecting: false,
+    running: false,
+    timeoutSeconds: 10,
+    retryCount: 0,
+    commands: [],
+  },
   aliasBook: {},
   currentHome: null,
   roomPollTimer: null,
@@ -206,7 +228,7 @@ const state = {
   lockOverlayAnimationId: 0,
   lockOverlayStarDrift: 0,
   lockOverlayShownAtMs: 0,
-  matrixLog: []
+  matrixLog: [],
 };
 
 let worldDispatchFlow = null;
@@ -508,6 +530,297 @@ function readStoredLogEnabledFlag() {
 
 function readStoredLogLevel() {
   return normalizeLogLevel(localStorage.getItem(LOG_LEVEL_KEY));
+}
+
+function normalizeMessageTtl(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return fallback;
+  }
+  return Math.floor(parsed);
+}
+
+function readStoredMessageTtl(key, fallback) {
+  const raw = localStorage.getItem(key);
+  return normalizeMessageTtl(raw, fallback);
+}
+
+function persistMessageTtl() {
+  localStorage.setItem(MSG_CHAT_TTL_KEY, String(state.messageTtl.chat));
+  localStorage.setItem(MSG_CMD_TTL_KEY, String(state.messageTtl.cmd));
+  localStorage.setItem(MSG_WHISPER_TTL_KEY, String(state.messageTtl.whisper));
+}
+
+function setMessageTtl(kind, ttlSeconds, announce = true) {
+  const normalizedKind = String(kind || '').trim().toLowerCase();
+  if (normalizedKind !== 'chat' && normalizedKind !== 'cmd' && normalizedKind !== 'whisper') {
+    return false;
+  }
+
+  const fallback = normalizedKind === 'chat'
+    ? DEFAULT_CHAT_TTL_SECONDS
+    : normalizedKind === 'cmd'
+      ? DEFAULT_CMD_TTL_SECONDS
+      : DEFAULT_WHISPER_TTL_SECONDS;
+  const next = normalizeMessageTtl(ttlSeconds, fallback);
+  state.messageTtl[normalizedKind] = next;
+  persistMessageTtl();
+  if (announce) {
+    appendMessage('system', `actor.msg.${normalizedKind}.ttl = ${next}`);
+  }
+  return true;
+}
+
+function getMessageTtl(kind) {
+  const normalizedKind = String(kind || '').trim().toLowerCase();
+  if (normalizedKind === 'chat') return state.messageTtl.chat;
+  if (normalizedKind === 'cmd') return state.messageTtl.cmd;
+  if (normalizedKind === 'whisper') return state.messageTtl.whisper;
+  return 60;
+}
+
+function setTemporaryMessageTtlOverride(ttlSeconds, announce = true) {
+  const parsed = Number(ttlSeconds);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return false;
+  }
+  state.temporaryMessageTtlOverride = Math.floor(parsed);
+  if (announce) {
+    appendMessage('system', `.ttl = ${state.temporaryMessageTtlOverride}`);
+  }
+  return true;
+}
+
+function clearTemporaryMessageTtlOverride(announce = true) {
+  state.temporaryMessageTtlOverride = null;
+  if (announce) {
+    appendMessage('system', '.ttl = unset');
+  }
+}
+
+function getTemporaryMessageTtlOverride() {
+  const value = Number(state.temporaryMessageTtlOverride);
+  if (!Number.isFinite(value) || value < 0) {
+    return null;
+  }
+  return Math.floor(value);
+}
+
+function batchStatusLine() {
+  const mode = state.batch.collecting ? 'collecting' : 'idle';
+  return `.batch mode=${mode} timeout=${state.batch.timeoutSeconds}s retry=${state.batch.retryCount} queued=${state.batch.commands.length}`;
+}
+
+function setBatchTimeoutSeconds(timeoutSeconds, announce = true) {
+  const parsed = Number(timeoutSeconds);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return false;
+  }
+  state.batch.timeoutSeconds = Math.floor(parsed);
+  state.batch.collecting = true;
+  state.batch.commands = [];
+  if (announce) {
+    appendMessage('system', `Batch started with timeout=${state.batch.timeoutSeconds}s.`);
+    appendMessage('system', batchStatusLine());
+  }
+  return true;
+}
+
+function setBatchRetryCount(retryCount, announce = true) {
+  const parsed = Number(retryCount);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return false;
+  }
+  state.batch.retryCount = Math.floor(parsed);
+  if (announce) {
+    appendMessage('system', `Batch retry=${state.batch.retryCount}.`);
+    appendMessage('system', batchStatusLine());
+  }
+  return true;
+}
+
+function queueBatchCommand(commandText) {
+  state.batch.commands.push(commandText);
+}
+
+function yamlScalar(value) {
+  if (value === null || value === undefined) {
+    return 'null';
+  }
+  if (typeof value === 'boolean') {
+    return value ? 'true' : 'false';
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return String(value);
+  }
+  const text = String(value);
+  if (/^[A-Za-z0-9._:\/-]+$/.test(text)) {
+    return text;
+  }
+  const escaped = text
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n');
+  return `"${escaped}"`;
+}
+
+function maRpcYaml(payload) {
+  const lines = ['---', 'ma:'];
+  for (const [key, value] of Object.entries(payload || {})) {
+    if (value === undefined) {
+      continue;
+    }
+    lines.push(`  ${key}: ${yamlScalar(value)}`);
+  }
+  return lines.join('\n');
+}
+
+function appendMaRpc(payload) {
+  const enriched = {
+    version: 1,
+    ...payload,
+  };
+  appendMessage('system', maRpcYaml(enriched));
+}
+
+function classifyRpcCode(message, status = 'failed') {
+  if (status === 'ok') {
+    return 'ok';
+  }
+  const text = String(message || '').trim().toLowerCase();
+  if (!text) return 'request_failed';
+  if (text.includes('timedout') || text.includes('timed out') || text.includes('timeout')) {
+    return 'timeout';
+  }
+  if (text.includes('not found') || text.includes('unknown actor') || text.includes('unknown actor or object')) {
+    return 'not_found';
+  }
+  if (text.includes('access denied') || text.includes('forbidden')) {
+    return 'forbidden';
+  }
+  if (text.includes('invalid') || text.includes('usage:')) {
+    return 'invalid_request';
+  }
+  if (text.includes("can't publish") || text.includes('publish failed')) {
+    return 'publish_failed';
+  }
+  return 'request_failed';
+}
+
+async function runBatchCommands() {
+  if (state.batch.running) {
+    appendMessage('system', 'Batch is already running.');
+    return;
+  }
+
+  const commands = state.batch.commands.slice();
+  if (!commands.length) {
+    appendMessage('system', 'Batch is empty.');
+    appendMessage('system', batchStatusLine());
+    return;
+  }
+
+  state.batch.collecting = false;
+  state.batch.running = true;
+  state.batch.commands = [];
+
+  const timeoutSeconds = Math.max(1, Number(state.batch.timeoutSeconds || 10));
+  const timeoutMs = timeoutSeconds * 1000;
+  const retryCount = Math.max(0, Number(state.batch.retryCount || 0));
+  const previousTemporaryTtl = getTemporaryMessageTtlOverride();
+  setTemporaryMessageTtlOverride(timeoutSeconds, false);
+
+  appendMessage('system', `Running batch: ${commands.length} command(s), timeout=${timeoutSeconds}s, retry=${retryCount}.`);
+  appendMaRpc({
+    status: 'ok',
+    code: 'batch_started',
+    content: 'batch started',
+    commandCount: commands.length,
+    timeout: timeoutSeconds,
+    retryMax: retryCount,
+  });
+
+  try {
+    for (let index = 0; index < commands.length; index += 1) {
+      const command = String(commands[index] || '').trim();
+      if (!command) {
+        continue;
+      }
+
+      let succeeded = false;
+      let lastError = '';
+      for (let attempt = 0; attempt <= retryCount; attempt += 1) {
+        const startedAtMs = Date.now();
+        try {
+          await withTimeout(
+            sendWithActiveTargetRequirementsIfNeeded(command),
+            timeoutMs,
+            'timedout'
+          );
+          succeeded = true;
+          appendMaRpc({
+            status: 'ok',
+            code: 'ok',
+            content: `message received and applied (${command})`,
+            command,
+            commandIndex: index + 1,
+            attempt: attempt + 1,
+            elapsedMs: Date.now() - startedAtMs,
+            retry: false,
+          });
+          break;
+        } catch (error) {
+          lastError = error instanceof Error ? error.message : String(error);
+          const willRetry = attempt < retryCount;
+          const code = classifyRpcCode(lastError, 'failed');
+          appendMaRpc({
+            status: 'failed',
+            code,
+            content: lastError || 'timedout',
+            command,
+            commandIndex: index + 1,
+            attempt: attempt + 1,
+            elapsedMs: Date.now() - startedAtMs,
+            retry: willRetry,
+            retryDelay: willRetry ? 1 : undefined,
+            retryMax: retryCount,
+          });
+          if (attempt < retryCount) {
+            appendMessage('system', `Batch retry ${attempt + 1}/${retryCount} for '${command}' after error: ${lastError}`);
+            await delay(1000);
+          }
+        }
+      }
+
+      if (!succeeded) {
+        throw new Error(`request failed with ${command}: ${lastError || 'timedout'}`);
+      }
+    }
+
+    appendMessage('system', `Batch complete (${commands.length} command(s)).`);
+    appendMaRpc({
+      status: 'ok',
+      code: 'batch_complete',
+      content: 'batch complete',
+      commandCount: commands.length,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    appendMessage('system', message);
+    appendMaRpc({
+      status: 'failed',
+      code: classifyRpcCode(message, 'failed'),
+      content: message,
+      retry: false,
+    });
+  } finally {
+    if (previousTemporaryTtl === null) {
+      clearTemporaryMessageTtlOverride(false);
+    } else {
+      setTemporaryMessageTtlOverride(previousTemporaryTtl, false);
+    }
+    state.batch.running = false;
+  }
 }
 
 function setDebugMode(enabled, announce = true) {
@@ -1889,6 +2202,8 @@ const whisperFlow = createWhisperFlow({
   findDidByEndpoint,
   fetchDidDocumentJsonByDid,
   sendWorldWhisper: send_world_whisper,
+  sendWorldWhisperWithTtl: send_world_whisper_with_ttl,
+  getMessageTtl,
 });
 
 const { sendWhisperToDid } = whisperFlow;
@@ -2272,6 +2587,15 @@ const { parseDot } = createDotCommands({
   setLogLevel,
   setDialogIdStyle,
   setAliasRewriteEnabled,
+  setMessageTtl,
+  getMessageTtl,
+  setTemporaryMessageTtlOverride,
+  clearTemporaryMessageTtlOverride,
+  getTemporaryMessageTtlOverride,
+  setBatchTimeoutSeconds,
+  setBatchRetryCount,
+  runBatchCommands,
+  batchStatusLine,
   onAliasBookChanged: refreshDialogAndPresenceFormatting,
   didRoot,
   resolveTargetDidRoot,
@@ -3055,7 +3379,10 @@ worldDispatchFlow = createWorldDispatchFlow({
   resolveCommandTargetDidOrToken,
   logger,
   sendWorldChat: send_world_chat,
+  sendWorldChatWithTtl: send_world_chat_with_ttl,
   sendWorldCmd: send_world_cmd,
+  sendWorldCmdWithTtl: send_world_cmd_with_ttl,
+  getMessageTtl,
   pollCurrentHomeEvents,
   appendAmbientProseAfterSpeech,
   renderLocalBroadcastMessage,
@@ -3104,12 +3431,24 @@ function enqueueCommandText(text) {
         return;
       }
 
+      if (state.batch.collecting && !state.batch.running) {
+        queueBatchCommand(queuedText);
+        appendMessage('system', `Batch +1 (${state.batch.commands.length}): ${queuedText}`);
+        return;
+      }
+
       await sendWithActiveTargetRequirementsIfNeeded(queuedText);
     })
     .catch((err) => {
       const message = err instanceof Error ? err.message : String(err);
       logger.error('command.send', message);
       appendMessage('system', `Send failed: ${message}`);
+      appendMaRpc({
+        status: 'failed',
+        code: classifyRpcCode(message, 'failed'),
+        content: message,
+        retry: false,
+      });
       if (state.activeObjectTargetAlias && isActiveTargetGoneMessage(message)) {
         const alias = String(state.activeObjectTargetAlias || '').trim();
         dropCachedRoomDidLookup(alias);
@@ -3218,6 +3557,10 @@ function restoreSavedValues() {
 
   state.aliasBook = loadAliasBook();
   state.debug = readStoredDebugFlag();
+  state.messageTtl.chat = readStoredMessageTtl(MSG_CHAT_TTL_KEY, DEFAULT_CHAT_TTL_SECONDS);
+  state.messageTtl.cmd = readStoredMessageTtl(MSG_CMD_TTL_KEY, DEFAULT_CMD_TTL_SECONDS);
+  state.messageTtl.whisper = readStoredMessageTtl(MSG_WHISPER_TTL_KEY, DEFAULT_WHISPER_TTL_SECONDS);
+  persistMessageTtl();
   setDialogIdStyle(localStorage.getItem(DIALOG_ID_STYLE_KEY) || 'alias');
   setAliasRewriteEnabled(localStorage.getItem(ALIAS_REWRITE_ENABLED_KEY) !== 'false');
   setAliasRenderEnabled(localStorage.getItem(ALIAS_RENDER_ENABLED_KEY) !== 'false');

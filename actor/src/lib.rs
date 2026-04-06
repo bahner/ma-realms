@@ -10,7 +10,8 @@ use chacha20poly1305::{
     Key, XChaCha20Poly1305, XNonce,
 };
 use did_ma::{
-    Did, Document, EncryptionKey, Message, SigningKey, generate_agent_identity,
+    DEFAULT_MESSAGE_TTL_SECS, Did, Document, EncryptionKey, Message, SigningKey,
+    generate_agent_identity,
 };
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey,
@@ -1224,6 +1225,7 @@ fn build_signed_world_request(
     command: WorldCommand,
     content_type: &str,
     timestamp_ms: u64,
+    ttl_seconds: u64,
 ) -> Result<WorldRequest, JsValue> {
     let encrypted: EncryptedIdentityBundle = serde_json::from_str(encrypted_bundle_json)
         .map_err(|e| js_err(format!("invalid bundle JSON: {e}")))?;
@@ -1272,6 +1274,7 @@ fn build_signed_world_request(
         content,
         &signing_key,
         timestamp_ms,
+        ttl_seconds,
     )?;
 
     Ok(WorldRequest {
@@ -1286,6 +1289,7 @@ fn build_signed_message_with_js_time(
     content: Vec<u8>,
     signing_key: &SigningKey,
     timestamp_ms: u64,
+    ttl_seconds: u64,
 ) -> Result<Message, JsValue> {
     let timestamp_secs = timestamp_ms / 1000;
     let mut message = Message {
@@ -1294,6 +1298,7 @@ fn build_signed_message_with_js_time(
         from,
         to,
         created_at: timestamp_secs,
+        ttl: ttl_seconds,
         content_type,
         reply_to: None,
         content,
@@ -1814,6 +1819,32 @@ pub fn set_bundle_language(
     }, false)
 }
 
+/// Update `ma:requestedTTL` (seconds) in the DID document and re-sign it.
+/// This is a receiver hint for preferred message retention/caching window.
+#[wasm_bindgen]
+pub fn set_bundle_requested_ttl(
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+    requested_ttl_seconds: u64,
+) -> Result<String, JsValue> {
+    update_bundle_document(passphrase, encrypted_bundle_json, move |document| {
+        document.set_ma_requested_ttl(requested_ttl_seconds);
+        Ok(())
+    }, false)
+}
+
+/// Remove optional `ma:requestedTTL` from the DID document and re-sign it.
+#[wasm_bindgen]
+pub fn clear_bundle_requested_ttl(
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+) -> Result<String, JsValue> {
+    update_bundle_document(passphrase, encrypted_bundle_json, |document| {
+        document.clear_ma_requested_ttl();
+        Ok(())
+    }, false)
+}
+
 /// Update the `ma:transports` field in the DID document with the agent's live
 /// iroh inbox endpoint and re-sign it.
 /// Returns JSON: `{ encrypted_bundle, did, ipns, document_json }`
@@ -2033,6 +2064,7 @@ pub async fn enter_world(
         },
         CONTENT_TYPE_WORLD,
         timestamp_ms,
+        DEFAULT_MESSAGE_TTL_SECS,
     )?;
     let response = send_world_request(endpoint_id, request).await?;
     update_room_did_cache_from_response(&response);
@@ -2054,6 +2086,30 @@ pub async fn send_world_chat(
     room: &str,
     text: &str,
 ) -> Result<String, JsValue> {
+    send_world_chat_with_ttl(
+        endpoint_id,
+        passphrase,
+        encrypted_bundle_json,
+        actor_name,
+        room,
+        text,
+        DEFAULT_MESSAGE_TTL_SECS,
+    )
+    .await
+}
+
+/// Send a signed `application/x-ma-chat` message to a room with explicit TTL (seconds).
+/// `ttl_seconds = 0` means no TTL expiration.
+#[wasm_bindgen]
+pub async fn send_world_chat_with_ttl(
+    endpoint_id: &str,
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+    actor_name: &str,
+    room: &str,
+    text: &str,
+    ttl_seconds: u64,
+) -> Result<String, JsValue> {
     let timestamp_ms = js_sys::Date::now() as u64;
     let request = build_signed_world_request(
         passphrase,
@@ -2067,6 +2123,7 @@ pub async fn send_world_chat(
         },
         CONTENT_TYPE_WORLD,
         timestamp_ms,
+        ttl_seconds,
     )?;
     let response = send_world_request(endpoint_id, request).await?;
     update_room_did_cache_from_response(&response);
@@ -2087,6 +2144,30 @@ pub async fn send_world_whisper(
     actor_name: &str,
     recipient_document_json: &str,
     text: &str,
+) -> Result<String, JsValue> {
+    send_world_whisper_with_ttl(
+        _endpoint_id,
+        passphrase,
+        encrypted_bundle_json,
+        actor_name,
+        recipient_document_json,
+        text,
+        DEFAULT_MESSAGE_TTL_SECS,
+    )
+    .await
+}
+
+/// Send an E2E-encrypted `application/x-ma-whisper` to recipient DID with explicit TTL (seconds).
+/// `ttl_seconds = 0` means no TTL expiration.
+#[wasm_bindgen]
+pub async fn send_world_whisper_with_ttl(
+    _endpoint_id: &str,
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+    actor_name: &str,
+    recipient_document_json: &str,
+    text: &str,
+    ttl_seconds: u64,
 ) -> Result<String, JsValue> {
     let encrypted: EncryptedIdentityBundle = serde_json::from_str(encrypted_bundle_json)
         .map_err(|e| js_err(format!("invalid bundle JSON: {e}")))?;
@@ -2113,6 +2194,7 @@ pub async fn send_world_whisper(
         cipher_payload,
         &signing_key,
         timestamp_ms,
+        ttl_seconds,
     )?;
 
     let response = send_whisper_signed_message(&recipient_endpoint_id, message.to_cbor().map_err(js_err)?).await?;
@@ -2187,6 +2269,30 @@ pub async fn send_world_message(
     room: &str,
     text: &str,
 ) -> Result<String, JsValue> {
+    send_world_message_with_ttl(
+        endpoint_id,
+        passphrase,
+        encrypted_bundle_json,
+        actor_name,
+        room,
+        text,
+        DEFAULT_MESSAGE_TTL_SECS,
+    )
+    .await
+}
+
+/// Send a room message over iroh using the world protocol with explicit TTL (seconds).
+/// `ttl_seconds = 0` means no TTL expiration.
+#[wasm_bindgen]
+pub async fn send_world_message_with_ttl(
+    endpoint_id: &str,
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+    actor_name: &str,
+    room: &str,
+    text: &str,
+    ttl_seconds: u64,
+) -> Result<String, JsValue> {
     let timestamp_ms = js_sys::Date::now() as u64;
     let envelope = parse_message(text);
     let is_admin_world_command =
@@ -2204,6 +2310,7 @@ pub async fn send_world_message(
         },
         CONTENT_TYPE_WORLD,
         timestamp_ms,
+        ttl_seconds,
     )?;
     let response = send_world_request(endpoint_id, request).await?;
     update_room_did_cache_from_response(&response);
@@ -2225,6 +2332,30 @@ pub async fn send_world_cmd(
     room: &str,
     text: &str,
 ) -> Result<String, JsValue> {
+    send_world_cmd_with_ttl(
+        endpoint_id,
+        passphrase,
+        encrypted_bundle_json,
+        actor_name,
+        room,
+        text,
+        DEFAULT_MESSAGE_TTL_SECS,
+    )
+    .await
+}
+
+/// Send a room/gameplay command over iroh using the command protocol with explicit TTL (seconds).
+/// `ttl_seconds = 0` means no TTL expiration.
+#[wasm_bindgen]
+pub async fn send_world_cmd_with_ttl(
+    endpoint_id: &str,
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+    actor_name: &str,
+    room: &str,
+    text: &str,
+    ttl_seconds: u64,
+) -> Result<String, JsValue> {
     let timestamp_ms = js_sys::Date::now() as u64;
     let rewritten_text = normalize_use_alias_command(room, text);
     let envelope = parse_message(&rewritten_text);
@@ -2239,6 +2370,7 @@ pub async fn send_world_cmd(
         },
         CONTENT_TYPE_WORLD,
         timestamp_ms,
+        ttl_seconds,
     )?;
     let response = send_world_request(endpoint_id, request).await?;
     update_room_did_cache_from_response(&response);
@@ -2271,6 +2403,7 @@ pub async fn poll_world_events(
         },
         CONTENT_TYPE_WORLD,
         timestamp_ms,
+        DEFAULT_MESSAGE_TTL_SECS,
     )?;
     let response = send_world_request(endpoint_id, request).await?;
     update_room_did_cache_from_response(&response);
