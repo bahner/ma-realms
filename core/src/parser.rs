@@ -64,17 +64,6 @@ pub enum ActorCommand {
 pub fn parse_message(input: &str) -> MessageEnvelope {
     let trimmed = input.trim();
 
-    // @@ is shorthand for @world world-admin commands.
-    if let Some(after_at2) = trimmed.strip_prefix("@@") {
-        let cmd = after_at2.trim().to_string();
-        return MessageEnvelope::ActorCommand {
-            target: "world".to_string(),
-            command: ActorCommand::Raw {
-                command: if cmd.is_empty() { "help".to_string() } else { cmd },
-            },
-        };
-    }
-
     if let Some(after_at) = trimmed.strip_prefix('@') {
         let rest = after_at.trim_start();
         if rest.is_empty() {
@@ -95,16 +84,16 @@ pub fn parse_message(input: &str) -> MessageEnvelope {
         let target = canonical_target(&target_base);
 
         if let Some(path) = target_path {
-            // Dotted target paths map to attribute access on the target actor.
-            let attribute_cmd = if command.is_empty() {
-                format!("prop {}", path)
+            // Dotted target paths map to method invocation (@world.save, @did.method, ...).
+            let method_cmd = if command.is_empty() {
+                path
             } else {
-                format!("prop {} {}", path, command)
+                format!("{} {}", path, command)
             };
             return MessageEnvelope::ActorCommand {
                 target,
                 command: ActorCommand::Raw {
-                    command: attribute_cmd,
+                    command: method_cmd,
                 },
             };
         }

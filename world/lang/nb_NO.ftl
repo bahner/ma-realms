@@ -5,13 +5,13 @@ world.private.status.off = @world private=off (åpen inngang)
 world.owner.required = @world bare world-eier kan kjøre den kommandoen.
 world.private.on = privat modus aktivert; nye brukere må banke på
 world.private.off = privat modus deaktivert; inngang er nå åpen
-world.private.usage = @world bruk: @@private [on|off|status]
+world.private.usage = @world bruk: @world.private [on|off|status]
 world.knock.empty = knock-innboksen er tom
 world.lang.show = lang_cid={$cid}
 world.lang.cleared = lang_cid tømt (lagre verden for å persistere)
 world.lang.set = lang_cid satt til {$cid} (lagre verden for å persistere)
-world.lang.usage.set = @world bruk: @@lang set <cid>
-world.lang.usage = @world bruk: @@lang [show|set <cid>|clear]
+world.lang.usage.set = @world bruk: @world.lang set <cid>
+world.lang.usage = @world bruk: @world.lang [show|set <cid>|clear]
 
 closet.empty = Du er i skapet og har ingen avatar ennå. Skriv 'help'.
 closet.help = Skap-kommandoer: help | show | hear | apply [ipns_key_base64] | citizen [ipns_key_base64] | avatar.help | avatar.peek | avatar.apply [ipns_key_base64] | avatar.name: <tekst> | avatar.description: <tekst> | avatar.name peek | avatar.description peek | document.help | document.peek | document.id peek | document.ma.transports peek | document.publish [ipns_key_base64] | document.republish [ipns_key_base64] | document.apply [ipns_key_base64] | recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>

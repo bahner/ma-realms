@@ -2140,18 +2140,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "ma-bot"
+name = "ma-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64",
  "chrono",
+ "did-ma",
  "iroh",
  "libp2p-identity",
  "ma-core",
+ "nanoid",
+ "rand 0.8.5",
  "reqwest",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tokio",
 ]
 
@@ -2183,6 +2188,7 @@ dependencies = [
  "did-ma",
  "iroh",
  "ma-core",
+ "moka",
  "nanoid",
  "rand 0.8.5",
  "reqwest",

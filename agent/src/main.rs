@@ -14,6 +14,9 @@ use ma_core::{
     DEFAULT_WORLD_RELAY_URL,
 };
 use serde::{Deserialize, Serialize};
+use tokio::time::{Duration, sleep};
+
+mod daemon;
 
 #[derive(Debug, Deserialize)]
 struct StatusResponse {
@@ -39,21 +42,96 @@ struct BotIdentityRecord {
 
 #[derive(Debug)]
 struct Args {
+    help: bool,
+    daemon: bool,
+    config: Option<String>,
+    slug: Option<String>,
+    listen: Option<String>,
+    kubo_key_alias: Option<String>,
     status_url: String,
     endpoint_id: Option<String>,
     name: Option<String>,
     description: Option<String>,
+    agent_loop: bool,
+    poll_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentCallInput {
+    room: String,
+    sender: Option<String>,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentCallOutput {
+    action: String,
+    reason: String,
+    command: Option<String>,
+}
+
+fn print_usage() {
+        println!(
+        "ma-agent usage:\n\
+    ma-agent [options]\n\
+\n\
+Modes:\n\
+    --daemon                    Run local ma-agentd API/admin daemon\n\
+    --agent-loop                Run stateless event->suggest loop\n\
+\n\
+Daemon options:\n\
+    --config <path>            Use explicit config file path (instead of XDG_CONFIG_HOME/ma/<slug>.yaml)\n\
+    --slug <slug>               Config slug (default: agent, loads ~/.config/ma/<slug>.yaml)\n\
+    --listen <host:port>        Daemon listen address (default from config or 127.0.0.1:5003)\n\
+    --kubo-key-alias <alias>    Required Kubo key alias for world DID root publish\n\
+\n\
+Agent options:\n\
+    --status-url <url>          World status endpoint (default: http://127.0.0.1:5002)\n\
+    --world-endpoint <id>       Override discovered world endpoint id\n\
+    --name <name>               Set closet name on startup\n\
+    --description <text>        Set closet description on startup\n\
+    --poll-ms <ms>              Poll interval for --agent-loop (min 250, default 1500)\n\
+\n\
+Help:\n\
+    -h, --help                  Show this help text\n"
+        );
 }
 
 fn parse_args() -> Args {
+        let mut help = false;
+    let mut daemon = false;
+        let mut config: Option<String> = None;
+    let mut slug: Option<String> = None;
+    let mut listen: Option<String> = None;
+    let mut kubo_key_alias: Option<String> = None;
     let mut status_url = String::from("http://127.0.0.1:5002");
     let mut endpoint_id: Option<String> = None;
     let mut name: Option<String> = None;
     let mut description: Option<String> = None;
+    let mut agent_loop = false;
+    let mut poll_ms: u64 = 1500;
 
     let mut iter = env::args().skip(1);
     while let Some(arg) = iter.next() {
         match arg.as_str() {
+            "-h" | "--help" => {
+                help = true;
+            }
+            "--daemon" => {
+                daemon = true;
+            }
+            "--slug" => {
+                slug = iter.next();
+            }
+            "--config" => {
+                config = iter.next();
+            }
+            "--listen" => {
+                listen = iter.next();
+            }
+            "--kubo-key-alias" => {
+                kubo_key_alias = iter.next();
+            }
             "--status-url" => {
                 if let Some(v) = iter.next() {
                     status_url = v;
@@ -68,15 +146,99 @@ fn parse_args() -> Args {
             "--description" => {
                 description = iter.next();
             }
+            "--agent-loop" => {
+                agent_loop = true;
+            }
+            "--poll-ms" => {
+                if let Some(v) = iter.next() {
+                    poll_ms = v.parse::<u64>().unwrap_or(1500).max(250);
+                }
+            }
             _ => {}
         }
     }
 
     Args {
+        help,
+        daemon,
+        config,
+        slug,
+        listen,
+        kubo_key_alias,
         status_url,
         endpoint_id,
         name,
         description,
+        agent_loop,
+        poll_ms,
+    }
+}
+
+fn agent_call(input: &AgentCallInput) -> Option<AgentCallOutput> {
+    let text = input.message.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("help") {
+        return Some(AgentCallOutput {
+            action: "suggest".to_string(),
+            reason: "event contains help-intent".to_string(),
+            command: Some("'I can help. What do you want to do here?'".to_string()),
+        });
+    }
+
+    if lower.contains("hello") || lower.contains("hei") {
+        return Some(AgentCallOutput {
+            action: "suggest".to_string(),
+            reason: "greeting detected".to_string(),
+            command: Some("'Hello. I am online.'".to_string()),
+        });
+    }
+
+    None
+}
+
+async fn run_agent_loop(
+    endpoint: &Endpoint,
+    endpoint_addr: EndpointAddr,
+    session_id: &str,
+    poll_ms: u64,
+) -> Result<()> {
+    println!("Agent loop enabled (stateless call mode). Poll interval: {} ms", poll_ms);
+    println!("Output format: JSON lines with action suggestions for external MCP/agent runner.");
+
+    loop {
+        let response = closet_command(endpoint, endpoint_addr.clone(), session_id.to_string(), "hear")
+            .await
+            .context("closet hear failed in agent loop")?;
+
+        if response.ok {
+            for event in response.lobby_events {
+                let input = AgentCallInput {
+                    room: event.room,
+                    sender: event.sender,
+                    message: event.message,
+                };
+                if let Some(output) = agent_call(&input) {
+                    let line = serde_json::json!({
+                        "kind": "agent.call",
+                        "input": input,
+                        "output": output,
+                    });
+                    println!("{}", serde_json::to_string(&line)?);
+                }
+            }
+        }
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("Agent loop stopped (ctrl-c).");
+                return Ok(());
+            }
+            _ = sleep(Duration::from_millis(poll_ms)) => {}
+        }
     }
 }
 
@@ -111,19 +273,34 @@ fn save_identity(record: &BotIdentityRecord) -> Result<PathBuf> {
 
     let path = root.join(format!("{}.json", record.fragment));
     let content = serde_json::to_string_pretty(record)?;
-    fs::write(&path, content).context("failed to write bot identity file")?;
+    fs::write(&path, content).context("failed to write agent identity file")?;
 
     Ok(path)
 }
 
 fn ensure_local_ipns_key() -> Result<(Vec<u8>, PathBuf)> {
     let root = config_root()?;
-    ensure_local_ipns_key_file(&root, "bot_ipns.key")
+    ensure_local_ipns_key_file(&root, "agent_ipns.key")
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = parse_args();
+
+    if args.help {
+        print_usage();
+        return Ok(());
+    }
+
+    if args.daemon {
+        return daemon::run_daemon(
+            args.slug.clone(),
+            args.listen.clone(),
+            args.kubo_key_alias.clone(),
+            args.config.clone().map(PathBuf::from),
+        )
+        .await;
+    }
 
     let endpoint_id = match args.endpoint_id {
         Some(v) if !v.trim().is_empty() => v,
@@ -148,7 +325,7 @@ async fn main() -> Result<()> {
     let _ = endpoint.online().await;
 
     println!("Using world endpoint: {endpoint_id}");
-    println!("Bot endpoint: {}", endpoint.id());
+    println!("Agent endpoint: {}", endpoint.id());
 
     let start = closet_start(&endpoint, endpoint_addr.clone()).await?;
     if !start.ok {
@@ -193,6 +370,7 @@ async fn main() -> Result<()> {
         endpoint_addr.clone(),
         session_id.clone(),
         base64::engine::general_purpose::STANDARD.encode(ipns_key_bytes),
+        None,
     )
     .await?;
 
@@ -224,7 +402,7 @@ async fn main() -> Result<()> {
 
     let enter = closet_command(
         &endpoint,
-        endpoint_addr,
+        endpoint_addr.clone(),
         session_id.clone(),
         "enter",
     )
@@ -234,8 +412,12 @@ async fn main() -> Result<()> {
     println!("Fragment: {fragment}");
     println!("Local IPNS key: {}", ipns_key_path.display());
     println!("Enter result: ok={} message='{}'", enter.ok, enter.message);
-    println!("Saved bot identity metadata to: {}", saved_path.display());
+    println!("Saved agent identity metadata to: {}", saved_path.display());
     println!("Avatar enter attempted via closet lane.");
+
+    if args.agent_loop {
+        run_agent_loop(&endpoint, endpoint_addr, &session_id, args.poll_ms).await?;
+    }
 
     endpoint.close().await;
 

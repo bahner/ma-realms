@@ -23,7 +23,7 @@ manages access control, and persists world state to IPFS via Kubo.
 ```txt
 Browser (ma-actor WASM)
     |
-    | iroh (ALPN lanes)
+    | iroh (inbox-first ingress)
     v
 ma-world
     |
@@ -39,9 +39,7 @@ ALPN lanes imported from `ma-core`:
 
 | Lane | ALPN identifier |
 | ------ | ----------------- |
-| World | `ma/world/1` |
-| Command | `ma/cmd/1` |
-| Chat | `ma/chat/1` |
+| Inbox | `ma/inbox/1` |
 | Broadcast | `ma/broadcast/1` |
 | Presence | `ma/presence/1` |
 
@@ -250,17 +248,17 @@ On startup the server:
 3. Initialises an iroh endpoint with that machine-local secret key
 4. Creates the default `lobby` room
 5. Binds the status page to the configured listen address
-6. Registers protocol handlers for all five ALPN lanes
+6. Registers protocol handlers for inbox-first signed ingress (`ma/inbox/1`) and auxiliary transports
 7. Prints the iroh endpoint id, status URL, and Kubo API URL
 
 ## World Admin Commands
 
-Use `@@` commands from an owner-controlled avatar session:
+Use `@world.<method>` commands from an owner-controlled avatar session:
 
-- `@@list` — lists world objects as `id => title`
-- `@@migrate-index` — re-pins all current room snapshots and republishes the world root CID index
+- `@world.list` — lists world objects as `id => title`
+- `@world.migrate-index` — re-pins all current room snapshots and republishes the world root CID index
 
-`@@` commands are validated as world-targeted operations and must be sent to
+`@world` commands are validated as world-targeted operations and must be sent to
 this world's DID (root or configured world DID).
 
 Room attributes are sourced from each room YAML CID. The world root index is
@@ -272,7 +270,7 @@ Room YAML (`ma_room` v2) stores room attributes plus references (`exit_cids`,
 materializes exits from those referenced CIDs.
 
 The runtime world DID document publishes bootstrap metadata under `ma`,
-including `rootCid`, transport hints, and world lane inbox data.
+including `rootCid`, transport hints, and inbox routing data.
 
 ## Status Page
 
@@ -281,7 +279,7 @@ The axum status surface exposes:
 - **`/`** — HTML dashboard: endpoint id, direct addresses, multiaddrs, relay URLs, rooms, avatars, recent events, owner DID, world CID, persisted room count
 - **`/openapi.json`** — OpenAPI 3.1 document for status API endpoints
 - **`/status.json`** — JSON `{ world, snapshot, runtime }` for programmatic access
-- `world.capabilities` lists lane capabilities (`world`, `cmd`, `chat`) with ALPN + supported request kinds
+- `world.capabilities` lists lane capabilities (`inbox`) with ALPN + supported request kinds
 - Transport-level request rejections include `transport_ack` in `WorldResponse` (`lane`, `code`, `detail`)
 - **`/world/slug`** — POST form endpoint to set world slug used as named pin alias
 - **`/world/kubo`** — POST form endpoint to set runtime Kubo API URL
@@ -402,7 +400,7 @@ Requires `curl` and `jq` in your environment.
 1. Open `/` in browser.
 2. In **Create Unlock Bundle**, enter passphrase and generate bundle JSON.
 3. In **Unlock Runtime**, provide passphrase + bundle JSON.
-4. World transitions to unlocked state and starts handling command lanes.
+4. World transitions to unlocked state and starts handling inbox traffic.
 
 Bundle format uses Argon2id key derivation and XChaCha20-Poly1305 encryption.
 
@@ -453,7 +451,7 @@ CORS is open (`*`) so `ma-actor` can fetch status from the browser.
 
 - Kubo is expected local/private unless intentionally exposed.
 - Signed DID documents and signed messages are validated before command handling.
-- `@@` admin commands are world-target DID validated.
+- `@world` admin commands are world-target DID validated.
 - Runtime state save/load uses signed + encrypted envelopes.
 
 ## Cleanup

@@ -29,7 +29,7 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use ma_core::{
-    ActorCommand, BROADCAST_ALPN, CHAT_ALPN, CMD_ALPN, CONTENT_TYPE_CHAT, CONTENT_TYPE_CMD,
+    ActorCommand, BROADCAST_ALPN,
     CLOSET_ALPN, ClosetRequest, ClosetResponse,
     ClosetCommand, ClosetProfileField, ClosetRecoveryCommand,
     ClosetDidPublishPlan, ensure_issued_document_root_match, ensure_session_document_root_match,
@@ -39,14 +39,16 @@ use ma_core::{
     CLOSET_COMMANDS_INLINE, MAILBOX_COMMANDS_INLINE,
     ObjectMessageIntent, ObjectMessageKind, ObjectMessageRetention, ObjectMessageTarget,
     ObjectRuntimeState, PRESENCE_ALPN, PresenceAvatar, RoomActorAction, RoomActorContext,
-    RoomEvent, TransportAck, TransportAckCode, WORLD_ALPN, WorldCommand, WorldLane, WorldRequest,
+    RoomEvent, TransportAck, TransportAckCode, INBOX_ALPN, WorldCommand, WorldLane, WorldRequest,
     WorldResponse, compile_acl, evaluate_compiled_acl_with_owner, execute_room_actor_command,
     normalize_spoken_text, parse_capability_acl_text, parse_object_local_capability_acl,
     parse_closet_command, plan_closet_did_publish,
     LegacyRequirement, RequirementChecker, RequirementSet, RequirementValue,
     pin_update_add_rm,
+    ROOM_METHOD_BROADCAST_SEND,
     TtlCache,
 };
+use moka::sync::Cache;
 use nanoid::nanoid;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -101,6 +103,7 @@ const KNOCK_DECIDED_TTL_SECS: i64 = 60 * 60;
 const CLOSET_SESSION_TTL_SECS: i64 = 30 * 60;
 #[allow(dead_code)]
 const MAX_OBJECT_INBOX: usize = 512;
+const OBJECT_INBOX_INDEX_CAPACITY: u64 = 4096;
 const MAILBOX_LOCK_SECS: u64 = 600;
 const OBJECT_WASHER_INTERVAL_SECS: u64 = 20;
 const CLOSET_LISTENING_MESSAGE: &str = "someone appears to be listening from the closet";
@@ -134,7 +137,6 @@ struct CachedDidDocument {
 
 #[derive(Clone, Debug)]
 pub(crate) struct AvatarRequest {
-    pub inbox: String,
     pub did: Did,
     pub agent_endpoint: String,
     pub language_order: String,
@@ -279,6 +281,47 @@ struct ObjectRequirementRuntime {
     world_owner: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct InboxRoute {
+    room_name: String,
+    object_id: String,
+}
+
+fn parse_room_inbox_symbol(symbol: &str) -> Option<&str> {
+    let trimmed = symbol.trim();
+    let rest = trimmed.strip_prefix("room.")?;
+    let object = rest.strip_suffix(".inbox")?;
+    let object = object.trim();
+    if object.is_empty() {
+        None
+    } else {
+        Some(object)
+    }
+}
+
+fn parse_room_inbox_proxy(command: &str) -> Option<(String, String)> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let head = parts.next().unwrap_or_default();
+    let rest = parts.next().unwrap_or_default().trim();
+    let object = head.strip_suffix(".inbox")?.trim();
+    if object.is_empty() {
+        return None;
+    }
+
+    let target = format!("room.{}.inbox", object);
+    let command = if rest.is_empty() {
+        "list".to_string()
+    } else {
+        rest.to_string()
+    };
+    Some((target, command))
+}
+
 fn parse_rfc3339_unix(value: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(value)
         .ok()
@@ -309,7 +352,11 @@ impl RequirementChecker for ObjectRequirementRuntime {
                     .unwrap_or(RequirementValue::Null),
             ),
             "world.slug" => Some(RequirementValue::String(DEFAULT_WORLD_SLUG.to_string())),
+            "inbox" => Some(RequirementValue::String(format!("room.{}.inbox", self.room_name))),
             _ => {
+                if parse_room_inbox_symbol(symbol).is_some() {
+                    return Some(RequirementValue::String(symbol.to_string()));
+                }
                 if let Some(state_key) = symbol.strip_prefix("state.") {
                     let _ = state_key;
                     return Some(RequirementValue::Null);
@@ -398,7 +445,7 @@ pub struct World {
     world_did_root: Arc<RwLock<Option<String>>>,
     /// Full world DID (with fragment) from authored world config.
     world_did: Arc<RwLock<Option<String>>>,
-    /// Runtime state lock; when false, command lanes reject world interactions.
+    /// Runtime state lock; when false, inbox ingress rejects world interactions.
     unlocked: Arc<RwLock<bool>>,
     /// Global capability ACL (typically loaded from world_root.refs.global_acl_cid).
     global_capability_acl: Arc<RwLock<Option<CompiledCapabilityAcl>>>,
@@ -436,6 +483,8 @@ pub struct World {
     closet_sessions: Arc<RwLock<TtlCache<String, ClosetSession>>>,
     /// DID-root keyed profile data established via closet onboarding.
     closet_profiles: Arc<RwLock<HashMap<String, ClosetProfile>>>,
+    /// Fast lookup from object DID to room/object inbox route.
+    object_inbox_index: Cache<String, InboxRoute>,
 }
 
 #[derive(Clone, Debug)]
@@ -843,6 +892,7 @@ impl World {
                 MAX_CLOSET_SESSIONS,
             ))),
             closet_profiles: Arc::new(RwLock::new(HashMap::new())),
+            object_inbox_index: Cache::new(OBJECT_INBOX_INDEX_CAPACITY),
         }
     }
 
@@ -1793,7 +1843,7 @@ impl World {
                 }
             }
             ClosetCommand::Enter { room } => {
-                let (did, preferred_handle, session_fragment) = {
+                let (did, preferred_handle, _session_fragment) = {
                     let sessions = self.closet_sessions.read().await;
                     let key = session_id.to_string();
                     let Some(session) = sessions.get_any(&key) else {
@@ -1844,9 +1894,7 @@ impl World {
                     return Ok(ClosetResponse::err(session_id, detail).with_did(did_root));
                 }
 
-                let inbox = resolve_avatar_inbox_from_session(&did_obj, session_fragment.as_deref())?;
                 let avatar_req = AvatarRequest {
-                    inbox,
                     did: root_did,
                     agent_endpoint: endpoint.to_string(),
                     language_order: "nb_NO:en_UK".to_string(),
@@ -2071,6 +2119,29 @@ impl World {
             .values()
             .find(|obj| obj.matches_target(lookup))
             .map(|obj| obj.id.clone())
+    }
+
+    async fn resolve_inbox_target_object_id(&self, room_name: &str, target: &str) -> Option<String> {
+        let normalized = target.trim();
+        if normalized.eq_ignore_ascii_case(":inbox") || normalized.eq_ignore_ascii_case("inbox") {
+            let objects = self.room_objects.read().await;
+            let room_map = objects.get(room_name)?;
+            if room_map.contains_key("mailbox") {
+                return Some("mailbox".to_string());
+            }
+            return room_map
+                .values()
+                .find(|object| {
+                    object.has_receiver_role("world-inbox") || object.has_receiver_protocol("ma/inbox/1")
+                })
+                .map(|object| object.id.clone());
+        }
+
+        if let Some(token) = parse_room_inbox_symbol(normalized) {
+            return self.resolve_room_object_id(room_name, token).await;
+        }
+
+        None
     }
 
     async fn enqueue_object_durable_inbox_message(
@@ -3422,7 +3493,7 @@ impl World {
         &self,
         room_name: &str,
         req: AvatarRequest,
-        preferred_handle: Option<String>,
+        _preferred_handle: Option<String>,
     ) -> Result<String> {
         let mut rooms = self.rooms.write().await;
         let room = rooms
@@ -3436,17 +3507,18 @@ impl World {
             return Err(anyhow!("room ACL denied entry for {}", did_root));
         }
 
+        let actor_id = did_root.clone();
+
         // Same DID already present? Update endpoint and return existing handle.
-        if let Some(existing) = room.avatars.get(&req.inbox) {
+        if let Some(existing) = room.avatars.get(&actor_id) {
             if existing.agent_did == req.did {
-                info!("[{}] @{} already present ({:?})", room_name, req.inbox, req.did);
-                let handle = req.inbox.clone();
-                return Ok(handle);
+                info!("[{}] {} already present ({:?})", room_name, actor_id, req.did);
+                return Ok(actor_id);
             }
         }
 
         let avatar = Avatar::new(
-            req.inbox.clone(),
+            actor_id.clone(),
             req.did.clone(),
             req.agent_endpoint.clone(),
             req.language_order.clone(),
@@ -3454,12 +3526,12 @@ impl World {
         room.add_avatar(avatar);
         drop(rooms);
 
-        // Resolve and register handle.
-        let handle = self.register_handle(&did_root, preferred_handle, &req.inbox).await;
+        // Keep compatibility maps populated with identity mapping (did -> did).
+        let handle = self.register_handle(&did_root, None, &did_root).await;
 
-        info!("[{}] @{} joined ({:?}) from {}", room_name, handle, req.did, req.agent_endpoint);
+        info!("[{}] {} joined ({:?}) from {}", room_name, handle, req.did, req.agent_endpoint);
         self.record_event(format!(
-            "[{room_name}] @{} joined with {} from {}",
+            "[{room_name}] {} joined with {} from {}",
             handle,
             req.did.id(),
             req.agent_endpoint
@@ -3483,8 +3555,8 @@ impl World {
     async fn register_handle(
         &self,
         did_root: &str,
-        preferred: Option<String>,
-        fragment: &str,
+        _preferred: Option<String>,
+        _fragment: &str,
     ) -> String {
         // Same DID already has a handle? Return it.
         {
@@ -3494,37 +3566,14 @@ impl World {
             }
         }
 
-        let candidate = preferred
-            .filter(|h| !h.trim().is_empty())
-            .unwrap_or_else(|| fragment.to_string());
-        let candidate = candidate.trim().to_string();
-
-        let handle = {
-            let h2d = self.handle_to_did.read().await;
-            if let Some(owner) = h2d.get(&candidate) {
-                if owner == did_root {
-                    candidate
-                } else {
-                    // Collision: disambiguate with last 4 chars of the DID root.
-                    let suffix = if did_root.len() >= 4 { &did_root[did_root.len() - 4..] } else { did_root };
-                    format!("{}_{}", candidate, suffix)
-                }
-            } else {
-                candidate
-            }
-        };
+        // World identity is always root DID; display aliases belong to actor clients.
+        let handle = did_root.to_string();
 
         let mut h2d = self.handle_to_did.write().await;
         let mut d2h = self.did_to_handle.write().await;
         h2d.insert(handle.clone(), did_root.to_string());
         d2h.insert(did_root.to_string(), handle.clone());
         handle
-    }
-
-    /// Look up the handle for a root DID; falls back to the DID root id itself.
-    pub(crate) async fn resolve_handle(&self, did_root: &str) -> String {
-        let d2h = self.did_to_handle.read().await;
-        d2h.get(did_root).cloned().unwrap_or_else(|| did_root.to_string())
     }
 
     /// Broadcast a signed chat message to room event log.
@@ -3614,13 +3663,49 @@ impl World {
         sender_profile: &str,
         envelope: MessageEnvelope,
     ) -> Result<(String, bool, String)> {
+        let sender_root = from_did.without_fragment().id();
+        let sender_key = {
+            let rooms = self.rooms.read().await;
+            let room = rooms
+                .get(room_name)
+                .ok_or_else(|| anyhow!("Room {} not found", room_name))?;
+
+            if let Some(avatar) = room.avatars.get(from) {
+                if avatar.agent_did == from_did.without_fragment() {
+                    from.to_string()
+                } else {
+                    return Err(anyhow!(
+                        "sender DID mismatch for @{} in room {}",
+                        from,
+                        room_name
+                    ));
+                }
+            } else {
+                let mapped_did = {
+                    let map = self.handle_to_did.read().await;
+                    map.get(from).cloned()
+                };
+                let Some(mapped_did) = mapped_did else {
+                    return Err(anyhow!("unknown avatar @{} in room {}", from, room_name));
+                };
+                if mapped_did != sender_root {
+                    return Err(anyhow!("unknown avatar @{} in room {}", from, room_name));
+                }
+                if room.avatars.contains_key(&mapped_did) {
+                    mapped_did
+                } else {
+                    return Err(anyhow!("unknown avatar @{} in room {}", from, room_name));
+                }
+            }
+        };
+
         {
             let rooms = self.rooms.read().await;
             let room = rooms
                 .get(room_name)
                 .ok_or_else(|| anyhow!("Room {} not found", room_name))?;
 
-            let Some(avatar) = room.avatars.get(from) else {
+            let Some(avatar) = room.avatars.get(&sender_key) else {
                 return Err(anyhow!("unknown avatar @{} in room {}", from, room_name));
             };
             if avatar.agent_did != from_did.without_fragment() {
@@ -3635,20 +3720,20 @@ impl World {
         let (response, broadcasted, effective_room) = match envelope {
             MessageEnvelope::Chatter { text } => {
                 let speech = normalize_spoken_text(&text);
-                info!("[{}] {}: {}", room_name, from, speech);
-                self.record_event(format!("[{room_name}] {from}: {speech}")).await;
-                let rendered = format!("{}: {}", from, speech);
-                self.record_room_event(room_name, "speech", Some(from.to_string()), Some(from_did.id()), None, speech.clone())
+                info!("[{}] {}: {}", room_name, sender_key, speech);
+                self.record_event(format!("[{room_name}] {sender_key}: {speech}")).await;
+                let rendered = format!("{}: {}", sender_key, speech);
+                self.record_room_event(room_name, "speech", Some(sender_key.clone()), Some(from_did.id()), None, speech.clone())
                     .await;
                 (rendered, true, room_name.to_string())
             }
             MessageEnvelope::RoomCommand { command } => {
                 let caller_root_did = from_did.without_fragment().id();
                 let response = self
-                    .room_command(room_name, &command, from, sender_profile, Some(caller_root_did.as_str()))
+                    .room_command(room_name, &command, &sender_key, sender_profile, Some(caller_root_did.as_str()))
                     .await;
-                info!("[{}] {} -> @here: {} -> {}", room_name, from, command, response);
-                self.record_event(format!("[{room_name}] {from} -> @here: {command} => {}", response))
+                info!("[{}] {} -> @here: {} -> {}", room_name, sender_key, command, response);
+                self.record_event(format!("[{room_name}] {sender_key} -> @here: {command} => {}", response))
                     .await;
                 (response, false, room_name.to_string())
             }
@@ -3659,11 +3744,11 @@ impl World {
                     ActorCommand::Raw { .. } => None,
                 };
                 let (response, effective_room) = self
-                    .handle_actor_command(room_name, from, from_did, sender_profile, &target, command)
+                    .handle_actor_command(room_name, &sender_key, from_did, sender_profile, &target, command)
                     .await;
-                info!("[{}] {} -> @{} -> {}", room_name, from, target, response);
+                info!("[{}] {} -> @{} -> {}", room_name, sender_key, target, response);
                 self.record_event(format!(
-                    "[{room_name}] {from} -> @{target} => {}",
+                    "[{room_name}] {sender_key} -> @{target} => {}",
                     response.replace('\n', " ")
                 ))
                 .await;
@@ -3671,7 +3756,7 @@ impl World {
                     self.record_room_event(
                         room_name,
                         "speech",
-                        Some(from.to_string()),
+                        Some(sender_key.clone()),
                         Some(from_did.id()),
                         None,
                         speech_text.unwrap_or_else(|| response.clone()),
@@ -4385,6 +4470,21 @@ impl World {
                     ActorCommand::Say { payload } => payload,
                     ActorCommand::Raw { command } => command,
                 };
+                if let Some((inbox_target, inbox_command)) = parse_room_inbox_proxy(&room_cmd) {
+                    if let Some(result) = self
+                        .handle_object_method(
+                            room_name,
+                            from,
+                            from_did,
+                            sender_profile,
+                            &inbox_target,
+                            ActorCommand::Raw { command: inbox_command },
+                        )
+                        .await
+                    {
+                        return result;
+                    }
+                }
                 let caller_root_did = from_did.without_fragment().id();
                 (
                     self
@@ -4487,27 +4587,60 @@ impl World {
         let caller_root = from_did.without_fragment().id();
         let now_secs = Utc::now().timestamp().max(0) as u64;
 
+        let resolved_target = if let Some(inbox_object_id) = self
+            .resolve_inbox_target_object_id(room_name, target)
+            .await
+        {
+            inbox_object_id
+        } else if let Ok(did) = Did::try_from(target.trim()) {
+            let world_root = did.without_fragment().id();
+            if !self.is_local_world_root(&world_root).await {
+                return None;
+            }
+            let did_key = did.id().to_ascii_lowercase();
+            if let Some(route) = self.object_inbox_index.get(&did_key) {
+                let objects = self.room_objects.read().await;
+                let valid = objects
+                    .get(room_name)
+                    .map(|room_map| {
+                        route.room_name.eq_ignore_ascii_case(room_name)
+                            && room_map.contains_key(route.object_id.as_str())
+                    })
+                    .unwrap_or(false);
+                if valid {
+                    route.object_id
+                } else {
+                    self.object_inbox_index.invalidate(&did_key);
+                    did.fragment.clone()?
+                }
+            } else {
+                let fragment = did.fragment.clone()?;
+                self.object_inbox_index.insert(
+                    did_key,
+                    InboxRoute {
+                        room_name: room_name.to_string(),
+                        object_id: fragment.clone(),
+                    },
+                );
+                fragment
+            }
+        } else {
+            let token = target.trim().trim_start_matches('@').to_ascii_lowercase();
+            let objects = self.room_objects.read().await;
+            let room_map = objects.get(room_name)?;
+            room_map
+                .values()
+                .find(|obj| obj.matches_target(token.as_str()))
+                .map(|obj| obj.id.clone())?
+        };
+
         let object_id = {
             let mut objects = self.room_objects.write().await;
             let room_map = objects.get_mut(room_name)?;
-            let resolved_target = if let Ok(did) = Did::try_from(target.trim()) {
-                let world_root = did.without_fragment().id();
-                if !self.is_local_world_root(&world_root).await {
-                    return None;
-                }
-                did.fragment.clone()?
-            } else {
-                let token = target.trim().trim_start_matches('@').to_ascii_lowercase();
-                room_map
-                    .values()
-                    .find(|obj| obj.matches_target(token.as_str()))
-                    .map(|obj| obj.id.clone())?
-            };
-            let object_id = resolved_target;
-            if let Some(device) = room_map.get_mut(&object_id) {
+            if let Some(device) = room_map.get_mut(&resolved_target) {
                 device.clear_expired_lock(now_secs);
             }
-            object_id
+            resolved_target
         };
 
         if let Err(err) = self
@@ -5948,7 +6081,7 @@ impl World {
         // Caller's root DID is directly available from from_did
         let caller_root_did = from_did.without_fragment().id();
 
-        // @@claim — set world owner to caller DID if unclaimed.
+        // @world.claim — set world owner to caller DID if unclaimed.
         if method == "claim" {
             let current_owner = self.owner_did.read().await.clone();
             if let Some(owner) = current_owner {
@@ -6007,7 +6140,7 @@ impl World {
 
             if sub == "accept" {
                 let Some(id_raw) = parts.next() else {
-                    return "@world usage: @@knock accept <id>".to_string();
+                    return "@world usage: @world.knock accept <id>".to_string();
                 };
                 let id = match Self::parse_knock_id_arg(id_raw) {
                     Ok(value) => value,
@@ -6024,7 +6157,7 @@ impl World {
 
             if sub == "reject" {
                 let Some(id_raw) = parts.next() else {
-                    return "@world usage: @@knock reject <id> [note]".to_string();
+                    return "@world usage: @world.knock reject <id> [note]".to_string();
                 };
                 let id = match Self::parse_knock_id_arg(id_raw) {
                     Ok(value) => value,
@@ -6049,7 +6182,7 @@ impl World {
 
             if sub == "delete" {
                 let Some(id_raw) = parts.next() else {
-                    return "@world usage: @@knock delete <id>".to_string();
+                    return "@world usage: @world.knock delete <id>".to_string();
                 };
                 let id = match id_raw.parse::<u64>() {
                     Ok(value) => value,
@@ -6061,14 +6194,14 @@ impl World {
                 };
             }
 
-            return "@world usage: @@knock list [all] | @@knock accept <id> | @@knock reject <id> [note] | @@knock delete <id>"
+            return "@world usage: @world.knock list [all] | @world.knock accept <id> | @world.knock reject <id> [note] | @world.knock delete <id>"
                 .to_string();
         }
 
         if method == "invite" {
             let mut parts = arg.split_whitespace();
             let Some(target_did_raw) = parts.next() else {
-                return "@world usage: @@invite <did> [note]".to_string();
+                return "@world usage: @world.invite <did> [note]".to_string();
             };
 
             let target_root = match Self::parse_invite_root_did_arg(target_did_raw) {
@@ -6108,7 +6241,7 @@ impl World {
                 let removed = self.flush_closet_sessions().await;
                 return format!("@world flush closet: removed={}", removed);
             }
-            return "@world usage: @@flush [knock|closet|all]".to_string();
+            return "@world usage: @world.flush [knock|closet|all]".to_string();
         }
 
         if method == "migrate-index" {
@@ -6153,7 +6286,7 @@ impl World {
 
         if method == "load" {
             if arg.is_empty() {
-                return "@world usage: @@load <cid>".to_string();
+                return "@world usage: @world.load <cid>".to_string();
             }
             match self.load_encrypted_state(arg.as_str()).await {
                 Ok(root_cid) => {
@@ -6170,7 +6303,7 @@ impl World {
 
         if method == "dig" {
             if arg.is_empty() {
-                return "@world usage: @@dig <direction> [to|til <#dest|did:ma:...#room>]".to_string();
+                return "@world usage: @world.dig <direction> [to|til <#dest|did:ma:...#room>]".to_string();
             }
 
             let (exit_name, destination) = if let Some((dir, dest)) = arg
@@ -6193,7 +6326,7 @@ impl World {
                 Ok(did) => {
                     if self.is_local_world_root(&did.without_fragment().id()).await {
                         let Some(fragment) = did.fragment.clone() else {
-                            return "@world usage: @@dig <direction> [to <#dest|did:ma:...#room>]".to_string();
+                            return "@world usage: @world.dig <direction> [to <#dest|did:ma:...#room>]".to_string();
                         };
                         exit_target = fragment.clone();
                         local_room_to_create = Some(fragment);
@@ -6246,7 +6379,7 @@ impl World {
         }
 
         if method == "room" {
-            // @@room <name> acl show|open|close|allow <did>|deny <did>
+            // @world.room <name> acl show|open|close|allow <did>|deny <did>
             // World-owner admin override for room-level ACLs.
             // Does NOT automatically bypass the ACL — caller must change it explicitly.
             let mut room_parts = arg.splitn(3, char::is_whitespace);
@@ -6255,7 +6388,7 @@ impl World {
             let sub_arg = room_parts.next().unwrap_or_default().trim().to_string();
 
             if room_name_arg.is_empty() || sub != "acl" {
-                return "@world usage: @@room <name> acl show|open|close|allow <did>|deny <did>".to_string();
+                return "@world usage: @world.room <name> acl show|open|close|allow <did>|deny <did>".to_string();
             }
 
             let mut acl_parts = sub_arg.splitn(2, char::is_whitespace);
@@ -6297,7 +6430,7 @@ impl World {
                 }
                 "allow" => {
                     if acl_arg.is_empty() {
-                        return format!("@world usage: @@room {} acl allow <did>", room_name_arg);
+                        return format!("@world usage: @world.room {} acl allow <did>", room_name_arg);
                     }
                     let target_root = match Did::try_from(acl_arg.as_str()) {
                         Ok(d) => d.without_fragment().id(),
@@ -6315,7 +6448,7 @@ impl World {
                 }
                 "deny" => {
                     if acl_arg.is_empty() {
-                        return format!("@world usage: @@room {} acl deny <did>", room_name_arg);
+                        return format!("@world usage: @world.room {} acl deny <did>", room_name_arg);
                     }
                     let target_root = match Did::try_from(acl_arg.as_str()) {
                         Ok(d) => d.without_fragment().id(),
@@ -6336,7 +6469,7 @@ impl World {
                 }
                 _ => {
                     return format!(
-                        "@world unknown acl subcommand '{}'. usage: @@room {} acl show|open|close|allow <did>|deny <did>",
+                        "@world unknown acl subcommand '{}'. usage: @world.room {} acl show|open|close|allow <did>|deny <did>",
                         acl_cmd, room_name_arg
                     );
                 }
@@ -7310,61 +7443,19 @@ impl WorldProtocol {
             ));
         }
 
-        match request {
-            WorldRequest::Signed { message_cbor } => {
-                // Each ALPN lane has exactly one canonical content type.
-                let (message, sender_did, sender_document) = self.verify_message(message_cbor).await?;
-                let expected_ct = match self.lane {
-                    WorldLane::World => CONTENT_TYPE_WORLD,
-                    WorldLane::Cmd => CONTENT_TYPE_CMD,
-                    _ => return Err(anyhow!("signed request not supported on this lane")),
-                };
-                if !Self::content_type_matches(&message.content_type, expected_ct, "application/x-ma-command") {
-                    return Err(anyhow!("expected {} on this lane, got {}", expected_ct, message.content_type));
-                }
-                let command: WorldCommand = serde_json::from_slice(&message.content)
-                    .map_err(|err| anyhow!("invalid command payload: {}", err))?;
-                let sender_root = sender_did.without_fragment().id();
-                self.handle_command(command, &message, &sender_did, sender_document, agent_endpoint, &sender_root).await
-            }
-
-            WorldRequest::Chat { room, message_cbor } => {
-                if self.lane != WorldLane::Chat {
-                    return Err(anyhow!("chat is only supported on ma/chat/1"));
-                }
-                let (message, sender_did, _) = self.verify_message(message_cbor.clone()).await?;
-                if !Self::content_type_matches(&message.content_type, CONTENT_TYPE_CHAT, "application/x.ma.chat") {
-                    return Err(anyhow!("expected application/x-ma-chat, got {}", message.content_type));
-                }
-                let sender_root = sender_did.without_fragment().id();
-                let handle = self.world.resolve_handle(&sender_root).await;
-                if handle == sender_root {
-                    return Err(anyhow!("not registered in room — enter first"));
-                }
-                self.world.send_chat(&room, &handle, &sender_root, message_cbor).await?;
-                let latest_event_sequence = self.world.latest_room_event_sequence(&room).await?;
-                Ok(WorldResponse {
-                    ok: true,
-                    room,
-                    message: String::new(),
-                    endpoint_id: self.endpoint_id.clone(),
-                    latest_event_sequence,
-                    broadcasted: true,
-                    events: Vec::new(),
-                    handle,
-                    room_description: String::new(),
-                    room_title: String::new(),
-                    room_did: String::new(),
-                    avatars: Vec::new(),
-                    room_object_dids: HashMap::new(),
-                    transport_ack: None,
-                })
-            }
-
-            WorldRequest::Whisper { .. } => {
-                Err(anyhow!("whisper requests are not supported on this lane"))
-            }
+        // Each ALPN lane has exactly one canonical content type.
+        let (message, sender_did, sender_document) = self.verify_message(request.message_cbor).await?;
+        let expected_ct = CONTENT_TYPE_WORLD;
+        if !Self::content_type_matches(&message.content_type, expected_ct, "application/x-ma-command") {
+            return Err(anyhow!("expected {} on this lane, got {}", expected_ct, message.content_type));
         }
+        let command: WorldCommand = serde_json::from_slice(&message.content)
+            .map_err(|err| anyhow!("invalid command payload: {}", err))?;
+        if let Some(method) = command.internal_method() {
+            debug!("processing internal method '{}' on lane '{}'", method, self.lane.label());
+        }
+        let sender_root = sender_did.without_fragment().id();
+        self.handle_command(command, &message, &sender_did, sender_document, agent_endpoint, &sender_root).await
     }
 
     async fn handle_command(
@@ -7380,9 +7471,6 @@ impl WorldProtocol {
 
         match command {
             WorldCommand::Enter { room, preferred_handle } => {
-                if self.lane != WorldLane::World {
-                    return Err(anyhow!("enter is only supported on ma/world/1"));
-                }
                 let room = room.unwrap_or_else(|| DEFAULT_ROOM.to_string());
                 let root_did = sender_did.without_fragment();
                 let root_did_id = root_did.id();
@@ -7497,7 +7585,6 @@ impl WorldProtocol {
                         }),
                     });
                 }
-                let inbox = resolve_avatar_inbox(sender_did)?;
                 let profile_name = closet_profile
                     .as_ref()
                     .and_then(|profile| profile.name.clone());
@@ -7529,7 +7616,6 @@ impl WorldProtocol {
                     });
                 };
                 let avatar_req = AvatarRequest {
-                    inbox,
                     did: root_did,
                     agent_endpoint: agent_endpoint.clone(),
                     language_order: collapsed_language_order,
@@ -7578,6 +7664,7 @@ impl WorldProtocol {
                 })
             }
             WorldCommand::Message { room, envelope } => {
+                let method = ROOM_METHOD_BROADCAST_SEND;
                 let effective_sender_profile = self
                     .world
                     .avatar_language_order_for_did(&room, sender_root)
@@ -7589,30 +7676,16 @@ impl WorldProtocol {
                 );
                 if is_world_admin && !self.world.is_world_target_did(&message.to).await {
                     return Err(anyhow!(
-                        "@@ world commands must target this world DID; got to='{}'",
+                        "@world commands must target this world DID; got to='{}'",
                         message.to
                     ));
                 }
-                match self.lane {
-                    WorldLane::World if !is_world_admin => {
-                        return Err(anyhow!("ma/world/1 accepts only @@ world commands for message requests"));
-                    }
-                    WorldLane::Cmd if is_world_admin => {
-                        return Err(anyhow!("@@ world commands must be sent over ma/world/1"));
-                    }
-                    WorldLane::Chat => {
-                        return Err(anyhow!("command envelopes are not supported on ma/chat/1"));
-                    }
-                    _ => {}
+                if !is_world_admin {
+                    debug!("processing non-admin {} on lane '{}'", method, self.lane.label());
                 }
 
-                // Route command envelopes through the registered world handle for this DID root.
-                // This keeps re-entry transparent when DID fragment/alias does not exactly match
-                // the current in-room handle string.
-                let actor_name = self.world.resolve_handle(sender_root).await;
-                if actor_name == sender_root {
-                    return Err(anyhow!("not registered in room — enter first"));
-                }
+                // Route command envelopes through root DID identity only.
+                let actor_name = sender_root.to_string();
                 let (message, broadcasted, effective_room) = self
                     .world
                     .send_message(&room, &actor_name, sender_did, &effective_sender_profile, envelope)
@@ -7640,9 +7713,6 @@ impl WorldProtocol {
                 })
             }
             WorldCommand::RoomEvents { room, since_sequence } => {
-                if self.lane != WorldLane::World {
-                    return Err(anyhow!("room event polling is only supported on ma/world/1"));
-                }
                 let (events, latest_event_sequence) = self.world.room_events_since(&room, since_sequence).await?;
                 Ok(WorldResponse {
                     ok: true,
@@ -8224,12 +8294,7 @@ async fn ensure_world_did_document(
         document.clear_ma_link();
     }
     let transport_paths = vec![
-        format!("/ma-iroh/{endpoint_id}/{}", String::from_utf8_lossy(WORLD_ALPN)),
-        format!("/ma-iroh/{endpoint_id}/{}", String::from_utf8_lossy(CMD_ALPN)),
-        format!("/ma-iroh/{endpoint_id}/{}", String::from_utf8_lossy(CHAT_ALPN)),
-        format!("/ma-iroh/{endpoint_id}/{}", String::from_utf8_lossy(CLOSET_ALPN)),
-        format!("/ma-iroh/{endpoint_id}/{}", String::from_utf8_lossy(PRESENCE_ALPN)),
-        format!("/ma-iroh/{endpoint_id}/{}", String::from_utf8_lossy(BROADCAST_ALPN)),
+        format!("/ma-iroh/{endpoint_id}/{}", String::from_utf8_lossy(INBOX_ALPN)),
     ];
     document.set_ma_transports(serde_json::Value::Array(
         transport_paths
@@ -9154,7 +9219,7 @@ async fn main() -> Result<()> {
         .or_else(|| Some("local-dev".to_string()));
 
     let mut actor_web_cid = manual_actor_web_cid;
-    let mut actor_web_source_dir = resolve_actor_web_source_dir(&runtime_cfg);
+    let actor_web_build_source_dir = resolve_actor_web_source_dir(&runtime_cfg);
 
     let key_path = runtime_cfg
         .iroh_secret
@@ -9189,7 +9254,7 @@ async fn main() -> Result<()> {
     }
 
     if actor_web_cid.is_none() && actor_web_auto_build {
-        if let Some(source_dir) = actor_web_source_dir.as_deref() {
+        if let Some(source_dir) = actor_web_build_source_dir.as_deref() {
             let maybe_ipns_key = if actor_web_auto_publish_ipns {
                 Some(actor_web_ipns_key.as_str())
             } else {
@@ -9239,24 +9304,29 @@ async fn main() -> Result<()> {
         }
     }
 
-    if actor_web_source_dir.is_none() {
-        if let Some(cid) = actor_web_cid.as_deref() {
-            let cache_root = runtime_cfg
-                .actor_web_cache_dir
-                .clone()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| xdg_data_home().join("ma").join("actor-web"));
-            actor_web_source_dir = Some(materialize_actor_web_from_cid(&kubo_url, cid, &cache_root).await?);
-        }
-    }
-
-    let actor_web_runtime = actor_web_source_dir.map(|source_dir| {
-        (
-            source_dir,
-            actor_web_version.clone(),
-            actor_web_cid.clone(),
+    let actor_web_cid = actor_web_cid.ok_or_else(|| {
+        anyhow!(
+            "actor web CID is required at runtime but could not be resolved. Provide --cid, set actor_web_cid in runtime config, ensure actor web auto-build succeeds, or ensure actor_web_ipns_key resolves to /ipfs/<cid>."
         )
-    });
+    })?;
+
+    let cache_root = runtime_cfg
+        .actor_web_cache_dir
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| xdg_data_home().join("ma").join("actor-web"));
+    let actor_web_source_dir = materialize_actor_web_from_cid(&kubo_url, &actor_web_cid, &cache_root).await?;
+    info!(
+        "Actor web runtime materialized from CID {} into {}",
+        actor_web_cid,
+        actor_web_source_dir.display()
+    );
+
+    let actor_web_runtime = Some((
+        actor_web_source_dir,
+        actor_web_version.clone(),
+        Some(actor_web_cid.clone()),
+    ));
 
     let run_result: Result<()> = async {
         let world_master_key = derive_world_master_key(endpoint.secret_key(), &world_slug);
@@ -9338,33 +9408,13 @@ async fn main() -> Result<()> {
         let did_cache = Arc::new(RwLock::new(HashMap::new()));
         let router = Router::builder(endpoint.clone())
             .accept(
-                WORLD_ALPN,
+                INBOX_ALPN,
                 WorldProtocol {
                     world: world.clone(),
                     endpoint: endpoint.clone(),
                     endpoint_id: endpoint_id.clone(),
                     did_cache: did_cache.clone(),
-                    lane: WorldLane::World,
-                },
-            )
-            .accept(
-                CMD_ALPN,
-                WorldProtocol {
-                    world: world.clone(),
-                    endpoint: endpoint.clone(),
-                    endpoint_id: endpoint_id.clone(),
-                    did_cache,
-                    lane: WorldLane::Cmd,
-                },
-            )
-            .accept(
-                CHAT_ALPN,
-                WorldProtocol {
-                    world: world.clone(),
-                    endpoint: endpoint.clone(),
-                    endpoint_id: endpoint_id.clone(),
-                    did_cache: Arc::new(RwLock::new(HashMap::new())),
-                    lane: WorldLane::Chat,
+                    lane: WorldLane::Inbox,
                 },
             )
             .accept(
@@ -9407,9 +9457,7 @@ async fn main() -> Result<()> {
             entry_acl: world.entry_acl_source().await,
             started_at: Utc::now().to_rfc3339(),
             capabilities: vec![
-                LaneCapability::for_lane(WorldLane::World),
-                LaneCapability::for_lane(WorldLane::Cmd),
-                LaneCapability::for_lane(WorldLane::Chat),
+                LaneCapability::for_lane(WorldLane::Inbox),
             ],
             actor_web: None,
         };
@@ -9445,9 +9493,7 @@ async fn main() -> Result<()> {
         info!("Created default room: {}", DEFAULT_ROOM);
         info!("World endpoint id: {}", world_info.endpoint_id);
         info!("World status page: {}", world_info.status_url);
-        info!("World protocol ALPN: {}", String::from_utf8_lossy(WORLD_ALPN));
-        info!("Command protocol ALPN: {}", String::from_utf8_lossy(CMD_ALPN));
-        info!("Chat protocol ALPN: {}", String::from_utf8_lossy(CHAT_ALPN));
+        info!("Inbox protocol ALPN: {}", String::from_utf8_lossy(INBOX_ALPN));
         info!("Closet protocol ALPN: {}", String::from_utf8_lossy(CLOSET_ALPN));
         info!("Broadcast protocol ALPN (outbound push to agents): {}", String::from_utf8_lossy(BROADCAST_ALPN));
         info!("World entry ACL: {}", world_info.entry_acl);
@@ -9460,8 +9506,6 @@ async fn main() -> Result<()> {
                 actor_web.source_dir,
                 actor_web.version.as_deref().unwrap_or("unknown")
             );
-        } else {
-            info!("Actor web runtime disabled (set actor_web_dir in runtime config to enable)");
         }
 
         for relay_url in &world_info.relay_urls {
@@ -9506,13 +9550,7 @@ async fn main() -> Result<()> {
             .record_event(format!("optional published location hint: {}", world_info.location_hint))
             .await;
         world
-            .record_event(format!("world protocol ready on ALPN {}", String::from_utf8_lossy(WORLD_ALPN)))
-            .await;
-        world
-            .record_event(format!("command protocol ready on ALPN {}", String::from_utf8_lossy(CMD_ALPN)))
-            .await;
-        world
-            .record_event(format!("chat protocol ready on ALPN {}", String::from_utf8_lossy(CHAT_ALPN)))
+            .record_event(format!("inbox protocol ready on ALPN {}", String::from_utf8_lossy(INBOX_ALPN)))
             .await;
 
         info!("World initialized. Waiting for connections...");
@@ -9579,29 +9617,6 @@ async fn probe_relay(relay_url: &str) -> String {
         Ok(resp) => format!("http {} in {}ms", resp.status().as_u16(), started.elapsed().as_millis()),
         Err(err) => format!("error {} in {}ms", err, started.elapsed().as_millis()),
     }
-}
-
-fn resolve_avatar_inbox(did: &Did) -> Result<String> {
-    did.fragment
-        .clone()
-        .ok_or_else(|| anyhow!("sender DID must include #fragment (local avatar inbox atom)"))
-}
-
-fn resolve_avatar_inbox_from_session(did: &Did, session_fragment: Option<&str>) -> Result<String> {
-    if let Some(fragment) = did.fragment.clone() {
-        return Ok(fragment);
-    }
-
-    let fallback = session_fragment
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_string());
-
-    fallback.ok_or_else(|| {
-        anyhow!(
-            "sender DID must include #fragment (local avatar inbox atom); run apply in closet to assign alias/fragment first"
-        )
-    })
 }
 
 fn load_entry_acl() -> Result<EntryAcl> {

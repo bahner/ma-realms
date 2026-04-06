@@ -93,6 +93,16 @@ body {
   background: rgba(255, 250, 242, 0.75);
 }
 
+#btn-alias.aliasing-inverted {
+  background: #0b0b0b;
+  color: #ffdead;
+  border-color: #0b0b0b;
+}
+
+#btn-alias.aliasing-inverted:hover {
+  box-shadow: 0 6px 12px rgba(0, 0, 0, 0.26);
+}
+
 .card,
 .chat {
   border: 1px solid var(--line);
@@ -596,10 +606,63 @@ button.primary {
   padding: 0.18rem 0.1rem;
 }
 
-.avatar-item::before {
-  content: '@';
+.matrix-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 62;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: rgba(14, 10, 8, 0.58);
+  backdrop-filter: blur(3px);
+}
+
+.matrix-card {
+  width: min(960px, 100%);
+  max-height: min(92vh, 920px);
+  display: grid;
+  grid-template-rows: auto minmax(260px, 1fr) auto;
+  gap: 0.65rem;
+  border: 1px solid var(--line-strong);
+  border-radius: 16px;
+  background: rgba(255, 253, 248, 0.98);
+  box-shadow: 0 22px 52px rgba(40, 31, 22, 0.34);
+  padding: 0.85rem;
+}
+
+.matrix-head h2 {
+  margin: 0;
+  font-size: 1.2rem;
+  font-family: "Iowan Old Style", "Palatino Linotype", serif;
+}
+
+.matrix-head p {
+  margin: 0.22rem 0 0;
   color: var(--muted);
-  margin-right: 0.1em;
+  font-size: 0.9rem;
+}
+
+.matrix-text {
+  margin: 0;
+  min-height: 260px;
+  max-height: 62vh;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: #fffdf8;
+  color: var(--text);
+  padding: 0.75rem;
+  overflow: auto;
+  font-family: "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.86rem;
+  line-height: 1.42;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.matrix-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.55rem;
 }
 
 @media (max-width: 780px) {
@@ -655,6 +718,10 @@ button.primary {
   }
 
   .yaml-editor-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .matrix-actions {
     grid-template-columns: 1fr;
   }
 

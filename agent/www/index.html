@@ -1,0 +1,902 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ma-agentd admin</title>
+<style>
+:root {
+  --bg0: #071019;
+  --bg1: #0e1a2a;
+  --ink: #d8efff;
+  --muted: #9ec4d9;
+  --line: rgba(140, 200, 235, 0.27);
+  --accent: #5ce3ff;
+  --accent-2: #ffbe6e;
+  --ok: #66f39a;
+  --warn: #ffc25a;
+  --danger: #ff7c7c;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: var(--ink);
+  font-family: "Iosevka Web", "JetBrains Mono", "IBM Plex Mono", ui-monospace, monospace;
+  background:
+    radial-gradient(1200px 600px at 8% -5%, rgba(67, 227, 255, 0.2), transparent 58%),
+    radial-gradient(850px 500px at 100% 110%, rgba(255, 190, 110, 0.18), transparent 60%),
+    linear-gradient(155deg, var(--bg0), var(--bg1));
+  overflow-x: hidden;
+}
+
+.ambient {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.orb {
+  position: absolute;
+  width: 38vmax;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  filter: blur(36px);
+  opacity: 0.25;
+}
+
+.orb.a {
+  background: #4dd5ff;
+  top: -14vmax;
+  left: -8vmax;
+  animation: driftA 18s ease-in-out infinite;
+}
+
+.orb.b {
+  background: #ffbe6e;
+  right: -12vmax;
+  bottom: -12vmax;
+  animation: driftB 20s ease-in-out infinite;
+}
+
+@keyframes driftA {
+  0%, 100% { transform: translate3d(0, 0, 0); }
+  50% { transform: translate3d(4vmax, 3vmax, 0); }
+}
+
+@keyframes driftB {
+  0%, 100% { transform: translate3d(0, 0, 0); }
+  50% { transform: translate3d(-4vmax, -2vmax, 0); }
+}
+
+.app {
+  position: relative;
+  z-index: 1;
+  width: min(1200px, 100% - 1.5rem);
+  margin: 1.2rem auto 1.5rem;
+}
+
+.hero {
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 16px 18px;
+  background: linear-gradient(160deg, rgba(10, 28, 45, 0.82), rgba(8, 22, 41, 0.68));
+  box-shadow: 0 16px 50px rgba(0, 0, 0, 0.3);
+  margin-bottom: 12px;
+}
+
+.hero-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+h1 {
+  margin: 0;
+  font-size: clamp(1.2rem, 2.1vw, 1.7rem);
+  letter-spacing: 0.02em;
+}
+
+.sub {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.hero-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.chip-row {
+  margin-top: 12px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.chip {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 6px 10px;
+  color: var(--muted);
+  background: rgba(8, 27, 43, 0.5);
+  font-size: 0.84rem;
+}
+
+.chip.live {
+  color: #dff9ff;
+}
+
+.chip.toggle {
+  cursor: pointer;
+  transition: box-shadow 180ms ease, border-color 180ms ease, color 180ms ease, background 180ms ease;
+}
+
+.chip.toggle.on {
+  color: #e7fff3;
+  border-color: rgba(102, 243, 154, 0.72);
+  background: linear-gradient(160deg, rgba(19, 65, 44, 0.74), rgba(16, 55, 37, 0.68));
+  box-shadow: 0 0 0 1px rgba(102, 243, 154, 0.25), 0 0 18px rgba(102, 243, 154, 0.36);
+}
+
+.chip.toggle.off {
+  color: #ffe5ba;
+  border-color: rgba(255, 194, 90, 0.56);
+  background: linear-gradient(160deg, rgba(71, 43, 16, 0.68), rgba(59, 34, 13, 0.62));
+}
+
+.live-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+  background: var(--ok);
+  box-shadow: 0 0 0 0 rgba(102, 243, 154, 0.7);
+  animation: pulse 1.8s ease-out infinite;
+  vertical-align: baseline;
+}
+
+@keyframes pulse {
+  0% { box-shadow: 0 0 0 0 rgba(102, 243, 154, 0.7); }
+  80% { box-shadow: 0 0 0 8px rgba(102, 243, 154, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(102, 243, 154, 0); }
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: 1.1fr 1fr;
+  gap: 12px;
+}
+
+.panel {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 12px;
+  background: linear-gradient(155deg, rgba(9, 25, 42, 0.82), rgba(8, 21, 36, 0.7));
+}
+
+.panel h2 {
+  margin: 0 0 10px;
+  font-size: 0.95rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #cceeff;
+}
+
+.meta-line {
+  margin-bottom: 6px;
+  color: var(--muted);
+}
+
+.mono {
+  color: var(--ink);
+  word-break: break-all;
+}
+
+.form-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+button {
+  border: 1px solid rgba(136, 214, 255, 0.5);
+  background: linear-gradient(160deg, rgba(13, 43, 66, 0.86), rgba(9, 30, 52, 0.76));
+  color: #dff5ff;
+  border-radius: 10px;
+  padding: 8px 11px;
+  cursor: pointer;
+}
+
+button:hover {
+  border-color: rgba(156, 225, 255, 0.85);
+  transform: translateY(-1px);
+}
+
+button:active { transform: translateY(0); }
+
+button.warn {
+  border-color: rgba(255, 194, 90, 0.5);
+  background: linear-gradient(160deg, rgba(70, 41, 15, 0.86), rgba(61, 34, 13, 0.72));
+}
+
+input {
+  padding: 8px 10px;
+  min-width: 220px;
+  border-radius: 10px;
+  border: 1px solid rgba(142, 200, 229, 0.35);
+  background: rgba(5, 16, 29, 0.84);
+  color: var(--ink);
+}
+
+input:focus {
+  outline: none;
+  border-color: rgba(108, 227, 255, 0.9);
+  box-shadow: 0 0 0 3px rgba(88, 198, 255, 0.2);
+}
+
+pre {
+  margin: 0;
+  white-space: pre-wrap;
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid rgba(114, 183, 216, 0.25);
+  background: rgba(5, 15, 27, 0.94);
+  color: #cce9fb;
+  padding: 10px;
+  border-radius: 10px;
+}
+
+.span-2 { grid-column: 1 / -1; }
+
+.lock-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 999;
+  display: none;
+  align-items: stretch;
+  justify-content: stretch;
+  padding: 0;
+  background:
+    radial-gradient(circle at 12% 10%, rgba(255, 190, 236, 0.24), transparent 40%),
+    radial-gradient(circle at 88% 90%, rgba(172, 241, 255, 0.24), transparent 42%),
+    linear-gradient(160deg, rgba(21, 25, 61, 0.86), rgba(21, 35, 66, 0.82));
+  backdrop-filter: blur(10px) saturate(120%);
+}
+
+.lock-overlay.show { display: flex; }
+
+.lock-card {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  background: transparent;
+  color: #e8f3fb;
+  text-align: left;
+  box-shadow: none;
+  overflow: clip;
+}
+
+.lock-banner {
+  position: absolute;
+  top: clamp(0.9rem, 2.8vh, 2rem);
+  left: clamp(0.9rem, 2.8vw, 2.2rem);
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin-bottom: 0;
+  max-width: min(92vw, 760px);
+  padding: 0.75rem 0.9rem;
+  border-radius: 14px;
+  border: 1px solid rgba(230, 220, 255, 0.42);
+  background: linear-gradient(165deg, rgba(48, 58, 110, 0.72), rgba(52, 83, 127, 0.58));
+  backdrop-filter: blur(5px);
+  box-shadow: 0 16px 40px rgba(10, 9, 28, 0.35);
+}
+
+.lock-brand {
+  margin: 0;
+  width: fit-content;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 226, 255, 0.52);
+  background: rgba(54, 60, 122, 0.55);
+  color: #ffeefe;
+  font-size: 0.74rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 5px 11px;
+}
+
+.lock-card h2 {
+  margin: 0;
+  font-size: clamp(2rem, 5.8vw, 4.1rem);
+  line-height: 0.95;
+  font-weight: 760;
+  letter-spacing: 0.01em;
+  color: #f4f7ff;
+}
+
+.lock-card p {
+  margin: 0;
+  color: #e8f0ff;
+}
+
+.lock-sub {
+  margin-top: 2px;
+  font-size: 0.98rem;
+  color: #f7ecff;
+}
+
+.lock-trust {
+  margin-top: 6px;
+  display: flex;
+  gap: 8px;
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+
+.lock-pill {
+  border: 1px solid rgba(238, 225, 255, 0.3);
+  border-radius: 999px;
+  background: rgba(54, 67, 116, 0.56);
+  color: #f3f2ff;
+  font-size: 0.79rem;
+  padding: 6px 10px;
+}
+
+.lock-card button {
+  margin-top: 4px;
+  min-width: 180px;
+  font-weight: 600;
+  border-color: rgba(255, 227, 255, 0.62);
+  background: linear-gradient(165deg, rgba(112, 102, 212, 0.9), rgba(84, 141, 212, 0.84));
+  box-shadow: 0 0 0 1px rgba(242, 225, 255, 0.24) inset, 0 8px 18px rgba(0, 0, 0, 0.3);
+}
+
+.lock-canvas {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  display: block;
+  background: #172447;
+}
+
+@media (max-width: 980px) {
+  .grid { grid-template-columns: 1fr; }
+  .span-2 { grid-column: auto; }
+  .hero-top { flex-direction: column; align-items: stretch; }
+  .hero-actions { justify-content: flex-start; }
+  input { min-width: 0; width: 100%; }
+  .lock-banner {
+    right: 0.8rem;
+    left: 0.8rem;
+    max-width: none;
+  }
+  .lock-trust {
+    gap: 6px;
+  }
+}
+</style>
+</head>
+<body>
+<div class="ambient" aria-hidden="true">
+  <div class="orb a"></div>
+  <div class="orb b"></div>
+</div>
+
+<main class="app">
+  <section class="hero">
+    <div class="hero-top">
+      <div>
+        <h1 id="title">ma-agentd</h1>
+        <div class="sub">Live daemon cockpit with lockscreen guardrails</div>
+      </div>
+      <div class="hero-actions">
+        <button id="btn-lock" type="button" class="warn">Lock</button>
+        <button id="btn-refresh-all" type="button">Refresh all</button>
+      </div>
+    </div>
+    <div class="chip-row">
+      <div class="chip live" id="healthChip"><span class="live-dot"></span>daemon online</div>
+      <div class="chip" id="clockChip">--:--:--</div>
+      <button class="chip toggle off" id="lockCountdown" type="button" title="Toggle auto-lock">--s</button>
+    </div>
+  </section>
+
+  <section class="grid">
+    <section class="panel">
+      <h2>Runtime Meta</h2>
+      <div class="meta-line">agent version: <span id="agentVersion" class="mono">-</span></div>
+      <div class="meta-line">listen: <span id="listen" class="mono">-</span></div>
+      <div class="meta-line">kubo key alias: <span id="kuboKeyAliasDisplay" class="mono">-</span></div>
+      <div class="meta-line">config: <span id="configPath" class="mono">-</span></div>
+      <div class="meta-line">data: <span id="dataRoot" class="mono">-</span></div>
+    </section>
+
+    <section class="panel">
+      <h2>Config</h2>
+      <div class="form-row">
+        <input id="slug" placeholder="slug" />
+        <input id="kuboKeyAlias" placeholder="kubo key alias" />
+      </div>
+      <div class="form-row">
+        <input id="lockTtl" placeholder="lock ttl (seconds, 0 = off)" type="number" min="0" step="1" />
+        <button onclick="saveConfig()">Save config</button>
+        <button onclick="validateAlias()">Validate alias</button>
+      </div>
+      <pre id="cfg"></pre>
+    </section>
+
+    <section class="panel span-2">
+      <h2>Agents</h2>
+      <div class="form-row">
+        <button onclick="refreshAgents()">Refresh agents</button>
+        <button onclick="createAgent()">Create agent</button>
+      </div>
+      <pre id="agents"></pre>
+    </section>
+
+    <section class="panel span-2">
+      <h2>Logs</h2>
+      <div class="form-row">
+        <input id="agentId" placeholder="agent id" />
+        <input id="q" placeholder="search logs" />
+        <button onclick="loadLogs()">Load logs</button>
+      </div>
+      <pre id="logs"></pre>
+    </section>
+  </section>
+</main>
+
+<div id="lock-overlay" class="lock-overlay" role="dialog" aria-modal="true" aria-hidden="true">
+  <div class="lock-card">
+    <canvas id="lock-canvas" class="lock-canvas" aria-hidden="true"></canvas>
+    <div class="lock-banner">
+      <div class="lock-brand">Sirius Relay // Pan-Galactic Shift</div>
+      <h2 id="lock-title">don't panic</h2>
+      <p>The relay is safe. This console is just resting.</p>
+      <p class="lock-sub" id="lock-countdown">Auto-lock in --</p>
+      <button id="btn-unlock" type="button">Open the bridge</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let lockShownAt = 0;
+let lockTimerId = null;
+let lockDeadlineMs = 0;
+let autoLockEnabled = true;
+let currentSlug = 'agent';
+let lastNonZeroTtlSeconds = 120;
+let lockSceneRaf = 0;
+let lockScenePhase = 0;
+
+function resizeLockCanvas(canvas) {
+  if (!canvas) return;
+  const ratio = window.devicePixelRatio || 1;
+  const width = Math.max(1, Math.floor(canvas.clientWidth * ratio));
+  const height = Math.max(1, Math.floor(canvas.clientHeight * ratio));
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+}
+
+function drawLockScene(ts) {
+  const canvas = byId('lock-canvas');
+  if (!canvas) {
+    lockSceneRaf = 0;
+    return;
+  }
+
+  resizeLockCanvas(canvas);
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    lockSceneRaf = 0;
+    return;
+  }
+
+  const w = canvas.width;
+  const h = canvas.height;
+  lockScenePhase = ts;
+
+  const sky = ctx.createLinearGradient(0, 0, 0, h);
+  sky.addColorStop(0, '#22386f');
+  sky.addColorStop(0.58, '#1b2e58');
+  sky.addColorStop(1, '#182344');
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, w, h);
+
+  const glint = ctx.createRadialGradient(w * 0.2, h * 0.15, 20, w * 0.2, h * 0.15, w * 0.65);
+  glint.addColorStop(0, 'rgba(255, 208, 246, 0.22)');
+  glint.addColorStop(1, 'rgba(255, 208, 246, 0)');
+  ctx.fillStyle = glint;
+  ctx.fillRect(0, 0, w, h);
+
+  for (let i = 0; i < 24; i += 1) {
+    const loop = (lockScenePhase * 0.045 + i * 77) % (h + 280);
+    const y = h - loop + Math.sin(lockScenePhase * 0.001 + i * 0.5) * 11;
+    const x =
+      ((i + 1) / 26) * w +
+      Math.sin(lockScenePhase * 0.0007 + i * 1.4) * (w * 0.045);
+    const radius = (10 + (i % 5) * 4) * (window.devicePixelRatio || 1);
+
+    const bubble = ctx.createRadialGradient(
+      x - radius * 0.25,
+      y - radius * 0.25,
+      radius * 0.15,
+      x,
+      y,
+      radius
+    );
+    bubble.addColorStop(0, 'rgba(255, 249, 255, 0.55)');
+    bubble.addColorStop(0.35, i % 3 === 0 ? 'rgba(255, 191, 235, 0.28)' : 'rgba(187, 238, 255, 0.28)');
+    bubble.addColorStop(1, 'rgba(181, 219, 255, 0.04)');
+
+    ctx.beginPath();
+    ctx.fillStyle = bubble;
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  lockSceneRaf = requestAnimationFrame(drawLockScene);
+}
+
+function startLockScene() {
+  if (lockSceneRaf) return;
+  lockSceneRaf = requestAnimationFrame(drawLockScene);
+}
+
+function stopLockScene() {
+  if (lockSceneRaf) {
+    cancelAnimationFrame(lockSceneRaf);
+    lockSceneRaf = 0;
+  }
+}
+
+function autoLockStorageKey(slug) {
+  const normalized = String(slug || '').trim() || 'agent';
+  return `ma-agentd.autoLockEnabled.${normalized}`;
+}
+
+function loadAutoLockPreference(slug) {
+  try {
+    const raw = localStorage.getItem(autoLockStorageKey(slug));
+    if (raw === 'on') return true;
+    if (raw === 'off') return false;
+  } catch (_) {
+    // Ignore localStorage errors.
+  }
+  return null;
+}
+
+function saveAutoLockPreference(slug, enabled) {
+  try {
+    localStorage.setItem(autoLockStorageKey(slug), enabled ? 'on' : 'off');
+  } catch (_) {
+    // Ignore localStorage errors.
+  }
+}
+
+function syncAutoLockFromConfig(config) {
+  const slug = String(config?.slug || '').trim() || 'agent';
+  currentSlug = slug;
+  const ttl = Number.isFinite(config?.lock_ttl) ? Number(config.lock_ttl) : 0;
+  if (ttl > 0) {
+    lastNonZeroTtlSeconds = ttl;
+  }
+  const stored = loadAutoLockPreference(slug);
+  const defaultEnabled = ttl > 0;
+  autoLockEnabled = stored === null ? defaultEnabled : stored;
+}
+
+function byId(id) {
+  return document.getElementById(id);
+}
+
+function titleForSlug(slug) {
+  const s = String(slug || '').trim();
+  return s ? `ma-agentd (${s})` : 'ma-agentd';
+}
+
+function readLockTtlSeconds() {
+  const raw = String(byId('lockTtl')?.value || '').trim();
+  const ttl = Number.parseInt(raw, 10);
+  if (!Number.isFinite(ttl) || ttl < 0) {
+    return 0;
+  }
+  return ttl;
+}
+
+function setLockTtlSeconds(ttl) {
+  const value = Math.max(0, Number.parseInt(String(ttl || 0), 10) || 0);
+  const input = byId('lockTtl');
+  if (input) {
+    input.value = String(value);
+  }
+  if (value > 0) {
+    lastNonZeroTtlSeconds = value;
+  }
+  return value;
+}
+
+function updateClock() {
+  const now = new Date();
+  const text = now.toLocaleTimeString([], { hour12: false });
+  byId('clockChip').textContent = text;
+}
+
+function updateLockCountdownLabel() {
+  const el = byId('lockCountdown');
+  const overlay = byId('lock-countdown');
+  if (!el) return;
+  const overlayVisible = byId('lock-overlay')?.classList.contains('show');
+  if (overlayVisible) {
+    el.textContent = 'LOCK';
+    if (overlay) overlay.textContent = 'Console locked now';
+    el.classList.remove('on', 'off');
+    el.classList.add('off');
+    el.setAttribute('aria-pressed', 'false');
+    return;
+  }
+
+  const ttlSeconds = readLockTtlSeconds();
+
+  if (!autoLockEnabled || ttlSeconds <= 0) {
+    el.textContent = `${ttlSeconds}s`;
+    if (overlay) overlay.textContent = 'Auto-lock paused';
+    el.classList.remove('on');
+    el.classList.add('off');
+    el.setAttribute('aria-pressed', 'false');
+    return;
+  }
+
+  const remaining = Math.max(0, Math.ceil((lockDeadlineMs - Date.now()) / 1000));
+  el.textContent = `${remaining}s`;
+  if (overlay) overlay.textContent = `Auto-lock in ${remaining}s`;
+  el.classList.remove('off');
+  el.classList.add('on');
+  el.setAttribute('aria-pressed', 'true');
+}
+
+function showLockOverlay() {
+  const overlay = byId('lock-overlay');
+  if (!overlay) return;
+  lockShownAt = Date.now();
+  overlay.classList.add('show');
+  overlay.setAttribute('aria-hidden', 'false');
+  startLockScene();
+  updateLockCountdownLabel();
+}
+
+function hideLockOverlay() {
+  const overlay = byId('lock-overlay');
+  if (!overlay) return;
+  overlay.classList.remove('show');
+  overlay.setAttribute('aria-hidden', 'true');
+  stopLockScene();
+  resetLockTimer();
+}
+
+function clearLockTimer() {
+  if (lockTimerId !== null) {
+    clearTimeout(lockTimerId);
+    lockTimerId = null;
+  }
+  lockDeadlineMs = 0;
+}
+
+function resetLockTimer() {
+  clearLockTimer();
+  let ttlSeconds = readLockTtlSeconds();
+  if (ttlSeconds > 0) {
+    lastNonZeroTtlSeconds = ttlSeconds;
+  }
+
+  if (autoLockEnabled && ttlSeconds <= 0) {
+    ttlSeconds = setLockTtlSeconds(lastNonZeroTtlSeconds > 0 ? lastNonZeroTtlSeconds : 120);
+  }
+
+  if (!autoLockEnabled || ttlSeconds <= 0) {
+    updateLockCountdownLabel();
+    return;
+  }
+  lockDeadlineMs = Date.now() + ttlSeconds * 1000;
+  lockTimerId = setTimeout(() => {
+    showLockOverlay();
+  }, ttlSeconds * 1000);
+  updateLockCountdownLabel();
+}
+
+function bindActivityListeners() {
+  const reset = () => {
+    const overlay = byId('lock-overlay');
+    if (overlay && overlay.classList.contains('show')) {
+      return;
+    }
+    resetLockTimer();
+  };
+  ['pointerdown', 'keydown', 'mousemove', 'touchstart', 'scroll'].forEach((eventName) => {
+    document.addEventListener(eventName, reset, { passive: true });
+  });
+}
+
+function applyHealthToMeta(payload) {
+  const data = payload || {};
+  byId('agentVersion').textContent = String(data.agent_version || '-');
+  byId('listen').textContent = String(data.listen || '-');
+  byId('kuboKeyAliasDisplay').textContent = String(data.kubo_key_alias || '-');
+  byId('configPath').textContent = String(data.config_path || '-');
+  byId('dataRoot').textContent = String(data.data_root || '-');
+}
+
+function setHealthChip(ok, message) {
+  const chip = byId('healthChip');
+  if (!chip) return;
+  chip.innerHTML = `<span class="live-dot"></span>${message}`;
+  if (ok) {
+    chip.style.borderColor = 'rgba(102, 243, 154, 0.45)';
+    chip.style.color = '#e3ffe8';
+    return;
+  }
+  chip.style.borderColor = 'rgba(255, 124, 124, 0.55)';
+  chip.style.color = '#ffdede';
+}
+
+async function refreshHealth() {
+  const r = await fetch('/api/v0/health');
+  if (!r.ok) {
+    throw new Error(`health ${r.status}`);
+  }
+  const j = await r.json();
+  applyHealthToMeta(j);
+  setHealthChip(true, 'daemon online');
+}
+
+async function refreshAgents() {
+  const r = await fetch('/api/v0/agents');
+  const j = await r.json();
+  byId('agents').textContent = JSON.stringify(j, null, 2);
+}
+
+async function refreshConfig() {
+  const r = await fetch('/api/v0/config');
+  const j = await r.json();
+  byId('cfg').textContent = JSON.stringify(j, null, 2);
+
+  if (j.config) {
+    byId('slug').value = j.config.slug || '';
+    byId('kuboKeyAlias').value = j.config.kubo_key_alias || '';
+    byId('lockTtl').value = Number.isFinite(j.config.lock_ttl) ? String(j.config.lock_ttl) : '0';
+    byId('title').textContent = titleForSlug(j.config.slug);
+    syncAutoLockFromConfig(j.config);
+  }
+
+  resetLockTimer();
+}
+
+async function saveConfig() {
+  const slug = byId('slug').value.trim();
+  const kubo_key_alias = byId('kuboKeyAlias').value.trim();
+  const lock_ttl_raw = byId('lockTtl').value.trim();
+  const parsedLockTtl = Number.parseInt(lock_ttl_raw, 10);
+  const lock_ttl = Number.isFinite(parsedLockTtl) && parsedLockTtl >= 0 ? parsedLockTtl : 0;
+
+  const r = await fetch('/api/v0/config/update', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      slug: slug || null,
+      kubo_key_alias: kubo_key_alias || null,
+      lock_ttl,
+    }),
+  });
+  const j = await r.json();
+  byId('cfg').textContent = JSON.stringify(j, null, 2);
+  if (j.config) {
+    byId('title').textContent = titleForSlug(j.config.slug);
+    byId('lockTtl').value = Number.isFinite(j.config.lock_ttl) ? String(j.config.lock_ttl) : '0';
+    syncAutoLockFromConfig(j.config);
+  }
+  await refreshHealth();
+  resetLockTimer();
+  alert(j.message || 'config updated');
+}
+
+async function validateAlias() {
+  const kubo_key_alias = byId('kuboKeyAlias').value.trim();
+  const qs = kubo_key_alias ? `?alias=${encodeURIComponent(kubo_key_alias)}` : '';
+  const r = await fetch(`/api/v0/config/validate-key-alias${qs}`);
+  const j = await r.json();
+  byId('cfg').textContent = JSON.stringify(j, null, 2);
+}
+
+async function createAgent() {
+  const id = prompt('agent id (empty = nanoid)') || '';
+  const r = await fetch('/api/v0/agents/create', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id: id || null }),
+  });
+  const j = await r.json();
+  await refreshAgents();
+  alert(j.message || 'ok');
+}
+
+async function loadLogs() {
+  const id = byId('agentId').value.trim();
+  if (!id) return;
+  const q = encodeURIComponent(byId('q').value.trim());
+  const r = await fetch(`/api/v0/agents/${id}/logs?q=${q}&limit=200`);
+  const j = await r.json();
+  byId('logs').textContent = JSON.stringify(j, null, 2);
+}
+
+async function refreshAll() {
+  try {
+    await Promise.all([refreshHealth(), refreshConfig(), refreshAgents()]);
+  } catch (error) {
+    setHealthChip(false, `daemon unreachable (${error instanceof Error ? error.message : String(error)})`);
+  }
+}
+
+byId('btn-lock')?.addEventListener('click', showLockOverlay);
+byId('btn-unlock')?.addEventListener('click', hideLockOverlay);
+byId('btn-refresh-all')?.addEventListener('click', () => {
+  refreshAll();
+});
+byId('lockCountdown')?.addEventListener('click', () => {
+  autoLockEnabled = !autoLockEnabled;
+  if (autoLockEnabled && readLockTtlSeconds() <= 0) {
+    setLockTtlSeconds(lastNonZeroTtlSeconds > 0 ? lastNonZeroTtlSeconds : 120);
+  }
+  saveAutoLockPreference(currentSlug, autoLockEnabled);
+  resetLockTimer();
+});
+byId('lockTtl')?.addEventListener('input', () => {
+  const ttl = readLockTtlSeconds();
+  if (ttl > 0) {
+    lastNonZeroTtlSeconds = ttl;
+  }
+  resetLockTimer();
+});
+
+byId('lock-overlay')?.addEventListener('click', (event) => {
+  if (event.target !== event.currentTarget) return;
+  if (Date.now() - lockShownAt < 250) return;
+  hideLockOverlay();
+});
+
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') hideLockOverlay();
+});
+
+bindActivityListeners();
+updateClock();
+updateLockCountdownLabel();
+refreshAll();
+
+setInterval(updateClock, 1000);
+setInterval(updateLockCountdownLabel, 1000);
+setInterval(() => {
+  if (document.visibilityState === 'visible') {
+    refreshHealth().catch((error) => {
+      setHealthChip(false, `daemon unreachable (${error instanceof Error ? error.message : String(error)})`);
+    });
+  }
+}, 15000);
+</script>
+</body>
+</html>

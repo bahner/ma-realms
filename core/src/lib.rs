@@ -65,11 +65,12 @@ pub use protocol::{
     ClosetRequest, ClosetResponse,
     LaneCapability, PresenceAvatar, RoomEvent, TransportAck, TransportAckCode, WorldCommand,
     WorldLane, WorldRequest, WorldResponse,
-    BROADCAST_ALPN, CHAT_ALPN, CLOSET_ALPN, CMD_ALPN, DEFAULT_WORLD_RELAY_URL, INBOX_ALPN, PRESENCE_ALPN,
-    WHISPER_ALPN, WORLD_ALPN,
+    BROADCAST_ALPN, CLOSET_ALPN, DEFAULT_WORLD_RELAY_URL, INBOX_ALPN, PRESENCE_ALPN,
+    WHISPER_ALPN,
     DEFAULT_CONTENT_TYPE, CONTENT_TYPE_CHAT, CONTENT_TYPE_PRESENCE,
-    CONTENT_TYPE_CMD, CONTENT_TYPE_WORLD, CONTENT_TYPE_BROADCAST,
+    CONTENT_TYPE_WORLD, CONTENT_TYPE_BROADCAST,
     CONTENT_TYPE_DOC, CONTENT_TYPE_WHISPER,
+    ROOM_METHOD_BROADCAST_SEND, ROOM_METHOD_EVENTS_POLL, ROOM_METHOD_PRESENCE_LIST,
 };
 pub use requirements::{
     LegacyRequirement, RequirementArgArity, RequirementChecker, RequirementEvaluation,
@@ -148,38 +149,27 @@ mod tests {
         );
     }
 
-        #[test]
-        fn parses_world_admin_shorthand() {
-            // @@ is shorthand for @world
-            assert_eq!(
-                parse_message("@@claim"),
-                MessageEnvelope::ActorCommand {
-                    target: "world".to_string(),
-                    command: ActorCommand::Raw {
-                        command: "claim".to_string()
-                    }
+    #[test]
+    fn parses_world_dotted_method_command() {
+        assert_eq!(
+            parse_message("@world.save"),
+            MessageEnvelope::ActorCommand {
+                target: "world".to_string(),
+                command: ActorCommand::Raw {
+                    command: "save".to_string()
                 }
-            );
-            assert_eq!(
-                parse_message("@@dig north to #garden"),
-                MessageEnvelope::ActorCommand {
-                    target: "world".to_string(),
-                    command: ActorCommand::Raw {
-                        command: "dig north to #garden".to_string()
-                    }
+            }
+        );
+        assert_eq!(
+            parse_message("@world.dig north to #garden"),
+            MessageEnvelope::ActorCommand {
+                target: "world".to_string(),
+                command: ActorCommand::Raw {
+                    command: "dig north to #garden".to_string()
                 }
-            );
-            // bare @@ = help
-            assert_eq!(
-                parse_message("@@"),
-                MessageEnvelope::ActorCommand {
-                    target: "world".to_string(),
-                    command: ActorCommand::Raw {
-                        command: "help".to_string()
-                    }
-                }
-            );
-        }
+            }
+        );
+    }
 
     #[test]
     fn parses_room_command() {

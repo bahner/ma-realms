@@ -5,13 +5,13 @@ world.private.status.off = @world private=off (open entry)
 world.owner.required = @world only the world owner can run that command.
 world.private.on = private mode enabled; new entrants must knock
 world.private.off = private mode disabled; entry is now open
-world.private.usage = @world usage: @@private [on|off|status]
+world.private.usage = @world usage: @world.private [on|off|status]
 world.knock.empty = knock inbox is empty
 world.lang.show = lang_cid={$cid}
 world.lang.cleared = lang_cid cleared (save world to persist)
 world.lang.set = lang_cid set to {$cid} (save world to persist)
-world.lang.usage.set = @world usage: @@lang set <cid>
-world.lang.usage = @world usage: @@lang [show|set <cid>|clear]
+world.lang.usage.set = @world usage: @world.lang set <cid>
+world.lang.usage = @world usage: @world.lang [show|set <cid>|clear]
 
 closet.empty = You are in the closet and have no avatar yet. Type 'help'.
 closet.help = Closet commands: help | show | hear | apply [ipns_key_base64] | citizen [ipns_key_base64] | avatar.help | avatar.peek | avatar.apply [ipns_key_base64] | avatar.name: <text> | avatar.description: <text> | avatar.name peek | avatar.description peek | document.help | document.peek | document.id peek | document.ma.transports peek | document.publish [ipns_key_base64] | document.republish [ipns_key_base64] | document.apply [ipns_key_base64] | recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>

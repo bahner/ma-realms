@@ -17,6 +17,8 @@
     </header>
 
     <div id="session-tools" class="session-tools hidden" aria-label="Session tools">
+      <button id="btn-alias" type="button" aria-pressed="true">Aliasing</button>
+      <button id="btn-log" type="button">Logg</button>
       <button id="btn-export" type="button">Export Bundle</button>
       <button id="btn-lock" type="button">Lock</button>
     </div>
@@ -130,6 +132,20 @@
         <button id="yaml-editor-cancel" type="button">Close</button>
         <button id="yaml-editor-close-eval" type="button" class="hidden">Close and Eval</button>
         <button id="yaml-editor-save" class="primary" type="button">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="matrix-modal" class="matrix-modal hidden" role="dialog" aria-modal="true" aria-hidden="true" aria-label="I/O command log">
+    <div class="matrix-card">
+      <header class="matrix-head">
+        <h2>I/O Log</h2>
+        <p>Rå logg for kommandoer inn/ut i denne fanen.</p>
+      </header>
+      <pre id="matrix-text" class="matrix-text"></pre>
+      <div class="matrix-actions">
+        <button id="matrix-refresh" type="button">Refresh</button>
+        <button id="matrix-close" class="primary" type="button">Close</button>
       </div>
     </div>
   </div>

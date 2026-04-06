@@ -12,6 +12,9 @@ export function createDotCommands({
   setDebugMode,
   setLogEnabled,
   setLogLevel,
+  setDialogIdStyle,
+  setAliasRewriteEnabled,
+  onAliasBookChanged,
   didRoot,
   resolveTargetDidRoot,
   saveBlockedDidRoots,
@@ -31,49 +34,32 @@ export function createDotCommands({
   sendWhisperToDid,
   runSmokeTest,
 }) {
-  function didFragmentOf(did) {
-    const value = String(did || '').trim();
-    const idx = value.indexOf('#');
-    if (idx === -1 || idx === value.length - 1) {
-      return '';
-    }
-    return value.slice(idx + 1).trim();
+  function normalizeAliasNameToken(input) {
+    const raw = String(input || '').trim();
+    if (!raw) return '';
+    return raw;
   }
 
-  async function resolveAliasAddress(addressInput) {
-    const raw = String(addressInput || '').trim();
-    if (!raw) {
-      throw new Error('Usage: .alias <name> <address|#fragment>');
+  function normalizeAliasTargetToken(input) {
+    const raw = String(input || '').trim();
+    if (!raw) return '';
+    if (/\s/u.test(raw)) {
+      return '';
     }
-    if (!raw.startsWith('#')) {
+    return raw;
+  }
+
+  function resolveAliasBookKey(input) {
+    const raw = String(input || '').trim();
+    if (!raw) return '';
+    if (Object.prototype.hasOwnProperty.call(state.aliasBook, raw)) {
       return raw;
     }
-
-    const fragment = raw.slice(1).trim();
-    if (!fragment) {
-      throw new Error('Usage: .alias <name> <address|#fragment>');
+    const alt = raw.startsWith('@') ? raw.slice(1) : `@${raw}`;
+    if (alt && Object.prototype.hasOwnProperty.call(state.aliasBook, alt)) {
+      return alt;
     }
-
-    if (!state.currentHome) {
-      throw new Error('Fragment lookup requires an active room connection. Connect first, then run .alias #fragment <name>.');
-    }
-
-    for (const entry of state.roomPresence.values()) {
-      const did = String(entry?.did || '').trim();
-      if (!isMaDid(did)) {
-        continue;
-      }
-      const didFragment = didFragmentOf(did);
-      if (didFragment && didFragment.toLowerCase() === fragment.toLowerCase()) {
-        return did;
-      }
-    }
-
-    try {
-      return await lookupDidInCurrentRoom(`#${fragment}`);
-    } catch (_) {
-      return await lookupDidInCurrentRoom(fragment);
-    }
+    return raw;
   }
 
   function parseDot(input) {
@@ -97,12 +83,12 @@ export function createDotCommands({
       appendSystemUi('Dot commands:', 'Punktkommandoer:');
       appendSystemUi('  .help                      - this message', '  .help                      - denne meldingen');
       appendSystemUi('  .identity                  - show local pre-publish DID document as raw JSON', '  .identity                  - vis lokalt DID-dokument (før publisering) som rå JSON');
-      appendSystemUi('  .aliases add <name> <address|#fragment> - add/update alias', '  .aliases add <navn> <adresse|#fragment> - legg til/oppdater alias');
-      appendSystemUi('  .aliases add #fragment <name> - same as above, reversed order', '  .aliases add #fragment <navn> - samme som over, omvendt rekkefølge');
+      appendSystemUi('  .aliases add <name> <target> - add/update alias (no spaces in target)', '  .aliases add <navn> <mål> - legg til/oppdater alias (ingen mellomrom i mål)');
       appendSystemUi('  .set home [did:ma:...#room]- set home target (or current position)', '  .set home [did:ma:...#room]- sett home-mål (eller nåværende posisjon)');
       appendSystemUi('  .aliases del <name>        - remove alias', '  .aliases del <navn>        - fjern alias');
       appendSystemUi('  .aliases                   - list aliases', '  .aliases                   - list alias');
       appendSystemUi('  .aliases.<name>            - show address for one alias', '  .aliases.<navn>            - vis adresse for ett alias');
+      appendSystemUi('  .aliases.rewrite [on|off]  - rewrite aliases to DID before parsing', '  .aliases.rewrite [on|off]  - skriv alias om til DID før parsing');
       appendSystemUi('  .inspect @here|@me|@exit <name>|<object>- inspect room/me/exit/object and discover DID/CIDs', '  .inspect @here|@me|@exit <navn>|<objekt>- inspiser rom/meg/utgang/objekt og finn DID/CID');
       appendSystemUi('  .use <object|did> [as alias] - set local default target', '  .use <objekt|did> [as alias] - sett lokal standardtarget');
       appendSystemUi('  .unuse @alias              - clear local default target', '  .unuse @alias              - fjern lokal standardtarget');
@@ -119,6 +105,7 @@ export function createDotCommands({
       appendSystemUi('  .log                       - show log settings', '  .log                       - vis logginnstillinger');
       appendSystemUi('  .log.enabled [true|false]  - get/set console logging enabled', '  .log.enabled [true|false]  - hent/sett om konsoll-logging er aktiv');
       appendSystemUi('  .log.level [warn|info|debug|error] - get/set console log level', '  .log.level [warn|info|debug|error] - hent/sett loggnivå i konsoll');
+      appendSystemUi('  .dialog.id [alias|fragment|did] - get/set DID rendering in dialog', '  .dialog.id [alias|fragment|did] - hent/sett DID-visning i dialog');
       appendSystemUi('Gameplay (bare, no prefix):', 'Gameplay (bart, uten prefiks):');
       appendSystemUi('  go did:ma:<world>#<room>   - connect when currently disconnected', '  go did:ma:<world>#<room>   - koble til når du er frakoblet');
       appendMessage('system', '  pick up <object>           - pick up object before open/list/accept actions');
@@ -129,7 +116,7 @@ export function createDotCommands({
       appendMessage('system', "  'Hello world               - shorthand for @me say Hello world");
       appendSystemUi('  @target command args       - send command to actor', '  @target command args       - send kommando til actor');
       appendMessage('system', "  @target 'message           - whisper to actor (E2E)");
-      appendSystemUi('  @@command                  - world-admin command', '  @@command                  - world-admin-kommando');
+      appendSystemUi('  @world.<command>           - world-admin command', '  @world.<kommando>          - world-admin-kommando');
       return true;
     }
 
@@ -179,7 +166,7 @@ export function createDotCommands({
 
       const sub = String(args[0] || '').trim().toLowerCase();
       if (sub !== 'add' && sub !== 'del') {
-        appendMessage('system', 'Usage: .aliases | .aliases add <name> <address|#fragment> | .aliases del <name> | .aliases.<name>');
+        appendMessage('system', 'Usage: .aliases | .aliases add <name> <target> | .aliases del <name> | .aliases.<name> | .aliases.rewrite [on|off]');
         return true;
       }
 
@@ -188,62 +175,81 @@ export function createDotCommands({
           appendMessage('system', 'Usage: .aliases del <name>');
           return true;
         }
-        const name = String(args[1] || '').trim();
-        if (!Object.prototype.hasOwnProperty.call(state.aliasBook, name)) {
-          appendMessage('system', `Alias not found: ${name}`);
+        const inputName = normalizeAliasNameToken(args[1]);
+        const name = resolveAliasBookKey(inputName);
+        if (!name || !Object.prototype.hasOwnProperty.call(state.aliasBook, name)) {
+          appendMessage('system', `Alias not found: ${inputName || String(args[1] || '').trim()}`);
           return true;
         }
         delete state.aliasBook[name];
         saveAliasBook();
+        if (typeof onAliasBookChanged === 'function') {
+          onAliasBookChanged();
+        }
         appendMessage('system', `Alias removed: ${name}`);
         return true;
       }
 
-      if (args.length < 3) {
-        appendMessage('system', 'Usage: .aliases add <name> <address|#fragment> | .aliases add #fragment <name>');
+      if (args.length !== 3) {
+        appendMessage('system', 'Usage: .aliases add <name> <target>');
         return true;
       }
 
-      let name = String(args[1] || '').trim();
-      let address = String(args.slice(2).join(' ') || '').trim();
-      if (name.startsWith('#') && args.length === 3) {
-        address = name;
-        name = String(args[2] || '').trim();
-      }
+      let name = normalizeAliasNameToken(args[1]);
+      const address = normalizeAliasTargetToken(args[2]);
 
       if (!isPrintableAliasLabel(name)) {
         appendMessage('system', 'Alias name must be printable UTF-8 (no spaces/control chars), up to 64 chars.');
         return true;
       }
 
-      Promise.resolve()
-        .then(async () => {
-          const resolvedAddress = await resolveAliasAddress(address);
-          state.aliasBook[name] = resolvedAddress;
-          saveAliasBook();
-          if (address.startsWith('#')) {
-            appendMessage('system', `Alias saved: ${name} => ${resolvedAddress} (resolved from ${address})`);
-          } else {
-            appendMessage('system', `Alias saved: ${name} => ${resolvedAddress}`);
-          }
-        })
-        .catch((error) => {
-          appendMessage('system', `Alias failed: ${error instanceof Error ? error.message : String(error)}`);
-        });
+      if (!address) {
+        appendMessage('system', 'Alias value must be a non-empty target without spaces.');
+        return true;
+      }
+
+      state.aliasBook[name] = address;
+      saveAliasBook();
+      if (typeof onAliasBookChanged === 'function') {
+        onAliasBookChanged();
+      }
+      appendMessage('system', `Alias saved: ${name} => ${address}`);
+      return true;
+    }
+
+    if (dotCommand === 'aliases.rewrite') {
+      if (args.length === 0) {
+        appendMessage('system', `${state.aliasRewriteEnabled ? 'on' : 'off'}`);
+        return true;
+      }
+      if (args.length !== 1) {
+        appendMessage('system', 'Usage: .aliases.rewrite [on|off]');
+        return true;
+      }
+      const mode = String(args[0] || '').trim().toLowerCase();
+      if (mode !== 'on' && mode !== 'off') {
+        appendMessage('system', 'Usage: .aliases.rewrite [on|off]');
+        return true;
+      }
+      if (typeof setAliasRewriteEnabled === 'function') {
+        setAliasRewriteEnabled(mode === 'on');
+      }
+      appendMessage('system', `Alias rewrite is now ${mode}.`);
       return true;
     }
 
     if (dotCommand.startsWith('aliases.')) {
-      const aliasName = verbToken.slice('aliases.'.length).trim();
+      const inputAliasName = normalizeAliasNameToken(verbToken.slice('aliases.'.length).trim());
+      const aliasName = resolveAliasBookKey(inputAliasName);
       if (!aliasName) {
         appendMessage('system', 'Usage: .aliases.<name>');
         return true;
       }
       if (!Object.prototype.hasOwnProperty.call(state.aliasBook, aliasName)) {
-        appendMessage('system', `Alias not found: ${aliasName}`);
+        appendMessage('system', `Alias not found: ${inputAliasName}`);
         return true;
       }
-      appendMessage('system', `${state.aliasBook[aliasName]}`);
+      appendMessage('system', `.aliases.${aliasName} ${state.aliasBook[aliasName]}`);
       return true;
     }
 
@@ -338,6 +344,28 @@ export function createDotCommands({
         return true;
       }
       setLogLevel(level);
+      return true;
+    }
+
+    if (dotCommand === 'dialog.id') {
+      if (args.length === 0) {
+        appendMessage('system', `${state.dialogIdStyle || 'alias'}`);
+        return true;
+      }
+      if (args.length !== 1) {
+        appendMessage('system', 'Usage: .dialog.id [alias|fragment|did]');
+        return true;
+      }
+      const mode = String(args[0] || '').trim().toLowerCase();
+      if (mode !== 'alias' && mode !== 'fragment' && mode !== 'did') {
+        appendMessage('system', 'Usage: .dialog.id [alias|fragment|did]');
+        return true;
+      }
+      if (typeof setDialogIdStyle === 'function' && !setDialogIdStyle(mode)) {
+        appendMessage('system', 'Could not update dialog ID style.');
+        return true;
+      }
+      appendMessage('system', `Dialog DID style set to: ${mode}`);
       return true;
     }
 

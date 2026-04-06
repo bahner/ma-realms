@@ -6,9 +6,6 @@ use serde::{Deserialize, Serialize};
 
 // ─── ALPN Protocol Identifiers ──────────────────────────────────────────────
 
-pub const WORLD_ALPN: &[u8] = b"ma/world/1";
-pub const CMD_ALPN: &[u8] = b"ma/cmd/1";
-pub const CHAT_ALPN: &[u8] = b"ma/chat/1";
 pub const CLOSET_ALPN: &[u8] = b"ma/closet/1";
 pub const BROADCAST_ALPN: &[u8] = b"ma/broadcast/1";
 pub const PRESENCE_ALPN: &[u8] = b"ma/presence/1";
@@ -21,51 +18,44 @@ pub const DEFAULT_WORLD_RELAY_URL: &str = "https://euc1-1.relay.n0.iroh-canary.i
 pub const DEFAULT_CONTENT_TYPE: &str = "application/x-ma";
 pub const CONTENT_TYPE_CHAT: &str = "application/x-ma-chat";
 pub const CONTENT_TYPE_PRESENCE: &str = "application/x-ma-presence";
-pub const CONTENT_TYPE_CMD: &str = "application/x-ma-cmd";
 pub const CONTENT_TYPE_WORLD: &str = "application/x-ma-world";
 pub const CONTENT_TYPE_BROADCAST: &str = "application/x-ma-broadcast";
 pub const CONTENT_TYPE_DOC: &str = "application/x-ma-doc";
 pub const CONTENT_TYPE_WHISPER: &str = "application/x-ma-whisper";
 
+// ─── Internal Method Identifiers (object-style routing) ───────────────────
+
+pub const ROOM_METHOD_EVENTS_POLL: &str = "room.events.poll";
+pub const ROOM_METHOD_BROADCAST_SEND: &str = "room.broadcast.send";
+pub const ROOM_METHOD_PRESENCE_LIST: &str = "room.presence.list";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorldLane {
-    World,
-    Cmd,
-    Chat,
+    Inbox,
 }
 
 impl WorldLane {
     pub fn alpn(self) -> &'static [u8] {
         match self {
-            Self::World => WORLD_ALPN,
-            Self::Cmd => CMD_ALPN,
-            Self::Chat => CHAT_ALPN,
+            Self::Inbox => INBOX_ALPN,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::World => "world",
-            Self::Cmd => "cmd",
-            Self::Chat => "chat",
+            Self::Inbox => "inbox",
         }
     }
 
     pub fn supports_request(self, request: &WorldRequest) -> bool {
-        match (self, request) {
-            (Self::World, WorldRequest::Signed { .. }) => true,
-            (Self::Cmd, WorldRequest::Signed { .. }) => true,
-            (Self::Chat, WorldRequest::Chat { .. }) => true,
-            _ => false,
-        }
+        let _ = request;
+        matches!(self, Self::Inbox)
     }
 
     pub fn signed_content_type(self) -> Option<&'static str> {
         match self {
-            Self::World => Some(CONTENT_TYPE_WORLD),
-            Self::Cmd => Some(CONTENT_TYPE_CMD),
-            Self::Chat => None,
+            Self::Inbox => Some(CONTENT_TYPE_WORLD),
         }
     }
 }
@@ -101,8 +91,8 @@ impl LaneCapability {
         Self {
             lane,
             alpn: String::from_utf8_lossy(lane.alpn()).to_string(),
-            supports_signed: matches!(lane, WorldLane::World | WorldLane::Cmd),
-            supports_chat: matches!(lane, WorldLane::Chat),
+            supports_signed: matches!(lane, WorldLane::Inbox),
+            supports_chat: false,
             supports_whisper: false,
         }
     }
@@ -179,13 +169,20 @@ pub enum WorldCommand {
     },
 }
 
+impl WorldCommand {
+    pub fn internal_method(&self) -> Option<&'static str> {
+        match self {
+            Self::Message { .. } => Some(ROOM_METHOD_BROADCAST_SEND),
+            Self::RoomEvents { .. } => Some(ROOM_METHOD_EVENTS_POLL),
+            Self::Enter { .. } => None,
+        }
+    }
+}
+
 /// Transport wrapper for requests sent over iroh connections.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum WorldRequest {
-    Signed { message_cbor: Vec<u8> },
-    Chat { room: String, message_cbor: Vec<u8> },
-    Whisper { message_cbor: Vec<u8> },
+pub struct WorldRequest {
+    pub message_cbor: Vec<u8>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

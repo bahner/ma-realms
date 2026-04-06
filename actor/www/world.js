@@ -100,6 +100,40 @@ export function parseEnterDirective(message) {
   return rawDid;
 }
 
+export function resolveAliasTargetToken(token, aliases, depth = 0) {
+  const raw = String(token || '').trim();
+  if (!raw) {
+    return '';
+  }
+  const normalized = raw.toLowerCase();
+  if (depth > 6) {
+    return '';
+  }
+  const mapped = aliases.get(normalized)
+    || (normalized.startsWith('@') ? aliases.get(normalized.slice(1)) : aliases.get(`@${normalized}`));
+  if (!mapped) {
+    return '';
+  }
+  if (isMaDid(mapped)) {
+    return mapped;
+  }
+  const mappedToken = String(mapped || '').trim();
+  if (!mappedToken.startsWith('@')) {
+    return '';
+  }
+  const mappedKey = mappedToken.toLowerCase();
+  // Treat self-referential mappings as terminal targets (e.g. panteia => @panteia).
+  if (mappedKey === normalized || mappedKey === `@${normalized}` || `@${mappedKey}` === normalized) {
+    return mappedToken;
+  }
+  if (aliases.has(mappedKey)
+    || (mappedKey.startsWith('@') && aliases.has(mappedKey.slice(1)))
+    || (!mappedKey.startsWith('@') && aliases.has(`@${mappedKey}`))) {
+    return resolveAliasTargetToken(mappedKey, aliases, depth + 1);
+  }
+  return mappedToken;
+}
+
 export function createWorldTitleFlow({ state, properName, documentRef = document }) {
   function currentWorldName() {
     const alias = String(state.currentHome?.alias || '').trim();
@@ -239,7 +273,6 @@ export function createWorldDispatchFlow({
   resolveCommandTargetDidOrToken,
   logger,
   sendWorldChat,
-  sendWorldMessage,
   sendWorldCmd,
   pollCurrentHomeEvents,
   appendAmbientProseAfterSpeech,
@@ -250,11 +283,137 @@ export function createWorldDispatchFlow({
   isNotRegisteredInRoomMessage,
   performTransparentReentry,
 }) {
-  function activeActorName() {
-    if (state.currentHome) {
-      return String(state.currentHome.handle || state.aliasName || '').trim();
+  function resolveWorldConnectTarget(rawTarget) {
+    const target = String(rawTarget || '').trim();
+    if (!target) {
+      return '';
     }
-    return String(state.aliasName || '').trim();
+    if (isMaDid(target)) {
+      return target;
+    }
+
+    const endpoint = normalizeIrohAddress(target);
+    if (isLikelyIrohAddress(endpoint) || target.startsWith('/ma-iroh/')) {
+      return target;
+    }
+
+    const plain = target.startsWith('@') ? target.slice(1) : target;
+    const keys = [target, plain, `@${plain}`];
+    for (const key of keys) {
+      const resolved = String(state.aliasBook?.[key] || '').trim();
+      if (!resolved) {
+        continue;
+      }
+      if (isMaDid(resolved)) {
+        return resolved;
+      }
+      const resolvedEndpoint = normalizeIrohAddress(resolved);
+      if (isLikelyIrohAddress(resolvedEndpoint) || resolved.startsWith('/ma-iroh/')) {
+        return resolved;
+      }
+    }
+
+    return '';
+  }
+
+  function actorFragmentFromDid(did) {
+    const value = String(did || '').trim();
+    const idx = value.indexOf('#');
+    if (idx === -1 || idx >= value.length - 1) {
+      return '';
+    }
+    return value.slice(idx + 1).trim();
+  }
+
+  function activeActorName() {
+    const fragment = actorFragmentFromDid(state.identity?.did);
+    if (fragment) {
+      return fragment;
+    }
+    return String(state.aliasName || 'actor').trim();
+  }
+
+  function aliasTargetMap() {
+    const result = new Map();
+    for (const [alias, value] of Object.entries(state.aliasBook || {})) {
+      const rawKey = String(alias || '').trim();
+      if (!rawKey) {
+        continue;
+      }
+      const target = String(value || '').trim();
+      if (!target || /\s/u.test(target)) {
+        continue;
+      }
+      const lowered = rawKey.toLowerCase();
+      result.set(lowered, target);
+      if (lowered.startsWith('@')) {
+        result.set(lowered.slice(1), target);
+      } else {
+        result.set(`@${lowered}`, target);
+      }
+    }
+    return result;
+  }
+
+  function resolveAliasTarget(token, aliases) {
+    return resolveAliasTargetToken(token, aliases);
+  }
+
+  function rewriteAliasesToDid(input) {
+    const text = String(input || '');
+    if (!state.aliasRewriteEnabled) {
+      return text;
+    }
+    if (!text.trim() || text.trim().startsWith("'")) {
+      return text;
+    }
+
+    const aliases = aliasTargetMap();
+    if (!aliases.size) {
+      return text;
+    }
+
+    let out = text;
+
+    out = out.replace(/^(\s*go\s+)(\S+)(.*)$/i, (all, prefix, target, suffix) => {
+      const rawTarget = String(target || '').trim();
+      if (!rawTarget) {
+        return all;
+      }
+      const resolved = resolveAliasTarget(rawTarget, aliases);
+      if (!resolved) {
+        return all;
+      }
+      if (isMaDid(resolved)) {
+        return `${prefix}${resolved}${suffix}`;
+      }
+      const normalizedEndpoint = normalizeIrohAddress(resolved);
+      if (isLikelyIrohAddress(normalizedEndpoint)) {
+        return `${prefix}${normalizedEndpoint}${suffix}`;
+      }
+      if (resolved.startsWith('/ma-iroh/')) {
+        return `${prefix}${resolved}${suffix}`;
+      }
+      return all;
+    });
+
+    out = out.replace(/@([^\s]+)/g, (all, token) => {
+      const raw = String(token || '').trim();
+      if (!raw) {
+        return all;
+      }
+      const dotIdx = raw.indexOf('.');
+      const base = dotIdx === -1 ? raw : raw.slice(0, dotIdx);
+      const suffix = dotIdx === -1 ? '' : raw.slice(dotIdx);
+      const resolved = resolveAliasTarget(base, aliases);
+      if (!resolved) {
+        return all;
+      }
+      const targetToken = isMaDid(resolved) ? `@${resolved}` : resolved;
+      return `${targetToken}${suffix}`;
+    });
+
+    return out;
   }
 
   async function sendWorldCommandQuery(commandText) {
@@ -288,54 +447,82 @@ export function createWorldDispatchFlow({
       : 0;
 
     try {
-      const trimmedText = text.trim();
+      const rewrittenInput = rewriteAliasesToDid(text);
+      const trimmedText = rewrittenInput.trim();
       const closetInput = normalizeClosetInput(trimmedText);
+      const hasActiveClosetSession = Boolean(
+        String(state.closetSessionId || '').trim()
+        && String(state.closetEndpointId || '').trim()
+      );
+      const isClosetEndpointActive = hasActiveClosetSession && (
+        !state.currentHome
+        || String(state.currentHome?.endpointId || '').trim() === String(state.closetEndpointId || '').trim()
+      );
 
       if (!state.identity) {
         appendMessage('system', 'Create or unlock an identity first.');
         return;
       }
 
-      if (!state.currentHome) {
-        if (state.closetSessionId && state.closetEndpointId) {
-          const goMatch = trimmedText.match(/^go\s+(.+)$/i);
-          if (goMatch) {
-            const room = String(goMatch[1] || '').trim();
-            if (room) {
-              if (!String(state.closetSessionDid || '').trim()) {
-                const applyResponse = await closetCommandForCurrentWorld('apply');
-                renderClosetResponse(applyResponse);
-                if (!String(state.closetSessionDid || '').trim()) {
-                  appendMessage('system', 'Closet session still has no DID. Complete required profile fields, then try go out again.');
-                  return;
-                }
-              }
+      if (isClosetEndpointActive) {
+        const shortcutConnectTarget = String(trimmedText || '').trim();
+        if (shortcutConnectTarget.startsWith('@') && !/\s/u.test(shortcutConnectTarget)) {
+          await enterHome(shortcutConnectTarget);
+          return;
+        }
 
-              const response = await closetCommandForCurrentWorld(`enter ${room}`);
-              renderClosetResponse(response);
-              const reconnectRoom = room.toLowerCase() === 'out' ? 'lobby' : room;
-              await enterHome(state.closetEndpointId, reconnectRoom, {
-                silent: true,
-                skipLocalDidProbe: true,
-              });
+        const goMatch = trimmedText.match(/^go\s+(.+)$/i);
+        if (goMatch) {
+          const targetOrRoom = String(goMatch[1] || '').trim();
+          if (targetOrRoom) {
+            const connectTarget = resolveWorldConnectTarget(targetOrRoom);
+            if (connectTarget) {
+              await enterHome(targetOrRoom);
               return;
             }
-          }
 
-          if (closetInput) {
-            const response = await closetCommandForCurrentWorld(closetInput);
+            if (!String(state.closetSessionDid || '').trim()) {
+              const applyResponse = await closetCommandForCurrentWorld('apply');
+              renderClosetResponse(applyResponse);
+              if (!String(state.closetSessionDid || '').trim()) {
+                appendMessage('system', 'Closet session still has no DID. Complete required profile fields, then try go out again.');
+                return;
+              }
+            }
+
+            const response = await closetCommandForCurrentWorld(`enter ${targetOrRoom}`);
             renderClosetResponse(response);
-          } else {
-            appendMessage('system', 'Active closet session. Use dot commands (for example: avatar.peek, avatar.name bahner, actor.peek, actor.apply).');
+            const reconnectRoom = targetOrRoom.toLowerCase() === 'out' ? 'lobby' : targetOrRoom;
+            await enterHome(state.closetEndpointId, reconnectRoom, {
+              silent: true,
+              skipLocalDidProbe: true,
+            });
+            return;
           }
+        }
+
+        if (closetInput) {
+          const response = await closetCommandForCurrentWorld(closetInput);
+          renderClosetResponse(response);
+        } else {
+          appendMessage('system', 'Active closet session. Use dot commands (for example: avatar.peek, avatar.name bahner, actor.peek, actor.apply).');
+        }
+        return;
+      }
+
+      if (!state.currentHome) {
+        const shortcutConnectTarget = String(trimmedText || '').trim();
+        if (shortcutConnectTarget.startsWith('@') && !/\s/u.test(shortcutConnectTarget)) {
+          await enterHome(shortcutConnectTarget);
           return;
         }
 
         const bootstrapMatch = trimmedText.match(/^go\s+(.+)$/i);
         if (bootstrapMatch) {
           const target = String(bootstrapMatch[1] || '').trim();
+          const connectTarget = resolveWorldConnectTarget(target);
           const looksLikeDid = isMaDid(target);
-          const looksLikeAlias = Object.prototype.hasOwnProperty.call(state.aliasBook, target);
+          const looksLikeAlias = Boolean(connectTarget);
           const looksLikeEndpoint = isLikelyIrohAddress(normalizeIrohAddress(target));
 
           if (looksLikeDid || looksLikeAlias || looksLikeEndpoint) {
@@ -423,36 +610,6 @@ export function createWorldDispatchFlow({
         appendAmbientProseAfterSpeech().catch((err) => {
           logger.log('ambient.prose', `failed: ${err instanceof Error ? err.message : String(err)}`);
         });
-        return;
-      }
-
-      if (trimmedText.startsWith('@@')) {
-        const sendStart = Date.now();
-        logger.log('send.command', `room=${state.currentHome.room} actor=${activeActorName()} msg_len=${trimmedText.length}`);
-
-        const result = JSON.parse(
-          await sendWorldMessage(
-            state.currentHome.endpointId,
-            state.passphrase,
-            state.encryptedBundle,
-            activeActorName(),
-            state.currentHome.room,
-            trimmedText
-          )
-        );
-        const elapsed = Date.now() - sendStart;
-        logger.log('send.command', `response ok=${result.ok} broadcasted=${result.broadcasted} latest_seq=${result.latest_event_sequence || 0} in ${elapsed}ms`);
-
-        if (!result.ok) {
-          throw new Error(result.message || 'send failed');
-        }
-
-        if (!result.broadcasted) {
-          applyWorldResponse(result);
-          return;
-        }
-
-        await pollCurrentHomeEvents();
         return;
       }
 

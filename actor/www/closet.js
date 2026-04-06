@@ -8,6 +8,8 @@ import {
   closet_command,
   closet_submit_citizenship,
   closet_publish_did_document,
+  validate_did_document,
+  validate_identity_bundle_keys,
 } from './pkg/ma_actor.js';
 import { DID_MA_PREFIX, isMaDid } from './did.js';
 
@@ -161,6 +163,7 @@ export function createClosetFlow({
           help: () => `__resource_help__ ${resolvedScope}`,
           show: () => `__resource_show__ ${resolvedScope} show`,
           peek: () => `__resource_show__ ${resolvedScope} peek`,
+          validate: () => `__resource_validate__ ${resolvedScope}`,
           apply: () => (args ? `__resource_apply__ ${resolvedScope} ${args}` : `__resource_apply__ ${resolvedScope}`),
           publish: () => (args ? `__resource_apply__ ${resolvedScope} ${args}` : `__resource_apply__ ${resolvedScope}`),
           republish: () => (args ? `__resource_apply__ ${resolvedScope} ${args}` : `__resource_apply__ ${resolvedScope}`),
@@ -236,6 +239,132 @@ export function createClosetFlow({
       throw new Error(`document path not found: ${normalizedPath}`);
     }
     return `document.${normalizedPath} peek\n${JSON.stringify(resolved.value, null, 2)}`;
+  }
+
+  function collectVerificationRefs(value) {
+    if (!value) return [];
+    if (typeof value === 'string') {
+      const trimmed = String(value || '').trim();
+      return trimmed ? [trimmed] : [];
+    }
+    if (Array.isArray(value)) {
+      return value
+        .map((entry) => {
+          if (typeof entry === 'string') return entry.trim();
+          if (entry && typeof entry === 'object') return String(entry.id || '').trim();
+          return '';
+        })
+        .filter(Boolean);
+    }
+    if (value && typeof value === 'object') {
+      const id = String(value.id || '').trim();
+      return id ? [id] : [];
+    }
+    return [];
+  }
+
+  function assertPublishableDidDocument(documentJson, contextLabel = 'document publish') {
+    const raw = String(documentJson || '').trim();
+    if (!raw) {
+      throw new Error(`${contextLabel}: missing DID document JSON`);
+    }
+
+    // Primary validation path: use did:ma native validate()/verify().
+    try {
+      validate_did_document(raw);
+    } catch (error) {
+      throw new Error(`${contextLabel}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    let document;
+    try {
+      document = JSON.parse(raw);
+    } catch (error) {
+      throw new Error(`${contextLabel}: DID document is not valid JSON (${error instanceof Error ? error.message : String(error)})`);
+    }
+
+    const did = String(document?.id || '').trim();
+    if (!isMaDid(did)) {
+      throw new Error(`${contextLabel}: document.id must be did:ma:*`);
+    }
+
+    const verificationMethods = Array.isArray(document?.verificationMethod)
+      ? document.verificationMethod
+      : [];
+    if (!verificationMethods.length) {
+      throw new Error(`${contextLabel}: verificationMethod is missing`);
+    }
+
+    const methodIds = new Set();
+    let methodsWithPublicKeys = 0;
+    for (const method of verificationMethods) {
+      const id = String(method?.id || '').trim();
+      if (id) {
+        methodIds.add(id);
+        if (id.startsWith('#')) {
+          methodIds.add(`${did}${id}`);
+        }
+      }
+
+      const hasPublicKey = Boolean(
+        String(method?.publicKeyMultibase || method?.public_key_multibase || '').trim()
+        || String(method?.publicKeyBase58 || method?.public_key_base58 || '').trim()
+        || method?.publicKeyJwk
+        || method?.public_key_jwk
+      );
+      if (hasPublicKey) {
+        methodsWithPublicKeys += 1;
+      }
+    }
+    if (methodsWithPublicKeys === 0) {
+      throw new Error(`${contextLabel}: verificationMethod entries contain no public keys`);
+    }
+
+    const assertionRefs = collectVerificationRefs(document?.assertionMethod);
+    if (!assertionRefs.length) {
+      throw new Error(`${contextLabel}: assertionMethod is missing`);
+    }
+    for (const ref of assertionRefs) {
+      if (!methodIds.has(ref)) {
+        throw new Error(`${contextLabel}: assertionMethod reference '${ref}' has no matching verificationMethod.id`);
+      }
+    }
+
+    const keyAgreementRefs = collectVerificationRefs(document?.keyAgreement);
+    if (!keyAgreementRefs.length) {
+      throw new Error(`${contextLabel}: keyAgreement is missing`);
+    }
+    for (const ref of keyAgreementRefs) {
+      if (!methodIds.has(ref)) {
+        throw new Error(`${contextLabel}: keyAgreement reference '${ref}' has no matching verificationMethod.id`);
+      }
+    }
+
+    const ma = document?.ma && typeof document.ma === 'object' ? document.ma : null;
+    const currentInbox = String(ma?.currentInbox || ma?.current_inbox || '').trim();
+    if (!currentInbox) {
+      throw new Error(`${contextLabel}: ma.currentInbox is missing`);
+    }
+    const transports = Array.isArray(ma?.transports) ? ma.transports : [];
+    if (!transports.length) {
+      throw new Error(`${contextLabel}: ma.transports is missing`);
+    }
+    if (!transports.some((entry) => String(entry || '').trim() === currentInbox)) {
+      throw new Error(`${contextLabel}: ma.currentInbox must be included in ma.transports`);
+    }
+
+    return document;
+  }
+
+  function assertPublishableIdentityKeys(contextLabel = 'document publish') {
+    if (!state.passphrase || !state.encryptedBundle) {
+      throw new Error(`${contextLabel}: missing passphrase or encrypted bundle for key validation`);
+    }
+    try {
+      validate_identity_bundle_keys(state.passphrase, state.encryptedBundle);
+    } catch (error) {
+      throw new Error(`${contextLabel}: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   function parseClosetProfileMessage(message) {
@@ -479,6 +608,8 @@ export function createClosetFlow({
 
         stampBundleLifecycleForClosetSend();
         updated = state.identity || updated;
+        assertPublishableIdentityKeys('document publish');
+        assertPublishableDidDocument(updated.document_json, 'document publish');
 
         const published = parseClosetResponse(
           await invokeClosetRpc('document publish', () =>
@@ -610,7 +741,7 @@ export function createClosetFlow({
       if (resource === 'document') {
         return {
           ok: true,
-          message: 'document commands: document.help | document.show | document.ma.<field> show | document.publish [ipns_private_key_base64] | document.republish [ipns_private_key_base64] | document.apply [ipns_private_key_base64]'
+          message: 'document commands: document.help | document.show | document.validate | document.ma.<field> show | document.publish [ipns_private_key_base64] | document.republish [ipns_private_key_base64] | document.apply [ipns_private_key_base64]'
         };
       }
       return {
@@ -656,6 +787,23 @@ export function createClosetFlow({
       throw new Error(`unsupported show resource path: ${resource}`);
     }
 
+    const resourceValidateMatch = normalizedInput.match(/^__resource_validate__\s+([A-Za-z][A-Za-z0-9_-]*)$/);
+    if (resourceValidateMatch) {
+      const resource = String(resourceValidateMatch[1] || '').trim().toLowerCase();
+      if (resource !== 'document') {
+        throw new Error(`unsupported validate resource: ${resource}`);
+      }
+      if (!state.identity?.document_json) {
+        throw new Error('No local DID document is available to validate. Unlock identity first.');
+      }
+      assertPublishableDidDocument(state.identity.document_json, 'document.validate');
+      return {
+        ok: true,
+        latest_lobby_sequence: state.closetLobbySeq,
+        message: 'document.validate ok: DID document is publishable (keys, refs, transports).'
+      };
+    }
+
     const applyMatch = normalizedInput.match(/^(apply|citizen)(?:\s+(.+))?$/i);
     if (applyMatch) {
       state.closetPendingIpnsPrivateKeyB64 = String(applyMatch[2] || '').trim();
@@ -695,6 +843,8 @@ export function createClosetFlow({
 
           stampBundleLifecycleForClosetSend();
           updated = state.identity || updated;
+          assertPublishableIdentityKeys('closet apply publish-existing');
+          assertPublishableDidDocument(updated.document_json, 'closet apply publish-existing');
 
           const publishResponse = parseClosetResponse(
             await invokeClosetRpc('closet apply publish-existing', () =>
@@ -743,24 +893,80 @@ export function createClosetFlow({
     }
 
     if (applyMatch && String(state.closetSessionDid || '').trim()) {
+      if (state.passphrase && state.encryptedBundle && state.identity?.document_json) {
+        let updated = state.identity;
+        if (!state.inboxEndpointId) {
+          state.inboxEndpointId = await start_inbox_listener(state.passphrase, state.encryptedBundle);
+        }
+        if (state.inboxEndpointId) {
+          updated = JSON.parse(
+            set_bundle_transports(state.passphrase, state.encryptedBundle, state.inboxEndpointId)
+          );
+          const preferredLanguageOrder = String(state.languageOrder || '').trim();
+          if (preferredLanguageOrder) {
+            updated = JSON.parse(
+              set_bundle_language(state.passphrase, updated.encrypted_bundle, preferredLanguageOrder)
+            );
+          }
+          state.identity = updated;
+          state.encryptedBundle = updated.encrypted_bundle;
+          const bundleEl = byId('bundle-text');
+          if (bundleEl) {
+            bundleEl.value = updated.encrypted_bundle;
+          }
+          if (isValidAliasName(state.aliasName || '')) {
+            saveIdentityRecord(state.aliasName, updated.encrypted_bundle);
+          }
+        }
+
+        stampBundleLifecycleForClosetSend();
+        updated = state.identity || updated;
+        assertPublishableIdentityKeys('closet apply publish-existing');
+        assertPublishableDidDocument(updated.document_json, 'closet apply publish-existing');
+
+        const response = parseClosetResponse(
+          await invokeClosetRpc('closet apply publish-existing', () =>
+            closet_publish_did_document(
+              endpointId,
+              state.closetSessionId,
+              updated.document_json,
+              state.closetPendingIpnsPrivateKeyB64,
+              desiredFragmentForCloset()
+            )
+          )
+        );
+        if (!response.ok) {
+          const message = String(response.message || '').trim();
+          if (/ipns publish failed|did document is not published yet/i.test(message)) {
+            state.didPublishError = message;
+            const expiresAt = pendingDidPublishExpiresAt(state.closetSessionDid) || markDidPublishPending(state.closetSessionDid);
+            const secondsLeft = Math.max(1, Math.ceil((expiresAt - Date.now()) / 1000));
+            return {
+              ok: true,
+              latest_lobby_sequence: state.closetLobbySeq,
+              message: `${message}\nBackground publish is still pending (TTL ${secondsLeft}s). You can continue and use go out.`
+            };
+          }
+          throw new Error(
+            `${message || 'Closet apply failed.'} Provide the matching ipns_private_key_base64 for this DID if required, or run document.apply with the key.`
+          );
+        }
+        const didForCache = didRoot(String(response.did || state.identity?.did || state.closetSessionDid || ''));
+        if (didForCache) {
+          state.didDocCache.delete(didForCache);
+          clearDidPublishPending(didForCache);
+        }
+        state.closetLobbySeq = Number(response.latest_lobby_sequence || state.closetLobbySeq || 0);
+        return response;
+      }
+
       const response = parseClosetResponse(
         await invokeClosetRpc('closet apply update', () =>
           closet_command(endpointId, state.closetSessionId, normalizedInput)
         )
       );
       if (!response.ok) {
-        const message = String(response.message || '').trim();
-        if (/ipns publish failed|did document is not published yet/i.test(message)) {
-          state.didPublishError = message;
-          const expiresAt = pendingDidPublishExpiresAt(state.closetSessionDid) || markDidPublishPending(state.closetSessionDid);
-          const secondsLeft = Math.max(1, Math.ceil((expiresAt - Date.now()) / 1000));
-          return {
-            ok: true,
-            latest_lobby_sequence: state.closetLobbySeq,
-            message: `${message}\nBackground publish is still pending (TTL ${secondsLeft}s). You can continue and use go out.`
-          };
-        }
-        throw new Error(message || 'Closet apply failed.');
+        throw new Error(String(response.message || '').trim() || 'Closet apply failed.');
       }
       state.closetLobbySeq = Number(response.latest_lobby_sequence || state.closetLobbySeq || 0);
       return response;
@@ -804,6 +1010,8 @@ export function createClosetFlow({
       const providedKey = String(resourceApplyMatch[2] || '').trim();
       stampBundleLifecycleForClosetSend();
       updated = state.identity || updated;
+      assertPublishableIdentityKeys('document apply');
+      assertPublishableDidDocument(updated.document_json, 'document apply');
       const response = parseClosetResponse(
         await invokeClosetRpc('document apply', () =>
           closet_publish_did_document(

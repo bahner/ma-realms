@@ -380,6 +380,8 @@ fn validate_legacy_name(name: &str) -> Result<(), String> {
 
 fn is_allowed_symbol(symbol: &str) -> bool {
     matches!(symbol, "user" | "owner" | "location" | "opened_by" | "world.owner" | "world.slug")
+    || symbol == "inbox"
+    || (symbol.starts_with("room.") && symbol.ends_with(".inbox") && symbol.len() > "room..inbox".len())
         || symbol.starts_with("state.")
 }
 

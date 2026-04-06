@@ -122,7 +122,7 @@ All client commands use dot prefix (`.`). Bare text is gameplay sent to the worl
 
 - `@target command args` — send command to actor
 - `@target 'message` — whisper to actor (E2E encrypted)
-- `@@command` — world-admin command
+- `@world.<command>` — world-admin command
 
 ## Edit Modes
 
@@ -174,8 +174,9 @@ Browser calls require IPFS API CORS headers allowing your app origin (for exampl
 
 The WASM client uses ALPN constants and content types from `did-ma` directly
 (e.g. `CONTENT_TYPE_CHAT`, `CONTENT_TYPE_PRESENCE`, `CONTENT_TYPE_WHISPER`, `CONTENT_TYPE_BROADCAST`).
-Connection caches are maintained per transport kind (World, Cmd, Chat) so
-repeated interactions with the same world reuse the iroh connection.
+Connection caches are maintained inbox-first (signed world traffic over
+`ma/inbox/1`) so repeated interactions with the same world reuse the iroh
+connection.
 
 An inbox listener registers protocol handlers for the `ma/inbox/1`,
 `ma/whisper/1`, `ma/broadcast/1`, and `ma/presence/1` ALPN lanes so the

@@ -162,13 +162,15 @@ export function createAliasFlow({
   }
 
   function resolveAliasInput(value) {
+    const raw = String(value || '').trim();
+    if (!raw) {
+      return '';
+    }
+
     try {
-      return aliasResolveInput(
-        String(value || ''),
-        JSON.stringify(state.aliasBook || {})
-      );
+      return aliasResolveInput(raw, JSON.stringify(state.aliasBook || {}));
     } catch {
-      return String(value || '').trim();
+      return raw;
     }
   }
 

@@ -28,6 +28,7 @@ nanoid = "0.4"
 argon2 = "0.5"
 sha2 = "0.10"
 tar = "0.4"
+moka = { version = "0.12", features = ["sync"] }
 
 [[bin]]
 name = "ma-world"

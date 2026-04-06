@@ -1,11 +1,19 @@
-export function createDialogWriter({ byId, displayActor }) {
+export function createDialogWriter({ byId, displayActor, formatDialogText }) {
+  function asDialogText(value) {
+    const source = String(value || '');
+    if (typeof formatDialogText === 'function') {
+      return String(formatDialogText(source));
+    }
+    return source;
+  }
+
   function appendMessage(role, message) {
     const transcript = byId('transcript');
     const row = document.createElement('div');
     row.className = `msg ${role}`;
 
     const text = document.createElement('p');
-    text.textContent = message;
+    text.textContent = asDialogText(message);
 
     row.appendChild(text);
     transcript.appendChild(row);
@@ -23,11 +31,11 @@ export function createDialogWriter({ byId, displayActor }) {
   }
 
   function writeSystem(text) {
-    appendMessage('system', text);
+    appendMessage('system', asDialogText(text));
   }
 
   function writeWorld(text) {
-    appendMessage('world', text);
+    appendMessage('world', asDialogText(text));
   }
 
   return {

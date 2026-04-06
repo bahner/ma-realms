@@ -14,7 +14,6 @@ import init, {
   send_world_chat,
   send_world_whisper,
   send_world_cmd,
-  send_world_message,
   decode_chat_event_message,
   decode_whisper_event_message,
   start_inbox_listener,
@@ -107,6 +106,9 @@ const TAB_ALIAS_KEY = `${STORAGE_PREFIX}.tabAlias`;
 const DEBUG_KEY = `${STORAGE_PREFIX}.debug`;
 const LOG_ENABLED_KEY = `${STORAGE_PREFIX}.logEnabled`;
 const LOG_LEVEL_KEY = `${STORAGE_PREFIX}.logLevel`;
+const DIALOG_ID_STYLE_KEY = `${STORAGE_PREFIX}.dialogIdStyle`;
+const ALIAS_REWRITE_ENABLED_KEY = `${STORAGE_PREFIX}.aliasRewriteEnabled`;
+const ALIAS_RENDER_ENABLED_KEY = `${STORAGE_PREFIX}.aliasRenderEnabled`;
 const LEGACY_BUNDLE_KEY = 'ma.identity.v2.bundle';
 const LAST_ROOM_KEY_PREFIX = `${STORAGE_PREFIX}.lastRoom`;
 const LAST_ACTIVE_HOME_KEY_PREFIX = `${STORAGE_PREFIX}.lastActiveHome`;
@@ -163,6 +165,9 @@ const state = {
   debug: false,
   logEnabled: true,
   logLevel: 'info',
+  dialogIdStyle: 'alias',
+  aliasRewriteEnabled: true,
+  aliasRenderEnabled: true,
   aliasBook: {},
   currentHome: null,
   roomPollTimer: null,
@@ -199,7 +204,9 @@ const state = {
   editSession: null,
   editBusy: false,
   lockOverlayAnimationId: 0,
-  lockOverlayStarDrift: 0
+  lockOverlayStarDrift: 0,
+  lockOverlayShownAtMs: 0,
+  matrixLog: []
 };
 
 let worldDispatchFlow = null;
@@ -334,6 +341,67 @@ function loadActiveHomeSnapshot(identityDid) {
   }
 }
 
+function persistActiveHomeSnapshot(identityDid, snapshot) {
+  const key = activeHomeKey(identityDid);
+  if (!key || !snapshot || typeof snapshot !== 'object') {
+    return;
+  }
+  try {
+    localStorage.setItem(key, JSON.stringify(snapshot));
+  } catch (_) {
+    // Ignore storage write failures.
+  }
+}
+
+function clearActiveHomeSnapshot(identityDid) {
+  const key = activeHomeKey(identityDid);
+  if (!key) {
+    return;
+  }
+  try {
+    localStorage.removeItem(key);
+  } catch (_) {
+    // Ignore storage write failures.
+  }
+}
+
+function normalizeLegacySnapshotTarget(snapshot) {
+  const targetRaw = String(snapshot?.target || '').trim();
+  if (!targetRaw) {
+    return '';
+  }
+  const hashIdx = targetRaw.indexOf('#');
+  const token = hashIdx === -1 ? targetRaw : targetRaw.slice(0, hashIdx);
+  const fragment = hashIdx === -1 ? '' : targetRaw.slice(hashIdx + 1);
+
+  // Accept canonical values as-is.
+  if (isMaDid(token) || isLikelyIrohAddress(normalizeIrohAddress(token))) {
+    return targetRaw;
+  }
+
+  // Legacy snapshots may contain alias-like targets (e.g. @panteia#lobby).
+  const resolved = String(resolveAliasInput(token) || '').trim();
+  if (!resolved || resolved === token) {
+    return '';
+  }
+
+  if (isMaDid(resolved)) {
+    const resolvedRoot = didRoot(resolved);
+    if (!resolvedRoot) {
+      return '';
+    }
+    const room = String(fragment || '').trim();
+    return room ? `${resolvedRoot}#${room}` : resolved;
+  }
+
+  const endpoint = normalizeIrohAddress(resolved);
+  if (isLikelyIrohAddress(endpoint)) {
+    return endpoint;
+  }
+
+  return '';
+}
+
 async function restoreActiveHomeAfterUnlock() {
   if (!state.identity?.did) {
     return;
@@ -342,6 +410,24 @@ async function restoreActiveHomeAfterUnlock() {
   const snapshot = loadActiveHomeSnapshot(state.identity.did);
   if (!snapshot?.target) {
     return;
+  }
+
+  const normalizedLegacyTarget = normalizeLegacySnapshotTarget(snapshot);
+  if (!normalizedLegacyTarget) {
+    appendSystemUi(
+      'Skipping stale saved location target. Use go/home to reconnect manually.',
+      'Hopper over utdatert lagret lokasjon. Bruk go/home for manuell reconnect.'
+    );
+    clearActiveHomeSnapshot(state.identity.did);
+    return;
+  }
+  if (normalizedLegacyTarget !== snapshot.target) {
+    snapshot.target = normalizedLegacyTarget;
+    persistActiveHomeSnapshot(state.identity.did, {
+      ...snapshot,
+      target: normalizedLegacyTarget,
+      savedAt: Date.now(),
+    });
   }
 
   if (isUnconfiguredDidTarget(snapshot.target)) {
@@ -358,7 +444,9 @@ async function restoreActiveHomeAfterUnlock() {
 
   appendMessage('system', `Restoring last location: ${snapshot.target}`);
   try {
-    await enterHome(snapshot.target, snapshot.room || null);
+    await enterHome(snapshot.target, snapshot.room || null, {
+      allowClosetFallback: false,
+    });
   } catch (error) {
     appendMessage('system', `Could not restore last location: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -751,7 +839,38 @@ async function resolveCommandTargetDidOrToken(targetToken) {
     }
   }
 
-  const resolvedAlias = String(resolveAliasInput(raw) || '').trim();
+  const aliasDirect = String(state.aliasBook?.[raw] || '').trim();
+  const aliasWithAt = String(state.aliasBook?.[`@${raw}`] || '').trim();
+  const resolvedAlias = String(aliasDirect || aliasWithAt || resolveAliasInput(raw) || '').trim();
+
+  if (resolvedAlias.startsWith('@')) {
+    const aliasTarget = String(resolvedAlias || '').trim().replace(/^@+/, '');
+    if (!aliasTarget) {
+      throw new Error(`Alias target for '${raw}' is empty.`);
+    }
+
+    const nestedAliasDirect = String(state.aliasBook?.[aliasTarget] || '').trim();
+    const nestedAliasWithAt = String(state.aliasBook?.[`@${aliasTarget}`] || '').trim();
+    const nestedResolved = String(
+      nestedAliasDirect
+      || nestedAliasWithAt
+      || resolveAliasInput(aliasTarget)
+      || ''
+    ).trim();
+
+    if (isMaDid(aliasTarget)) {
+      cacheRoomDidLookup(raw, aliasTarget);
+      return aliasTarget;
+    }
+    if (isMaDid(nestedResolved)) {
+      cacheRoomDidLookup(raw, nestedResolved);
+      return nestedResolved;
+    }
+
+    // Keep @handle aliases as @handle (for remote actor names), do not force DID lookup.
+    return aliasTarget;
+  }
+
   if (isMaDid(resolvedAlias)) {
     return resolvedAlias;
   }
@@ -1293,14 +1412,19 @@ function renderAvatarPanel() {
   const list = byId('avatar-list');
   if (!list) return;
   list.innerHTML = '';
-  const sorted = Array.from(state.roomPresence.values()).sort((a, b) =>
-    a.handle.localeCompare(b.handle)
-  );
+  const sorted = Array.from(state.roomPresence.values()).sort((a, b) => {
+    const left = String(a?.did || a?.handle || '').toLowerCase();
+    const right = String(b?.did || b?.handle || '').toLowerCase();
+    return left.localeCompare(right);
+  });
   for (const entry of sorted) {
     const li = document.createElement('li');
     li.className = 'avatar-item';
-    li.textContent = entry.handle;
-    if (entry.did) li.title = entry.did;
+    const didText = String(entry?.did || '').trim();
+    li.textContent = didText ? formatDidForDialog(didText) : String(entry?.handle || '').trim();
+    if (didText) {
+      li.title = didText;
+    }
     list.appendChild(li);
   }
 }
@@ -1353,32 +1477,278 @@ function setSetupStatus(message) {
   byId('setup-status').textContent = message;
 }
 
+function didParts(value) {
+  const source = String(value || '').trim();
+  if (!source.startsWith('did:ma:')) {
+    return { root: '', fragment: '' };
+  }
+  const hash = source.indexOf('#');
+  if (hash === -1) {
+    return { root: source, fragment: '' };
+  }
+  return {
+    root: source.slice(0, hash),
+    fragment: source.slice(hash + 1),
+  };
+}
+
+function didRootText(value) {
+  const source = String(value || '').trim();
+  if (!source.startsWith('did:ma:')) {
+    return '';
+  }
+  const hash = source.indexOf('#');
+  return hash === -1 ? source : source.slice(0, hash);
+}
+
+function aliasForDid(rootDid) {
+  const entries = Object.entries(state.aliasBook || {});
+  for (const [alias, address] of entries) {
+    const resolvedRoot = didRootText(address);
+    if (resolvedRoot && resolvedRoot === rootDid) {
+      return alias;
+    }
+  }
+  return '';
+}
+
+function formatDidForDialog(value) {
+  const source = String(value || '').trim();
+  if (!source) {
+    return '';
+  }
+  if (!state.aliasRenderEnabled) {
+    return source;
+  }
+
+  // Alias mode only rewrites values that have an explicit alias mapping.
+  if (state.dialogIdStyle === 'alias') {
+    const root = didRootText(source);
+    if (!root) {
+      return source;
+    }
+    const alias = aliasForDid(root);
+    if (!alias) {
+      return source;
+    }
+    const hash = source.indexOf('#');
+    const fragment = hash === -1 ? '' : source.slice(hash + 1);
+    if (fragment && fragment.toLowerCase() !== alias.toLowerCase()) {
+      return `@${alias}#${fragment}`;
+    }
+    return `@${alias}`;
+  }
+
+  const parts = didParts(source);
+  if (!parts.root) {
+    return source;
+  }
+  if (state.dialogIdStyle === 'did') {
+    return source;
+  }
+  if (state.dialogIdStyle === 'fragment') {
+    if (parts.fragment) {
+      return `#${parts.fragment}`;
+    }
+    return parts.root;
+  }
+  return source;
+}
+
+function dialogText(text) {
+  const source = String(text || '');
+  const lowered = source.trim().toLowerCase();
+
+  // Never rewrite DID values in document/JSON output.
+  if (lowered.startsWith('document.')
+    || lowered.startsWith('{')
+    || lowered.startsWith('[')
+    || source.includes('\n{')
+    || source.includes('\n[')
+    || source.includes('"verificationMethod"')
+    || source.includes('"assertionMethod"')
+    || source.includes('"keyAgreement"')
+    || source.includes('"proof"')
+    || source.includes('"id": "did:ma:')) {
+    return source;
+  }
+
+  if (lowered.startsWith('.aliases')
+    || lowered.startsWith('alias saved:')
+    || lowered.startsWith('alias removed:')
+    || lowered.startsWith('alias not found:')
+    || lowered.startsWith('usage: .aliases')
+    || lowered.startsWith('resolving did target ')
+    || lowered.startsWith('connecting to ')
+    || lowered.startsWith('send failed:')
+    || lowered.startsWith('could not restore last location:')
+    || lowered.startsWith('did resolve note:')) {
+    return source;
+  }
+  return source.replace(/did:ma:[A-Za-z0-9]+(?:#[A-Za-z0-9._:-]+)?/g, (match) => formatDidForDialog(match));
+}
+
+function setAliasRewriteEnabled(enabled) {
+  const next = Boolean(enabled);
+  state.aliasRewriteEnabled = next;
+  localStorage.setItem(ALIAS_REWRITE_ENABLED_KEY, next ? 'true' : 'false');
+  return true;
+}
+
+function setAliasRenderEnabled(enabled) {
+  const next = Boolean(enabled);
+  state.aliasRenderEnabled = next;
+  localStorage.setItem(ALIAS_RENDER_ENABLED_KEY, next ? 'true' : 'false');
+  updateAliasToggleButton();
+  refreshDialogAndPresenceFormatting();
+  return true;
+}
+
+function toggleAliasRenderEnabled() {
+  setAliasRenderEnabled(!state.aliasRenderEnabled);
+}
+
+function updateAliasToggleButton() {
+  const btn = byId('btn-alias');
+  if (!btn) return;
+  btn.textContent = 'Aliasing';
+  btn.setAttribute('aria-pressed', state.aliasRenderEnabled ? 'true' : 'false');
+  btn.classList.toggle('aliasing-inverted', !state.aliasRenderEnabled);
+}
+
 function displayActor(senderDid, senderHandle) {
   const handle = String(senderHandle || '').trim();
   const did = String(senderDid || '').trim();
 
-  if (handle && did) {
-    return `${handle} (${did})`;
+  if (did) {
+    return did;
   }
 
   if (handle) {
     return handle.startsWith('@') ? handle : `@${handle}`;
   }
 
-  if (did) {
-    return did;
-  }
-
   return '@unknown';
+}
+
+function actorFragmentFromDid(did) {
+  const value = String(did || '').trim();
+  const idx = value.indexOf('#');
+  if (idx === -1 || idx >= value.length - 1) {
+    return '';
+  }
+  return value.slice(idx + 1).trim();
+}
+
+function currentActorFragment() {
+  const fragment = actorFragmentFromDid(state.identity?.did);
+  if (fragment) {
+    return fragment;
+  }
+  return String(state.aliasName || 'actor').trim();
+}
+
+function setDialogIdStyle(style) {
+  const normalized = String(style || '').trim().toLowerCase();
+  if (normalized !== 'alias' && normalized !== 'fragment' && normalized !== 'did') {
+    return false;
+  }
+  state.dialogIdStyle = normalized;
+  localStorage.setItem(DIALOG_ID_STYLE_KEY, normalized);
+  refreshDialogAndPresenceFormatting();
+  return true;
+}
+
+function recordMatrixLine(role, message) {
+  const entry = {
+    at: new Date().toISOString(),
+    role: String(role || 'world'),
+    message: String(message || ''),
+  };
+  state.matrixLog.push(entry);
+  if (state.matrixLog.length > 5000) {
+    state.matrixLog.splice(0, state.matrixLog.length - 5000);
+  }
+  if (!byId('matrix-modal')?.classList.contains('hidden')) {
+    renderMatrixView();
+  }
+}
+
+function recordCommandIo(direction, text) {
+  const dir = String(direction || '').toLowerCase();
+  const label = dir === 'out' ? 'out' : 'in';
+  recordMatrixLine(label, text);
+}
+
+function renderTranscriptFromMatrix() {
+  const transcript = byId('transcript');
+  if (!transcript) return;
+  transcript.innerHTML = '';
+  for (const entry of state.matrixLog) {
+    const row = document.createElement('div');
+    row.className = `msg ${entry.role}`;
+    const text = document.createElement('p');
+    text.textContent = dialogText(entry.message);
+    row.appendChild(text);
+    transcript.appendChild(row);
+  }
+  transcript.scrollTop = transcript.scrollHeight;
+}
+
+function renderMatrixView() {
+  const pre = byId('matrix-text');
+  if (!pre) return;
+  const lines = state.matrixLog.map((entry) => {
+    const at = String(entry.at || '');
+    const role = String(entry.role || 'in');
+    const message = String(entry.message || '');
+    return `[${at}] ${role}: ${message}`;
+  });
+  pre.textContent = lines.length ? lines.join('\n') : '(empty)';
+  pre.scrollTop = pre.scrollHeight;
+}
+
+function openMatrixModal() {
+  const modal = byId('matrix-modal');
+  if (!modal) return;
+  renderMatrixView();
+  modal.classList.remove('hidden');
+  modal.setAttribute('aria-hidden', 'false');
+}
+
+function closeMatrixModal() {
+  const modal = byId('matrix-modal');
+  if (!modal) return;
+  modal.classList.add('hidden');
+  modal.setAttribute('aria-hidden', 'true');
+}
+
+function refreshDialogAndPresenceFormatting() {
+  renderTranscriptFromMatrix();
+  renderAvatarPanel();
+  renderMatrixView();
+}
+
+function showLockOverlayTracked() {
+  state.lockOverlayShownAtMs = Date.now();
+  showLockOverlay();
+}
+
+function onLockOverlayClick(event) {
+  const elapsed = Date.now() - Number(state.lockOverlayShownAtMs || 0);
+  if (elapsed < 250) {
+    return;
+  }
+  if (event.target !== event.currentTarget) {
+    return;
+  }
+  hideLockOverlay();
 }
 
 function renderLocalBroadcastMessage(text) {
   const payload = String(text || '').trim();
   if (!payload) return;
-  const actor = displayActor(
-    state.identity?.did,
-    state.currentHome?.handle || state.aliasName || '@you'
-  );
+  const actor = displayActor(state.identity?.did, '');
   appendMessage('world', `${actor}: ${payload}`);
 }
 
@@ -1395,8 +1765,11 @@ const {
   ipfsGatewayFallbacks: IPFS_GATEWAY_FALLBACKS,
 });
 
-const dialogWriter = createDialogWriter({ byId, displayActor });
-const { appendMessage } = dialogWriter;
+const dialogWriter = createDialogWriter({ byId, displayActor, formatDialogText: dialogText });
+const appendMessage = (role, message) => {
+  recordCommandIo('in', `${String(role || 'world')}: ${String(message || '')}`);
+  dialogWriter.appendMessage(role, message);
+};
 
 const { fetchCurrentRoomInspectData, inspectExitByQuery } = createRoomInspectFlow({
   state,
@@ -1580,7 +1953,7 @@ async function pollCurrentHomeEvents() {
         home.endpointId,
         state.passphrase,
         state.encryptedBundle,
-        String(home.handle || state.aliasName || '').trim(),
+        currentActorFragment(),
         home.room,
         toSequenceBigInt(home.lastEventSequence || 0)
       )
@@ -1747,7 +2120,7 @@ async function runSmokeTest(targetAlias) {
         state.currentHome.endpointId,
         state.passphrase,
         state.encryptedBundle,
-        String(state.currentHome?.handle || state.aliasName || '').trim(),
+        currentActorFragment(),
         state.currentHome.room,
         marker
       ),
@@ -1897,6 +2270,9 @@ const { parseDot } = createDotCommands({
   setDebugMode,
   setLogEnabled,
   setLogLevel,
+  setDialogIdStyle,
+  setAliasRewriteEnabled,
+  onAliasBookChanged: refreshDialogAndPresenceFormatting,
   didRoot,
   resolveTargetDidRoot,
   saveBlockedDidRoots,
@@ -1991,7 +2367,7 @@ const identityFlow = createIdentityFlow({
   disconnectWorld: disconnect_world,
   clearRoomPresence,
   showSetup,
-  showLockOverlay,
+  showLockOverlay: showLockOverlayTracked,
 });
 
 const {
@@ -2217,9 +2593,9 @@ async function ensureHeldRequirementSatisfied(alias, objectDid) {
   const response = await sendWorldCommandQuery(`@${normalizedDid} show`);
   const kv = parseKeyValuePairs(response);
   const holder = String(kv.holder || '').trim();
-  const currentHandle = String(state.currentHome?.handle || state.aliasName || '').trim();
+  const currentDidRoot = didRoot(state.identity?.did || '');
   const aliasLabel = String(alias || '').trim() || '@object';
-  if (!holder || holder === '(none)' || !currentHandle || holder !== currentHandle) {
+  if (!holder || holder === '(none)' || !currentDidRoot || holder !== currentDidRoot) {
     throw new Error(uiText(
       `${aliasLabel}: you are not holding this object yet. Pick it up first.`,
       `${aliasLabel}: du har ikke plukket opp denne tingen enda. Plukk den opp først.`
@@ -2384,6 +2760,7 @@ async function enterHome(target, preferredRoom = null) {
   const options = (typeof arguments[2] === 'object' && arguments[2] !== null) ? arguments[2] : {};
   const silent = Boolean(options.silent);
   const skipLocalDidProbe = Boolean(options.skipLocalDidProbe);
+  const allowClosetFallback = options.allowClosetFallback !== false;
   if (!state.identity) {
     throw new Error('Load or create an identity before entering a home.');
   }
@@ -2399,12 +2776,35 @@ async function enterHome(target, preferredRoom = null) {
     throw new Error('go requires a target (did:ma:<world>#<room> or alias).');
   }
 
-  const resolvedInput = resolveAliasInput(alias);
+  const hashIdx = alias.indexOf('#');
+  const aliasBaseToken = hashIdx === -1 ? alias : alias.slice(0, hashIdx);
+  const aliasRoomFragment = hashIdx === -1 ? '' : alias.slice(hashIdx + 1);
+  const aliasAltToken = aliasBaseToken.startsWith('@') ? aliasBaseToken.slice(1) : `@${aliasBaseToken}`;
+
+  let resolvedBase = String(resolveAliasInput(aliasBaseToken) || '').trim();
+  if (!resolvedBase || resolvedBase === aliasBaseToken) {
+    const altResolved = String(resolveAliasInput(aliasAltToken) || '').trim();
+    if (altResolved && altResolved !== aliasAltToken) {
+      resolvedBase = altResolved;
+    }
+  }
+  if (!resolvedBase) {
+    resolvedBase = aliasBaseToken;
+  }
+
+  let resolvedInput = resolvedBase;
+  if (aliasRoomFragment) {
+    const room = String(aliasRoomFragment || '').trim();
+    if (isMaDid(resolvedBase)) {
+      resolvedInput = `${didRoot(resolvedBase)}#${room}`;
+    }
+  }
+
   const resolvedDidRoot = isMaDid(String(resolvedInput)) ? didRoot(resolvedInput) : '';
-  const resolvedDidFragment = String(resolvedInput).includes('#') ? String(resolvedInput).split('#')[1] : '';
+  const resolvedDidFragment = aliasRoomFragment || (String(resolvedInput).includes('#') ? String(resolvedInput).split('#')[1] : '');
   let endpointId = '';
   if (!isMaDid(String(resolvedInput))) {
-    endpointId = normalizeIrohAddress(resolvedInput);
+    endpointId = normalizeIrohAddress(resolvedBase);
   }
 
   if (resolvedDidRoot) {
@@ -2493,7 +2893,7 @@ async function enterHome(target, preferredRoom = null) {
   }
 
   if (!silent) {
-    appendMessage('system', `Connecting to ${humanizeIdentifier(endpointId)}...`);
+    appendMessage('system', `Connecting to ${endpointId}...`);
   }
 
   async function enterClosetOnboardingFallback(reasonText) {
@@ -2538,20 +2938,23 @@ async function enterHome(target, preferredRoom = null) {
   try {
     if (savedRoom && savedRoom !== 'lobby') {
       try {
-        result = JSON.parse(await enterWorldWithRetry(endpointId, state.aliasName, savedRoom));
+        result = JSON.parse(await enterWorldWithRetry(endpointId, currentActorFragment(), savedRoom));
         if (!result.ok) {
           logger.log('connect.home', `last room '${savedRoom}' denied (${result.message}), falling back to lobby`);
-          result = JSON.parse(await enterWorldWithRetry(endpointId, state.aliasName, 'lobby'));
+          result = JSON.parse(await enterWorldWithRetry(endpointId, currentActorFragment(), 'lobby'));
         }
       } catch (_) {
-        result = JSON.parse(await enterWorldWithRetry(endpointId, state.aliasName, 'lobby'));
+        result = JSON.parse(await enterWorldWithRetry(endpointId, currentActorFragment(), 'lobby'));
       }
     } else {
-      result = JSON.parse(await enterWorldWithRetry(endpointId, state.aliasName, 'lobby'));
+      result = JSON.parse(await enterWorldWithRetry(endpointId, currentActorFragment(), 'lobby'));
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (isClosetBootstrapFailureMessage(message)) {
+      if (!allowClosetFallback) {
+        throw new Error(message || 'Closet onboarding required.');
+      }
       await enterClosetOnboardingFallback(
         'No avatar available for this DID yet, or DID publish is not ready. Entering closet onboarding.'
       );
@@ -2564,6 +2967,9 @@ async function enterHome(target, preferredRoom = null) {
   if (!result.ok) {
     logger.warn('connect.home', `world enter returned ok=false: ${String(result.message || '(empty message)')}`);
     if (isClosetRequiredMessage(result.message) || isClosetBootstrapFailureMessage(result.message)) {
+      if (!allowClosetFallback) {
+        throw new Error(result.message || 'Closet onboarding required.');
+      }
       logger.log('connect.home', 'starting closet onboarding fallback after world rejection');
       await enterClosetOnboardingFallback(
         result.message || 'No avatar profile is ready yet. Closet onboarding is required first.'
@@ -2649,7 +3055,6 @@ worldDispatchFlow = createWorldDispatchFlow({
   resolveCommandTargetDidOrToken,
   logger,
   sendWorldChat: send_world_chat,
-  sendWorldMessage: send_world_message,
   sendWorldCmd: send_world_cmd,
   pollCurrentHomeEvents,
   appendAmbientProseAfterSpeech,
@@ -2682,6 +3087,8 @@ function enqueueCommandText(text) {
   if (!commandText) {
     return;
   }
+
+  recordCommandIo('out', commandText);
 
   // Readline-like history: keep unique latest entry and reset cursor.
   state.commandHistory.push(commandText);
@@ -2811,6 +3218,9 @@ function restoreSavedValues() {
 
   state.aliasBook = loadAliasBook();
   state.debug = readStoredDebugFlag();
+  setDialogIdStyle(localStorage.getItem(DIALOG_ID_STYLE_KEY) || 'alias');
+  setAliasRewriteEnabled(localStorage.getItem(ALIAS_REWRITE_ENABLED_KEY) !== 'false');
+  setAliasRenderEnabled(localStorage.getItem(ALIAS_RENDER_ENABLED_KEY) !== 'false');
   setCurrentPublishInfo();
 }
 
@@ -2840,9 +3250,18 @@ async function main() {
   byId('btn-create').addEventListener('click', onCreateIdentity);
   byId('btn-unlock').addEventListener('click', onUnlockIdentity);
   byId('btn-new-phrase').addEventListener('click', onNewPhrase);
+  byId('btn-alias').addEventListener('click', toggleAliasRenderEnabled);
+  byId('btn-log').addEventListener('click', openMatrixModal);
   byId('btn-export').addEventListener('click', exportBundle);
+  byId('matrix-close').addEventListener('click', closeMatrixModal);
+  byId('matrix-refresh').addEventListener('click', renderMatrixView);
+  byId('matrix-modal').addEventListener('click', (event) => {
+    if (event.target === byId('matrix-modal')) {
+      closeMatrixModal();
+    }
+  });
   byId('btn-lock').addEventListener('click', lockSession);
-  byId('lock-overlay').addEventListener('click', hideLockOverlay);
+  byId('lock-overlay').addEventListener('click', onLockOverlayClick);
   byId('lock-overlay').addEventListener('keydown', onLockOverlayKeydown);
   let aliasDraftTimer = null;
   byId('alias-name').addEventListener('input', (event) => {

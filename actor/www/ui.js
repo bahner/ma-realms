@@ -259,11 +259,6 @@ export function createUiFlow({
         ctx.restore();
       }
 
-      ctx.shadowBlur = 0;
-      ctx.fillStyle = 'rgba(214, 241, 255, 0.95)';
-      ctx.font = `700 ${subSize}px "Avenir Next", "Segoe UI", sans-serif`;
-      ctx.fillText('in LARGE FRIENDLY LETTERS', w * 0.5, textY + letterSize * 0.52);
-
       ctx.restore();
 
       state.lockOverlayAnimationId = requestAnimationFrame(paint);

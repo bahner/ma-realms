@@ -110,25 +110,19 @@ struct ClosetEndpointCache {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorldTransportKind {
-    World,
-    Cmd,
-    Chat,
+    Inbox,
 }
 
 impl WorldTransportKind {
     fn alpn(self) -> &'static [u8] {
         match self {
-            WorldTransportKind::World => WORLD_ALPN,
-            WorldTransportKind::Cmd => CMD_ALPN,
-            WorldTransportKind::Chat => CHAT_ALPN,
+            WorldTransportKind::Inbox => INBOX_ALPN,
         }
     }
 }
 
 thread_local! {
     static WORLD_CONN_CACHE: RefCell<Option<WorldConnCache>> = RefCell::new(None);
-    static CMD_CONN_CACHE: RefCell<Option<WorldConnCache>> = RefCell::new(None);
-    static CHAT_CONN_CACHE: RefCell<Option<WorldConnCache>> = RefCell::new(None);
     static CLOSET_ENDPOINT_CACHE: RefCell<Option<ClosetEndpointCache>> = RefCell::new(None);
     static ACL_COMPILED_CACHE: RefCell<HashMap<String, CompiledCapabilityAcl>> = RefCell::new(HashMap::new());
     static ROOM_DID_CACHE: RefCell<HashMap<String, CachedDidEntry>> = RefCell::new(HashMap::new());
@@ -178,25 +172,19 @@ const ROOM_DID_CACHE_TTL_MS: f64 = 5.0 * 60.0 * 1000.0;
 
 fn take_conn_cache(kind: WorldTransportKind) -> Option<WorldConnCache> {
     match kind {
-        WorldTransportKind::World => WORLD_CONN_CACHE.with(|c| c.borrow_mut().take()),
-        WorldTransportKind::Cmd => CMD_CONN_CACHE.with(|c| c.borrow_mut().take()),
-        WorldTransportKind::Chat => CHAT_CONN_CACHE.with(|c| c.borrow_mut().take()),
+        WorldTransportKind::Inbox => WORLD_CONN_CACHE.with(|c| c.borrow_mut().take()),
     }
 }
 
 fn store_conn_cache(kind: WorldTransportKind, cache: WorldConnCache) {
     match kind {
-        WorldTransportKind::World => WORLD_CONN_CACHE.with(|c| *c.borrow_mut() = Some(cache)),
-        WorldTransportKind::Cmd => CMD_CONN_CACHE.with(|c| *c.borrow_mut() = Some(cache)),
-        WorldTransportKind::Chat => CHAT_CONN_CACHE.with(|c| *c.borrow_mut() = Some(cache)),
+        WorldTransportKind::Inbox => WORLD_CONN_CACHE.with(|c| *c.borrow_mut() = Some(cache)),
     }
 }
 
 fn clear_conn_cache(kind: WorldTransportKind) {
     match kind {
-        WorldTransportKind::World => WORLD_CONN_CACHE.with(|c| *c.borrow_mut() = None),
-        WorldTransportKind::Cmd => CMD_CONN_CACHE.with(|c| *c.borrow_mut() = None),
-        WorldTransportKind::Chat => CHAT_CONN_CACHE.with(|c| *c.borrow_mut() = None),
+        WorldTransportKind::Inbox => WORLD_CONN_CACHE.with(|c| *c.borrow_mut() = None),
     }
 }
 
@@ -474,7 +462,7 @@ use ma_core::{
     ClosetResponse,
     CompiledCapabilityAcl,
     compile_acl,
-    CONTENT_TYPE_BROADCAST, CONTENT_TYPE_CHAT, CONTENT_TYPE_CMD, CONTENT_TYPE_PRESENCE,
+    CONTENT_TYPE_BROADCAST, CONTENT_TYPE_CHAT, CONTENT_TYPE_PRESENCE,
     CONTENT_TYPE_WORLD, CONTENT_TYPE_WHISPER,
     DEFAULT_WORLD_RELAY_URL,
     evaluate_compiled_acl_with_owner,
@@ -487,10 +475,11 @@ use ma_core::{
     normalize_relay_url as core_normalize_relay_url,
     parse_capability_acl_text,
     parse_message,
+    MessageEnvelope,
     resolve_inbox_endpoint_id as core_resolve_inbox_endpoint_id,
     resolve_alias_input as core_resolve_alias_input,
     RoomEvent, WorldCommand, WorldRequest, WorldResponse,
-    BROADCAST_ALPN, CHAT_ALPN, CMD_ALPN, INBOX_ALPN, PRESENCE_ALPN, WHISPER_ALPN, WORLD_ALPN,
+    BROADCAST_ALPN, INBOX_ALPN, PRESENCE_ALPN, WHISPER_ALPN,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -551,7 +540,6 @@ struct WorldActionResult {
     pending_whispers: Vec<RoomEvent>,
 }
 
-const WORLD_TARGET_DID: &str = "did:ma:world";
 const MAX_INBOX_EVENTS: usize = 256;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -951,17 +939,17 @@ fn decrypt_bundle(passphrase: &str, bundle: &EncryptedIdentityBundle) -> Result<
 async fn send_world_request(endpoint_id: &str, request: WorldRequest) -> Result<WorldResponse, JsValue> {
     let mut last_error: Option<JsValue> = None;
     for _ in 0..2 {
-        let mut cache = get_or_create_stream_cache(endpoint_id, WorldTransportKind::World).await?;
+        let mut cache = get_or_create_stream_cache(endpoint_id, WorldTransportKind::Inbox).await?;
         match exchange_on_stream(&mut cache, &request).await {
             Ok(response) => {
-                store_conn_cache(WorldTransportKind::World, cache);
+                store_conn_cache(WorldTransportKind::Inbox, cache);
                 return Ok(response);
             }
             Err(err) => {
                 last_error = Some(err);
                 cache.connection.close(0u32.into(), b"stream error");
                 cache.endpoint.close().await;
-                clear_conn_cache(WorldTransportKind::World);
+                clear_conn_cache(WorldTransportKind::Inbox);
             }
         }
     }
@@ -969,62 +957,10 @@ async fn send_world_request(endpoint_id: &str, request: WorldRequest) -> Result<
     Err(last_error.unwrap_or_else(|| js_err("world request failed")))
 }
 
-async fn send_world_cmd_request(endpoint_id: &str, request: WorldRequest) -> Result<WorldResponse, JsValue> {
-    let mut last_error: Option<JsValue> = None;
-    for _ in 0..2 {
-        let mut cache = get_or_create_stream_cache(endpoint_id, WorldTransportKind::Cmd).await?;
-        match exchange_on_stream(&mut cache, &request).await {
-            Ok(response) => {
-                store_conn_cache(WorldTransportKind::Cmd, cache);
-                return Ok(response);
-            }
-            Err(err) => {
-                last_error = Some(err);
-                cache.connection.close(0u32.into(), b"stream error");
-                cache.endpoint.close().await;
-                clear_conn_cache(WorldTransportKind::Cmd);
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| js_err("world cmd request failed")))
-}
-
-async fn send_world_chat_request(endpoint_id: &str, request: WorldRequest) -> Result<WorldResponse, JsValue> {
-    let mut last_error: Option<JsValue> = None;
-    for _ in 0..2 {
-        let mut cache = get_or_create_stream_cache(endpoint_id, WorldTransportKind::Chat).await?;
-        match exchange_on_stream(&mut cache, &request).await {
-            Ok(response) => {
-                store_conn_cache(WorldTransportKind::Chat, cache);
-                return Ok(response);
-            }
-            Err(err) => {
-                last_error = Some(err);
-                cache.connection.close(0u32.into(), b"stream error");
-                cache.endpoint.close().await;
-                clear_conn_cache(WorldTransportKind::Chat);
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| js_err("world chat request failed")))
-}
-
 /// Close and drop the cached world connection (call on lock/logout).
 #[wasm_bindgen]
 pub async fn disconnect_world() {
-    if let Some(cached) = take_conn_cache(WorldTransportKind::World) {
-        cached.connection.close(0u32.into(), b"bye");
-        cached.endpoint.close().await;
-    }
-
-    if let Some(cached) = take_conn_cache(WorldTransportKind::Cmd) {
-        cached.connection.close(0u32.into(), b"bye");
-        cached.endpoint.close().await;
-    }
-
-    if let Some(cached) = take_conn_cache(WorldTransportKind::Chat) {
+    if let Some(cached) = take_conn_cache(WorldTransportKind::Inbox) {
         cached.connection.close(0u32.into(), b"bye");
         cached.endpoint.close().await;
     }
@@ -1304,13 +1240,26 @@ fn build_signed_world_request(
         .and_then(|did| did.with_fragment(actor_name))
         .map_err(js_err)?;
 
-    let target_world_did = plain
+    let contextual_world_did = plain
         .document
         .ma
         .as_ref()
         .and_then(|ma| ma.world.clone())
         .filter(|did| Did::validate(did).is_ok())
-        .unwrap_or_else(|| WORLD_TARGET_DID.to_string());
+        .or_else(cached_world_target_did);
+
+    let target_world_did = match (&command, contextual_world_did) {
+        (WorldCommand::Message { .. }, Some(value)) => value,
+        (WorldCommand::Message { .. }, None) => {
+            return Err(js_err(
+                "world DID target is unknown; connect/enter a world first so actor can resolve room DID",
+            ));
+        }
+        (_, Some(value)) => value,
+        (_, None) => Did::try_from(plain.document.id.as_str())
+            .map(|did| did.without_fragment().id())
+            .unwrap_or_else(|_| plain.document.id.clone()),
+    };
 
     let signing_key = restore_signing_key(&plain.ipns, &plain.signing_private_key_hex)?;
     let content = serde_json::to_vec(&command).map_err(js_err)?;
@@ -1325,7 +1274,7 @@ fn build_signed_world_request(
         timestamp_ms,
     )?;
 
-    Ok(WorldRequest::Signed {
+    Ok(WorldRequest {
         message_cbor: message.to_cbor().map_err(js_err)?,
     })
 }
@@ -1356,24 +1305,32 @@ fn build_signed_message_with_js_time(
     Ok(message)
 }
 
-fn restore_signing_key(ipns: &str, private_key_hex: &str) -> Result<SigningKey, JsValue> {
-    let sign_did = Did::new(ipns, "sig").map_err(js_err)?;
-    let private_key_vec = hex::decode(private_key_hex).map_err(js_err)?;
+fn restore_signing_key_internal(ipns: &str, private_key_hex: &str) -> Result<SigningKey, String> {
+    let sign_did = Did::new(ipns, "sig").map_err(|e| e.to_string())?;
+    let private_key_vec = hex::decode(private_key_hex).map_err(|e| e.to_string())?;
     let private_key: [u8; 32] = private_key_vec
         .try_into()
-        .map_err(|_| js_err("invalid signing private key length"))?;
+        .map_err(|_| "invalid signing private key length".to_string())?;
 
-    SigningKey::from_private_key_bytes(sign_did, private_key).map_err(js_err)
+    SigningKey::from_private_key_bytes(sign_did, private_key).map_err(|e| e.to_string())
+}
+
+fn restore_signing_key(ipns: &str, private_key_hex: &str) -> Result<SigningKey, JsValue> {
+    restore_signing_key_internal(ipns, private_key_hex).map_err(js_err)
+}
+
+fn restore_encryption_key_internal(ipns: &str, private_key_hex: &str) -> Result<EncryptionKey, String> {
+    let enc_did = Did::new(ipns, "enc").map_err(|e| e.to_string())?;
+    let private_key_vec = hex::decode(private_key_hex).map_err(|e| e.to_string())?;
+    let private_key: [u8; 32] = private_key_vec
+        .try_into()
+        .map_err(|_| "invalid encryption private key length".to_string())?;
+
+    EncryptionKey::from_private_key_bytes(enc_did, private_key).map_err(|e| e.to_string())
 }
 
 fn restore_encryption_key(ipns: &str, private_key_hex: &str) -> Result<EncryptionKey, JsValue> {
-    let enc_did = Did::new(ipns, "enc").map_err(js_err)?;
-    let private_key_vec = hex::decode(private_key_hex).map_err(js_err)?;
-    let private_key: [u8; 32] = private_key_vec
-        .try_into()
-        .map_err(|_| js_err("invalid encryption private key length"))?;
-
-    EncryptionKey::from_private_key_bytes(enc_did, private_key).map_err(js_err)
+    restore_encryption_key_internal(ipns, private_key_hex).map_err(js_err)
 }
 
 fn restore_iroh_secret_key(private_key_hex: &str) -> Result<SecretKey, JsValue> {
@@ -1382,6 +1339,18 @@ fn restore_iroh_secret_key(private_key_hex: &str) -> Result<SecretKey, JsValue> 
         .try_into()
         .map_err(|_| js_err("invalid iroh secret key length"))?;
     Ok(SecretKey::from_bytes(&private_key))
+}
+
+fn cached_world_target_did() -> Option<String> {
+    let now = now_ms();
+    let active_room = ACTIVE_ROOM_CACHE.with(|slot| slot.borrow().clone())?;
+    ROOM_DID_CACHE.with(|slot| {
+        let mut map = slot.borrow_mut();
+        map.retain(|_, entry| entry.expires_at_ms > now);
+        let did_text = map.get(&active_room)?.did.clone();
+        let did = Did::try_from(did_text.as_str()).ok()?;
+        Some(did.without_fragment().id())
+    })
 }
 
 fn parse_signed_message_with_sender_document(sender_document_json: &str, message_cbor_b64: &str) -> Result<Message, JsValue> {
@@ -1452,6 +1421,7 @@ where
         .map_err(|e| js_err(format!("bundle corrupted: {e}")))?;
 
     update(&mut plain.document)?;
+    validate_full_did_key_references(&plain.document).map_err(js_err)?;
     if stamp_for_send {
         bump_document_lifecycle_metadata(&mut plain.document, plain.created_at);
     }
@@ -1476,6 +1446,58 @@ where
     };
 
     serde_json::to_string(&result).map_err(js_err)
+}
+
+fn validate_full_did_key_references(document: &Document) -> Result<(), String> {
+    let doc_root = Did::try_from(document.id.as_str())
+        .map_err(|e| format!("invalid document DID '{}': {}", document.id, e))?
+        .without_fragment()
+        .id();
+
+    for method in &document.verification_method {
+        let method_id = method.id.trim();
+        if method_id.starts_with('#') {
+            return Err(format!(
+                "invalid verificationMethod.id '{}': fragment-only ids are not allowed; expected full DID id like '{}#sig'",
+                method.id, doc_root
+            ));
+        }
+        let parsed = Did::try_from(method_id)
+            .map_err(|e| format!("invalid verificationMethod.id '{}': {}", method.id, e))?;
+        if parsed.without_fragment().id() != doc_root {
+            return Err(format!(
+                "invalid verificationMethod.id '{}': method root DID must match document root '{}'",
+                method.id, doc_root
+            ));
+        }
+    }
+
+    for (label, value) in [
+        ("assertionMethod", document.assertion_method.as_str()),
+        ("keyAgreement", document.key_agreement.as_str()),
+        ("proof.verificationMethod", document.proof.verification_method.as_str()),
+    ] {
+        let reference = value.trim();
+        if reference.is_empty() {
+            continue;
+        }
+        if reference.starts_with('#') {
+            return Err(format!(
+                "invalid {} '{}': fragment-only references are not allowed; expected full DID id like '{}#sig'",
+                label, value, doc_root
+            ));
+        }
+        let parsed = Did::try_from(reference)
+            .map_err(|e| format!("invalid {} '{}': {}", label, value, e))?;
+        if parsed.without_fragment().id() != doc_root {
+            return Err(format!(
+                "invalid {} '{}': reference root DID must match document root '{}'",
+                label, value, doc_root
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn now_iso_utc() -> String {
@@ -1607,6 +1629,147 @@ pub fn unlock_identity(passphrase: &str, encrypted_bundle_json: &str) -> Result<
     serde_json::to_string(&result).map_err(js_err)
 }
 
+/// Validate and verify a DID document JSON using did:ma's native logic.
+/// Returns "ok" when both `validate()` and `verify()` succeed.
+#[wasm_bindgen]
+pub fn validate_did_document(document_json: &str) -> Result<String, JsValue> {
+    let document = Document::unmarshal(document_json)
+        .map_err(|e| js_err(format!("invalid DID document JSON: {e}")))?;
+
+    document
+        .validate()
+        .map_err(|e| js_err(format!("DID document validate failed: {e}")))?;
+
+    document
+        .verify()
+        .map_err(|e| js_err(format!("DID document verify failed: {e}")))?;
+
+    Ok("ok".to_string())
+}
+
+/// Validate that an encrypted identity bundle contains usable private keys
+/// and that they match the DID document verification methods.
+fn validate_identity_bundle_keys_internal(
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+) -> Result<(), String> {
+    let encrypted: EncryptedIdentityBundle = serde_json::from_str(encrypted_bundle_json)
+        .map_err(|e| format!("invalid bundle JSON: {e}"))?;
+    let plain_bytes = decrypt_bundle(passphrase, &encrypted)?;
+    let plain: IdentityBundlePlain = serde_json::from_slice(&plain_bytes)
+        .map_err(|e| format!("bundle corrupted: {e}"))?;
+
+    validate_full_did_key_references(&plain.document)?;
+
+    if plain.ipns.trim().is_empty() {
+        return Err("identity bundle has empty ipns".to_string());
+    }
+    if plain.signing_private_key_hex.trim().is_empty() {
+        return Err("identity bundle has empty signing private key".to_string());
+    }
+    if plain.encryption_private_key_hex.trim().is_empty() {
+        return Err("identity bundle has empty encryption private key".to_string());
+    }
+
+    let signing_hex = plain.signing_private_key_hex.trim();
+    let encryption_hex = plain.encryption_private_key_hex.trim();
+    if signing_hex.len() != 64 {
+        return Err(format!(
+            "identity bundle signing private key has invalid hex length: expected 64, got {}",
+            signing_hex.len()
+        ));
+    }
+    if encryption_hex.len() != 64 {
+        return Err(format!(
+            "identity bundle encryption private key has invalid hex length: expected 64, got {}",
+            encryption_hex.len()
+        ));
+    }
+
+    let doc_did = Did::try_from(plain.document.id.as_str())
+        .map_err(|e| format!("invalid document DID '{}': {}", plain.document.id, e))?;
+    if doc_did.ipns != plain.ipns {
+        return Err(format!(
+            "identity bundle ipns '{}' does not match document DID ipns '{}'",
+            plain.ipns, doc_did.ipns
+        ));
+    }
+
+    plain
+        .document
+        .validate()
+        .map_err(|e| format!("DID document validate failed: {e}"))?;
+    plain
+        .document
+        .verify()
+        .map_err(|e| format!("DID document verify failed: {e}"))?;
+
+    let signing_key = restore_signing_key_internal(&plain.ipns, &plain.signing_private_key_hex)?;
+    signing_key
+        .validate()
+        .map_err(|e| format!("signing key validate failed: {e}"))?;
+    let encryption_key = restore_encryption_key_internal(&plain.ipns, &plain.encryption_private_key_hex)?;
+    encryption_key
+        .validate()
+        .map_err(|e| format!("encryption key validate failed: {e}"))?;
+
+    if signing_key.private_key_bytes().iter().all(|byte| *byte == 0) {
+        return Err("identity bundle signing private key is all zeros".to_string());
+    }
+    if encryption_key.private_key_bytes().iter().all(|byte| *byte == 0) {
+        return Err("identity bundle encryption private key is all zeros".to_string());
+    }
+
+    let assertion_vm = plain
+        .document
+        .get_verification_method_by_id(&plain.document.assertion_method)
+        .map_err(|e| e.to_string())?;
+    if assertion_vm.public_key_multibase != signing_key.public_key_multibase {
+        return Err("signing private key does not match document assertionMethod public key".to_string());
+    }
+
+    let agreement_vm = plain
+        .document
+        .get_verification_method_by_id(&plain.document.key_agreement)
+        .map_err(|e| e.to_string())?;
+    if agreement_vm.public_key_multibase != encryption_key.public_key_multibase {
+        return Err("encryption private key does not match document keyAgreement public key".to_string());
+    }
+
+    let doc_assertion_pk = plain
+        .document
+        .assertion_method_public_key()
+        .map_err(|e| format!("document assertionMethod public key decode failed: {e}"))?;
+    if doc_assertion_pk.to_bytes() != signing_key.verifying_key().to_bytes() {
+        return Err(
+            "identity bundle signing private key does not cryptographically match document assertionMethod public key"
+                .to_string(),
+        );
+    }
+
+    let doc_agreement_pk = plain
+        .document
+        .key_agreement_public_key_bytes()
+        .map_err(|e| format!("document keyAgreement public key decode failed: {e}"))?;
+    if doc_agreement_pk != *encryption_key.public_key.as_bytes() {
+        return Err(
+            "identity bundle encryption private key does not cryptographically match document keyAgreement public key"
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
+#[wasm_bindgen]
+pub fn validate_identity_bundle_keys(
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+) -> Result<String, JsValue> {
+    validate_identity_bundle_keys_internal(passphrase, encrypted_bundle_json).map_err(js_err)?;
+    Ok("ok".to_string())
+}
+
 /// Update the optional `ma:presenceHint` field in the DID document and re-sign it.
 /// Returns JSON: `{ encrypted_bundle, did, ipns, document_json }`
 #[wasm_bindgen]
@@ -1701,15 +1864,15 @@ pub fn set_bundle_updated_for_send(
 /// Enter a world over iroh using the world protocol.
 #[wasm_bindgen]
 pub async fn connect_world(endpoint_id: &str) -> Result<(), JsValue> {
-    let cache = get_or_create_stream_cache(endpoint_id, WorldTransportKind::World).await?;
-    store_conn_cache(WorldTransportKind::World, cache);
+    let cache = get_or_create_stream_cache(endpoint_id, WorldTransportKind::Inbox).await?;
+    store_conn_cache(WorldTransportKind::Inbox, cache);
     Ok(())
 }
 
 #[wasm_bindgen]
 pub async fn connect_world_with_relay(endpoint_id: &str, relay_url: &str) -> Result<(), JsValue> {
-    let cache = create_stream_cache(endpoint_id, Some(relay_url), WorldTransportKind::World).await?;
-    store_conn_cache(WorldTransportKind::World, cache);
+    let cache = create_stream_cache(endpoint_id, Some(relay_url), WorldTransportKind::Inbox).await?;
+    store_conn_cache(WorldTransportKind::Inbox, cache);
     Ok(())
 }
 
@@ -1891,33 +2054,21 @@ pub async fn send_world_chat(
     room: &str,
     text: &str,
 ) -> Result<String, JsValue> {
-    let encrypted: EncryptedIdentityBundle = serde_json::from_str(encrypted_bundle_json)
-        .map_err(|e| js_err(format!("invalid bundle JSON: {e}")))?;
-    let plain_bytes = decrypt_bundle(passphrase, &encrypted).map_err(js_err)?;
-    let plain: IdentityBundlePlain = serde_json::from_slice(&plain_bytes)
-        .map_err(|e| js_err(format!("bundle corrupted: {e}")))?;
-
-    let actor_name = actor_name.trim();
-    let from_did = Did::try_from(plain.document.id.as_str())
-        .and_then(|did| did.with_fragment(actor_name))
-        .map_err(js_err)?;
-    let signing_key = restore_signing_key(&plain.ipns, &plain.signing_private_key_hex)?;
-
     let timestamp_ms = js_sys::Date::now() as u64;
-    let message = build_signed_message_with_js_time(
-        from_did.id(),
-        String::new(),
-        CONTENT_TYPE_CHAT.to_string(),
-        text.as_bytes().to_vec(),
-        &signing_key,
+    let request = build_signed_world_request(
+        passphrase,
+        encrypted_bundle_json,
+        actor_name,
+        WorldCommand::Message {
+            room: room.trim().to_string(),
+            envelope: MessageEnvelope::Chatter {
+                text: text.to_string(),
+            },
+        },
+        CONTENT_TYPE_WORLD,
         timestamp_ms,
     )?;
-
-    let request = WorldRequest::Chat {
-        room: room.trim().to_string(),
-        message_cbor: message.to_cbor().map_err(js_err)?,
-    };
-    let response = send_world_chat_request(endpoint_id, request).await?;
+    let response = send_world_request(endpoint_id, request).await?;
     update_room_did_cache_from_response(&response);
 
     serde_json::to_string(&WorldActionResult {
@@ -2041,7 +2192,7 @@ pub async fn send_world_message(
     let is_admin_world_command =
         matches!(&envelope, ma_core::MessageEnvelope::ActorCommand { target, .. } if target.eq_ignore_ascii_case("world"));
     if !is_admin_world_command {
-        return Err(js_err("ma/world/1 only accepts @@ world commands; send normal commands over ma/cmd/1"));
+        return Err(js_err("ma/inbox/1 only accepts @world commands for send_world_message"));
     }
     let request = build_signed_world_request(
         passphrase,
@@ -2077,11 +2228,6 @@ pub async fn send_world_cmd(
     let timestamp_ms = js_sys::Date::now() as u64;
     let rewritten_text = normalize_use_alias_command(room, text);
     let envelope = parse_message(&rewritten_text);
-    let is_admin_world_command =
-        matches!(&envelope, ma_core::MessageEnvelope::ActorCommand { target, .. } if target.eq_ignore_ascii_case("world"));
-    if is_admin_world_command {
-        return Err(js_err("@@ world commands must use ma/world/1"));
-    }
 
     let request = build_signed_world_request(
         passphrase,
@@ -2091,10 +2237,10 @@ pub async fn send_world_cmd(
             room: room.trim().to_string(),
             envelope,
         },
-        CONTENT_TYPE_CMD,
+        CONTENT_TYPE_WORLD,
         timestamp_ms,
     )?;
-    let response = send_world_cmd_request(endpoint_id, request).await?;
+    let response = send_world_request(endpoint_id, request).await?;
     update_room_did_cache_from_response(&response);
 
     serde_json::to_string(&WorldActionResult {
@@ -2186,4 +2332,164 @@ pub fn normalize_bip39_phrase(phrase: &str) -> Result<String, JsValue> {
     let normalized = normalize_phrase_text(phrase);
     let mnemonic = Mnemonic::parse_in_normalized(Language::English, &normalized).map_err(js_err)?;
     Ok(mnemonic.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_valid_bundle(passphrase: &str, ipns: &str) -> String {
+        let mut generated = generate_agent_identity(ipns).expect("generate identity");
+        let signing_key = restore_signing_key_internal(ipns, &generated.signing_private_key_hex)
+            .expect("restore signing key");
+        let assertion_method = generated
+            .document
+            .get_verification_method_by_id(&generated.document.assertion_method)
+            .expect("assertion method")
+            .clone();
+        generated
+            .document
+            .sign(&signing_key, &assertion_method)
+            .expect("sign document");
+
+        let plain = IdentityBundlePlain {
+            version: 1,
+            created_at: 0,
+            ipns: ipns.to_string(),
+            signing_private_key_hex: generated.signing_private_key_hex,
+            encryption_private_key_hex: generated.encryption_private_key_hex,
+            iroh_secret_key_hex: None,
+            document: generated.document,
+        };
+        let plain_json = serde_json::to_vec(&plain).expect("serialize plain");
+        let encrypted = encrypt_bundle(passphrase, &plain_json).expect("encrypt bundle");
+        serde_json::to_string(&encrypted).expect("serialize encrypted")
+    }
+
+    fn mutate_bundle_plain(
+        passphrase: &str,
+        encrypted_bundle_json: &str,
+        mutator: impl FnOnce(&mut IdentityBundlePlain),
+    ) -> String {
+        let encrypted: EncryptedIdentityBundle =
+            serde_json::from_str(encrypted_bundle_json).expect("parse encrypted");
+        let plain_bytes = decrypt_bundle(passphrase, &encrypted).expect("decrypt bundle");
+        let mut plain: IdentityBundlePlain =
+            serde_json::from_slice(&plain_bytes).expect("parse plain");
+        mutator(&mut plain);
+        let mutated_plain_json = serde_json::to_vec(&plain).expect("serialize mutated plain");
+        let mutated_encrypted =
+            encrypt_bundle(passphrase, &mutated_plain_json).expect("encrypt mutated bundle");
+        serde_json::to_string(&mutated_encrypted).expect("serialize mutated encrypted")
+    }
+
+    #[test]
+    fn validate_identity_bundle_keys_accepts_valid_bundle() {
+        let passphrase = "test-passphrase";
+        let ipns = generate_ipns_id().expect("ipns id");
+        let encrypted_bundle_json = build_valid_bundle(passphrase, &ipns);
+
+        let result = validate_identity_bundle_keys(passphrase, &encrypted_bundle_json)
+            .expect("valid bundle should pass");
+        assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn validate_identity_bundle_keys_rejects_empty_signing_key() {
+        let passphrase = "test-passphrase";
+        let ipns = generate_ipns_id().expect("ipns id");
+        let encrypted_bundle_json = build_valid_bundle(passphrase, &ipns);
+        let mutated = mutate_bundle_plain(passphrase, &encrypted_bundle_json, |plain| {
+            plain.signing_private_key_hex.clear();
+        });
+
+        let err = validate_identity_bundle_keys_internal(passphrase, &mutated).expect_err("must fail");
+        assert!(
+            err.contains("empty signing private key"),
+            "expected empty signing key error"
+        );
+    }
+
+    #[test]
+    fn validate_identity_bundle_keys_rejects_invalid_encryption_key_length() {
+        let passphrase = "test-passphrase";
+        let ipns = generate_ipns_id().expect("ipns id");
+        let encrypted_bundle_json = build_valid_bundle(passphrase, &ipns);
+        let mutated = mutate_bundle_plain(passphrase, &encrypted_bundle_json, |plain| {
+            plain.encryption_private_key_hex = "ab".to_string();
+        });
+
+        let err = validate_identity_bundle_keys_internal(passphrase, &mutated).expect_err("must fail");
+        assert!(
+            err.contains("encryption private key has invalid hex length"),
+            "expected invalid encryption key length error"
+        );
+    }
+
+    #[test]
+    fn validate_identity_bundle_keys_rejects_ipns_did_mismatch() {
+        let passphrase = "test-passphrase";
+        let ipns = generate_ipns_id().expect("ipns id");
+        let encrypted_bundle_json = build_valid_bundle(passphrase, &ipns);
+        let other_ipns = generate_ipns_id().expect("other ipns id");
+        let mutated = mutate_bundle_plain(passphrase, &encrypted_bundle_json, |plain| {
+            plain.ipns = other_ipns;
+        });
+
+        let err = validate_identity_bundle_keys_internal(passphrase, &mutated).expect_err("must fail");
+        assert!(
+            err.contains("does not match document DID ipns"),
+            "expected DID/IPNS mismatch error"
+        );
+    }
+
+    #[test]
+    fn validate_identity_bundle_keys_rejects_signing_key_mismatch() {
+        let passphrase = "test-passphrase";
+        let ipns = generate_ipns_id().expect("ipns id");
+        let encrypted_bundle_json = build_valid_bundle(passphrase, &ipns);
+        let other_identity = generate_agent_identity(&ipns).expect("other identity");
+        let mismatched_signing_key_hex = other_identity.signing_private_key_hex;
+        let mutated = mutate_bundle_plain(passphrase, &encrypted_bundle_json, |plain| {
+            plain.signing_private_key_hex = mismatched_signing_key_hex;
+        });
+
+        let message =
+            validate_identity_bundle_keys_internal(passphrase, &mutated).expect_err("must fail");
+        assert!(
+            message.contains("signing private key does not match document assertionMethod public key")
+                || message.contains("does not cryptographically match document assertionMethod public key"),
+            "expected signing mismatch error, got: {}",
+            message
+        );
+    }
+
+    #[test]
+    fn validate_identity_bundle_keys_rejects_fragment_only_key_ids() {
+        let passphrase = "test-passphrase";
+        let ipns = generate_ipns_id().expect("ipns id");
+        let encrypted_bundle_json = build_valid_bundle(passphrase, &ipns);
+        let mutated = mutate_bundle_plain(passphrase, &encrypted_bundle_json, |plain| {
+            for method in &mut plain.document.verification_method {
+                let fragment = method
+                    .id
+                    .split('#')
+                    .nth(1)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "sig".to_string());
+                method.id = format!("#{}", fragment);
+            }
+            plain.document.assertion_method = "#sig".to_string();
+            plain.document.key_agreement = "#enc".to_string();
+            plain.document.proof.verification_method = "#sig".to_string();
+        });
+
+        let err = validate_identity_bundle_keys_internal(passphrase, &mutated)
+            .expect_err("fragment-only refs must be rejected");
+        assert!(
+            err.contains("fragment-only") && err.contains("expected full DID id"),
+            "expected explicit fragment-only rejection, got: {}",
+            err
+        );
+    }
 }
