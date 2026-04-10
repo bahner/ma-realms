@@ -1203,11 +1203,21 @@ fn build_signed_world_request(
         .filter(|did| Did::validate(did).is_ok())
         .or_else(cached_world_target_did);
 
-    let target_world_did = match (&command, contextual_world_did) {
+    let command_world_did = match &command {
+        WorldCommand::Message { envelope, .. } => match envelope {
+            ma_core::MessageEnvelope::ActorCommand { target, .. } => Did::try_from(target.trim())
+                .ok()
+                .map(|did| did.without_fragment().id()),
+            _ => None,
+        },
+        _ => None,
+    };
+
+    let target_world_did = match (&command, contextual_world_did.or(command_world_did)) {
         (WorldCommand::Message { .. }, Some(value)) => value,
         (WorldCommand::Message { .. }, None) => {
             return Err(js_err(
-                "world DID target is unknown; connect/enter a world first so actor can resolve room DID",
+                "world DID target is unknown; include a did:ma target (or connect/enter once to seed world DID)",
             ));
         }
         (_, Some(value)) => value,

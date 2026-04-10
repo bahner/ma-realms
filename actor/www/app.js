@@ -383,6 +383,62 @@ function clearActiveHomeSnapshot(identityDid) {
   }
 }
 
+function syncSpecialAliasesFromCurrentHome() {
+  const SPECIAL_KEYS = ['@world', '@here', '@me', '@avatar'];
+  const next = {};
+
+  const identityDid = String(state.identity?.did || '').trim();
+  if (isMaDid(identityDid)) {
+    next['@me'] = identityDid;
+    next['@avatar'] = identityDid;
+  }
+
+  const roomDid = String(state.currentHome?.roomDid || '').trim();
+  const endpointId = String(state.currentHome?.endpointId || '').trim();
+  const room = String(state.currentHome?.room || '').trim();
+
+  let worldDidRoot = '';
+  if (isMaDid(roomDid)) {
+    worldDidRoot = didRoot(roomDid);
+  }
+  if (!worldDidRoot && endpointId) {
+    worldDidRoot = didRoot(findDidByEndpoint(endpointId) || '');
+  }
+  if (worldDidRoot) {
+    next['@world'] = worldDidRoot;
+  }
+
+  let hereDid = '';
+  if (isMaDid(roomDid) && !isUnconfiguredDidTarget(roomDid)) {
+    hereDid = roomDid;
+  } else if (worldDidRoot && room) {
+    hereDid = `${worldDidRoot}#${room}`;
+  }
+  if (hereDid) {
+    next['@here'] = hereDid;
+  }
+
+  let changed = false;
+  for (const key of SPECIAL_KEYS) {
+    const expected = String(next[key] || '').trim();
+    const current = String(state.aliasBook?.[key] || '').trim();
+    if (expected) {
+      if (current !== expected) {
+        state.aliasBook[key] = expected;
+        changed = true;
+      }
+    } else if (current) {
+      delete state.aliasBook[key];
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    saveAliasBook();
+    refreshDialogAndPresenceFormatting();
+  }
+}
+
 function normalizeLegacySnapshotTarget(snapshot) {
   const targetRaw = String(snapshot?.target || '').trim();
   if (!targetRaw) {
@@ -1841,9 +1897,9 @@ function formatDidForDialog(value) {
     const hash = source.indexOf('#');
     const fragment = hash === -1 ? '' : source.slice(hash + 1);
     if (fragment && fragment.toLowerCase() !== alias.toLowerCase()) {
-      return `@${alias}#${fragment}`;
+      return `${alias}#${fragment}`;
     }
-    return `@${alias}`;
+    return alias;
   }
 
   const parts = didParts(source);
@@ -1889,6 +1945,7 @@ function dialogText(text) {
     || lowered.startsWith('connecting to ')
     || lowered.startsWith('send failed:')
     || lowered.startsWith('could not restore last location:')
+    || lowered.includes('unknown actor or object')
     || lowered.startsWith('did resolve note:')) {
     return source;
   }
@@ -1932,10 +1989,10 @@ function displayActor(senderDid, senderHandle) {
   }
 
   if (handle) {
-    return handle.startsWith('@') ? handle : `@${handle}`;
+    return handle;
   }
 
-  return '@unknown';
+  return 'unknown';
 }
 
 function actorFragmentFromDid(did) {
@@ -2769,6 +2826,40 @@ async function fetchDidDocumentJsonByDid(did, options) {
   return await didDocFlow.fetchDidDocumentJsonByDid(did, options);
 }
 
+async function resolveWorldEndpointForDid(did) {
+  const targetRoot = didRoot(String(did || '').trim());
+  if (!isMaDid(targetRoot)) {
+    throw new Error(`Expected did:ma root, got: ${did}`);
+  }
+
+  const targetDocJson = await withTimeout(
+    fetchDidDocumentJsonByDid(targetRoot, {
+      forceRefresh: true,
+      timeoutMs: 3500,
+    }),
+    4500,
+    `gateway DID resolve timed out for ${targetRoot}`
+  );
+
+  const targetDoc = parseDidDocumentUtil(targetDocJson);
+  if (!targetDoc || typeof targetDoc !== 'object') {
+    throw new Error(`Resolved DID document is invalid JSON for ${targetRoot}.`);
+  }
+
+  return await withTimeout(
+    resolveEndpointWithTypePolicy({
+      targetRoot,
+      targetDoc,
+      fetchDidDocumentJsonByDid,
+      didRoot,
+      parseDidDocument: parseDidDocumentUtil,
+      extractWorldEndpointFromDidDoc,
+    }),
+    4000,
+    `endpoint extraction timed out for ${targetRoot}`
+  );
+}
+
 async function autoFollowEnterDirective(message) {
   if (!didDocFlow) {
     throw new Error('DID document flow is not initialized yet.');
@@ -2838,9 +2929,7 @@ function setActiveObjectTarget(aliasOrDid, explicitDid = '', requirement = 'none
     }
   }
 
-  if (alias && !alias.startsWith('@')) {
-    alias = `@${alias.replace(/^@+/, '')}`;
-  }
+  alias = alias.replace(/^@+/, '');
 
   state.activeObjectTargetAlias = alias;
   state.activeObjectTargetDid = isMaDid(did) ? did : '';
@@ -2849,13 +2938,10 @@ function setActiveObjectTarget(aliasOrDid, explicitDid = '', requirement = 'none
 }
 
 function clearActiveObjectTarget(expectedAlias = '') {
-  const currentAlias = String(state.activeObjectTargetAlias || '').trim();
-  const normalizedExpected = String(expectedAlias || '').trim();
+  const currentAlias = String(state.activeObjectTargetAlias || '').trim().replace(/^@+/, '');
+  const normalizedExpected = String(expectedAlias || '').trim().replace(/^@+/, '');
   if (normalizedExpected) {
-    const normalizedAt = normalizedExpected.startsWith('@')
-      ? normalizedExpected
-      : `@${normalizedExpected.replace(/^@+/, '')}`;
-    if (currentAlias && currentAlias !== normalizedAt) {
+    if (currentAlias && currentAlias !== normalizedExpected) {
       return;
     }
   }
@@ -2881,7 +2967,9 @@ function maybePrefixActiveObjectTarget(text) {
   if (!alias) return String(text || '');
   if (!shouldAutoPrefixActiveTarget(text)) return String(text || '');
   const target = isMaDid(did) ? did : alias;
-  return `@${target} ${String(text || '').trim()}`;
+  const normalizedTarget = String(target || '').trim().replace(/^@+/, '');
+  if (!normalizedTarget) return String(text || '');
+  return `@${normalizedTarget} ${String(text || '').trim()}`;
 }
 
 async function ensureHeldRequirementSatisfied(alias, objectDid) {
@@ -2921,6 +3009,7 @@ const { applyWorldResponse } = createWorldResponseFlow({
   saveLastRoom,
   updateIdentityLine,
   updateRoomHeading: (...args) => updateRoomHeading(...args),
+  syncSpecialAliases: syncSpecialAliasesFromCurrentHome,
   clearActiveObjectTarget,
   clearRoomPresence,
   trackRoomPresence,
@@ -3261,6 +3350,7 @@ async function enterHome(target, preferredRoom = null) {
     lastEventSequence: toSequenceNumber(result.latest_event_sequence || 0),
     handle: result.handle || state.aliasName
   };
+  syncSpecialAliasesFromCurrentHome();
   primeDidLookupCacheFromRoomObjectDids(result.room_object_dids);
   saveLastRoom(endpointId, activeRoom);
   saveActiveHomeSnapshot();
@@ -3309,6 +3399,7 @@ worldDispatchFlow = createWorldDispatchFlow({
   state,
   appendMessage,
   enterHome,
+  resolveWorldEndpointForDid,
   isLikelyIrohAddress,
   normalizeIrohAddress,
   parseDot,

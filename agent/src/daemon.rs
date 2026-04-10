@@ -34,7 +34,6 @@ struct DaemonSecretPaths {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentdConfig {
-    pub slug: String,
     pub listen: String,
     pub kubo_api_url: String,
     pub kubo_key_alias: String,
@@ -53,12 +52,11 @@ pub struct AgentdConfig {
 impl Default for AgentdConfig {
     fn default() -> Self {
         Self {
-            slug: "agent".to_string(),
             listen: "127.0.0.1:5003".to_string(),
             kubo_api_url: "http://127.0.0.1:5001".to_string(),
-            kubo_key_alias: "agent".to_string(),
+            kubo_key_alias: "ma-agent".to_string(),
             passphrase: "dev-passphrase".to_string(),
-            world_key_file: "agent_world.key".to_string(),
+            world_key_file: "agentd_world.key".to_string(),
             iroh_key_file: AGENT_IROH_KEY_FILE.to_string(),
             enc_key_file: AGENT_ENC_KEY_FILE.to_string(),
             sig_key_file: AGENT_SIG_KEY_FILE.to_string(),
@@ -71,11 +69,6 @@ impl Default for AgentdConfig {
 
 impl AgentdConfig {
     fn normalize(&mut self) {
-        self.slug = self.slug.trim().to_string();
-        if self.slug.is_empty() {
-            self.slug = "agent".to_string();
-        }
-
         self.listen = self.listen.trim().to_string();
         if self.listen.is_empty() {
             self.listen = "127.0.0.1:5003".to_string();
@@ -88,7 +81,10 @@ impl AgentdConfig {
 
         self.kubo_key_alias = self.kubo_key_alias.trim().to_string();
         if self.kubo_key_alias.is_empty() {
-            self.kubo_key_alias = self.slug.clone();
+            self.kubo_key_alias = "ma-agent".to_string();
+        } else if self.kubo_key_alias == "agentd" {
+            // Migrate legacy default alias to the canonical ma-agent alias.
+            self.kubo_key_alias = "ma-agent".to_string();
         }
 
         self.passphrase = self.passphrase.trim().to_string();
@@ -98,7 +94,7 @@ impl AgentdConfig {
 
         self.world_key_file = self.world_key_file.trim().to_string();
         if self.world_key_file.is_empty() {
-            self.world_key_file = format!("{}_world.key", self.slug);
+            self.world_key_file = "agentd_world.key".to_string();
         }
 
         self.iroh_key_file = self.iroh_key_file.trim().to_string();
@@ -135,7 +131,6 @@ struct AgentMeta {
 struct AppState {
     cfg: Arc<RwLock<AgentdConfig>>,
     config_path: PathBuf,
-    config_is_explicit: bool,
     data_root: PathBuf,
     agents_dir: PathBuf,
     logs_dir: PathBuf,
@@ -159,7 +154,6 @@ struct AppendLogRequest {
 
 #[derive(Debug, Deserialize)]
 struct UpdateConfigRequest {
-    slug: Option<String>,
     kubo_key_alias: Option<String>,
     lock_ttl: Option<u64>,
 }
@@ -186,7 +180,6 @@ struct CreateAgentResponse {
 struct HealthResponse {
     ok: bool,
     agent_version: String,
-    slug: String,
     listen: String,
     kubo_api_url: String,
     kubo_key_alias: String,
@@ -241,18 +234,16 @@ struct ValidateAliasResponse {
 }
 
 pub async fn run_daemon(
-    slug: Option<String>,
     listen_override: Option<String>,
     kubo_key_alias_override: Option<String>,
     config_path_override: Option<PathBuf>,
 ) -> Result<()> {
     let (cfg, config_path) = load_or_init_config(
-        slug,
         listen_override,
         kubo_key_alias_override,
         config_path_override.clone(),
     )?;
-    let state = build_state(cfg, config_path, config_path_override.is_some())?;
+    let state = build_state(cfg, config_path)?;
 
     let app = Router::new()
         .route("/", get(index))
@@ -340,8 +331,7 @@ async fn sighup_reload_loop(state: AppState) {
     while stream.recv().await.is_some() {
         match reload_runtime_config(&state).await {
             Ok(cfg) => println!(
-                "SIGHUP: reloaded config (slug='{}', alias='{}', poll_ttl={}s)",
-                cfg.slug,
+                "SIGHUP: reloaded config (alias='{}', poll_ttl={}s)",
                 cfg.kubo_key_alias,
                 cfg.poll_ttl
             ),
@@ -354,19 +344,10 @@ async fn sighup_reload_loop(state: AppState) {
 async fn sighup_reload_loop(_state: AppState) {}
 
 fn load_or_init_config(
-    slug: Option<String>,
     listen_override: Option<String>,
     kubo_key_alias_override: Option<String>,
     config_path_override: Option<PathBuf>,
 ) -> Result<(AgentdConfig, PathBuf)> {
-    let requested_slug = slug
-        .unwrap_or_else(|| "agent".to_string())
-        .trim()
-        .to_string();
-    if !is_valid_agent_id(&requested_slug) {
-        return Err(anyhow!("invalid slug '{}': expected [A-Za-z0-9_-]+", requested_slug));
-    }
-
     let config_path = if let Some(path) = config_path_override {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -374,7 +355,7 @@ fn load_or_init_config(
         }
         path
     } else {
-        daemon_config_root()?.join(format!("{}.yaml", requested_slug))
+        daemon_config_root()?.join("agentd.yaml")
     };
 
     let mut cfg = if config_path.exists() {
@@ -384,24 +365,19 @@ fn load_or_init_config(
             .with_context(|| format!("failed to parse {}", config_path.display()))?
     } else {
         AgentdConfig {
-            slug: requested_slug.clone(),
             listen: "127.0.0.1:5003".to_string(),
             kubo_api_url: "http://127.0.0.1:5001".to_string(),
-            kubo_key_alias: requested_slug.clone(),
+            kubo_key_alias: "ma-agent".to_string(),
             poll_ttl: 10,
             lock_ttl: 120,
             passphrase: "dev-passphrase".to_string(),
-            world_key_file: format!("{}_world.key", requested_slug),
+            world_key_file: "agentd_world.key".to_string(),
             iroh_key_file: AGENT_IROH_KEY_FILE.to_string(),
             enc_key_file: AGENT_ENC_KEY_FILE.to_string(),
             sig_key_file: AGENT_SIG_KEY_FILE.to_string(),
             world_did_root: String::new(),
         }
     };
-
-    if cfg.slug.trim().is_empty() {
-        cfg.slug = requested_slug.clone();
-    }
 
     if let Some(override_listen) = listen_override {
         let value = override_listen.trim();
@@ -427,8 +403,8 @@ fn load_or_init_config(
     Ok((cfg, config_path))
 }
 
-fn build_state(cfg: AgentdConfig, config_path: PathBuf, config_is_explicit: bool) -> Result<AppState> {
-    let data_root = data_root_for_slug(&cfg.slug)?;
+fn build_state(cfg: AgentdConfig, config_path: PathBuf) -> Result<AppState> {
+    let data_root = data_root_global()?;
     let agents_dir = data_root.join("agents");
     let logs_dir = data_root.join("logs");
 
@@ -437,10 +413,11 @@ fn build_state(cfg: AgentdConfig, config_path: PathBuf, config_is_explicit: bool
     fs::create_dir_all(&logs_dir)
         .with_context(|| format!("failed to create {}", logs_dir.display()))?;
 
+    migrate_legacy_agent_data(&data_root, &agents_dir, &logs_dir)?;
+
     Ok(AppState {
         cfg: Arc::new(RwLock::new(cfg)),
         config_path,
-        config_is_explicit,
         data_root,
         agents_dir,
         logs_dir,
@@ -521,12 +498,7 @@ fn ensure_daemon_secret_files_for(cfg: &AgentdConfig, config_path: &FsPath) -> R
 }
 
 async fn reload_runtime_config(state: &AppState) -> Result<AgentdConfig> {
-    let slug = {
-        let cfg = state.cfg.read().await;
-        cfg.slug.clone()
-    };
-
-    let mut cfg = load_or_default_config_for_slug(&slug)?;
+    let mut cfg = load_or_default_config()?;
     cfg.normalize();
     let _ = ensure_daemon_secret_files_for(&cfg, &state.config_path)?;
     {
@@ -546,70 +518,28 @@ async fn persist_runtime_config(state: &AppState, cfg: AgentdConfig) -> Result<P
     Ok(path)
 }
 
-fn merge_configs(base: &AgentdConfig, incoming: &AgentdConfig) -> AgentdConfig {
-    let mut out = base.clone();
-
-    if !incoming.listen.trim().is_empty() {
-        out.listen = incoming.listen.clone();
-    }
-    if !incoming.kubo_api_url.trim().is_empty() {
-        out.kubo_api_url = incoming.kubo_api_url.clone();
-    }
-    if !incoming.kubo_key_alias.trim().is_empty() {
-        out.kubo_key_alias = incoming.kubo_key_alias.clone();
-    }
-    if incoming.poll_ttl > 0 {
-        out.poll_ttl = incoming.poll_ttl;
-    }
-    out.lock_ttl = incoming.lock_ttl;
-    if !incoming.passphrase.trim().is_empty() {
-        out.passphrase = incoming.passphrase.clone();
-    }
-    if !incoming.world_key_file.trim().is_empty() {
-        out.world_key_file = incoming.world_key_file.clone();
-    }
-    if !incoming.iroh_key_file.trim().is_empty() {
-        out.iroh_key_file = incoming.iroh_key_file.clone();
-    }
-    if !incoming.enc_key_file.trim().is_empty() {
-        out.enc_key_file = incoming.enc_key_file.clone();
-    }
-    if !incoming.sig_key_file.trim().is_empty() {
-        out.sig_key_file = incoming.sig_key_file.clone();
-    }
-    if !incoming.world_did_root.trim().is_empty() {
-        out.world_did_root = incoming.world_did_root.clone();
-    }
-
-    out
-}
-
-fn load_or_default_config_for_slug(slug: &str) -> Result<AgentdConfig> {
+fn load_or_default_config() -> Result<AgentdConfig> {
     let config_root = daemon_config_root()?;
-    let config_path = config_root.join(format!("{}.yaml", slug));
+    let config_path = config_root.join("agentd.yaml");
 
     if config_path.exists() {
         let raw = fs::read_to_string(&config_path)
             .with_context(|| format!("failed to read {}", config_path.display()))?;
         let mut cfg = serde_yaml::from_str::<AgentdConfig>(&raw)
             .with_context(|| format!("failed to parse {}", config_path.display()))?;
-        if cfg.slug.trim().is_empty() {
-            cfg.slug = slug.to_string();
-        }
         cfg.normalize();
         let _ = ensure_daemon_secret_files_for(&cfg, &config_path)?;
         return Ok(cfg);
     }
 
     let mut cfg = AgentdConfig {
-        slug: slug.to_string(),
         listen: "127.0.0.1:5003".to_string(),
         kubo_api_url: "http://127.0.0.1:5001".to_string(),
-        kubo_key_alias: slug.to_string(),
+        kubo_key_alias: "ma-agent".to_string(),
         poll_ttl: 10,
         lock_ttl: 120,
         passphrase: "dev-passphrase".to_string(),
-        world_key_file: format!("{}_world.key", slug),
+        world_key_file: "agentd_world.key".to_string(),
         iroh_key_file: AGENT_IROH_KEY_FILE.to_string(),
         enc_key_file: AGENT_ENC_KEY_FILE.to_string(),
         sig_key_file: AGENT_SIG_KEY_FILE.to_string(),
@@ -638,14 +568,79 @@ fn read_agent_version() -> Option<String> {
     }
 }
 
-fn data_root_for_slug(slug: &str) -> Result<PathBuf> {
+fn data_root_base() -> Result<PathBuf> {
     let base = if let Ok(xdg_data) = env::var("XDG_DATA_HOME") {
         PathBuf::from(xdg_data)
     } else {
         let home = env::var("HOME").context("HOME is not set")?;
         PathBuf::from(home).join(".local").join("share")
     };
-    Ok(base.join("ma").join(slug))
+    Ok(base.join("ma"))
+}
+
+fn data_root_global() -> Result<PathBuf> {
+    Ok(data_root_base()?.join("agentd"))
+}
+
+fn migrate_legacy_agent_data(data_root: &FsPath, agents_dir: &FsPath, logs_dir: &FsPath) -> Result<()> {
+    let ma_root = data_root
+        .parent()
+        .ok_or_else(|| anyhow!("invalid data root {}", data_root.display()))?;
+
+    let Ok(entries) = fs::read_dir(ma_root) else {
+        return Ok(());
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
+            continue;
+        };
+        if name == "agentd" {
+            continue;
+        }
+
+        let legacy_agents = path.join("agents");
+        let legacy_logs = path.join("logs");
+
+        if let Ok(files) = fs::read_dir(&legacy_agents) {
+            for file in files.flatten() {
+                let src = file.path();
+                if src.extension().and_then(|v| v.to_str()) != Some("json") {
+                    continue;
+                }
+                let Some(file_name) = src.file_name() else {
+                    continue;
+                };
+                let dst = agents_dir.join(file_name);
+                if !dst.exists() {
+                    let _ = fs::copy(&src, &dst);
+                }
+            }
+        }
+
+        if let Ok(files) = fs::read_dir(&legacy_logs) {
+            for file in files.flatten() {
+                let src = file.path();
+                if src.extension().and_then(|v| v.to_str()) != Some("log") {
+                    continue;
+                }
+                let Some(file_name) = src.file_name() else {
+                    continue;
+                };
+                let dst = logs_dir.join(file_name);
+                if !dst.exists() {
+                    let _ = fs::copy(&src, &dst);
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn is_valid_agent_id(id: &str) -> bool {
@@ -730,10 +725,23 @@ struct KuboKeyInfo {
 fn kubo_key_alias(cfg: &AgentdConfig) -> String {
     let alias = cfg.kubo_key_alias.trim();
     if alias.is_empty() {
-        cfg.slug.clone()
+        "ma-agent".to_string()
     } else {
         alias.to_string()
     }
+}
+
+async fn kubo_create_key(kubo_url: &str, key_name: &str) -> Result<()> {
+    let base = kubo_url.trim_end_matches('/');
+    let url = format!("{base}/api/v0/key/gen");
+
+    reqwest::Client::new()
+        .post(url)
+        .query(&[("arg", key_name), ("type", "ed25519")])
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
 }
 
 async fn kubo_list_keys(kubo_url: &str) -> Result<Vec<KuboKeyInfo>> {
@@ -918,16 +926,21 @@ async fn ensure_world_root_did_published(state: &AppState) -> Result<String> {
     let world_key_name = kubo_key_alias(&cfg);
 
     let key_id = {
-        let keys = kubo_list_keys(kubo_url).await?;
+        let mut keys = kubo_list_keys(kubo_url).await?;
+        if keys.iter().all(|key| key.name != world_key_name) {
+            println!(
+                "startup publish: creating missing kubo key alias '{}'",
+                world_key_name
+            );
+            kubo_create_key(kubo_url, &world_key_name).await?;
+            keys = kubo_list_keys(kubo_url).await?;
+        }
+
         if let Some(existing) = keys.iter().find(|key| key.name == world_key_name) {
             existing.id.clone()
         } else {
-            eprintln!(
-                "WARN: kubo key alias '{}' was not found. Waiting for manual setup.",
-                world_key_name
-            );
             return Err(anyhow!(
-                "kubo key alias '{}' was not found (manual setup required)",
+                "kubo key alias '{}' is missing after create attempt",
                 world_key_name
             ));
         }
@@ -1072,7 +1085,6 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         ok: true,
         agent_version: read_agent_version().unwrap_or_else(|| "dev".to_string()),
-        slug: cfg.slug,
         listen: cfg.listen,
         kubo_api_url: cfg.kubo_api_url,
         kubo_key_alias: cfg.kubo_key_alias,
@@ -1112,43 +1124,7 @@ async fn update_config(
     Json(req): Json<UpdateConfigRequest>,
 ) -> Json<ConfigResponse> {
     let cfg_now = state.cfg.read().await.clone();
-    let next_slug = req
-        .slug
-        .clone()
-        .unwrap_or_else(|| cfg_now.slug.clone())
-        .trim()
-        .to_string();
-
-    if !is_valid_agent_id(&next_slug) {
-        return Json(ConfigResponse {
-            ok: false,
-            message: format!("invalid slug '{}': expected [A-Za-z0-9_-]+", next_slug),
-            config: cfg_now,
-            config_path: state.config_path.display().to_string(),
-            restart_required: false,
-        });
-    }
-
     let mut merged = cfg_now.clone();
-    merged.slug = next_slug.clone();
-
-    if next_slug != cfg_now.slug && !state.config_is_explicit {
-        match load_or_default_config_for_slug(&next_slug) {
-            Ok(incoming) => {
-                merged = merge_configs(&merged, &incoming);
-            }
-            Err(err) => {
-                return Json(ConfigResponse {
-                    ok: false,
-                    message: format!("failed loading config for slug '{}': {}", next_slug, err),
-                    config: cfg_now,
-                    config_path: state.config_path.display().to_string(),
-                    restart_required: false,
-                });
-            }
-        }
-        merged.slug = next_slug.clone();
-    }
 
     if let Some(alias) = req.kubo_key_alias.as_ref() {
         let alias = alias.trim();

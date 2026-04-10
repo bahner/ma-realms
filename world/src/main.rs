@@ -31,7 +31,7 @@ use iroh::{
 };
 use ma_core::{
     ActorCommand, BROADCAST_ALPN,
-    CONTENT_TYPE_BROADCAST, CONTENT_TYPE_PRESENCE, CONTENT_TYPE_WORLD, CompiledCapabilityAcl,
+    CONTENT_TYPE_PRESENCE, CONTENT_TYPE_WORLD, CompiledCapabilityAcl,
     CONTENT_TYPE_DOC, DEFAULT_WORLD_RELAY_URL,
     ExitData, LaneCapability, MessageEnvelope, ObjectDefinition, ObjectInboxMessage,
     MAILBOX_COMMANDS_INLINE,
@@ -210,20 +210,6 @@ struct PresenceSnapshotEvent {
     seq: u64,
     ts: String,
 }
-
-#[derive(Clone, Debug, Serialize)]
-struct RoomBroadcastEvent {
-    v: u8,
-    kind: String,
-    room: String,
-    room_did: String,
-    sender: Option<String>,
-    message: String,
-    seq: u64,
-    ts: String,
-}
-
-
 
 #[derive(Clone, Debug)]
 struct WorldProtocol {
@@ -857,20 +843,37 @@ impl World {
         updated
     }
 
-    async fn touch_avatar_presence_for_endpoint(&self, room_name: &str, endpoint: &str) -> bool {
-        let mut rooms = self.rooms.write().await;
-        let Some(room) = rooms.get_mut(room_name) else {
-            return false;
-        };
+    async fn avatar_language_order_for_did(&self, room_name: &str, did_root: &str) -> Option<String> {
+        let rooms = self.rooms.read().await;
+        let room = rooms.get(room_name)?;
+        room.avatars
+            .values()
+            .find(|avatar| avatar.agent_did.without_fragment().id() == did_root)
+            .map(|avatar| avatar.language_order.clone())
+            .filter(|value| !value.trim().is_empty())
+    }
 
-        let mut updated = false;
-        for avatar in room.avatars.values_mut() {
-            if avatar.agent_endpoint == endpoint {
-                avatar.touch_presence();
-                updated = true;
-            }
-        }
-        updated
+    async fn avatar_handle_for_did(&self, room_name: &str, did_root: &str) -> Option<String> {
+        let rooms = self.rooms.read().await;
+        let room = rooms.get(room_name)?;
+        room
+            .avatars
+            .iter()
+            .find(|(_, avatar)| avatar.agent_did.without_fragment().id() == did_root)
+            .map(|(handle, _)| handle.clone())
+    }
+
+    async fn avatar_room_for_did(&self, did_root: &str) -> Option<String> {
+        let rooms = self.rooms.read().await;
+        rooms
+            .iter()
+            .find(|(_, room)| {
+                room
+                    .avatars
+                    .values()
+                    .any(|avatar| avatar.agent_did.without_fragment().id() == did_root)
+            })
+            .map(|(room_name, _)| room_name.clone())
     }
 
     async fn prune_stale_avatars(&self, stale_after: Duration) -> Vec<String> {
@@ -916,15 +919,6 @@ impl World {
         changed_rooms
     }
 
-    async fn avatar_language_order_for_did(&self, room_name: &str, did_root: &str) -> Option<String> {
-        let rooms = self.rooms.read().await;
-        let room = rooms.get(room_name)?;
-        room.avatars
-            .values()
-            .find(|avatar| avatar.agent_did.without_fragment().id() == did_root)
-            .map(|avatar| avatar.language_order.clone())
-            .filter(|value| !value.trim().is_empty())
-    }
     async fn ensure_lobby_intrinsic_objects(&self) {
         let room_name = DEFAULT_ROOM;
         let rooms = self.rooms.read().await;
@@ -2614,54 +2608,88 @@ impl World {
         envelope: MessageEnvelope,
     ) -> Result<(String, bool, String)> {
         let sender_root = from_did.without_fragment().id();
+        let from_norm = from.trim().trim_start_matches('@').to_string();
+        let sender_presence_required = match &envelope {
+            MessageEnvelope::ActorCommand { target, .. } => {
+                let normalized = target.trim().to_ascii_lowercase();
+                matches!(
+                    normalized.as_str(),
+                    "avatar" | "me" | "self" | "here" | "room" | "world"
+                )
+            }
+            _ => true,
+        };
         let sender_key = {
             let rooms = self.rooms.read().await;
             let room = rooms
                 .get(room_name)
                 .ok_or_else(|| anyhow!("Room {} not found", room_name))?;
 
-            if let Some(avatar) = room.avatars.get(from) {
-                if avatar.agent_did == from_did.without_fragment() {
-                    from.to_string()
+            if !sender_presence_required {
+                if let Some((handle, avatar)) = room
+                    .avatars
+                    .iter()
+                    .find(|(_, avatar)| avatar.agent_did.without_fragment().id() == sender_root)
+                {
+                    if avatar.agent_did != from_did.without_fragment() {
+                        return Err(anyhow!(
+                            "sender DID mismatch for @{} in room {}",
+                            from_norm,
+                            room_name
+                        ));
+                    }
+                    handle.clone()
+                } else if !from_norm.is_empty() {
+                    from_norm.clone()
                 } else {
-                    return Err(anyhow!(
-                        "sender DID mismatch for @{} in room {}",
-                        from,
-                        room_name
-                    ));
+                    sender_root.clone()
                 }
             } else {
-                let mapped_did = {
-                    let map = self.handle_to_did.read().await;
-                    map.get(from).cloned()
-                };
-                let Some(mapped_did) = mapped_did else {
-                    return Err(anyhow!("unknown avatar @{} in room {}", from, room_name));
-                };
-                if mapped_did != sender_root {
-                    return Err(anyhow!("unknown avatar @{} in room {}", from, room_name));
-                }
-                if room.avatars.contains_key(&mapped_did) {
-                    mapped_did
+
+                if let Some(avatar) = room.avatars.get(from_norm.as_str()) {
+                    if avatar.agent_did == from_did.without_fragment() {
+                        from_norm.clone()
+                    } else {
+                        return Err(anyhow!(
+                            "sender DID mismatch for @{} in room {}",
+                            from_norm,
+                            room_name
+                        ));
+                    }
                 } else {
-                    return Err(anyhow!("unknown avatar @{} in room {}", from, room_name));
+                    if let Some((handle, avatar)) = room
+                        .avatars
+                        .iter()
+                        .find(|(_, avatar)| avatar.agent_did.without_fragment().id() == sender_root)
+                    {
+                        if avatar.agent_did != from_did.without_fragment() {
+                            return Err(anyhow!(
+                                "sender DID mismatch for @{} in room {}",
+                                from_norm,
+                                room_name
+                            ));
+                        }
+                        handle.clone()
+                    } else {
+                        return Err(anyhow!("unknown avatar @{} in room {}", from_norm, room_name));
+                    }
                 }
             }
         };
 
-        {
+        if sender_presence_required {
             let rooms = self.rooms.read().await;
             let room = rooms
                 .get(room_name)
                 .ok_or_else(|| anyhow!("Room {} not found", room_name))?;
 
             let Some(avatar) = room.avatars.get(&sender_key) else {
-                return Err(anyhow!("unknown avatar @{} in room {}", from, room_name));
+                return Err(anyhow!("unknown avatar @{} in room {}", from_norm, room_name));
             };
             if avatar.agent_did != from_did.without_fragment() {
                 return Err(anyhow!(
                     "sender DID mismatch for @{} in room {}",
-                    from,
+                    from_norm,
                     room_name
                 ));
             }
@@ -3534,6 +3562,7 @@ impl World {
     ) -> Option<(String, String)> {
         let caller_root = from_did.without_fragment().id();
         let now_secs = Utc::now().timestamp().max(0) as u64;
+        let mut active_room = room_name.to_string();
 
         let resolved_target = if let Some(inbox_object_id) = self
             .resolve_inbox_target_object_id(room_name, target)
@@ -3549,38 +3578,77 @@ impl World {
             if let Some(route) = self.object_inbox_index.get(&did_key) {
                 let objects = self.room_objects.read().await;
                 let valid = objects
-                    .get(room_name)
+                    .get(route.room_name.as_str())
                     .map(|room_map| {
-                        route.room_name.eq_ignore_ascii_case(room_name)
-                            && room_map.contains_key(route.object_id.as_str())
+                        room_map.contains_key(route.object_id.as_str())
                     })
                     .unwrap_or(false);
                 if valid {
+                    active_room = route.room_name.clone();
                     route.object_id
                 } else {
                     self.object_inbox_index.invalidate(&did_key);
-                    did.fragment.clone()?
+                    let fragment = did.fragment.clone()?;
+                    let discovered_room = objects
+                        .iter()
+                        .find_map(|(candidate_room, room_map)| {
+                            if room_map.contains_key(fragment.as_str()) {
+                                Some(candidate_room.clone())
+                            } else {
+                                None
+                            }
+                        });
+                    drop(objects);
+
+                    if let Some(found_room) = discovered_room {
+                        active_room = found_room.clone();
+                        self.object_inbox_index.insert(
+                            did_key,
+                            InboxRoute {
+                                room_name: found_room,
+                                object_id: fragment.clone(),
+                            },
+                        );
+                    }
+                    fragment
                 }
             } else {
                 let fragment = did.fragment.clone()?;
-                self.object_inbox_index.insert(
-                    did_key,
-                    InboxRoute {
-                        room_name: room_name.to_string(),
-                        object_id: fragment.clone(),
-                    },
-                );
+                let objects = self.room_objects.read().await;
+                let discovered_room = objects
+                    .iter()
+                    .find_map(|(candidate_room, room_map)| {
+                        if room_map.contains_key(fragment.as_str()) {
+                            Some(candidate_room.clone())
+                        } else {
+                            None
+                        }
+                    });
+                drop(objects);
+
+                if let Some(found_room) = discovered_room {
+                    active_room = found_room.clone();
+                    self.object_inbox_index.insert(
+                        did_key,
+                        InboxRoute {
+                            room_name: found_room,
+                            object_id: fragment.clone(),
+                        },
+                    );
+                }
                 fragment
             }
         } else {
             let token = target.trim().trim_start_matches('@').to_ascii_lowercase();
             let objects = self.room_objects.read().await;
-            let room_map = objects.get(room_name)?;
+            let room_map = objects.get(active_room.as_str())?;
             room_map
                 .values()
                 .find(|obj| obj.matches_target(token.as_str()))
                 .map(|obj| obj.id.clone())?
         };
+
+        let room_name = active_room.as_str();
 
         let object_id = {
             let mut objects = self.room_objects.write().await;
@@ -6237,81 +6305,6 @@ impl WorldProtocol {
         }
     }
 
-    async fn push_room_broadcast(
-        &self,
-        room_name: &str,
-        sender: Option<String>,
-        message: String,
-    ) {
-        let context = self.room_presence_context(room_name).await;
-        let (room_did, _room_title, _room_description, _avatars, endpoints) = match context {
-            Ok(value) => value,
-            Err(err) => {
-                warn!("broadcast context unavailable for room '{}': {}", room_name, err);
-                return;
-            }
-        };
-        let signing_key = match self.room_signing_key(&room_did).await {
-            Ok(key) => key,
-            Err(err) => {
-                warn!("broadcast signing key unavailable for {}: {}", room_did, err);
-                return;
-            }
-        };
-
-        let seq = self
-            .world
-            .latest_room_event_sequence(room_name)
-            .await
-            .unwrap_or(0);
-        let payload = RoomBroadcastEvent {
-            v: 1,
-            kind: "room.broadcast".to_string(),
-            room: room_name.to_string(),
-            room_did: room_did.clone(),
-            sender,
-            message,
-            seq,
-            ts: Utc::now().to_rfc3339(),
-        };
-        let content = match serde_json::to_vec(&payload) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                warn!("broadcast encode failed for room '{}': {}", room_name, err);
-                return;
-            }
-        };
-        let message = match Message::new(
-            room_did.clone(),
-            room_did,
-            CONTENT_TYPE_BROADCAST,
-            content,
-            &signing_key,
-        ) {
-            Ok(msg) => msg,
-            Err(err) => {
-                warn!("broadcast message build failed: {}", err);
-                return;
-            }
-        };
-        let cbor = match message.to_cbor() {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                warn!("broadcast cbor encode failed: {}", err);
-                return;
-            }
-        };
-
-        for endpoint in endpoints {
-            if let Err(err) = self
-                .send_signed_push_to_endpoint_on_lane(&endpoint, cbor.clone(), BROADCAST_ALPN)
-                .await
-            {
-                warn!("broadcast push to {} failed: {}", endpoint, err);
-            }
-        }
-    }
-
     async fn process_request(&self, request: WorldRequest, agent_endpoint: String) -> WorldResponse {
         match self.handle_request(request, agent_endpoint).await {
             Ok(resp) => resp,
@@ -6647,14 +6640,26 @@ impl WorldProtocol {
                 })
             }
             WorldCommand::Message { room, envelope } => {
+                let route_room = match &envelope {
+                    MessageEnvelope::ActorCommand { target, .. }
+                        if target.eq_ignore_ascii_case("avatar") =>
+                    {
+                        self.world
+                            .avatar_room_for_did(sender_root)
+                            .await
+                            .unwrap_or_else(|| room.clone())
+                    }
+                    _ => room.clone(),
+                };
+
                 let _ = self
                     .world
-                    .touch_avatar_presence_for_did(&room, sender_root)
+                    .touch_avatar_presence_for_did(&route_room, sender_root)
                     .await;
                 let method = ROOM_METHOD_BROADCAST_SEND;
                 let effective_sender_profile = self
                     .world
-                    .avatar_language_order_for_did(&room, sender_root)
+                    .avatar_language_order_for_did(&route_room, sender_root)
                     .await
                     .unwrap_or_else(|| "nb_NO:en_UK".to_string());
                 let is_world_admin = matches!(
@@ -6671,14 +6676,18 @@ impl WorldProtocol {
                     debug!("processing non-admin {} on lane '{}'", method, self.lane.label());
                 }
 
-                // Route command envelopes through root DID identity only.
-                let actor_name = sender_root.to_string();
+                // Route command envelopes using the active room handle bound to sender DID.
+                let actor_name = self
+                    .world
+                    .avatar_handle_for_did(&route_room, sender_root)
+                    .await
+                    .unwrap_or_else(|| sender_root.to_string());
                 let (message, broadcasted, effective_room) = self
                     .world
-                    .send_message(&room, &actor_name, sender_did, &effective_sender_profile, envelope)
+                    .send_message(&route_room, &actor_name, sender_did, &effective_sender_profile, envelope)
                     .await?;
-                if effective_room != room {
-                    self.push_presence_snapshot(&room).await;
+                if effective_room != route_room {
+                    self.push_presence_snapshot(&route_room).await;
                     self.push_presence_snapshot(&effective_room).await;
                 }
                 let latest_event_sequence = self.world.latest_room_event_sequence(&effective_room).await?;

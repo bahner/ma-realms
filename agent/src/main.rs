@@ -3,15 +3,17 @@ use std::{env, path::PathBuf};
 use anyhow::{Result, anyhow};
 
 mod daemon;
+mod mcp_stdio;
 
 #[derive(Debug)]
 struct Args {
     help: bool,
     daemon: bool,
+    mcp: bool,
     config: Option<String>,
-    slug: Option<String>,
     listen: Option<String>,
     kubo_key_alias: Option<String>,
+    agentd_url: Option<String>,
 }
 
 fn print_usage() {
@@ -21,12 +23,15 @@ fn print_usage() {
 \n\
 Modes:\n\
     --daemon                    Run local ma-agentd API/admin daemon\n\
+    --mcp                       Run MCP stdio server (proxying ma-agentd API)\n\
 \n\
 Daemon options:\n\
-    --config <path>             Use explicit config file path (instead of XDG_CONFIG_HOME/ma/<slug>.yaml)\n\
-    --slug <slug>               Config slug (default: agent, loads ~/.config/ma/<slug>.yaml)\n\
+    --config <path>             Use explicit config file path (instead of XDG_CONFIG_HOME/ma/agentd.yaml)\n\
     --listen <host:port>        Daemon listen address (default from config or 127.0.0.1:5003)\n\
     --kubo-key-alias <alias>    Required Kubo key alias for world DID root publish\n\
+\n\
+MCP options:\n\
+    --agentd-url <url>          ma-agentd API base URL (default: http://127.0.0.1:5003)\n\
 \n\
 Help:\n\
     -h, --help                  Show this help text\n"
@@ -36,10 +41,11 @@ Help:\n\
 fn parse_args() -> Args {
     let mut help = false;
     let mut daemon = false;
+    let mut mcp = false;
     let mut config: Option<String> = None;
-    let mut slug: Option<String> = None;
     let mut listen: Option<String> = None;
     let mut kubo_key_alias: Option<String> = None;
+    let mut agentd_url: Option<String> = None;
 
     let mut iter = env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -50,8 +56,8 @@ fn parse_args() -> Args {
             "--daemon" => {
                 daemon = true;
             }
-            "--slug" => {
-                slug = iter.next();
+            "--mcp" => {
+                mcp = true;
             }
             "--config" => {
                 config = iter.next();
@@ -62,6 +68,9 @@ fn parse_args() -> Args {
             "--kubo-key-alias" => {
                 kubo_key_alias = iter.next();
             }
+            "--agentd-url" => {
+                agentd_url = iter.next();
+            }
             _ => {}
         }
     }
@@ -69,10 +78,11 @@ fn parse_args() -> Args {
     Args {
         help,
         daemon,
+        mcp,
         config,
-        slug,
         listen,
         kubo_key_alias,
+        agentd_url,
     }
 }
 
@@ -85,17 +95,19 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    if args.daemon {
-        return daemon::run_daemon(
-            args.slug.clone(),
-            args.listen.clone(),
-            args.kubo_key_alias.clone(),
-            args.config.clone().map(PathBuf::from),
-        )
-        .await;
+    if args.mcp && args.daemon {
+        return Err(anyhow!("choose one mode: --daemon or --mcp"));
     }
 
-    Err(anyhow!(
-        "non-daemon agent mode has been removed; use --daemon"
-    ))
+    if args.mcp {
+        return mcp_stdio::run_mcp(args.agentd_url.clone()).await;
+    }
+
+    // Default mode is daemon for ergonomic local operation.
+    daemon::run_daemon(
+        args.listen.clone(),
+        args.kubo_key_alias.clone(),
+        args.config.clone().map(PathBuf::from),
+    )
+    .await
 }

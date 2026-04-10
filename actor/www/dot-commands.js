@@ -43,6 +43,8 @@ export function createDotCommands({
   sendWhisperToDid,
   runSmokeTest,
 }) {
+  const DYNAMIC_SPECIAL_ALIASES = new Set(['@here', '@me', '@world', '@avatar']);
+
   function normalizeAliasNameToken(input) {
     const raw = String(input || '').trim();
     if (!raw) return '';
@@ -93,6 +95,7 @@ export function createDotCommands({
       appendSystemUi('  .help                      - this message', '  .help                      - denne meldingen');
       appendSystemUi('  .identity                  - show local pre-publish DID document as raw JSON', '  .identity                  - vis lokalt DID-dokument (før publisering) som rå JSON');
       appendSystemUi('  .aliases add <name> <target> - add/update alias (no spaces in target)', '  .aliases add <navn> <mål> - legg til/oppdater alias (ingen mellomrom i mål)');
+      appendSystemUi('    note: @here/@me/@world/@avatar are updated automatically', '    merk: @here/@me/@world/@avatar oppdateres automatisk');
       appendSystemUi('  .set home [did:ma:...#room]- set home target (or current position)', '  .set home [did:ma:...#room]- sett home-mål (eller nåværende posisjon)');
       appendSystemUi('  .aliases del <name>        - remove alias', '  .aliases del <navn>        - fjern alias');
       appendSystemUi('  .aliases                   - list aliases', '  .aliases                   - list alias');
@@ -193,6 +196,10 @@ export function createDotCommands({
         }
         const inputName = normalizeAliasNameToken(args[1]);
         const name = resolveAliasBookKey(inputName);
+        if (DYNAMIC_SPECIAL_ALIASES.has(name)) {
+          appendMessage('system', `Alias ${name} is managed automatically.`);
+          return true;
+        }
         if (!name || !Object.prototype.hasOwnProperty.call(state.aliasBook, name)) {
           appendMessage('system', `Alias not found: ${inputName || String(args[1] || '').trim()}`);
           return true;
@@ -213,6 +220,11 @@ export function createDotCommands({
 
       let name = normalizeAliasNameToken(args[1]);
       const address = normalizeAliasTargetToken(args[2]);
+
+      if (DYNAMIC_SPECIAL_ALIASES.has(name)) {
+        appendMessage('system', `Alias ${name} is managed automatically.`);
+        return true;
+      }
 
       if (!isPrintableAliasLabel(name)) {
         appendMessage('system', 'Alias name must be printable UTF-8 (no spaces/control chars), up to 64 chars.');

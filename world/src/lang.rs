@@ -154,12 +154,3 @@ pub(crate) fn tr_world(lang: &str, key: &str, fallback: &str) -> String {
         .cloned()
         .unwrap_or_else(|| fallback.to_string())
 }
-
-pub(crate) fn tr_world_vars(lang: &str, key: &str, vars: &[(&str, String)], fallback: &str) -> String {
-    let mut rendered = tr_world(lang, key, fallback);
-    for (name, value) in vars {
-        rendered = rendered.replace(&format!("{{$ {} }}", name), value);
-        rendered = rendered.replace(&format!("{{${}}}", name), value);
-    }
-    rendered
-}

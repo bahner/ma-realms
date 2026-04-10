@@ -1,11 +1,11 @@
-.PHONY: help core-build actor-build world-build actor-cid write-agent-version write-actor-version run-world dev dev-agent check clean distclean
+.PHONY: help core-build actor-build world-build actor-cid write-agent-version write-actor-version run-world dev dev-agent dev-agent-mcp check clean distclean
 
 WORLD_SLUG ?= ma
 WORLD_LISTEN ?=
 WORLD_KUBO_URL ?=
-MA_AGENT_SLUG ?= agent
 MA_AGENT_LISTEN ?=
 MA_AGENT_KUBO_KEY_ALIAS ?=
+MA_AGENTD_URL ?= http://127.0.0.1:5003
 
 MA_ACTOR_VERSION_ORIGIN := $(origin MA_ACTOR_VERSION)
 
@@ -39,7 +39,8 @@ help:
 	@echo "  make write-agent-version                     Write agent/.generated/agent-version.txt"
 	@echo "  make write-actor-version                     Write actor/www/pkg/build-version.js when MA_ACTOR_VERSION is set"
 	@echo "  make dev                                     Alias for run-world"
-	@echo "  make dev-agent [MA_AGENT_SLUG=slug] [MA_AGENT_LISTEN=ip:port] [MA_AGENT_KUBO_KEY_ALIAS=alias]"
+	@echo "  make dev-agent [MA_AGENT_LISTEN=ip:port] [MA_AGENT_KUBO_KEY_ALIAS=alias]"
+	@echo "  make dev-agent-mcp [MA_AGENTD_URL=url]      Start MCP bridge for ma-agentd"
 	@echo "  make check                                   cargo check workspace"
 	@echo "  make clean                                   Clean sub-crate build artifacts"
 	@echo "  make distclean                               Deep clean across sub-crates"
@@ -94,7 +95,7 @@ dev: run-world
 
 dev-agent: write-agent-version
 	@set -e; \
-	args="--daemon --slug $(MA_AGENT_SLUG)"; \
+	args="--daemon"; \
 	if [ -n "$(MA_AGENT_LISTEN)" ]; then \
 		args="$$args --listen $(MA_AGENT_LISTEN)"; \
 	fi; \
@@ -103,8 +104,15 @@ dev-agent: write-agent-version
 	fi; \
 	echo "Starting ma-agentd"; \
 	echo "MA_AGENT_VERSION=$(MA_AGENT_VERSION)"; \
-	echo "Command: cargo run --manifest-path agent/Cargo.toml -- $$args"; \
-	cargo run --manifest-path agent/Cargo.toml -- $$args
+	echo "Command: cargo run --manifest-path agent/Cargo.toml --bin ma-agent -- $$args"; \
+	cargo run --manifest-path agent/Cargo.toml --bin ma-agent -- $$args
+
+dev-agent-mcp:
+	@set -e; \
+	echo "Starting ma-agent MCP server"; \
+	echo "MA_AGENTD_URL=$(MA_AGENTD_URL)"; \
+	echo "Command: cargo run --manifest-path agent/Cargo.toml --bin ma-agent -- --mcp --agentd-url $(MA_AGENTD_URL)"; \
+	cargo run --manifest-path agent/Cargo.toml --bin ma-agent -- --mcp --agentd-url "$(MA_AGENTD_URL)"
 
 check:
 	cargo check -q

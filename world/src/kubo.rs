@@ -730,24 +730,6 @@ pub async fn generate_kubo_key(kubo_url: &str, key_name: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn remove_kubo_key(kubo_url: &str, key_name: &str) -> Result<()> {
-    let base = kubo_url.trim_end_matches('/');
-    let url = format!("{base}/api/v0/key/rm");
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
-
-    client
-        .post(url)
-        .query(&[("arg", key_name)])
-        .send()
-        .await?
-        .error_for_status()?;
-
-    Ok(())
-}
-
 pub async fn import_kubo_key(kubo_url: &str, key_name: &str, key_bytes: Vec<u8>) -> Result<KuboKey> {
     let base = kubo_url.trim_end_matches('/');
     let url = format!("{base}/api/v0/key/import");

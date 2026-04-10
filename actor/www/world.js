@@ -189,14 +189,14 @@ export function createWorldFlow({
   }
 
   function reportActiveTargetVanished(alias) {
-    const normalizedAlias = String(alias || '').trim() || '@dings';
+    const normalizedAlias = String(alias || '').trim().replace(/^@+/, '') || 'dings';
     appendMessage('system', `${normalizedAlias} vanished in a puff of logic.`);
   }
 
   async function restoreActiveObjectTargetAfterReentry(alias, did) {
-    const normalizedAlias = String(alias || '').trim();
+    const normalizedAlias = String(alias || '').trim().replace(/^@+/, '');
     const normalizedDid = String(did || '').trim();
-    if (!normalizedAlias.startsWith('@') || !isMaDid(normalizedDid)) {
+    if (!normalizedAlias || !isMaDid(normalizedDid)) {
       return;
     }
 
@@ -264,6 +264,7 @@ export function createWorldDispatchFlow({
   state,
   appendMessage,
   enterHome,
+  resolveWorldEndpointForDid,
   isLikelyIrohAddress,
   normalizeIrohAddress,
   parseDot,
@@ -293,6 +294,145 @@ export function createWorldDispatchFlow({
       return Math.floor(configured);
     }
     return 60;
+  }
+
+  function actorRootDidFromState() {
+    const did = String(state.identity?.did || '').trim();
+    if (!isMaDid(did)) {
+      return '';
+    }
+    return String(did.split('#')[0] || '').trim();
+  }
+
+  function roomHintFromDidTarget(targetDid) {
+    const raw = String(targetDid || '').trim();
+    const hashIdx = raw.indexOf('#');
+    if (hashIdx === -1 || hashIdx >= raw.length - 1) {
+      return 'lobby';
+    }
+    const fragment = String(raw.slice(hashIdx + 1) || '').trim();
+    if (!fragment || fragment.includes('.')) {
+      return 'lobby';
+    }
+    const safe = fragment.toLowerCase();
+    if (safe === 'world' || safe === 'room' || safe === 'here' || safe === 'avatar' || safe === 'me' || safe === 'self') {
+      return 'lobby';
+    }
+    return 'lobby';
+  }
+
+  function normalizeDidTargetPath(baseDid, pathRaw) {
+    const did = String(baseDid || '').trim();
+    const path = String(pathRaw || '').trim();
+    if (!isMaDid(did)) {
+      return { targetDid: did, targetPath: path, routeWorld: false };
+    }
+    if (!path || did.includes('#')) {
+      return { targetDid: did, targetPath: path, routeWorld: false };
+    }
+
+    const segments = path
+      .split('.')
+      .map((segment) => String(segment || '').trim())
+      .filter(Boolean);
+    if (segments.length === 1) {
+      return {
+        targetDid: did,
+        targetPath: segments[0],
+        routeWorld: true,
+      };
+    }
+    if (segments.length < 2) {
+      return { targetDid: did, targetPath: path, routeWorld: false };
+    }
+
+    const fragment = segments[0];
+    const targetPath = segments.slice(1).join('.');
+    return {
+      targetDid: `${did}#${fragment}`,
+      targetPath,
+      routeWorld: false,
+    };
+  }
+
+  async function sendStatelessDidCommand(inputText) {
+    const trimmed = String(inputText || '').trim();
+    if (!trimmed.startsWith('@')) {
+      return false;
+    }
+
+    const spaceIdx = trimmed.indexOf(' ');
+    const rawTarget = (spaceIdx === -1
+      ? trimmed.slice(1)
+      : trimmed.slice(1, spaceIdx)).trim();
+    const remainder = (spaceIdx === -1
+      ? ''
+      : trimmed.slice(spaceIdx + 1)).trim();
+
+    if (!rawTarget) {
+      return false;
+    }
+
+    const dotIdx = rawTarget.indexOf('.');
+    const baseRaw = String(dotIdx === -1 ? rawTarget : rawTarget.slice(0, dotIdx)).trim();
+    const pathRaw = String(dotIdx === -1 ? '' : rawTarget.slice(dotIdx + 1)).trim();
+    if (!baseRaw) {
+      return false;
+    }
+
+    const resolvedBase = isMaDid(baseRaw)
+      ? baseRaw
+      : await resolveCommandTargetDidOrToken(baseRaw);
+    const normalizedDid = String(resolvedBase || '').trim().replace(/^@+/, '');
+    if (!isMaDid(normalizedDid)) {
+      return false;
+    }
+
+    const { targetDid, targetPath, routeWorld } = normalizeDidTargetPath(normalizedDid, pathRaw);
+
+    const worldDidRoot = String(targetDid.split('#')[0] || '').trim();
+    if (!worldDidRoot) {
+      return false;
+    }
+
+    const endpointId = await resolveWorldEndpointForDid(worldDidRoot);
+    if (!isLikelyIrohAddress(endpointId)) {
+      throw new Error(`DID ${worldDidRoot} did not resolve to a valid iroh endpoint.`);
+    }
+
+    const normalizedTarget = routeWorld
+      ? `world.${targetPath}`
+      : (targetPath ? `${targetDid}.${targetPath}` : targetDid);
+    const normalizedInput = remainder
+      ? `@${normalizedTarget} ${remainder}`
+      : `@${normalizedTarget}`;
+    const roomHint = roomHintFromDidTarget(targetDid);
+    const sender = actorRootDidFromState() || activeActorName();
+
+    const sendStart = Date.now();
+    logger.log('send.command.stateless', `room=${roomHint} sender=${sender} msg_len=${normalizedInput.length}`);
+
+    const result = JSON.parse(
+      await sendWorldCmdWithTtl(
+        endpointId,
+        state.passphrase,
+        state.encryptedBundle,
+        sender,
+        roomHint,
+        normalizedInput,
+        BigInt(resolveTtlSeconds('cmd'))
+      )
+    );
+
+    const elapsed = Date.now() - sendStart;
+    logger.log('send.command.stateless', `response ok=${result.ok} broadcasted=${result.broadcasted} latest_seq=${result.latest_event_sequence || 0} in ${elapsed}ms`);
+
+    if (!result.ok) {
+      throw new Error(result.message || 'send failed');
+    }
+
+    appendMessage('world', String(result.message || '(no response)'));
+    return true;
   }
 
   function resolveWorldConnectTarget(rawTarget) {
@@ -380,6 +520,11 @@ export function createWorldDispatchFlow({
       return text;
     }
 
+    // Preserve explicit DID targets exactly as typed.
+    if (/^\s*@did:ma:/iu.test(text)) {
+      return text;
+    }
+
     const aliases = aliasTargetMap();
     if (!aliases.size) {
       return text;
@@ -407,22 +552,6 @@ export function createWorldDispatchFlow({
         return `${prefix}${resolved}${suffix}`;
       }
       return all;
-    });
-
-    out = out.replace(/@([^\s]+)/g, (all, token) => {
-      const raw = String(token || '').trim();
-      if (!raw) {
-        return all;
-      }
-      const dotIdx = raw.indexOf('.');
-      const base = dotIdx === -1 ? raw : raw.slice(0, dotIdx);
-      const suffix = dotIdx === -1 ? '' : raw.slice(dotIdx);
-      const resolved = resolveAliasTarget(base, aliases);
-      if (!resolved) {
-        return all;
-      }
-      const targetToken = isMaDid(resolved) ? `@${resolved}` : resolved;
-      return `${targetToken}${suffix}`;
     });
 
     out = out.replace(/^(\s*@(?:here|world)\.owner\s+)(\S+)(.*)$/i, (all, prefix, value, suffix) => {
@@ -477,6 +606,9 @@ export function createWorldDispatchFlow({
     const attempt = (options && typeof options === 'object' && Number.isFinite(options.attempt))
       ? Number(options.attempt)
       : 0;
+    const bootstrapAttempt = (options && typeof options === 'object' && Number.isFinite(options.bootstrapAttempt))
+      ? Number(options.bootstrapAttempt)
+      : 0;
 
     try {
       const rewrittenInput = rewriteAliasesToDid(text);
@@ -489,9 +621,47 @@ export function createWorldDispatchFlow({
 
       if (!state.currentHome) {
         const shortcutConnectTarget = String(trimmedText || '').trim();
-        if (shortcutConnectTarget.startsWith('@') && !/\s/u.test(shortcutConnectTarget)) {
+        const atTarget = shortcutConnectTarget.startsWith('@')
+          ? shortcutConnectTarget.slice(1).trim()
+          : '';
+        const looksLikeAtCommandTarget = atTarget
+          && (atTarget.startsWith('did:ma:') || atTarget.includes('#') || atTarget.includes('.'));
+
+        if (shortcutConnectTarget.startsWith('@')
+          && !/\s/u.test(shortcutConnectTarget)
+          && !looksLikeAtCommandTarget) {
           await enterHome(shortcutConnectTarget);
           return;
+        }
+
+        if (shortcutConnectTarget.startsWith('@') && atTarget.startsWith('did:ma:')) {
+          const sent = await sendStatelessDidCommand(trimmedText);
+          if (!sent) {
+            appendMessage('system', 'Invalid DID target command. Use @did:ma:<world>[#object].<method> [args].');
+          }
+          return;
+        }
+
+        if (shortcutConnectTarget.startsWith('@') && looksLikeAtCommandTarget) {
+          const sent = await sendStatelessDidCommand(trimmedText);
+          if (sent) {
+            return;
+          }
+        }
+
+        // Stateless DID-object commands should not require an explicit `go ...` first.
+        if (bootstrapAttempt < 1 && atTarget && atTarget.startsWith('did:ma:')) {
+          const dotIdx = atTarget.indexOf('.');
+          const didToken = String(dotIdx === -1 ? atTarget : atTarget.slice(0, dotIdx)).trim();
+          const hashIdx = didToken.indexOf('#');
+          const worldDidRoot = String(hashIdx === -1 ? didToken : didToken.slice(0, hashIdx)).trim();
+          if (worldDidRoot) {
+            await enterHome(worldDidRoot, null, { silent: true });
+            return await sendCurrentWorldMessage(text, {
+              attempt,
+              bootstrapAttempt: bootstrapAttempt + 1,
+            });
+          }
         }
 
         const bootstrapMatch = trimmedText.match(/^go\s+(.+)$/i);
@@ -584,7 +754,7 @@ export function createWorldDispatchFlow({
       }
 
       if (trimmedText.startsWith('@')) {
-        const trimmed = trimmedText;
+        const trimmed = trimmedText.replace(/^@+/, '@');
         const whisperSep = trimmed.indexOf(" '");
         if (whisperSep > 1) {
           const target = trimmed.substring(1, whisperSep).trim();
@@ -616,63 +786,34 @@ export function createWorldDispatchFlow({
           return;
         }
 
-        const baseTarget = String(rawTarget.split('.')[0] || '').trim().toLowerCase();
-        const isBuiltinPathTarget = baseTarget === 'world'
-          || baseTarget === 'avatar'
-          || baseTarget === 'me'
-          || baseTarget === 'self'
-          || baseTarget === 'here'
-          || baseTarget === 'room';
-
-        const hasDottedPath = rawTarget.includes('.');
-        const canSendAsIs = isBuiltinPathTarget && (hasDottedPath || !remainder);
-
-        if (canSendAsIs) {
-          const normalizedInput = remainder
-            ? `@${rawTarget} ${remainder}`
-            : `@${rawTarget}`;
-          const sendStart = Date.now();
-          logger.log('send.command', `room=${state.currentHome.room} actor=${activeActorName()} msg_len=${normalizedInput.length}`);
-          const result = JSON.parse(
-            await sendWorldCmdWithTtl(
-              state.currentHome.endpointId,
-              state.passphrase,
-              state.encryptedBundle,
-              activeActorName(),
-              state.currentHome.room,
-              normalizedInput,
-              BigInt(resolveTtlSeconds('cmd'))
-            )
-          );
-          const elapsed = Date.now() - sendStart;
-          logger.log('send.command', `response ok=${result.ok} broadcasted=${result.broadcasted} latest_seq=${result.latest_event_sequence || 0} in ${elapsed}ms`);
-
-          if (!result.ok) {
-            throw new Error(result.message || 'send failed');
-          }
-
-          if (!result.broadcasted) {
-            applyWorldResponse(result);
-            return;
-          }
-
-          await pollCurrentHomeEvents();
-          return;
-        }
-
-        if (!remainder) {
+        const dotIdx = rawTarget.indexOf('.');
+        const baseRaw = String(dotIdx === -1 ? rawTarget : rawTarget.slice(0, dotIdx)).trim();
+        const pathRaw = String(dotIdx === -1 ? '' : rawTarget.slice(dotIdx + 1)).trim();
+        if (!baseRaw) {
           appendMessage('system', '?');
           return;
         }
 
-        const target = rawTarget;
+        const resolvedBase = isMaDid(baseRaw)
+          ? baseRaw
+          : await resolveCommandTargetDidOrToken(baseRaw);
+        const normalizedDid = String(resolvedBase || '').trim().replace(/^@+/, '');
+        if (!isMaDid(normalizedDid)) {
+          throw new Error('Target after @ must resolve to did:ma.');
+        }
 
-        if (await tryHandleDidTargetMetaPoll(target, remainder)) {
+        const { targetDid, targetPath, routeWorld } = normalizeDidTargetPath(normalizedDid, pathRaw);
+        const normalizedTarget = routeWorld
+          ? `world.${targetPath}`
+          : (targetPath ? `${targetDid}.${targetPath}` : targetDid);
+
+        if (remainder && await tryHandleDidTargetMetaPoll(normalizedTarget, remainder)) {
           return;
         }
 
-        const resolvedTarget = await resolveCommandTargetDidOrToken(target);
-        const normalized = `@${resolvedTarget} ${remainder}`;
+        const normalized = remainder
+          ? `@${normalizedTarget} ${remainder}`
+          : `@${normalizedTarget}`;
 
         const sendStart = Date.now();
         logger.log('send.command', `room=${state.currentHome.room} actor=${activeActorName()} msg_len=${trimmed.length}`);
@@ -754,6 +895,7 @@ export function createWorldResponseFlow({
   saveLastRoom,
   updateIdentityLine,
   updateRoomHeading,
+  syncSpecialAliases,
   clearActiveObjectTarget,
   clearRoomPresence,
   trackRoomPresence,
@@ -793,6 +935,9 @@ export function createWorldResponseFlow({
       if (result.room_title) state.currentHome.roomTitle = result.room_title;
       if (typeof result.room_description === 'string') state.currentHome.roomDescription = result.room_description;
       saveLastRoom(state.currentHome.endpointId, nextRoom);
+      if (typeof syncSpecialAliases === 'function') {
+        syncSpecialAliases();
+      }
       updateIdentityLine();
       syncRoomHeading();
 
