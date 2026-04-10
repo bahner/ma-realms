@@ -261,16 +261,11 @@ fn default_object_persistence_policy() -> ObjectPersistencePolicy {
     ObjectPersistencePolicy::DurableDebounced
 }
 
-pub const MAILBOX_COMMANDS_INLINE: &str = "help | show | take | drop | open | close | list | pop | pending | ask <target> <text> | retry <request_id> | reply <request_id> <text> | accept <id> | reject <id> [note] | invite <did> | set cid <cid> | set content-b64 <base64-yaml> | flush";
-pub const CLOSET_COMMANDS_INLINE: &str = "help | show";
+pub const MAILBOX_COMMANDS_INLINE: &str = "help | _list | did | kind | cid [<cid|base64-yaml>] | content-b64 <base64-yaml> | holder | opened_by | durable | persistence | durable_inbox_messages | ephemeral_inbox_messages | outbound_messages | pending_messages | take | drop | open | close | list | pop | pending | ask <target> <text> | retry <request_id> | reply <request_id> <text> | accept <id> | reject <id> [note] | invite <did> | flush";
 
 const MAILBOX_HELP_NB: &str = "mailbox kommandoer:\n- show/status/look\n- take, drop\n- open, close\n- list, pop, pending\n- ask <target> <text>\n- retry <request_id>\n- reply <request_id> <text>\n- accept <id>, reject <id> [note]\n- invite <did> [note]\n- set cid <cid>\n- set content-b64 <base64-yaml>\n- flush";
 
 const MAILBOX_HELP_EN: &str = "mailbox commands:\n- show/status/look\n- take, drop\n- open, close\n- list, pop, pending\n- ask <target> <text>\n- retry <request_id>\n- reply <request_id> <text>\n- accept <id>, reject <id> [note]\n- invite <did> [note]\n- set cid <cid>\n- set content-b64 <base64-yaml>\n- flush";
-
-const CLOSET_HELP_NB: &str = "closet kommandoer:\n- show/status/look\n\ncloset står fast i lobbyen og kan ikke flyttes.\nBruk ma/closet/1 for profilflyt (navn/beskrivelse).";
-
-const CLOSET_HELP_EN: &str = "closet commands:\n- show/status/look\n\nThe closet is fixed in the lobby and cannot be moved.\nUse ma/closet/1 for profile flow (name/description).";
 
 fn mailbox_admin_requirements() -> Vec<String> {
     vec!["user == location".to_string(), "user == world.owner".to_string()]
@@ -353,68 +348,6 @@ impl ObjectRuntimeState {
             owner_did: None,
             durable: true,
             persistence: ObjectPersistencePolicy::DurableImmediate,
-            ttl_secs: None,
-            holder: None,
-            opened_by: None,
-            locked_by: None,
-            lock_expires_at: None,
-            inbox: VecDeque::new(),
-            pending_outbox: Vec::new(),
-            pending_ephemeral_requests: HashMap::new(),
-            next_ephemeral_request_seq: 0,
-            state: default_object_state(),
-            state_cid: None,
-            state_dirty: true,
-        }
-    }
-
-    pub fn intrinsic_closet(room: &str) -> Self {
-        Self {
-            id: "closet".to_string(),
-            name: "closet".to_string(),
-            kind: "fixture".to_string(),
-            cid: None,
-            definition: Some(ObjectDefinition {
-                id: "closet".to_string(),
-                name: "closet".to_string(),
-                descriptions: HashMap::new(),
-                tags: vec!["system".to_string(), "closet".to_string(), "lobby".to_string()],
-                aliases: vec!["closet".to_string(), "skap".to_string()],
-                verbs: vec![
-                    ObjectVerbDefinition {
-                        name: "hjelp".to_string(),
-                        aliases: vec!["hjelp".to_string(), "help".to_string()],
-                        requirements: Vec::new(),
-                        evaluator: ObjectVerbEvaluator {
-                            evaluator_type: "built-in".to_string(),
-                            name: "print".to_string(),
-                            version: 1,
-                        },
-                        content: Some(CLOSET_HELP_NB.to_string()),
-                    },
-                    ObjectVerbDefinition {
-                        name: "help".to_string(),
-                        aliases: vec!["help".to_string(), "hjelp".to_string()],
-                        requirements: Vec::new(),
-                        evaluator: ObjectVerbEvaluator {
-                            evaluator_type: "built-in".to_string(),
-                            name: "print".to_string(),
-                            version: 1,
-                        },
-                        content: Some(CLOSET_HELP_EN.to_string()),
-                    },
-                ],
-                program: None,
-            }),
-            meta: default_object_meta(),
-            meta_cid: None,
-            meta_dirty: true,
-            room: room.to_string(),
-            aliases: vec!["closet".to_string(), "skap".to_string()],
-            receivers: Vec::new(),
-            owner_did: None,
-            durable: true,
-            persistence: ObjectPersistencePolicy::DurableDebounced,
             ttl_secs: None,
             holder: None,
             opened_by: None,

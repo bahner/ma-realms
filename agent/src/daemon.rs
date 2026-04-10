@@ -667,6 +667,24 @@ fn agent_log_path(state: &AppState, agent_id: &str) -> PathBuf {
     state.logs_dir.join(format!("{}.log", agent_id))
 }
 
+fn append_agent_log_line(state: &AppState, agent_id: &str, line: &str) -> Result<()> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("line must not be empty"));
+    }
+
+    let log_path = agent_log_path(state, agent_id);
+    let stamped = format!("{} {}\n", Utc::now().to_rfc3339(), trimmed);
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, stamped.as_bytes()))
+        .with_context(|| format!("failed appending log '{}'", log_path.display()))?;
+
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct KuboKeyListResponse {
     #[serde(rename = "Keys")]
@@ -999,7 +1017,7 @@ async fn ensure_world_root_did_published(state: &AppState) -> Result<String> {
     document.add_verification_method(key_agreement_vm.clone())?;
     document.assertion_method = assertion_vm_id;
     document.key_agreement = key_agreement_vm.id.clone();
-    document.set_ma_type("agent");
+    document.set_ma_type("agent")?;
     let now = now_zulu();
     document.set_ma_transports(expected_agent_transports(&iroh_endpoint_id));
     document.set_ma_created(existing_created.unwrap_or_else(|| now.clone()));
@@ -1318,6 +1336,14 @@ async fn create_agent(
         });
     }
 
+    if let Err(err) = append_agent_log_line(&state, &id, "agent created") {
+        return Json(CreateAgentResponse {
+            ok: false,
+            message: format!("failed writing initial log for '{}': {}", id, err),
+            agent: None,
+        });
+    }
+
     Json(CreateAgentResponse {
         ok: true,
         message: format!("agent '{}' created", id),
@@ -1422,17 +1448,10 @@ async fn append_log(
         });
     }
 
-    let log_path = agent_log_path(&state, &id);
-    let stamped = format!("{} {}\n", Utc::now().to_rfc3339(), line);
-    if let Err(err) = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .and_then(|mut file| std::io::Write::write_all(&mut file, stamped.as_bytes()))
-    {
+    if let Err(err) = append_agent_log_line(&state, &id, line) {
         return Json(GenericResponse {
             ok: false,
-            message: format!("failed appending log '{}': {}", log_path.display(), err),
+            message: err.to_string(),
         });
     }
 

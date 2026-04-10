@@ -823,28 +823,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab03c107fafeb3ee9f5925686dbb7a73bc76e3932abb0d2b365cb64b169cf04c"
 
 [[package]]
-name = "did-ma"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "chacha20poly1305",
- "ciborium",
- "cid",
- "ed25519-dalek 2.2.0",
- "hex",
- "js-sys",
- "multibase",
- "nanoid",
- "rand_core 0.6.4",
- "regex",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "unsigned-varint",
- "x25519-dalek",
-]
-
-[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2125,12 +2103,12 @@ dependencies = [
  "blake3",
  "chacha20poly1305",
  "ciborium",
- "did-ma",
  "getrandom 0.2.17",
  "hex",
  "iroh",
  "js-sys",
  "ma-core",
+ "ma-did",
  "serde",
  "serde_json",
  "tokio",
@@ -2147,10 +2125,11 @@ dependencies = [
  "axum",
  "base64",
  "chrono",
- "did-ma",
+ "hex",
  "iroh",
  "libp2p-identity",
  "ma-core",
+ "ma-did",
  "nanoid",
  "rand 0.8.5",
  "reqwest",
@@ -2165,14 +2144,36 @@ name = "ma-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "did-ma",
  "iroh",
  "libp2p-identity",
+ "ma-did",
  "moka",
  "serde",
  "serde_json",
  "serde_yaml",
  "tokio",
+]
+
+[[package]]
+name = "ma-did"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "chacha20poly1305",
+ "ciborium",
+ "cid",
+ "ed25519-dalek 2.2.0",
+ "hex",
+ "js-sys",
+ "multibase",
+ "nanoid",
+ "rand_core 0.6.4",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "unsigned-varint",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -2185,9 +2186,9 @@ dependencies = [
  "base64",
  "chacha20poly1305",
  "chrono",
- "did-ma",
  "iroh",
  "ma-core",
+ "ma-did",
  "moka",
  "nanoid",
  "rand 0.8.5",

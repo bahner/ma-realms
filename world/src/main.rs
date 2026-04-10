@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    env,
     fs,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
@@ -30,19 +31,17 @@ use iroh::{
 };
 use ma_core::{
     ActorCommand, BROADCAST_ALPN,
-    CLOSET_ALPN, ClosetRequest, ClosetResponse,
-    ClosetCommand, ClosetProfileField, ClosetRecoveryCommand,
-    ClosetDidPublishPlan, ensure_issued_document_root_match, ensure_session_document_root_match,
     CONTENT_TYPE_BROADCAST, CONTENT_TYPE_PRESENCE, CONTENT_TYPE_WORLD, CompiledCapabilityAcl,
-    DEFAULT_WORLD_RELAY_URL,
+    CONTENT_TYPE_DOC, DEFAULT_WORLD_RELAY_URL,
     ExitData, LaneCapability, MessageEnvelope, ObjectDefinition, ObjectInboxMessage,
-    CLOSET_COMMANDS_INLINE, MAILBOX_COMMANDS_INLINE,
+    MAILBOX_COMMANDS_INLINE,
+    IpfsPublishDidRequest, IpfsPublishDidResponse,
     ObjectMessageIntent, ObjectMessageKind, ObjectMessageRetention, ObjectMessageTarget,
-    ObjectRuntimeState, PRESENCE_ALPN, PresenceAvatar, RoomActorAction, RoomActorContext,
+    ObjectRuntimeState, IPFS_ALPN, PRESENCE_ALPN, PresenceAvatar, RoomActorAction, RoomActorContext,
     RoomEvent, TransportAck, TransportAckCode, INBOX_ALPN, WorldCommand, WorldLane, WorldRequest,
     WorldResponse, compile_acl, evaluate_compiled_acl_with_owner, execute_room_actor_command,
     normalize_spoken_text, parse_capability_acl_text, parse_object_local_capability_acl,
-    parse_closet_command, plan_closet_did_publish,
+    parse_property_command, parse_property_command_for_keys,
     LegacyRequirement, RequirementChecker, RequirementSet, RequirementValue,
     pin_update_add_rm,
     ROOM_METHOD_BROADCAST_SEND,
@@ -76,14 +75,12 @@ use lang::{
     collapse_world_language_order_strict,
     supported_world_languages_text,
     tr_world,
-    tr_world_vars,
     world_lang_from_profile,
 };
 use kubo::{
     IpnsPublishOptions, dag_get_dag_cbor, dag_put_dag_cbor, generate_kubo_key, ipfs_add,
     import_kubo_key, ipns_publish_with_retry, list_kubo_key_names, list_kubo_keys, name_resolve, pin_add_named,
     pin_rm, wait_for_kubo_api,
-    remove_kubo_key,
 };
 use room::{Room, RoomAcl};
 use schema::{
@@ -97,16 +94,15 @@ const WORLD_ENTRY_ACL_ENV: &str = "MA_WORLD_ENTRY_ACL";
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:5002";
 const MAX_EVENTS: usize = 200;
 const MAX_KNOCK_INBOX: usize = 512;
-const MAX_CLOSET_SESSIONS: usize = 512;
 const KNOCK_PENDING_TTL_SECS: i64 = 24 * 60 * 60;
 const KNOCK_DECIDED_TTL_SECS: i64 = 60 * 60;
-const CLOSET_SESSION_TTL_SECS: i64 = 30 * 60;
 #[allow(dead_code)]
 const MAX_OBJECT_INBOX: usize = 512;
 const OBJECT_INBOX_INDEX_CAPACITY: u64 = 4096;
 const MAILBOX_LOCK_SECS: u64 = 600;
 const OBJECT_WASHER_INTERVAL_SECS: u64 = 20;
-const CLOSET_LISTENING_MESSAGE: &str = "someone appears to be listening from the closet";
+const PRESENCE_PROBE_INTERVAL_SECS_DEFAULT: u64 = 10;
+const PRESENCE_STALE_AFTER_SECS_DEFAULT: u64 = 25;
 const RELAY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_WORLD_SLUG: &str = "ma";
 const DEFAULT_KUBO_API_URL: &str = "http://127.0.0.1:5001";
@@ -239,36 +235,9 @@ struct WorldProtocol {
 }
 
 #[derive(Clone, Debug)]
-struct ClosetProtocol {
+struct IpfsProtocol {
     world: Arc<World>,
-}
-
-#[derive(Clone, Debug)]
-struct ClosetSession {
-    id: String,
-    endpoint: String,
-    created_at: String,
-    last_seen_at: String,
-    last_lobby_sequence: u64,
-    announced_listening: bool,
-    name: Option<String>,
-    description: Option<String>,
-    alias: Option<String>,
-    did: Option<String>,
-    fragment: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-struct ClosetProfile {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    preferred_alias: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    recovery_checksum: Option<String>,
-    updated_at: String,
+    did_cache: Arc<RwLock<HashMap<String, CachedDidDocument>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -479,10 +448,6 @@ pub struct World {
     knock_inbox: Arc<RwLock<TtlCache<u64, KnockMessage>>>,
     /// Monotonic knock id sequence.
     next_knock_id: Arc<RwLock<u64>>,
-    /// Ephemeral pre-DID onboarding sessions keyed by session id.
-    closet_sessions: Arc<RwLock<TtlCache<String, ClosetSession>>>,
-    /// DID-root keyed profile data established via closet onboarding.
-    closet_profiles: Arc<RwLock<HashMap<String, ClosetProfile>>>,
     /// Fast lookup from object DID to room/object inbox route.
     object_inbox_index: Cache<String, InboxRoute>,
 }
@@ -731,8 +696,6 @@ struct RuntimeStateDoc {
     room_cids: HashMap<String, String>,
     #[serde(default)]
     room_objects: HashMap<String, Vec<ObjectRuntimeState>>,
-    #[serde(default)]
-    closet_profiles: HashMap<String, ClosetProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lang_cid: Option<String>,
 }
@@ -812,44 +775,6 @@ struct LegacyRoomYaml {
 }
 
 impl World {
-    async fn closet_lang_for_session(&self, session_id: &str, endpoint: &str) -> &'static str {
-        let session = {
-            let sessions = self.closet_sessions.read().await;
-            let key = session_id.to_string();
-            sessions.get_any(&key).cloned()
-        };
-
-        if let Some(session) = session {
-            if let Some(session_did) = session.did.as_deref() {
-                if let Ok(did) = Did::try_from(session_did) {
-                    let did_root = did.without_fragment().id();
-                    if let Some(profile) = self.avatar_language_order_for_did(DEFAULT_ROOM, did_root.as_str()).await {
-                        return world_lang_from_profile(&profile);
-                    }
-                }
-            }
-        }
-
-        if let Some(did_root) = self.did_root_by_endpoint(DEFAULT_ROOM, endpoint).await {
-            if let Some(profile) = self
-                .avatar_language_order_for_did(DEFAULT_ROOM, did_root.as_str())
-                .await
-            {
-                return world_lang_from_profile(&profile);
-            }
-        }
-
-        world_lang_from_profile("nb_NO:en_UK")
-    }
-
-    fn recovery_checksum(secret: &str) -> String {
-        let normalized = secret.trim();
-        let mut hasher = Sha256::new();
-        hasher.update(b"ma/closet/recovery/v1");
-        hasher.update(normalized.as_bytes());
-        B64.encode(hasher.finalize())
-    }
-
     pub(crate) fn new(entry_acl: EntryAcl, kubo_url: String, world_root_pin_name: String) -> Self {
         Self {
             rooms: Arc::new(RwLock::new(HashMap::new())),
@@ -887,447 +812,12 @@ impl World {
                 MAX_KNOCK_INBOX,
             ))),
             next_knock_id: Arc::new(RwLock::new(0)),
-            closet_sessions: Arc::new(RwLock::new(TtlCache::with_capacity(
-                Duration::from_secs(CLOSET_SESSION_TTL_SECS as u64),
-                MAX_CLOSET_SESSIONS,
-            ))),
-            closet_profiles: Arc::new(RwLock::new(HashMap::new())),
             object_inbox_index: Cache::new(OBJECT_INBOX_INDEX_CAPACITY),
         }
     }
 
     pub async fn world_root_pin_name(&self) -> String {
         self.world_root_pin_name.read().await.clone()
-    }
-
-    async fn issue_bootstrap_did(
-        &self,
-        requester_endpoint: &str,
-        desired_alias: Option<&str>,
-    ) -> Result<(String, String, String)> {
-        let kubo_url = self.kubo_url.read().await.clone();
-        let existing_names = list_kubo_key_names(&kubo_url).await?;
-
-        let fragment = if let Some(alias) = desired_alias {
-            let normalized = alias.trim();
-            if normalized.is_empty() {
-                return Err(anyhow!("alias cannot be empty"));
-            }
-            if !is_valid_nanoid_id(normalized) {
-                return Err(anyhow!(
-                    "invalid alias '{}': expected [A-Za-z0-9_-]+",
-                    normalized
-                ));
-            }
-            if existing_names.iter().any(|name| name == normalized) {
-                return Err(anyhow!(
-                    "fragment '{}' exists already; choose another alias/fragment and try again",
-                    normalized
-                ));
-            }
-            normalized.to_string()
-        } else {
-            let mut generated: Option<String> = None;
-            for _ in 0..64 {
-                let candidate = nanoid!();
-                if !existing_names.iter().any(|name| name == &candidate) {
-                    generated = Some(candidate);
-                    break;
-                }
-            }
-            generated.ok_or_else(|| anyhow!("failed to allocate a unique fragment"))?
-        };
-
-        generate_kubo_key(&kubo_url, &fragment).await?;
-        let keys = list_kubo_keys(&kubo_url).await?;
-        let did_ipns = keys
-            .iter()
-            .find(|key| key.name == fragment)
-            .map(|key| key.id.trim().to_string())
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| anyhow!("kubo key '{}' created but missing usable Id", fragment))?;
-
-        let did = Did::new_root(&did_ipns)
-            .map_err(|e| anyhow!("failed to construct did from key id '{}': {}", did_ipns, e))?
-            .id();
-
-        let did_obj = Did::try_from(did.as_str())
-            .map_err(|e| anyhow!("failed to parse generated did '{}': {}", did, e))?;
-        if !self.can_enter(&did_obj).await {
-            let _ = remove_kubo_key(&kubo_url, &fragment).await;
-            let did_root = did_obj.without_fragment().id();
-            let (knock_id, duplicate) = self
-                .enqueue_knock(DEFAULT_ROOM, &did_root, requester_endpoint, None)
-                .await;
-            let message = if duplicate {
-                format!(
-                    "entry denied for {}; existing knock request id={} is pending",
-                    did_root, knock_id
-                )
-            } else {
-                format!(
-                    "entry denied for {}; knock request queued with id={}",
-                    did_root, knock_id
-                )
-            };
-            return Err(anyhow!(message));
-        }
-
-        Ok((did, fragment.clone(), fragment))
-    }
-
-    async fn closet_start_session(&self, endpoint: &str) -> Result<(String, u64)> {
-        self.prune_closet_sessions().await;
-        let session_id = nanoid!();
-        let latest_lobby_sequence = self.latest_room_event_sequence(DEFAULT_ROOM).await?;
-        let mut profile_name: Option<String> = None;
-        let mut profile_description: Option<String> = None;
-        let mut profile_alias: Option<String> = None;
-        let mut profile_did: Option<String> = None;
-
-        if let Some(did_root) = self.did_root_by_endpoint(DEFAULT_ROOM, endpoint).await {
-            profile_did = Some(did_root.clone());
-            if let Some(profile) = self
-                .closet_profiles
-                .read()
-                .await
-                .get(&did_root)
-                .cloned()
-            {
-                profile_name = profile.name;
-                profile_description = profile.description;
-                profile_alias = profile.preferred_alias;
-            }
-        }
-
-        let now = Utc::now().to_rfc3339();
-        let session = ClosetSession {
-            id: session_id.clone(),
-            endpoint: endpoint.to_string(),
-            created_at: now.clone(),
-            last_seen_at: now,
-            last_lobby_sequence: latest_lobby_sequence,
-            announced_listening: false,
-            name: profile_name,
-            description: profile_description,
-            alias: profile_alias,
-            did: profile_did,
-            fragment: None,
-        };
-        let mut sessions = self.closet_sessions.write().await;
-        let stale_for_endpoint = sessions
-            .items_any()
-            .into_iter()
-            .filter_map(|(id, existing)| {
-                if existing.endpoint == endpoint {
-                    Some(id.clone())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        for key in stale_for_endpoint {
-            let _ = sessions.remove(&key);
-        }
-
-        while sessions.len_any() >= MAX_CLOSET_SESSIONS {
-            let _ = sessions.pop_first_any();
-        }
-
-        sessions.insert(session_id.clone(), session);
-        drop(sessions);
-        self.announce_closet_listener(session_id.as_str(), endpoint).await?;
-        Ok((session_id, latest_lobby_sequence))
-    }
-
-    async fn prune_closet_sessions(&self) -> usize {
-        let mut sessions = self.closet_sessions.write().await;
-        sessions.flush()
-    }
-
-    async fn flush_closet_sessions(&self) -> usize {
-        let mut sessions = self.closet_sessions.write().await;
-        let removed = sessions.len_any();
-        sessions.clear();
-        removed
-    }
-
-    async fn announce_closet_listener(&self, session_id: &str, endpoint: &str) -> Result<()> {
-        let mut sessions = self.closet_sessions.write().await;
-        let key = session_id.to_string();
-        {
-            let Some(session) = sessions.get_mut_any(&key) else {
-                return Err(anyhow!("unknown closet session"));
-            };
-            if session.endpoint != endpoint {
-                return Err(anyhow!("closet session endpoint mismatch"));
-            }
-            if session.announced_listening {
-                return Ok(());
-            }
-            session.announced_listening = true;
-        }
-        let _ = sessions.touch(&key);
-        drop(sessions);
-
-        self.record_room_event(
-            DEFAULT_ROOM,
-            "system",
-            None,
-            None,
-            Some(endpoint.to_string()),
-            CLOSET_LISTENING_MESSAGE.to_string(),
-        )
-        .await;
-        Ok(())
-    }
-
-    async fn closet_session_owned_by(
-        &self,
-        session_id: &str,
-        endpoint: &str,
-    ) -> Result<ClosetSession> {
-        let mut sessions = self.closet_sessions.write().await;
-        let key = session_id.to_string();
-        let session = {
-            let session = sessions
-                .get_mut_any(&key)
-                .ok_or_else(|| anyhow!("unknown closet session"))?;
-            if session.endpoint != endpoint {
-                return Err(anyhow!("closet session endpoint mismatch"));
-            }
-            session.last_seen_at = Utc::now().to_rfc3339();
-            session.clone()
-        };
-        let _ = sessions.touch(&key);
-        Ok(session)
-    }
-
-    async fn closet_answer(
-        &self,
-        session_id: &str,
-        endpoint: &str,
-        field: &str,
-        value: &str,
-    ) -> Result<String> {
-        let mut sessions = self.closet_sessions.write().await;
-        let key = session_id.to_string();
-        let normalized_field = field.trim().to_ascii_lowercase();
-        let normalized_value = value.trim().to_string();
-        let result = {
-            let Some(session) = sessions.get_mut_any(&key) else {
-                return Err(anyhow!("unknown closet session"));
-            };
-            if session.endpoint != endpoint {
-                return Err(anyhow!("closet session endpoint mismatch"));
-            }
-            session.last_seen_at = Utc::now().to_rfc3339();
-
-            match normalized_field.as_str() {
-            "name" => {
-                if normalized_value.is_empty() {
-                    return Err(anyhow!("name cannot be empty"));
-                }
-                session.name = Some(normalized_value);
-                Ok("avatar name stored".to_string())
-            }
-            "description" | "desc" => {
-                if normalized_value.is_empty() {
-                    return Err(anyhow!("description cannot be empty"));
-                }
-                session.description = Some(normalized_value);
-                Ok("avatar description stored".to_string())
-            }
-            _ => Err(anyhow!("unknown closet field '{}': use name|description", field)),
-            }
-        };
-
-        let _ = sessions.touch(&key);
-        result
-    }
-
-    async fn upsert_closet_profile(
-        &self,
-        did_raw: &str,
-        name: Option<String>,
-        description: Option<String>,
-        preferred_alias: Option<String>,
-    ) -> Result<()> {
-        let did = Did::try_from(did_raw)
-            .map_err(|e| anyhow!("invalid closet profile DID '{}': {}", did_raw, e))?;
-        let did_root = did.without_fragment().id();
-
-        let mut profiles = self.closet_profiles.write().await;
-        let profile = profiles.entry(did_root).or_default();
-        if let Some(value) = name {
-            let normalized = value.trim().to_string();
-            if !normalized.is_empty() {
-                profile.name = Some(normalized);
-            }
-        }
-        if let Some(value) = description {
-            let normalized = value.trim().to_string();
-            if !normalized.is_empty() {
-                profile.description = Some(normalized);
-            }
-        }
-        if let Some(value) = preferred_alias {
-            let normalized = value.trim().to_string();
-            if !normalized.is_empty() {
-                profile.preferred_alias = Some(normalized);
-            }
-        }
-        profile.updated_at = Utc::now().to_rfc3339();
-        Ok(())
-    }
-
-    async fn set_recovery_secret_for_did(&self, did_raw: &str, secret: &str) -> Result<()> {
-        let did = Did::try_from(did_raw)
-            .map_err(|e| anyhow!("invalid DID '{}': {}", did_raw, e))?;
-        let did_root = did.without_fragment().id();
-        let checksum = Self::recovery_checksum(secret);
-        let mut profiles = self.closet_profiles.write().await;
-        let profile = profiles.entry(did_root).or_default();
-        profile.recovery_checksum = Some(checksum);
-        profile.updated_at = Utc::now().to_rfc3339();
-        Ok(())
-    }
-
-    async fn rekey_identity_from_recovery(
-        &self,
-        handle_raw: &str,
-        recovery_secret: &str,
-        new_did_raw: &str,
-    ) -> Result<(String, String, String)> {
-        let handle = handle_raw.trim().trim_start_matches('@').to_string();
-        if handle.is_empty() {
-            return Err(anyhow!("handle cannot be empty"));
-        }
-        let secret = recovery_secret.trim();
-        if secret.is_empty() {
-            return Err(anyhow!("recovery secret cannot be empty"));
-        }
-
-        let new_did = Did::try_from(new_did_raw)
-            .map_err(|e| anyhow!("invalid new DID '{}': {}", new_did_raw, e))?;
-        let new_root = new_did.without_fragment().id();
-
-        let old_root = {
-            let handle_to_did = self.handle_to_did.read().await;
-            handle_to_did
-                .get(&handle)
-                .cloned()
-                .ok_or_else(|| anyhow!("unknown avatar handle '{}'; expected existing handle", handle))?
-        };
-
-        let expected_checksum = {
-            let profiles = self.closet_profiles.read().await;
-            profiles
-                .get(&old_root)
-                .and_then(|p| p.recovery_checksum.clone())
-                .ok_or_else(|| anyhow!("no recovery checksum is set for @{}", handle))?
-        };
-        if expected_checksum != Self::recovery_checksum(secret) {
-            return Err(anyhow!("invalid recovery secret"));
-        }
-
-        {
-            let did_to_handle = self.did_to_handle.read().await;
-            if let Some(existing_handle) = did_to_handle.get(&new_root) {
-                if existing_handle != &handle {
-                    return Err(anyhow!(
-                        "new DID already owns handle @{}; choose another DID",
-                        existing_handle
-                    ));
-                }
-            }
-        }
-
-        {
-            let mut handle_to_did = self.handle_to_did.write().await;
-            let current = handle_to_did
-                .get(&handle)
-                .cloned()
-                .ok_or_else(|| anyhow!("handle mapping disappeared for @{}", handle))?;
-            if current != old_root {
-                return Err(anyhow!("handle @{} no longer maps to expected DID", handle));
-            }
-            handle_to_did.insert(handle.clone(), new_root.clone());
-        }
-        {
-            let mut did_to_handle = self.did_to_handle.write().await;
-            did_to_handle.remove(&old_root);
-            did_to_handle.insert(new_root.clone(), handle.clone());
-        }
-
-        {
-            let mut acl = self.entry_acl.write().await;
-            acl.allowed_dids.remove(&old_root);
-            acl.allowed_dids.insert(new_root.clone());
-        }
-
-        {
-            let mut owner = self.owner_did.write().await;
-            if owner.as_deref() == Some(old_root.as_str()) {
-                *owner = Some(new_root.clone());
-            }
-        }
-
-        {
-            let mut rooms = self.rooms.write().await;
-            for room in rooms.values_mut() {
-                if room.acl.owner.as_deref() == Some(old_root.as_str()) {
-                    room.acl.owner = Some(new_root.clone());
-                }
-                if room.acl.allow.remove(&old_root) {
-                    room.acl.allow.insert(new_root.clone());
-                }
-                room.acl.deny.remove(&new_root);
-
-                room.avatars
-                    .retain(|_, av| av.agent_did.without_fragment().id() != old_root);
-            }
-        }
-
-        {
-            let mut room_objects = self.room_objects.write().await;
-            for room_map in room_objects.values_mut() {
-                for object in room_map.values_mut() {
-                    if object.owner_did.as_deref() == Some(old_root.as_str()) {
-                        object.owner_did = Some(new_root.clone());
-                        object.meta_dirty = true;
-                    }
-                }
-            }
-        }
-
-        {
-            let mut profiles = self.closet_profiles.write().await;
-            let mut profile = profiles.remove(&old_root).unwrap_or_default();
-            profile.updated_at = Utc::now().to_rfc3339();
-            profiles.insert(new_root.clone(), profile);
-        }
-
-        self.record_room_event(
-            DEFAULT_ROOM,
-            "system",
-            Some(handle.clone()),
-            Some(new_root.clone()),
-            None,
-            format!("{} rekeyed identity", handle),
-        )
-        .await;
-
-        Ok((handle, old_root, new_root))
-    }
-
-    async fn did_root_by_endpoint(&self, room_name: &str, endpoint: &str) -> Option<String> {
-        let rooms = self.rooms.read().await;
-        let room = rooms.get(room_name)?;
-        room.avatars
-            .values()
-            .find(|avatar| avatar.agent_endpoint == endpoint)
-            .map(|avatar| avatar.agent_did.without_fragment().id())
     }
 
     async fn set_avatar_description_for_did(
@@ -1351,6 +841,81 @@ impl World {
         updated
     }
 
+    async fn touch_avatar_presence_for_did(&self, room_name: &str, did_root: &str) -> bool {
+        let mut rooms = self.rooms.write().await;
+        let Some(room) = rooms.get_mut(room_name) else {
+            return false;
+        };
+
+        let mut updated = false;
+        for avatar in room.avatars.values_mut() {
+            if avatar.agent_did.without_fragment().id() == did_root {
+                avatar.touch_presence();
+                updated = true;
+            }
+        }
+        updated
+    }
+
+    async fn touch_avatar_presence_for_endpoint(&self, room_name: &str, endpoint: &str) -> bool {
+        let mut rooms = self.rooms.write().await;
+        let Some(room) = rooms.get_mut(room_name) else {
+            return false;
+        };
+
+        let mut updated = false;
+        for avatar in room.avatars.values_mut() {
+            if avatar.agent_endpoint == endpoint {
+                avatar.touch_presence();
+                updated = true;
+            }
+        }
+        updated
+    }
+
+    async fn prune_stale_avatars(&self, stale_after: Duration) -> Vec<String> {
+        let now = SystemTime::now();
+        let mut changed_rooms = Vec::new();
+
+        let mut rooms = self.rooms.write().await;
+        for (room_name, room) in rooms.iter_mut() {
+            let stale_handles = room
+                .avatars
+                .iter()
+                .filter_map(|(handle, avatar)| {
+                    let age = now
+                        .duration_since(avatar.last_seen_at)
+                        .unwrap_or_else(|_| Duration::from_secs(0));
+                    if age > stale_after {
+                        Some(handle.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            if stale_handles.is_empty() {
+                continue;
+            }
+
+            for handle in stale_handles {
+                if let Some(avatar) = room.avatars.remove(&handle) {
+                    info!(
+                        "[{}] removed stale avatar {} (endpoint={}, stale_after={}s)",
+                        room_name,
+                        handle,
+                        avatar.agent_endpoint,
+                        stale_after.as_secs()
+                    );
+                }
+            }
+
+            changed_rooms.push(room_name.clone());
+        }
+
+        changed_rooms
+    }
+
     async fn avatar_language_order_for_did(&self, room_name: &str, did_root: &str) -> Option<String> {
         let rooms = self.rooms.read().await;
         let room = rooms.get(room_name)?;
@@ -1360,656 +925,6 @@ impl World {
             .map(|avatar| avatar.language_order.clone())
             .filter(|value| !value.trim().is_empty())
     }
-
-    async fn closet_submit_citizenship(
-        &self,
-        session_id: &str,
-        endpoint: &str,
-        ipns_private_key_base64: &str,
-        desired_alias: Option<&str>,
-    ) -> Result<(String, String, String)> {
-        let session = self.closet_session_owned_by(session_id, endpoint).await?;
-        let (did, fragment, key_name) = if ipns_private_key_base64.trim().is_empty() {
-            self.issue_bootstrap_did(endpoint, desired_alias).await?
-        } else {
-            self.issue_bootstrap_citizenship(endpoint, ipns_private_key_base64, desired_alias)
-                .await?
-        };
-
-        self.upsert_closet_profile(
-            &did,
-            session.name.clone(),
-            session.description.clone(),
-            session.alias.clone(),
-        )
-            .await?;
-
-        {
-            let mut sessions = self.closet_sessions.write().await;
-            let key = session_id.to_string();
-            if let Some(active) = sessions.get_mut_any(&key) {
-                active.did = Some(did.clone());
-                active.fragment = Some(fragment.clone());
-            }
-            let _ = sessions.touch(&key);
-        }
-
-        Ok((did, fragment, key_name))
-    }
-
-    async fn closet_publish_did_document(
-        &self,
-        session_id: &str,
-        endpoint: &str,
-        did_document_json: &str,
-        ipns_private_key_base64: &str,
-        desired_fragment: Option<&str>,
-    ) -> Result<(String, String, String)> {
-        let session = self.closet_session_owned_by(session_id, endpoint).await?;
-        let document = Document::unmarshal(did_document_json)
-            .map_err(|e| anyhow!("invalid DID document JSON: {}", e))?;
-        document
-            .validate()
-            .map_err(|e| anyhow!("invalid DID document: {}", e))?;
-        document
-            .verify()
-            .map_err(|e| anyhow!("DID document signature verification failed: {}", e))?;
-
-        let document_did = Did::try_from(document.id.as_str())
-            .map_err(|e| anyhow!("invalid document DID '{}': {}", document.id, e))?
-            ;
-        let document_root = document_did.without_fragment().id();
-        let document_ipns_id = document_did.ipns.clone();
-        let provided_key = ipns_private_key_base64.trim();
-        let kubo_url = self.kubo_url.read().await.clone();
-
-        ensure_session_document_root_match(session.did.as_deref(), &document_root)?;
-
-        let ipns_path = format!("/ipns/{}", document_ipns_id);
-        let was_published_before = if provided_key.is_empty() {
-            Some(kubo::name_resolve(&kubo_url, &ipns_path, true).await.is_ok())
-        } else {
-            None
-        };
-
-        let local_key_name = if provided_key.is_empty() {
-            let keys = list_kubo_keys(&kubo_url).await?;
-            keys.into_iter()
-                .find(|key| key.id.trim() == document_ipns_id)
-                .map(|key| key.name)
-        } else {
-            None
-        };
-
-        let publish_plan = plan_closet_did_publish(
-            provided_key,
-            &document_root,
-            was_published_before,
-            local_key_name,
-        )?;
-
-        let key_name = match publish_plan {
-            ClosetDidPublishPlan::ImportProvidedKey => {
-                let desired_alias = desired_fragment
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .or(document_did.fragment.as_deref());
-                let (issued_did, _fragment, key_name) = self
-                    .closet_submit_citizenship(session_id, endpoint, provided_key, desired_alias)
-                    .await?;
-                ensure_issued_document_root_match(&issued_did, &document_root)?;
-                key_name
-            }
-            ClosetDidPublishPlan::UseExistingLocalKey { key_name } => {
-                let mut sessions = self.closet_sessions.write().await;
-                let key = session_id.to_string();
-                if let Some(active) = sessions.get_mut_any(&key) {
-                    active.did = Some(document_root.clone());
-                    active.fragment = Some(key_name.clone());
-                }
-                let _ = sessions.touch(&key);
-                key_name
-            }
-        };
-
-        let document_cid = ipfs_add(&kubo_url, did_document_json.as_bytes().to_vec()).await?;
-        let ipns_options = IpnsPublishOptions::default();
-        ipns_publish_with_retry(
-            &kubo_url,
-            &key_name,
-            &document_cid,
-            &ipns_options,
-            3,
-            Duration::from_millis(1_000),
-        )
-        .await?;
-
-        Ok((document_root, document_cid, key_name))
-    }
-
-    async fn closet_command(
-        &self,
-        session_id: &str,
-        endpoint: &str,
-        input: &str,
-    ) -> Result<ClosetResponse> {
-        let active_lang = self.closet_lang_for_session(session_id, endpoint).await;
-        let command = parse_closet_command(input);
-
-        if matches!(&command, ClosetCommand::Empty) {
-            return Ok(ClosetResponse::ok(
-                session_id,
-                tr_world(active_lang, "closet.empty", "You are in the closet and have no avatar yet. Type 'help'."),
-            ));
-        }
-
-        if matches!(&command, ClosetCommand::Help) {
-            return Ok(
-                ClosetResponse::ok(
-                    session_id,
-                    tr_world(active_lang, "closet.help", "Closet commands: help | show | hear | apply [ipns_key_base64] | citizen [ipns_key_base64] | avatar.apply [ipns_key_base64] | avatar.peek | avatar.name <text> | avatar.description <text> | avatar.name.peek | avatar.description.peek | actor.apply [ipns_key_base64] | actor.peek | actor.id.peek | actor.ma.transports.peek | actor.publish [ipns_key_base64] | actor.republish [ipns_key_base64] | recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>"),
-                )
-                .with_prompt(tr_world(active_lang, "closet.help.prompt", "If actor DID does not exist yet: run apply first. After actor is created, set avatar name/description. Then type 'go out' in the actor UI.")),
-            );
-        }
-
-        if matches!(&command, ClosetCommand::Show) {
-            let session = self.closet_session_owned_by(session_id, endpoint).await?;
-            let did = session.did.clone().unwrap_or_else(|| "(none)".to_string());
-            let name = session.name.clone().unwrap_or_else(|| "(unset)".to_string());
-            let description = session
-                .description
-                .clone()
-                .unwrap_or_else(|| "(unset)".to_string());
-            let recovery = if let Some(did_raw) = session.did.as_deref() {
-                let did_root = Did::try_from(did_raw)
-                    .map_err(|e| anyhow!("invalid closet DID '{}': {}", did_raw, e))?
-                    .without_fragment()
-                    .id();
-                self.closet_profiles
-                    .read()
-                    .await
-                    .get(&did_root)
-                    .and_then(|profile| profile.recovery_checksum.clone())
-                    .is_some()
-            } else {
-                false
-            };
-
-            return Ok(
-                ClosetResponse::ok(
-                    session_id,
-                    format!(
-                        "closet profile: did={} name={} description={} recovery={}",
-                        did,
-                        name,
-                        description,
-                        if recovery { "set" } else { "unset" }
-                    ),
-                )
-                .with_did_opt(session.did)
-                .with_fragment_opt(session.fragment),
-            );
-        }
-
-        if matches!(&command, ClosetCommand::Hear) {
-            let since = {
-                let sessions = self.closet_sessions.read().await;
-                let key = session_id.to_string();
-                let Some(session) = sessions.get_any(&key) else {
-                    return Err(anyhow!("unknown closet session"));
-                };
-                if session.endpoint != endpoint {
-                    return Err(anyhow!("closet session endpoint mismatch"));
-                }
-                session.last_lobby_sequence
-            };
-
-            let (events, latest_lobby_sequence) = self.room_events_since(DEFAULT_ROOM, since).await?;
-            {
-                let mut sessions = self.closet_sessions.write().await;
-                let key = session_id.to_string();
-                if let Some(session) = sessions.get_mut_any(&key) {
-                    session.last_lobby_sequence = latest_lobby_sequence;
-                    session.last_seen_at = Utc::now().to_rfc3339();
-                }
-                let _ = sessions.touch(&key);
-            }
-
-            return Ok(
-                ClosetResponse::ok(
-                    session_id,
-                    if events.is_empty() {
-                        tr_world(active_lang, "closet.hear.none", "No new lobby events.")
-                    } else {
-                        tr_world_vars(
-                            active_lang,
-                            "closet.hear.count",
-                            &[("count", events.len().to_string())],
-                            &format!("Heard {} lobby event(s).", events.len()),
-                        )
-                    },
-                )
-                .with_lobby_events(events, latest_lobby_sequence),
-            );
-        }
-
-        match command {
-            ClosetCommand::MissingFieldValue { field } => {
-                return Err(anyhow!("usage: {} <value>", field.as_str()));
-            }
-            ClosetCommand::SetField { field, value } => {
-                let session = self.closet_session_owned_by(session_id, endpoint).await?;
-                if session.did.is_none() {
-                    return Ok(
-                        ClosetResponse::err(
-                            session_id,
-                            tr_world(
-                                active_lang,
-                                "closet.actor.required",
-                                "actor identity does not exist in this world yet; run apply first",
-                            ),
-                        )
-                        .with_prompt(tr_world(
-                            active_lang,
-                            "closet.actor.required.prompt",
-                            "run apply first; after actor creation you can set name/description",
-                        )),
-                    );
-                }
-
-                let msg = self
-                    .closet_answer(session_id, endpoint, field.as_str(), value.as_str())
-                    .await?;
-
-                if let Some(did) = session.did.as_deref() {
-                    self.upsert_closet_profile(
-                        did,
-                        session.name.clone(),
-                        session.description.clone(),
-                        session.alias.clone(),
-                    )
-                    .await?;
-
-                    if matches!(field, ClosetProfileField::Description) {
-                        let did_root = Did::try_from(did)
-                            .map_err(|e| anyhow!("invalid closet DID '{}': {}", did, e))?
-                            .without_fragment()
-                            .id();
-                        let _ = self
-                            .set_avatar_description_for_did(
-                                DEFAULT_ROOM,
-                                did_root.as_str(),
-                                value.trim(),
-                            )
-                            .await;
-                    }
-                }
-
-                return Ok(ClosetResponse::ok(session_id, msg));
-            }
-            ClosetCommand::Apply {
-                ipns_private_key_base64,
-            } => {
-                let session = self.closet_session_owned_by(session_id, endpoint).await?;
-
-                if let Some(existing_did) = session.did.as_deref() {
-                    self.upsert_closet_profile(
-                        existing_did,
-                        session.name.clone(),
-                        session.description.clone(),
-                        session.alias.clone(),
-                    )
-                    .await?;
-                    return Ok(
-                        ClosetResponse::ok(
-                            session_id,
-                            tr_world(
-                                active_lang,
-                                "closet.apply.updated",
-                                "changes applied. You can stay in the closet and keep editing; type 'go out' when ready.",
-                            ),
-                        )
-                        .with_did(existing_did.to_string())
-                        .with_fragment_opt(session.fragment),
-                    );
-                }
-
-                let (did, fragment, key_name) = self
-                    .closet_submit_citizenship(
-                        session_id,
-                        endpoint,
-                        ipns_private_key_base64.as_str(),
-                        session.alias.as_deref(),
-                    )
-                    .await?;
-                return Ok(
-                    ClosetResponse::ok(
-                        session_id,
-                        tr_world(
-                            active_lang,
-                            "closet.apply.accepted",
-                            "application accepted. type 'go out' in the actor UI to enter the world.",
-                        ),
-                    )
-                    .with_did(did)
-                    .with_fragment(fragment)
-                    .with_key_name(key_name),
-                );
-            }
-            ClosetCommand::Recovery(recovery_command) => {
-                match recovery_command {
-                    ClosetRecoveryCommand::Usage => {
-                        return Ok(ClosetResponse::err(
-                            session_id,
-                            tr_world(
-                                active_lang,
-                                "closet.recovery.usage",
-                                "usage: recovery set <passphrase> | recovery status | recovery rekey <@handle> <passphrase>",
-                            ),
-                        ));
-                    }
-                    ClosetRecoveryCommand::Set { passphrase } => {
-                        if passphrase.len() < 8 {
-                            return Ok(ClosetResponse::err(
-                                session_id,
-                                tr_world(
-                                    active_lang,
-                                    "closet.recovery.passphrase.short",
-                                    "recovery passphrase must be at least 8 characters",
-                                ),
-                            ));
-                        }
-
-                        let session = self.closet_session_owned_by(session_id, endpoint).await?;
-                        let did = if let Some(did) = session.did.clone() {
-                            did
-                        } else if let Some(root) = self.did_root_by_endpoint(DEFAULT_ROOM, endpoint).await {
-                            root
-                        } else {
-                            return Ok(ClosetResponse::err(
-                                session_id,
-                                tr_world(
-                                    active_lang,
-                                    "closet.recovery.set.requires_did",
-                                    "recovery set requires a DID in this closet session (run apply first or open closet while logged in)",
-                                ),
-                            ));
-                        };
-
-                        self.set_recovery_secret_for_did(&did, passphrase.as_str()).await?;
-                        return Ok(ClosetResponse::ok(
-                            session_id,
-                            tr_world(
-                                active_lang,
-                                "closet.recovery.set.stored",
-                                "recovery checksum stored",
-                            ),
-                        ));
-                    }
-                    ClosetRecoveryCommand::Status => {
-                        let session = self.closet_session_owned_by(session_id, endpoint).await?;
-                        let did = if let Some(did) = session.did.clone() {
-                            Some(did)
-                        } else {
-                            self.did_root_by_endpoint(DEFAULT_ROOM, endpoint).await
-                        };
-                        let Some(did) = did else {
-                            return Ok(ClosetResponse::err(
-                                session_id,
-                                tr_world(
-                                    active_lang,
-                                    "closet.recovery.status.no_context",
-                                    "no DID context for this closet session",
-                                ),
-                            ));
-                        };
-                        let did_root = Did::try_from(did.as_str())
-                            .map_err(|e| anyhow!("invalid DID '{}': {}", did, e))?
-                            .without_fragment()
-                            .id();
-                        let configured = self
-                            .closet_profiles
-                            .read()
-                            .await
-                            .get(&did_root)
-                            .and_then(|profile| profile.recovery_checksum.clone())
-                            .is_some();
-
-                        return Ok(ClosetResponse::ok(
-                            session_id,
-                            if configured {
-                                tr_world(
-                                    active_lang,
-                                    "closet.recovery.status.configured",
-                                    "recovery is configured",
-                                )
-                            } else {
-                                tr_world(
-                                    active_lang,
-                                    "closet.recovery.status.not_configured",
-                                    "recovery is not configured",
-                                )
-                            },
-                        ));
-                    }
-                    ClosetRecoveryCommand::Rekey { handle, passphrase } => {
-                        if handle.is_empty() || passphrase.is_empty() {
-                            return Ok(ClosetResponse::err(
-                                session_id,
-                                tr_world(
-                                    active_lang,
-                                    "closet.recovery.rekey.usage",
-                                    "usage: recovery rekey <@handle> <passphrase>",
-                                ),
-                            ));
-                        }
-
-                        let session = self.closet_session_owned_by(session_id, endpoint).await?;
-                        let Some(new_did) = session.did.clone() else {
-                            return Ok(ClosetResponse::err(
-                                session_id,
-                                tr_world(
-                                    active_lang,
-                                    "closet.recovery.rekey.requires_new_did",
-                                    "closet_recovery_rekey_requires_new_did: run apply first",
-                                ),
-                            ));
-                        };
-
-                        let (resolved_handle, old_root, new_root) = self
-                            .rekey_identity_from_recovery(handle.as_str(), passphrase.as_str(), &new_did)
-                            .await?;
-                        return Ok(
-                            ClosetResponse::ok(
-                                session_id,
-                                tr_world_vars(
-                                    active_lang,
-                                    "closet.recovery.rekey.done",
-                                    &[
-                                        ("handle", resolved_handle.clone()),
-                                        ("old", old_root.clone()),
-                                        ("new", new_root.clone()),
-                                    ],
-                                    &format!(
-                                        "rekey complete for @{} ({} -> {})",
-                                        resolved_handle, old_root, new_root
-                                    ),
-                                ),
-                            )
-                            .with_did(new_did),
-                        );
-                    }
-                }
-            }
-            ClosetCommand::Enter { room } => {
-                let (did, preferred_handle, _session_fragment) = {
-                    let sessions = self.closet_sessions.read().await;
-                    let key = session_id.to_string();
-                    let Some(session) = sessions.get_any(&key) else {
-                        return Err(anyhow!("unknown closet session"));
-                    };
-                    if session.endpoint != endpoint {
-                        return Err(anyhow!("closet session endpoint mismatch"));
-                    }
-                    let did = session
-                        .did
-                        .clone()
-                        .ok_or_else(|| anyhow!("no DID in session; run 'apply' first"))?;
-                    (did, session.name.clone(), session.fragment.clone())
-                };
-
-                let room = room
-                    .map(|value| {
-                        let trimmed = value.trim();
-                        if trimmed.eq_ignore_ascii_case("out") {
-                            DEFAULT_ROOM.to_string()
-                        } else {
-                            trimmed.to_string()
-                        }
-                    })
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| DEFAULT_ROOM.to_string());
-
-                let did_obj = Did::try_from(did.as_str())
-                    .map_err(|e| anyhow!("invalid session DID '{}': {}", did, e))?;
-                let root_did = did_obj.without_fragment();
-
-                if !self.can_enter(&root_did).await {
-                    let did_root = root_did.id();
-                    let (knock_id, duplicate) = self
-                        .enqueue_knock(&room, &did_root, endpoint, preferred_handle)
-                        .await;
-                    let detail = if duplicate {
-                        format!(
-                            "entry denied for {}; existing knock request id={} is pending",
-                            did_root, knock_id
-                        )
-                    } else {
-                        format!(
-                            "entry denied for {}; knock request queued with id={}",
-                            did_root, knock_id
-                        )
-                    };
-                    return Ok(ClosetResponse::err(session_id, detail).with_did(did_root));
-                }
-
-                let avatar_req = AvatarRequest {
-                    did: root_did,
-                    agent_endpoint: endpoint.to_string(),
-                    language_order: "nb_NO:en_UK".to_string(),
-                };
-                let handle = self.join_room(&room, avatar_req, preferred_handle).await?;
-
-                return Ok(
-                    ClosetResponse::ok(
-                        session_id,
-                        tr_world_vars(
-                            active_lang,
-                            "closet.entered",
-                            &[("room", room.clone()), ("handle", handle.clone())],
-                            &format!("entered {} as @{}", room, handle),
-                        ),
-                    )
-                    .with_did(did),
-                );
-            }
-            ClosetCommand::Unknown { method } => {
-                return Ok(ClosetResponse::err(
-                    session_id,
-                    tr_world_vars(
-                        active_lang,
-                        "closet.command.unknown",
-                        &[("verb", method.clone()), ("method", method.clone())],
-                        &format!("Unknown closet command '{}'. Type 'help'.", method),
-                    ),
-                ));
-            }
-            ClosetCommand::Empty
-            | ClosetCommand::Help
-            | ClosetCommand::Show
-            | ClosetCommand::Hear => {}
-        }
-
-        unreachable!("closet command handling returned no response")
-    }
-
-    async fn issue_bootstrap_citizenship(
-        &self,
-        requester_endpoint: &str,
-        ipns_private_key_base64: &str,
-        desired_alias: Option<&str>,
-    ) -> Result<(String, String, String)> {
-        let kubo_url = self.kubo_url.read().await.clone();
-        let existing_names = list_kubo_key_names(&kubo_url).await?;
-
-        let fragment = if let Some(alias) = desired_alias {
-            let normalized = alias.trim();
-            if normalized.is_empty() {
-                return Err(anyhow!("alias cannot be empty"));
-            }
-            if !is_valid_nanoid_id(normalized) {
-                return Err(anyhow!(
-                    "invalid alias '{}': expected [A-Za-z0-9_-]+",
-                    normalized
-                ));
-            }
-            if existing_names.iter().any(|name| name == normalized) {
-                return Err(anyhow!(
-                    "alias '{}' is already taken (username/fragment in use); choose another alias and run apply again",
-                    normalized
-                ));
-            }
-            normalized.to_string()
-        } else {
-            let mut generated: Option<String> = None;
-            for _ in 0..64 {
-                let candidate = nanoid!();
-                if !existing_names.iter().any(|name| name == &candidate) {
-                    generated = Some(candidate);
-                    break;
-                }
-            }
-            generated.ok_or_else(|| anyhow!("failed to allocate a unique fragment"))?
-        };
-
-        let key_bytes = B64
-            .decode(ipns_private_key_base64.trim().as_bytes())
-            .map_err(|e| anyhow!("invalid ipns key base64: {}", e))?;
-        if key_bytes.is_empty() {
-            return Err(anyhow!("ipns key payload is empty"));
-        }
-
-        let imported = import_kubo_key(&kubo_url, &fragment, key_bytes).await?;
-        let did = Did::new_root(&imported.id)
-            .map_err(|e| anyhow!("failed to construct did from key id '{}': {}", imported.id, e))?
-            .id();
-
-        let did_obj = Did::try_from(did.as_str())
-            .map_err(|e| anyhow!("failed to parse imported did '{}': {}", did, e))?;
-        if !self.can_enter(&did_obj).await {
-            let _ = remove_kubo_key(&kubo_url, &imported.name).await;
-            let did_root = did_obj.without_fragment().id();
-            let (knock_id, duplicate) = self
-                .enqueue_knock(DEFAULT_ROOM, &did_root, requester_endpoint, None)
-                .await;
-            let message = if duplicate {
-                format!(
-                    "entry denied for {}; existing knock request id={} is pending",
-                    did_root, knock_id
-                )
-            } else {
-                format!(
-                    "entry denied for {}; knock request queued with id={}",
-                    did_root, knock_id
-                )
-            };
-            return Err(anyhow!(message));
-        }
-
-        Ok((did, fragment, imported.name))
-    }
-
     async fn ensure_lobby_intrinsic_objects(&self) {
         let room_name = DEFAULT_ROOM;
         let rooms = self.rooms.read().await;
@@ -2030,15 +945,6 @@ impl World {
                 }
             }
             mailbox
-        });
-        room_map.entry("closet".to_string()).or_insert_with(|| {
-            let closet = ObjectRuntimeState::intrinsic_closet(room_name);
-            if let Some(definition) = closet.definition.as_ref() {
-                if let Err(err) = content_validation::validate_object_definition(definition, "intrinsic:closet") {
-                    warn!("invalid intrinsic closet definition: {}", err);
-                }
-            }
-            closet
         });
     }
 
@@ -3493,7 +2399,7 @@ impl World {
         &self,
         room_name: &str,
         req: AvatarRequest,
-        _preferred_handle: Option<String>,
+        preferred_handle: Option<String>,
     ) -> Result<String> {
         let mut rooms = self.rooms.write().await;
         let room = rooms
@@ -3507,27 +2413,39 @@ impl World {
             return Err(anyhow!("room ACL denied entry for {}", did_root));
         }
 
-        let actor_id = did_root.clone();
-
-        // Same DID already present? Update endpoint and return existing handle.
-        if let Some(existing) = room.avatars.get(&actor_id) {
-            if existing.agent_did == req.did {
-                info!("[{}] {} already present ({:?})", room_name, actor_id, req.did);
-                return Ok(actor_id);
-            }
+        // Same DID already present? Refresh endpoint/presence and return existing handle.
+        if let Some((existing_handle, existing)) = room
+            .avatars
+            .iter_mut()
+            .find(|(_, avatar)| avatar.agent_did.without_fragment().id() == did_root)
+        {
+            existing.agent_endpoint = req.agent_endpoint.clone();
+            existing.language_order = req.language_order.clone();
+            existing.touch_presence();
+            info!("[{}] {} already present ({:?})", room_name, existing_handle, req.did);
+            return Ok(existing_handle.clone());
         }
 
+        drop(rooms);
+
+        let did_fragment = req.did.fragment.clone().unwrap_or_default();
+        let handle = self
+            .register_handle(&did_root, preferred_handle, &did_fragment)
+            .await;
+
         let avatar = Avatar::new(
-            actor_id.clone(),
+            handle.clone(),
             req.did.clone(),
             req.agent_endpoint.clone(),
             req.language_order.clone(),
         );
+
+        let mut rooms = self.rooms.write().await;
+        let room = rooms
+            .get_mut(room_name)
+            .ok_or_else(|| anyhow!("Room {} not found", room_name))?;
         room.add_avatar(avatar);
         drop(rooms);
-
-        // Keep compatibility maps populated with identity mapping (did -> did).
-        let handle = self.register_handle(&did_root, None, &did_root).await;
 
         info!("[{}] {} joined ({:?}) from {}", room_name, handle, req.did, req.agent_endpoint);
         self.record_event(format!(
@@ -3555,8 +2473,8 @@ impl World {
     async fn register_handle(
         &self,
         did_root: &str,
-        _preferred: Option<String>,
-        _fragment: &str,
+        preferred: Option<String>,
+        fragment: &str,
     ) -> String {
         // Same DID already has a handle? Return it.
         {
@@ -3566,14 +2484,46 @@ impl World {
             }
         }
 
-        // World identity is always root DID; display aliases belong to actor clients.
-        let handle = did_root.to_string();
-
         let mut h2d = self.handle_to_did.write().await;
         let mut d2h = self.did_to_handle.write().await;
-        h2d.insert(handle.clone(), did_root.to_string());
-        d2h.insert(did_root.to_string(), handle.clone());
-        handle
+
+        let preferred_norm = preferred
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.trim_start_matches('@').to_string())
+            .filter(|value| is_valid_nanoid_id(value.as_str()));
+        let fragment_norm = fragment
+            .trim()
+            .trim_start_matches('@')
+            .to_string();
+
+        let mut candidates: Vec<String> = Vec::new();
+        if let Some(name) = preferred_norm {
+            candidates.push(name);
+        }
+        if is_valid_nanoid_id(fragment_norm.as_str())
+            && !candidates.iter().any(|entry| entry == &fragment_norm)
+        {
+            candidates.push(fragment_norm);
+        }
+        candidates.push(did_root.to_string());
+
+        for candidate in candidates {
+            match h2d.get(candidate.as_str()) {
+                Some(owner) if owner != did_root => continue,
+                _ => {
+                    h2d.insert(candidate.clone(), did_root.to_string());
+                    d2h.insert(did_root.to_string(), candidate.clone());
+                    return candidate;
+                }
+            }
+        }
+
+        let fallback = did_root.to_string();
+        h2d.insert(fallback.clone(), did_root.to_string());
+        d2h.insert(did_root.to_string(), fallback.clone());
+        fallback
     }
 
     /// Broadcast a signed chat message to room event log.
@@ -3986,7 +2936,6 @@ impl World {
             owner_did,
             room_cids,
             room_objects,
-            closet_profiles: self.closet_profiles.read().await.clone(),
             lang_cid: self.lang_cid.read().await.clone(),
         };
 
@@ -4408,7 +3357,6 @@ impl World {
             self.allow_entry_did(&owner).await;
         }
         *self.room_cids.write().await = state.room_cids;
-        *self.closet_profiles.write().await = state.closet_profiles;
         *self.lang_cid.write().await = state.lang_cid;
         *self.state_cid.write().await = Some(state_cid.to_string());
 
@@ -4687,38 +3635,6 @@ impl World {
         let mut parts = trimmed.split_whitespace();
         let method = parts.next().unwrap_or("help").to_ascii_lowercase();
 
-        if object_id == "closet" {
-            if matches!(method.as_str(), "take" | "pickup" | "hold" | "drop" | "open" | "close") {
-                return Some((
-                    "@closet is fixed in the lobby and cannot be moved.".to_string(),
-                    room_name.to_string(),
-                ));
-            }
-
-            if matches!(method.as_str(), "help" | "hjelp") {
-                return Some((
-                    format!("{} commands: {}", object_label, CLOSET_COMMANDS_INLINE),
-                    room_name.to_string(),
-                ));
-            }
-
-            if matches!(method.as_str(), "show" | "status" | "look") {
-                let listeners = self.closet_sessions.read().await.len_any();
-                return Some((
-                    format!(
-                        "{} is fixed in the lobby. active_closet_sessions={} notice='{}'",
-                        object_label, listeners, CLOSET_LISTENING_MESSAGE
-                    ),
-                    room_name.to_string(),
-                ));
-            }
-
-            return Some((
-                format!("{} commands: {}", object_label, CLOSET_COMMANDS_INLINE),
-                room_name.to_string(),
-            ));
-        }
-
         let verb_requirements = {
             let objects = self.room_objects.read().await;
             let room_map = objects.get(room_name)?;
@@ -4855,10 +3771,117 @@ impl World {
             ));
         }
 
-        if method == "set" {
-            let sub = parts.next().unwrap_or_default().to_ascii_lowercase();
-            let rest = parts.collect::<Vec<_>>().join(" ");
-            let value = rest.trim();
+        if let Some(property) = parse_property_command_for_keys(
+            trimmed,
+            &[
+                "_list",
+                "did",
+                "kind",
+                "name",
+                "owner",
+                "cid",
+                "content-b64",
+                "holder",
+                "opened_by",
+                "durable",
+                "persistence",
+                "durable_inbox_messages",
+                "ephemeral_inbox_messages",
+                "outbound_messages",
+                "pending_messages",
+            ],
+        ) {
+            let key = property.key;
+            let value = property.value.unwrap_or_default();
+
+            let (
+                device_name,
+                device_kind,
+                object_did,
+                cid,
+                holder,
+                opened_by,
+                durable,
+                persistence,
+                durable_inbox_messages,
+                ephemeral_inbox_messages,
+                outbound_messages,
+                owner,
+            ) = {
+                let world_owner = self.owner_did.read().await.clone();
+                let objects = self.room_objects.read().await;
+                let room_map = objects.get(room_name)?;
+                let device = room_map.get(&object_id)?;
+                let world_did_root = self
+                    .local_world_did_root()
+                    .await
+                    .unwrap_or_else(|| "did:ma:unconfigured".to_string());
+                (
+                    device.name.clone(),
+                    device.kind.clone(),
+                    format!("{}#{}", world_did_root, device.id),
+                    device.cid.clone().unwrap_or_else(|| "(builtin)".to_string()),
+                    device.holder.clone().unwrap_or_else(|| "(none)".to_string()),
+                    device
+                        .opened_by
+                        .clone()
+                        .unwrap_or_else(|| "(closed)".to_string()),
+                    device.durable,
+                    format!("{:?}", device.persistence).to_ascii_lowercase(),
+                    device.durable_inbox_len(),
+                    device.ephemeral_inbox_len(),
+                    device.pending_outbox.len(),
+                    device
+                        .owner_did
+                        .clone()
+                        .or(world_owner)
+                        .unwrap_or_else(|| "(none)".to_string()),
+                )
+            };
+            let pending_messages = self.list_knocks(true).await.len();
+
+            if key == "_list" {
+                return Some((
+                    format!(
+                        "@ .object.did {}\n@ .object.kind {}\n@ .object.name {}\n@ .object.owner {}\n@ .object.cid {}\n@ .object.holder {}\n@ .object.opened_by {}\n@ .object.durable {}\n@ .object.persistence {}\n@ .object.durable_inbox_messages {}\n@ .object.ephemeral_inbox_messages {}\n@ .object.outbound_messages {}\n@ .object.pending_messages {}",
+                        object_did,
+                        device_kind,
+                        device_name,
+                        owner,
+                        cid,
+                        holder,
+                        opened_by,
+                        durable,
+                        persistence,
+                        durable_inbox_messages,
+                        ephemeral_inbox_messages,
+                        outbound_messages,
+                        pending_messages,
+                    ),
+                    room_name.to_string(),
+                ));
+            }
+
+            if value.is_empty() {
+                let response = match key.as_str() {
+                    "did" => object_did,
+                    "kind" => device_kind,
+                    "name" => device_name,
+                    "owner" => owner,
+                    "cid" => cid,
+                    "holder" => holder,
+                    "opened_by" => opened_by,
+                    "durable" => durable.to_string(),
+                    "persistence" => persistence,
+                    "durable_inbox_messages" => durable_inbox_messages.to_string(),
+                    "ephemeral_inbox_messages" => ephemeral_inbox_messages.to_string(),
+                    "outbound_messages" => outbound_messages.to_string(),
+                    "pending_messages" => pending_messages.to_string(),
+                    "content-b64" => "(write-only)".to_string(),
+                    _ => format!("unknown object attribute '{}'", key),
+                };
+                return Some((response, room_name.to_string()));
+            }
 
             let (object_name, object_owner, is_world_owner) = {
                 let owner = self.owner_did.read().await.clone();
@@ -4881,20 +3904,13 @@ impl World {
                 .unwrap_or(false);
             if !is_object_owner && !is_world_owner {
                 return Some((
-                    format!("only @{} owner or world owner can set definition", object_name),
+                    format!("only @{} owner or world owner can change object definition", object_name),
                     room_name.to_string(),
                 ));
             }
 
-            if sub == "cid" {
-                if value.is_empty() {
-                    return Some((
-                        format!("usage: {} set cid <cid|base64-yaml>", object_label),
-                        room_name.to_string(),
-                    ));
-                }
-
-                let (cid, definition, published_from_yaml) = match self.resolve_object_cid_or_yaml_input(value).await {
+            if key == "cid" {
+                let (cid, definition, published_from_yaml) = match self.resolve_object_cid_or_yaml_input(value.as_str()).await {
                     Ok(tuple) => tuple,
                     Err(err) => {
                         return Some((
@@ -4923,14 +3939,7 @@ impl World {
                 ));
             }
 
-            if sub == "content" || sub == "content-b64" {
-                if value.is_empty() {
-                    return Some((
-                        format!("usage: {} set content-b64 <base64-yaml>", object_label),
-                        room_name.to_string(),
-                    ));
-                }
-
+            if key == "content-b64" {
                 let decoded = match B64.decode(value.as_bytes()) {
                     Ok(bytes) => bytes,
                     Err(err) => {
@@ -4985,43 +3994,21 @@ impl World {
             }
 
             return Some((
-                format!("usage: {} set cid <cid|base64-yaml> | {} set content-b64 <base64-yaml>", object_label, object_label),
+                format!("@{} attribute '{}' is read-only", device_name, key),
                 room_name.to_string(),
             ));
         }
 
-        if method == "show" || method == "status" || method == "look" {
-            let (device_name, device_kind, object_did, cid, holder, opened_by, durable, persistence, durable_inbox_messages, ephemeral_inbox_messages, outbound_messages) = {
-                let objects = self.room_objects.read().await;
-                let room_map = objects.get(room_name)?;
-                let device = room_map.get(&object_id)?;
-                let world_did_root = self
-                    .local_world_did_root()
-                    .await
-                    .unwrap_or_else(|| "did:ma:unconfigured".to_string());
-                (
-                    device.name.clone(),
-                    device.kind.clone(),
-                    format!("{}#{}", world_did_root, device.id),
-                    device.cid.clone().unwrap_or_else(|| "(builtin)".to_string()),
-                    device.holder.clone().unwrap_or_else(|| "(none)".to_string()),
-                    device
-                        .opened_by
-                        .clone()
-                        .unwrap_or_else(|| "(closed)".to_string()),
-                    device.durable,
-                    format!("{:?}", device.persistence).to_ascii_lowercase(),
-                    device.durable_inbox_len(),
-                    device.ephemeral_inbox_len(),
-                    device.pending_outbox.len(),
-                )
-            };
-            let pending = self.list_knocks(true).await.len();
+        if method == "set" {
             return Some((
-                format!(
-                    "@{} did={} kind={} cid={} holder={} opened_by={} durable={} persistence={} durable_inbox_messages={} ephemeral_inbox_messages={} outbound_messages={} pending_messages={}",
-                    device_name, object_did, device_kind, cid, holder, opened_by, durable, persistence, durable_inbox_messages, ephemeral_inbox_messages, outbound_messages, pending
-                ),
+                format!("{} 'set ...' is deprecated. Use dot notation: @target.cid <cid|base64-yaml> or @target.content-b64 <base64-yaml>", object_label),
+                room_name.to_string(),
+            ));
+        }
+
+        if matches!(method.as_str(), "show" | "status" | "look" | "describe" | "apply") {
+            return Some((
+                format!("{} '{}' is deprecated. Use dot notation: @target._list or @target.<did|kind|name|owner|cid|holder|opened_by|durable|persistence|durable_inbox_messages|ephemeral_inbox_messages|outbound_messages|pending_messages>", object_label, method),
                 room_name.to_string(),
             ));
         }
@@ -5395,13 +4382,6 @@ impl World {
         sender_profile: &str,
         command: ActorCommand,
     ) -> (String, String) {
-        fn split_prop_args(input: &str) -> (String, String) {
-            let mut parts = input.trim().splitn(2, char::is_whitespace);
-            let path = parts.next().unwrap_or_default().trim().to_string();
-            let value = parts.next().unwrap_or_default().trim().to_string();
-            (path, value)
-        }
-
         fn split_selector_key(path: &str) -> (Option<String>, String) {
             let raw = path.trim();
             if let Some(rest) = raw.strip_prefix('#') {
@@ -5426,13 +4406,15 @@ impl World {
                 let trimmed = command.trim();
 
                 if let Some(rest) = trimmed.strip_prefix("prop ") {
-                    let (path, value) = split_prop_args(rest);
-                    if path.is_empty() {
+                    let Some(property) = parse_property_command(rest) else {
                         return (
                             "@avatar usage: @avatar.<name|description|owner|fragment|lang> [value] | @avatar.#<selector>.<name|description|owner|fragment|lang>".to_string(),
                             room_name.to_string(),
                         );
-                    }
+                    };
+
+                    let path = property.key;
+                    let value = property.value.unwrap_or_default();
 
                     let (selector, key) = split_selector_key(&path);
                     if key.is_empty() {
@@ -5548,7 +4530,7 @@ impl World {
                             let Some(collapsed) = collapse_world_language_order_strict(&value) else {
                                 return (
                                     format!(
-                                        "@avatar language rejected. supported={}. Set language in closet, or leave.",
+                                        "@avatar language rejected. supported={}. Set language here, or leave.",
                                         supported_world_languages_text()
                                     ),
                                     room_name.to_string(),
@@ -5566,7 +4548,7 @@ impl World {
                             }
                             let _ = caller_fragment;
                             return (
-                                "@avatar.name is read-only in runtime; set alias/fragment in closet profile.".to_string(),
+                                "@avatar.name is read-only in runtime; set alias/fragment at identity bootstrap.".to_string(),
                                 room_name.to_string(),
                             );
                         }
@@ -5888,7 +4870,7 @@ impl World {
                     let Some(collapsed) = collapse_world_language_order_strict(value) else {
                         return (
                             format!(
-                                "@avatar language rejected. supported={}. Set language in closet, or leave.",
+                                "@avatar language rejected. supported={}. Set language here, or leave.",
                                 supported_world_languages_text()
                             ),
                             room_name.to_string(),
@@ -5933,13 +4915,6 @@ impl World {
         sender_profile: &str,
         command: &str,
     ) -> String {
-        fn split_prop_args(input: &str) -> (String, String) {
-            let mut parts = input.trim().splitn(2, char::is_whitespace);
-            let path = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
-            let value = parts.next().unwrap_or_default().trim().to_string();
-            (path, value)
-        }
-
         let normalized = command.trim();
         let active_lang = world_lang_from_profile(sender_profile);
 
@@ -5947,7 +4922,7 @@ impl World {
             return tr_world(
                 active_lang,
                 "world.help.commands",
-                "@world commands: help | list | claim | knock list [all] | knock accept <id> | knock reject <id> [note] | knock delete <id> | invite <did> [note] | room <name> acl show|open|close|allow <did>|deny <did> | flush [knock|closet|all] | migrate-index | save | load <cid> | dig <direction> [to|til <#dest|did>]",
+                "@world commands: help | list | claim | knock list [all] | knock accept <id> | knock reject <id> [note] | knock delete <id> | invite <did> [note] | room <name> acl show|open|close|allow <did>|deny <did> | flush [knock|all] | migrate-index | save | load <cid> | dig <direction> [to|til <#dest|did>]",
             );
         }
 
@@ -5955,11 +4930,12 @@ impl World {
         let method = parts.next().unwrap_or_default().to_ascii_lowercase();
         let arg = parts.next().unwrap_or_default().trim().to_string();
 
-        if method == "prop" {
-            let (path, value) = split_prop_args(&arg);
-            if path.is_empty() {
-                return "@world usage: @world.<owner|did|rooms|lang_cid> [value]".to_string();
-            }
+        if let Some(property) = parse_property_command_for_keys(
+            normalized,
+            &["_list", "owner", "did", "rooms", "lang_cid"],
+        ) {
+            let path = property.key;
+            let value = property.value.unwrap_or_default();
 
             let caller_root_did = from_did.without_fragment().id();
 
@@ -6031,7 +5007,8 @@ impl World {
                     if owner_did.is_some() && !is_owner {
                         return "You don't have access to this.".to_string();
                     }
-                    return match self.set_owner_did(value.as_str()).await {
+                    let normalized = value.trim();
+                    return match self.set_owner_did(normalized).await {
                         Ok(root) => root,
                         Err(err) => format!("@world invalid owner DID '{}': {}", value, err),
                     };
@@ -6230,18 +5207,13 @@ impl World {
             let scope = arg.trim().to_ascii_lowercase();
             if scope.is_empty() || scope == "all" {
                 let knocks = self.flush_knock_inbox().await;
-                let closet = self.flush_closet_sessions().await;
-                return format!("@world flush all: knocks={} closet_sessions={}", knocks, closet);
+                return format!("@world flush all: knocks={}", knocks);
             }
             if scope == "knock" || scope == "knocks" {
                 let removed = self.flush_knock_inbox().await;
                 return format!("@world flush knock: removed={}", removed);
             }
-            if scope == "closet" || scope == "closet_sessions" {
-                let removed = self.flush_closet_sessions().await;
-                return format!("@world flush closet: removed={}", removed);
-            }
-            return "@world usage: @world.flush [knock|closet|all]".to_string();
+            return "@world usage: @world.flush [knock|all]".to_string();
         }
 
         if method == "migrate-index" {
@@ -6488,7 +5460,7 @@ impl World {
         caller_root_did: Option<&str>,
     ) -> String {
 
-        let (room_exists, avatars, acl_owner, acl_summary, description, did) = {
+        let (room_exists, avatars, acl_owner, acl_summary, title, description, did) = {
             let rooms = self.rooms.read().await;
             if let Some(room) = rooms.get(room_name) {
                 (
@@ -6496,11 +5468,12 @@ impl World {
                     room.avatars.keys().cloned().collect::<Vec<_>>(),
                     room.acl.owner.clone(),
                     room.acl.summary(),
+                    room.title_or_default(),
                     room.description_or_default(),
                     Some(room.did.clone()),
                 )
             } else {
-                (false, Vec::new(), None, "(none)".to_string(), String::new(), None)
+                (false, Vec::new(), None, "(none)".to_string(), String::new(), String::new(), None)
             }
         };
         let things = self.room_object_names(room_name).await;
@@ -6513,6 +5486,7 @@ impl World {
             acl_owner_did: acl_owner.as_deref(),
             acl_summary: &acl_summary,
             caller_root_did,
+            title: &title,
             description: &description,
             did: did.as_deref(),
         };
@@ -6599,7 +5573,8 @@ impl World {
             RoomActorAction::SetAttribute { key, value } => {
                 match key.as_str() {
                     "owner" => {
-                        let did = match Did::try_from(value.as_str()) {
+                        let normalized = value.trim();
+                        let did = match Did::try_from(normalized) {
                             Ok(d) => d.without_fragment().id(),
                             Err(e) => {
                                 response = format!("@here invalid owner DID '{}': {}", value, e);
@@ -6704,7 +5679,7 @@ impl World {
                                     .await
                                     .insert(room_name.to_string(), cid.clone());
                                 if let Err(e) = self.save_world_index().await {
-                                    warn!("Failed to save world index after set content-b64: {}", e);
+                                    warn!("Failed to save world index after @here.content-b64: {}", e);
                                 }
                                 response = format!(
                                     "@here room '{}' content published and applied as {}",
@@ -6719,7 +5694,7 @@ impl World {
                             let exit_id = parts.next().unwrap_or_default().trim();
                             let encoded = parts.next().unwrap_or_default().trim();
                             if exit_id.is_empty() || encoded.is_empty() {
-                                response = "@here usage: @here set exit-content-b64 <exit-id> <base64-yaml>".to_string();
+                                response = "@here usage: @here.exit-content-b64 <exit-id> <base64-yaml>".to_string();
                                 return response;
                             }
 
@@ -6757,7 +5732,7 @@ impl World {
                                 room_cids.get(room_name).cloned()
                             };
                             let Some(current_room_cid) = current_room_cid else {
-                                response = "@here room has no published CID yet; use @here set content-b64 for full room YAML first".to_string();
+                                response = "@here room has no published CID yet; use @here.content-b64 for full room YAML first".to_string();
                                 return response;
                             };
 
@@ -6973,6 +5948,81 @@ impl World {
         events.push_back(entry);
         sequence
     }
+}
+
+async fn best_effort_publish_did_document_to_kubo(
+    world: Arc<World>,
+    did_document_json: String,
+    ipns_private_key_base64: String,
+    desired_fragment: Option<String>,
+) -> Result<(Option<String>, Option<String>)> {
+    let document = Document::unmarshal(&did_document_json)
+        .map_err(|e| anyhow!("invalid DID document JSON: {}", e))?;
+    let document_did = Did::try_from(document.id.as_str())
+        .map_err(|e| anyhow!("invalid document DID '{}': {}", document.id, e))?;
+    let document_ipns_id = document_did.ipns.clone();
+
+    let kubo_url = world.kubo_url().await;
+    let keys = list_kubo_keys(&kubo_url).await?;
+
+    let desired = desired_fragment
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or(document_did.fragment.clone());
+
+    let mut key_name: Option<String> = None;
+
+    if let Some(alias) = desired {
+        if let Some(existing) = keys.iter().find(|key| key.name == alias) {
+            if existing.id.trim() != document_ipns_id {
+                return Err(anyhow!(
+                    "fragment '{}' exists already with another key id",
+                    alias
+                ));
+            }
+            key_name = Some(alias);
+        } else if !ipns_private_key_base64.trim().is_empty() {
+            let key_bytes = B64
+                .decode(ipns_private_key_base64.trim())
+                .map_err(|e| anyhow!("invalid base64 key payload: {}", e))?;
+            let imported = import_kubo_key(&kubo_url, &alias, key_bytes).await?;
+            if imported.id.trim() != document_ipns_id {
+                return Err(anyhow!(
+                    "imported key id '{}' does not match document ipns '{}'",
+                    imported.id,
+                    document_ipns_id
+                ));
+            }
+            key_name = Some(alias);
+        }
+    }
+
+    if key_name.is_none() {
+        key_name = keys
+            .iter()
+            .find(|key| key.id.trim() == document_ipns_id)
+            .map(|key| key.name.clone());
+    }
+
+    let Some(key_name) = key_name else {
+        return Ok((None, None));
+    };
+
+    let document_cid = ipfs_add(&kubo_url, did_document_json.into_bytes()).await?;
+    let ipns_options = IpnsPublishOptions::default();
+    ipns_publish_with_retry(
+        &kubo_url,
+        &key_name,
+        &document_cid,
+        &ipns_options,
+        3,
+        Duration::from_millis(1_000),
+    )
+    .await?;
+
+    Ok((Some(key_name), Some(document_cid)))
 }
 
 impl WorldProtocol {
@@ -7352,7 +6402,7 @@ impl WorldProtocol {
                 || lowered.contains("did document") && lowered.contains("not found")
             {
                 anyhow!(
-                    "did document is not published yet for {} (closet onboarding required): {}",
+                    "did document is not published yet for {} (submit document via ma/ipfs/1): {}",
                     sender_root.id(),
                     detail
                 )
@@ -7481,53 +6531,6 @@ impl WorldProtocol {
                     .await
                     .get(&root_did_id)
                     .is_none();
-                let closet_profile = self
-                    .world
-                    .closet_profiles
-                    .read()
-                    .await
-                    .get(&root_did_id)
-                    .cloned();
-                let has_closet_profile = closet_profile
-                    .as_ref()
-                    .map(|profile| {
-                        profile
-                            .name
-                            .as_ref()
-                            .map(|v| !v.trim().is_empty())
-                            .unwrap_or(false)
-                            && profile
-                                .description
-                                .as_ref()
-                                .map(|v| !v.trim().is_empty())
-                                .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-
-                if is_first_enter {
-                    if !has_closet_profile {
-                        return Ok(WorldResponse {
-                            ok: false,
-                            room,
-                            message: "no avatar profile available yet; complete closet onboarding (name + description), then enter again".to_string(),
-                            endpoint_id: self.endpoint_id.clone(),
-                            latest_event_sequence: 0,
-                            broadcasted: false,
-                            events: Vec::new(),
-                            handle: String::new(),
-                            room_description: String::new(),
-                            room_title: String::new(),
-                            room_did: String::new(),
-                            avatars: Vec::new(),
-                            room_object_dids: HashMap::new(),
-                            transport_ack: Some(TransportAck {
-                                lane: self.lane.label().to_string(),
-                                code: TransportAckCode::Rejected,
-                                detail: "closet profile required".to_string(),
-                            }),
-                        });
-                    }
-                }
 
                 if !self.world.can_enter(&root_did).await {
                     let (allow_all, allow_owner, allow_count, owner_did, acl_source) =
@@ -7585,16 +6588,13 @@ impl WorldProtocol {
                         }),
                     });
                 }
-                let profile_name = closet_profile
-                    .as_ref()
-                    .and_then(|profile| profile.name.clone());
-                let selected_handle = preferred_handle.or(profile_name);
+                let selected_handle = preferred_handle;
                 let Some(collapsed_language_order) = collapse_world_language_order_strict(&sender_profile) else {
                     return Ok(WorldResponse {
                         ok: false,
                         room,
                         message: format!(
-                            "no supported language found in ma.language='{}'. supported={}. Choose language in closet, or leave.",
+                            "no supported language found in ma.language='{}'. supported={}",
                             sender_profile,
                             supported_world_languages_text()
                         ),
@@ -7621,27 +6621,10 @@ impl WorldProtocol {
                     language_order: collapsed_language_order,
                 };
                 let handle = self.world.join_room(&room, avatar_req, selected_handle).await?;
-                if let Some(profile) = closet_profile {
-                    if let Some(description) = profile.description {
-                        let _ = self
-                            .world
-                            .set_avatar_description_for_did(&room, &root_did_id, &description)
-                            .await;
-                    }
-                }
-                if room == DEFAULT_ROOM && is_first_enter && has_closet_profile {
-                    let closet_exit_text = format!("{} comes out of the closet and into the lobby.", handle);
-                    self.world
-                        .record_room_event(
-                            DEFAULT_ROOM,
-                            "broadcast",
-                            Some(handle.clone()),
-                            Some(root_did_id.clone()),
-                            Some(agent_endpoint.clone()),
-                            closet_exit_text.clone(),
-                        )
-                        .await;
-                    self.push_room_broadcast(DEFAULT_ROOM, Some(handle.clone()), closet_exit_text)
+                if is_first_enter {
+                    let _ = self
+                        .world
+                        .set_avatar_description_for_did(&room, &root_did_id, "skeleton avatar")
                         .await;
                 }
                 self.push_presence_snapshot(&room).await;
@@ -7664,6 +6647,10 @@ impl WorldProtocol {
                 })
             }
             WorldCommand::Message { room, envelope } => {
+                let _ = self
+                    .world
+                    .touch_avatar_presence_for_did(&room, sender_root)
+                    .await;
                 let method = ROOM_METHOD_BROADCAST_SEND;
                 let effective_sender_profile = self
                     .world
@@ -7713,6 +6700,10 @@ impl WorldProtocol {
                 })
             }
             WorldCommand::RoomEvents { room, since_sequence } => {
+                let _ = self
+                    .world
+                    .touch_avatar_presence_for_did(&room, sender_root)
+                    .await;
                 let (events, latest_event_sequence) = self.world.room_events_since(&room, since_sequence).await?;
                 Ok(WorldResponse {
                     ok: true,
@@ -7798,9 +6789,116 @@ impl ProtocolHandler for WorldProtocol {
     }
 }
 
-impl ProtocolHandler for ClosetProtocol {
+impl IpfsProtocol {
+    async fn process_request(&self, request: WorldRequest) -> IpfsPublishDidResponse {
+        match self.handle_request(request).await {
+            Ok(response) => response,
+            Err(err) => IpfsPublishDidResponse {
+                ok: false,
+                message: err.to_string(),
+                did: None,
+                key_name: None,
+                cid: None,
+            },
+        }
+    }
+
+    async fn handle_request(&self, request: WorldRequest) -> Result<IpfsPublishDidResponse> {
+        if !self.world.is_unlocked().await {
+            return Err(anyhow!(
+                "world is locked; unlock from the status page before sending IPFS publish"
+            ));
+        }
+
+        let message = Message::from_cbor(&request.message_cbor)
+            .map_err(|e| anyhow!("invalid signed message: {}", e))?;
+        if message.content_type != CONTENT_TYPE_DOC {
+            return Err(anyhow!(
+                "expected {} on ma/ipfs/1, got {}",
+                CONTENT_TYPE_DOC,
+                message.content_type
+            ));
+        }
+
+        let sender_did = Did::try_from(message.from.as_str())
+            .map_err(|e| anyhow!("invalid sender did '{}': {}", message.from, e))?;
+        let sender_root = sender_did.without_fragment().id();
+
+        let request_payload: IpfsPublishDidRequest = serde_json::from_slice(&message.content)
+            .map_err(|e| anyhow!("invalid IPFS publish payload: {}", e))?;
+
+        let document = Document::unmarshal(&request_payload.did_document_json)
+            .map_err(|e| anyhow!("invalid DID document JSON: {}", e))?;
+        document
+            .validate()
+            .map_err(|e| anyhow!("invalid DID document: {}", e))?;
+        document
+            .verify()
+            .map_err(|e| anyhow!("DID document signature verification failed: {}", e))?;
+
+        let document_did = Did::try_from(document.id.as_str())
+            .map_err(|e| anyhow!("invalid document DID '{}': {}", document.id, e))?;
+        let document_root = document_did.without_fragment().id();
+        if document_root != sender_root {
+            return Err(anyhow!(
+                "sender DID root '{}' does not match document DID root '{}'",
+                sender_root,
+                document_root
+            ));
+        }
+
+        message
+            .verify_with_document(&document)
+            .map_err(|e| anyhow!("request signature verification failed: {}", e))?;
+
+        {
+            let mut cache = self.did_cache.write().await;
+            cache.insert(
+                document_root.clone(),
+                CachedDidDocument {
+                    document: document.clone(),
+                    dirty: false,
+                },
+            );
+        }
+
+        let world = self.world.clone();
+        let did_document_json = request_payload.did_document_json.clone();
+        let ipns_private_key_base64 = request_payload.ipns_private_key_base64.clone();
+        let desired_fragment = request_payload.desired_fragment.clone();
+        tokio::spawn(async move {
+            match best_effort_publish_did_document_to_kubo(
+                world,
+                did_document_json,
+                ipns_private_key_base64,
+                desired_fragment,
+            )
+            .await
+            {
+                Ok((key_name, cid)) => {
+                    info!(
+                        "ma/ipfs publish best-effort finished: key_name={:?} cid={:?}",
+                        key_name, cid
+                    );
+                }
+                Err(err) => {
+                    warn!("ma/ipfs publish best-effort failed: {}", err);
+                }
+            }
+        });
+
+        Ok(IpfsPublishDidResponse {
+            ok: true,
+            message: "did document cached locally; background publish started".to_string(),
+            did: Some(document_root),
+            key_name: None,
+            cid: None,
+        })
+    }
+}
+
+impl ProtocolHandler for IpfsProtocol {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        let requester_endpoint = connection.remote_id().to_string();
         let (mut send, mut recv) = connection.accept_bi().await?;
 
         loop {
@@ -7810,207 +6908,25 @@ impl ProtocolHandler for ClosetProtocol {
                 Err(err) => return Err(AcceptError::from_err(err)),
             };
 
-            if frame_len > 128 * 1024 {
+            if frame_len > 1024 * 1024 {
                 return Err(AcceptError::from_err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("closet frame too large: {}", frame_len),
+                    format!("ipfs frame too large: {}", frame_len),
                 )));
             }
 
             let mut bytes = vec![0u8; frame_len];
             recv.read_exact(&mut bytes).await.map_err(AcceptError::from_err)?;
 
-            let response = match serde_json::from_slice::<ClosetRequest>(&bytes) {
-                Ok(ClosetRequest::Start) => {
-                    match self.world.closet_start_session(&requester_endpoint).await {
-                        Ok((session_id, latest_lobby_sequence)) => {
-                            let active_lang = self
-                                .world
-                                .closet_lang_for_session(&session_id, &requester_endpoint)
-                                .await;
-                            ClosetResponse::ok(
-                                &session_id,
-                                tr_world(
-                                    active_lang,
-                                    "closet.session.ready",
-                                    "closet session ready",
-                                ),
-                            )
-                            .with_prompt(tr_world(
-                                active_lang,
-                                "closet.session.ready.prompt",
-                                "Answer profile questions while waiting; you can hear lobby events from here.",
-                            ))
-                            .with_latest_lobby_sequence(latest_lobby_sequence)
-                        }
-                        Err(err) => ClosetResponse::err_unscoped(err.to_string()),
-                    }
-                }
-                Ok(ClosetRequest::HearLobby {
-                    session_id,
-                    since_sequence,
-                }) => {
-                    match self
-                        .world
-                        .closet_session_owned_by(&session_id, &requester_endpoint)
-                        .await
-                    {
-                        Ok(session) => match self.world.room_events_since(DEFAULT_ROOM, since_sequence).await {
-                            Ok((events, latest_lobby_sequence)) => {
-                                let active_lang = self
-                                    .world
-                                    .closet_lang_for_session(&session.id, &requester_endpoint)
-                                    .await;
-                                ClosetResponse::ok(
-                                    &session.id,
-                                    tr_world_vars(
-                                        active_lang,
-                                        "closet.session.active_since",
-                                        &[("created_at", session.created_at.clone())],
-                                        &format!("closet session active since {}", session.created_at),
-                                    ),
-                                )
-                                .with_lobby_events(events, latest_lobby_sequence)
-                            }
-                            Err(err) => ClosetResponse::err_unscoped(err.to_string())
-                                .with_latest_lobby_sequence(since_sequence),
-                        },
-                        Err(err) => ClosetResponse::err_unscoped(err.to_string())
-                            .with_latest_lobby_sequence(since_sequence),
-                    }
-                }
-                Ok(ClosetRequest::Answer {
-                    session_id,
-                    field,
-                    value,
-                }) => {
-                    match self
-                        .world
-                        .closet_answer(&session_id, &requester_endpoint, &field, &value)
-                        .await
-                    {
-                        Ok(message) => ClosetResponse::ok(&session_id, message),
-                        Err(err) => ClosetResponse::err_unscoped(err.to_string()),
-                    }
-                }
-                Ok(ClosetRequest::SubmitCitizenship {
-                    session_id,
-                    ipns_private_key_base64,
-                    desired_fragment,
-                }) => {
-                    let desired_fragment = desired_fragment
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty());
-                    match self
-                        .world
-                        .closet_submit_citizenship(
-                            &session_id,
-                            &requester_endpoint,
-                            &ipns_private_key_base64,
-                            desired_fragment,
-                        )
-                        .await
-                    {
-                        Ok((did, fragment, key_name)) => {
-                            let active_lang = self
-                                .world
-                                .closet_lang_for_session(&session_id, &requester_endpoint)
-                                .await;
-                            ClosetResponse::ok(
-                                &session_id,
-                                tr_world(
-                                    active_lang,
-                                    "closet.citizenship.imported",
-                                    "citizenship imported",
-                                ),
-                            )
-                            .with_prompt(tr_world(
-                                active_lang,
-                                "closet.citizenship.prompt",
-                                "Citizenship granted. Rebind your local identity to the returned DID and enter the world.",
-                            ))
-                            .with_did(did)
-                            .with_fragment(fragment)
-                            .with_key_name(key_name)
-                        }
-                        Err(err) => ClosetResponse::err_unscoped(err.to_string()),
-                    }
-                }
-                Ok(ClosetRequest::PublishDidDocument {
-                    session_id,
-                    did_document_json,
-                    ipns_private_key_base64,
-                    desired_fragment,
-                }) => {
-                    let desired_fragment = desired_fragment
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty());
-                    match self
-                        .world
-                        .closet_publish_did_document(
-                            &session_id,
-                            &requester_endpoint,
-                            &did_document_json,
-                            &ipns_private_key_base64,
-                            desired_fragment,
-                        )
-                        .await
-                    {
-                        Ok((did, cid, key_name)) => {
-                            let active_lang = self
-                                .world
-                                .closet_lang_for_session(&session_id, &requester_endpoint)
-                                .await;
-                            ClosetResponse::ok(
-                                &session_id,
-                                tr_world_vars(
-                                    active_lang,
-                                    "closet.did.published",
-                                    &[("cid", cid.clone())],
-                                    &format!("did document published at /ipfs/{}", cid),
-                                ),
-                            )
-                            .with_did(did)
-                            .with_fragment(key_name.clone())
-                            .with_key_name(key_name)
-                        }
-                        Err(err) => {
-                            let detail = err.to_string();
-                            if detail == "Can't publish. Secret key missing." {
-                                let active_lang = self
-                                    .world
-                                    .closet_lang_for_session(&session_id, &requester_endpoint)
-                                    .await;
-                                ClosetResponse::err(
-                                    &session_id,
-                                    tr_world(
-                                        active_lang,
-                                        "closet.publish.secret_key_missing",
-                                        "Can't publish. Secret key missing.",
-                                    ),
-                                )
-                            } else {
-                                ClosetResponse::err_unscoped(detail)
-                            }
-                        }
-                    }
-                }
-                Ok(ClosetRequest::Command { session_id, input }) => {
-                    match self
-                        .world
-                        .closet_command(&session_id, &requester_endpoint, &input)
-                        .await
-                    {
-                        Ok(response) => response,
-                        Err(err) => ClosetResponse::err_unscoped(err.to_string()),
-                    }
-                }
-                Err(err) => ClosetResponse::err_unscoped(format!(
-                    "invalid closet request JSON: {}",
-                    err
-                )),
+            let response = match serde_json::from_slice::<WorldRequest>(&bytes) {
+                Ok(request) => self.process_request(request).await,
+                Err(err) => IpfsPublishDidResponse {
+                    ok: false,
+                    message: format!("invalid ipfs request JSON: {}", err),
+                    did: None,
+                    key_name: None,
+                    cid: None,
+                },
             };
 
             let payload = serde_json::to_vec(&response).map_err(AcceptError::from_err)?;
@@ -8025,7 +6941,6 @@ impl ProtocolHandler for ClosetProtocol {
         Ok(())
     }
 }
-
 
 fn derive_world_master_key(secret_key: &SecretKey, world_slug: &str) -> [u8; 32] {
     // Deterministic per-world key derived from machine-local iroh identity.
@@ -8175,7 +7090,7 @@ async fn publish_world_did_runtime_ma(
     .map_err(|e| anyhow!("failed to restore world signing key: {}", e))?;
 
     let mut document = kubo::fetch_did_document(kubo_url, &world_did).await?;
-    document.set_ma_type("world");
+    document.set_ma_type("world")?;
 
     if pointer_mode {
         let state_key_name = runtime_state_key_name(world_slug);
@@ -8305,7 +7220,7 @@ async fn ensure_world_did_document(
     document.add_verification_method(key_agreement_vm)?;
     document.assertion_method = assertion_vm_id;
     document.key_agreement = key_agreement_vm_id;
-    document.set_ma_type("world");
+    document.set_ma_type("world")?;
     if let Some(state_ipns_id) = state_ipns_id {
         document.set_ma_link(format!("/ipns/{}", state_ipns_id));
     } else {
@@ -9424,23 +8339,20 @@ async fn main() -> Result<()> {
         }
 
         let did_cache = Arc::new(RwLock::new(HashMap::new()));
+        let inbox_protocol = WorldProtocol {
+            world: world.clone(),
+            endpoint: endpoint.clone(),
+            endpoint_id: endpoint_id.clone(),
+            did_cache: did_cache.clone(),
+            lane: WorldLane::Inbox,
+        };
+        let ipfs_protocol = IpfsProtocol {
+            world: world.clone(),
+            did_cache: did_cache.clone(),
+        };
         let router = Router::builder(endpoint.clone())
-            .accept(
-                INBOX_ALPN,
-                WorldProtocol {
-                    world: world.clone(),
-                    endpoint: endpoint.clone(),
-                    endpoint_id: endpoint_id.clone(),
-                    did_cache: did_cache.clone(),
-                    lane: WorldLane::Inbox,
-                },
-            )
-            .accept(
-                CLOSET_ALPN,
-                ClosetProtocol {
-                    world: world.clone(),
-                },
-            )
+            .accept(INBOX_ALPN, inbox_protocol.clone())
+            .accept(IPFS_ALPN, ipfs_protocol)
             .spawn();
         let online_started = Instant::now();
         let online_status = match tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await {
@@ -9512,7 +8424,7 @@ async fn main() -> Result<()> {
         info!("World endpoint id: {}", world_info.endpoint_id);
         info!("World status page: {}", world_info.status_url);
         info!("Inbox protocol ALPN: {}", String::from_utf8_lossy(INBOX_ALPN));
-        info!("Closet protocol ALPN: {}", String::from_utf8_lossy(CLOSET_ALPN));
+        info!("IPFS protocol ALPN (citizenship): {}", String::from_utf8_lossy(IPFS_ALPN));
         info!("Broadcast protocol ALPN (outbound push to agents): {}", String::from_utf8_lossy(BROADCAST_ALPN));
         info!("World entry ACL: {}", world_info.entry_acl);
         info!("Optional DID field ma:presenceHint = {}", world_info.location_hint);
@@ -9541,6 +8453,38 @@ async fn main() -> Result<()> {
         world
             .record_event(format!("world online at {}", world_info.status_url))
             .await;
+
+        let presence_probe_secs = env::var("MA_PRESENCE_PROBE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v >= 1)
+            .unwrap_or(PRESENCE_PROBE_INTERVAL_SECS_DEFAULT);
+        let presence_stale_secs = env::var("MA_PRESENCE_STALE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v >= 2)
+            .unwrap_or(PRESENCE_STALE_AFTER_SECS_DEFAULT)
+            .max(presence_probe_secs + 1);
+
+        let inbox_presence = inbox_protocol.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(presence_probe_secs));
+            let stale_after = Duration::from_secs(presence_stale_secs);
+            loop {
+                ticker.tick().await;
+                let changed_rooms = inbox_presence.world.prune_stale_avatars(stale_after).await;
+                for room_name in changed_rooms {
+                    inbox_presence.push_presence_snapshot(&room_name).await;
+                }
+            }
+        });
+
+        info!(
+            "Presence pruning enabled: probe={}s stale_after={}s",
+            presence_probe_secs,
+            presence_stale_secs
+        );
+
         if !world.is_unlocked().await {
             world
                 .record_event("world runtime locked; unlock required before handling commands".to_string())

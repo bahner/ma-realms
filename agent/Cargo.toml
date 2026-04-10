@@ -8,10 +8,11 @@ anyhow = "1.0"
 axum = "0.8"
 base64 = "0.22"
 chrono = "0.4"
+hex = "0.4"
 iroh = { version = "0.97.0" }
 libp2p-identity = { version = "0.2", features = ["ed25519", "peerid", "rand"] }
 ma-core = { path = "../core" }
-did-ma = { path = "../../ma" }
+did-ma = { package = "ma-did", path = "../../did" }
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 nanoid = "0.4"
 rand = "0.8"

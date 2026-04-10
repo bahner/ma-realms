@@ -1,6 +1,6 @@
 # ma-actor
 
-A WebAssembly home client built on top of `did-ma`.
+A WebAssembly home client built on top of `ma-did`.
 
 It creates/unlocks local encrypted identity bundles, publishes DID documents to IPNS via IPFS API, and provides a command-driven browser UI.
 
@@ -172,7 +172,7 @@ Browser calls require IPFS API CORS headers allowing your app origin (for exampl
 
 ## Protocol & Transport
 
-The WASM client uses ALPN constants and content types from `did-ma` directly
+The WASM client uses ALPN constants and content types from `ma-did` directly
 (e.g. `CONTENT_TYPE_CHAT`, `CONTENT_TYPE_PRESENCE`, `CONTENT_TYPE_WHISPER`, `CONTENT_TYPE_BROADCAST`).
 Connection caches are maintained inbox-first (signed world traffic over
 `ma/inbox/1`) so repeated interactions with the same world reuse the iroh

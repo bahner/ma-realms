@@ -45,3 +45,5 @@ Before adding new functionalit check to see if there are established methods in 
 Make sure to supplement did:ma og ma-core with new functions that have general value, but ask before making changes to did:ma
 
 Don't mutate data that's is badly formed. Raise an error instead.
+
+When validating input always check if input is valid and else fail. You should mot explicitly search for previously mention errors and just raise an error for arbitrary values, unless this is required. Don't create a set of error values, but of valid values and check for membership in that else fail.

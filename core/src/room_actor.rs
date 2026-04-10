@@ -1,3 +1,5 @@
+use crate::parse_property_command_for_keys;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoomActorAction {
     None,
@@ -29,6 +31,7 @@ pub struct RoomActorContext<'a> {
     pub acl_summary: &'a str,
     pub caller_root_did: Option<&'a str>,
     pub description: &'a str,
+    pub title: &'a str,
     pub did: Option<&'a str>,
 }
 
@@ -82,7 +85,8 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "help", "who", "l", "acl", "describe", "show",
     "invite <did>", "deny <did>", "kick <handle>",
     "dig <direction> [to|til <#dest|did:ma:...#room>]",
-    "set <owner|title|description|cid|content-b64|exit-content-b64> <value>",
+    "owner [did]", "title [value]", "description [value]",
+    "cid [value]", "content-b64 [value]", "exit-content-b64 [value]",
 ];
 
 fn cmd_help(_ctx: &RoomActorContext<'_>) -> RoomActorResult {
@@ -195,7 +199,7 @@ fn cmd_set(arg: &str, ctx: &RoomActorContext<'_>) -> RoomActorResult {
     let value = unquote(&value_raw);
 
     if key.is_empty() || value.is_empty() {
-        return none_result("@here usage: @here set <owner|title|description|cid|content-b64|exit-content-b64> <value>".to_string());
+        return none_result("@here usage: @here.<owner|title|description|cid|content-b64|exit-content-b64> [value]".to_string());
     }
 
     match key.as_str() {
@@ -248,6 +252,52 @@ fn cmd_set(arg: &str, ctx: &RoomActorContext<'_>) -> RoomActorResult {
     }
 }
 
+const ROOM_PROPERTY_KEYS: &[&str] = &[
+    "_list",
+    "owner",
+    "title",
+    "description",
+    "cid",
+    "content-b64",
+    "exit-content-b64",
+];
+
+fn cmd_property(command: &str, ctx: &RoomActorContext<'_>) -> Option<RoomActorResult> {
+    let property = parse_property_command_for_keys(command, ROOM_PROPERTY_KEYS)?;
+    let key = property.key;
+
+    if key == "_list" {
+        let owner = ctx.acl_owner_did.unwrap_or("(none)");
+        let did = ctx.did.unwrap_or("(unknown)");
+        return Some(none_result(format!(
+            "@ .here.owner {}\n@ .here.title {}\n@ .here.description {}\n@ .here.did {}",
+            owner,
+            ctx.title,
+            ctx.description,
+            did
+        )));
+    }
+
+    let Some(value) = property.value else {
+        let response = match key.as_str() {
+            "owner" => ctx.acl_owner_did.unwrap_or("(none)").to_string(),
+            "title" => ctx.title.to_string(),
+            "description" => ctx.description.to_string(),
+            "cid" | "content-b64" | "exit-content-b64" => {
+                "(write-only)".to_string()
+            }
+            _ => format!(
+                "@here unknown attribute '{}'. Supported: owner, title, description, cid, content-b64, exit-content-b64",
+                key
+            ),
+        };
+        return Some(none_result(response));
+    };
+
+    let result = cmd_set(&format!("{} {}", key, value), ctx);
+    Some(result)
+}
+
 // ─── Main dispatch ──────────────────────────────────────────────────────────
 
 pub fn execute_room_actor_command(command: &str, ctx: &RoomActorContext<'_>) -> RoomActorResult {
@@ -255,6 +305,16 @@ pub fn execute_room_actor_command(command: &str, ctx: &RoomActorContext<'_>) -> 
 
     if normalized.is_empty() || normalized.eq_ignore_ascii_case("help") {
         return cmd_help(ctx);
+    }
+
+    if normalized.to_ascii_lowercase().starts_with("set ") {
+        return none_result(
+            "@here 'set ...' is deprecated. Use dot notation: @here.<owner|title|description|cid|content-b64|exit-content-b64> [value]".to_string()
+        );
+    }
+
+    if let Some(result) = cmd_property(normalized, ctx) {
+        return result;
     }
 
     let (method, arg) = split_method_arg(normalized);
@@ -273,7 +333,6 @@ pub fn execute_room_actor_command(command: &str, ctx: &RoomActorContext<'_>) -> 
     match method.as_str() {
         "invite" | "deny" | "kick" => return cmd_invite_deny_kick(&method, &arg, ctx),
         "dig"                      => return cmd_dig(&arg, ctx),
-        "set"                      => return cmd_set(&arg, ctx),
         _ => {}
     }
 
@@ -286,4 +345,41 @@ pub fn execute_room_actor_command(command: &str, ctx: &RoomActorContext<'_>) -> 
     //   }
 
     none_result(format!("@here unknown command: {}", normalized))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{execute_room_actor_command, RoomActorAction, RoomActorContext};
+
+    fn sample_ctx() -> RoomActorContext<'static> {
+        RoomActorContext {
+            room_name: "lobby",
+            room_exists: true,
+            avatars: vec!["aurora".to_string()],
+            things: Vec::new(),
+            acl_owner_did: Some("did:ma:owner"),
+            acl_summary: "*",
+            caller_root_did: Some("did:ma:owner"),
+            title: "Lobby",
+            description: "Welcome",
+            did: Some("did:ma:world#lobby"),
+        }
+    }
+
+    #[test]
+    fn supports_owner_dot_notation() {
+        let result = execute_room_actor_command("owner did:ma:new-owner", &sample_ctx());
+        assert!(matches!(
+            result.action,
+            RoomActorAction::SetAttribute { ref key, ref value }
+            if key == "owner" && value == "did:ma:new-owner"
+        ));
+    }
+
+    #[test]
+    fn rejects_legacy_set_syntax() {
+        let result = execute_room_actor_command("set owner did:ma:new-owner", &sample_ctx());
+        assert!(result.response.contains("deprecated"));
+        assert!(matches!(result.action, RoomActorAction::None));
+    }
 }

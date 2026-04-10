@@ -263,9 +263,6 @@ export function createWorldFlow({
 export function createWorldDispatchFlow({
   state,
   appendMessage,
-  normalizeClosetInput,
-  closetCommandForCurrentWorld,
-  renderClosetResponse,
   enterHome,
   isLikelyIrohAddress,
   normalizeIrohAddress,
@@ -428,6 +425,25 @@ export function createWorldDispatchFlow({
       return `${targetToken}${suffix}`;
     });
 
+    out = out.replace(/^(\s*@(?:here|world)\.owner\s+)(\S+)(.*)$/i, (all, prefix, value, suffix) => {
+      const rawValue = String(value || '').trim();
+      if (!rawValue) {
+        return all;
+      }
+
+      // Keep value syntax strict: resolve bare alias tokens only.
+      if (rawValue.startsWith('@')) {
+        return all;
+      }
+
+      const resolved = resolveAliasTarget(rawValue, aliases);
+      const normalized = String(resolved || '').trim();
+      if (!normalized) {
+        return all;
+      }
+      return `${prefix}${normalized}${String(suffix || '')}`;
+    });
+
     return out;
   }
 
@@ -465,64 +481,9 @@ export function createWorldDispatchFlow({
     try {
       const rewrittenInput = rewriteAliasesToDid(text);
       const trimmedText = rewrittenInput.trim();
-      const closetInput = normalizeClosetInput(trimmedText);
-      const hasActiveClosetSession = Boolean(
-        String(state.closetSessionId || '').trim()
-        && String(state.closetEndpointId || '').trim()
-      );
-      const isClosetEndpointActive = hasActiveClosetSession && (
-        !state.currentHome
-        || String(state.currentHome?.endpointId || '').trim() === String(state.closetEndpointId || '').trim()
-      );
 
       if (!state.identity) {
         appendMessage('system', 'Create or unlock an identity first.');
-        return;
-      }
-
-      if (isClosetEndpointActive) {
-        const shortcutConnectTarget = String(trimmedText || '').trim();
-        if (shortcutConnectTarget.startsWith('@') && !/\s/u.test(shortcutConnectTarget)) {
-          await enterHome(shortcutConnectTarget);
-          return;
-        }
-
-        const goMatch = trimmedText.match(/^go\s+(.+)$/i);
-        if (goMatch) {
-          const targetOrRoom = String(goMatch[1] || '').trim();
-          if (targetOrRoom) {
-            const connectTarget = resolveWorldConnectTarget(targetOrRoom);
-            if (connectTarget) {
-              await enterHome(targetOrRoom);
-              return;
-            }
-
-            if (!String(state.closetSessionDid || '').trim()) {
-              const applyResponse = await closetCommandForCurrentWorld('apply');
-              renderClosetResponse(applyResponse);
-              if (!String(state.closetSessionDid || '').trim()) {
-                appendMessage('system', 'Closet session still has no DID. Complete required profile fields, then try go out again.');
-                return;
-              }
-            }
-
-            const response = await closetCommandForCurrentWorld(`enter ${targetOrRoom}`);
-            renderClosetResponse(response);
-            const reconnectRoom = targetOrRoom.toLowerCase() === 'out' ? 'lobby' : targetOrRoom;
-            await enterHome(state.closetEndpointId, reconnectRoom, {
-              silent: true,
-              skipLocalDidProbe: true,
-            });
-            return;
-          }
-        }
-
-        if (closetInput) {
-          const response = await closetCommandForCurrentWorld(closetInput);
-          renderClosetResponse(response);
-        } else {
-          appendMessage('system', 'Active closet session. Use dot commands (for example: avatar.peek, avatar.name bahner, actor.peek, actor.apply).');
-        }
         return;
       }
 
@@ -548,14 +509,6 @@ export function createWorldDispatchFlow({
         }
 
         appendMessage('system', 'Not connected. Use go did:ma:<world>#<room> or go home (after .set home).');
-        return;
-      }
-
-      if (state.closetSessionId && state.closetEndpointId
-        && state.currentHome.endpointId === state.closetEndpointId
-        && closetInput) {
-        const response = await closetCommandForCurrentWorld(closetInput);
-        renderClosetResponse(response);
         return;
       }
 

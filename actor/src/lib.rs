@@ -104,11 +104,6 @@ struct WorldConnCache {
     target_id: String,
 }
 
-struct ClosetEndpointCache {
-    endpoint: Endpoint,
-    target_id: String,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorldTransportKind {
     Inbox,
@@ -124,43 +119,10 @@ impl WorldTransportKind {
 
 thread_local! {
     static WORLD_CONN_CACHE: RefCell<Option<WorldConnCache>> = RefCell::new(None);
-    static CLOSET_ENDPOINT_CACHE: RefCell<Option<ClosetEndpointCache>> = RefCell::new(None);
     static ACL_COMPILED_CACHE: RefCell<HashMap<String, CompiledCapabilityAcl>> = RefCell::new(HashMap::new());
     static ROOM_DID_CACHE: RefCell<HashMap<String, CachedDidEntry>> = RefCell::new(HashMap::new());
     static ROOM_OBJECT_DID_CACHE: RefCell<HashMap<String, CachedDidEntry>> = RefCell::new(HashMap::new());
     static ACTIVE_ROOM_CACHE: RefCell<Option<String>> = RefCell::new(None);
-}
-
-fn take_closet_endpoint_cache() -> Option<ClosetEndpointCache> {
-    CLOSET_ENDPOINT_CACHE.with(|c| c.borrow_mut().take())
-}
-
-fn store_closet_endpoint_cache(cache: ClosetEndpointCache) {
-    CLOSET_ENDPOINT_CACHE.with(|c| *c.borrow_mut() = Some(cache));
-}
-
-async fn get_or_create_closet_endpoint(target_id_str: &str) -> Result<Endpoint, JsValue> {
-    if let Some(cached) = take_closet_endpoint_cache() {
-        if cached.target_id == target_id_str {
-            let endpoint = cached.endpoint.clone();
-            store_closet_endpoint_cache(cached);
-            return Ok(endpoint);
-        }
-        cached.endpoint.close().await;
-    }
-
-    let endpoint = Endpoint::builder(presets::N0)
-        .bind()
-        .await
-        .map_err(|e| js_err(format!("endpoint bind failed: {e}")))?;
-    let _ = endpoint.online().await;
-
-    store_closet_endpoint_cache(ClosetEndpointCache {
-        endpoint: endpoint.clone(),
-        target_id: target_id_str.to_string(),
-    });
-
-    Ok(endpoint)
 }
 
 #[derive(Clone, Debug)]
@@ -458,13 +420,10 @@ async fn exchange_on_stream(cache: &mut WorldConnCache, request: &WorldRequest) 
     serde_json::from_slice(&response_bytes).map_err(js_err)
 }
 use ma_core::{
-    send_closet_request as core_send_closet_request,
-    ClosetRequest,
-    ClosetResponse,
     CompiledCapabilityAcl,
     compile_acl,
     CONTENT_TYPE_BROADCAST, CONTENT_TYPE_CHAT, CONTENT_TYPE_PRESENCE,
-    CONTENT_TYPE_WORLD, CONTENT_TYPE_WHISPER,
+    CONTENT_TYPE_DOC, CONTENT_TYPE_WORLD, CONTENT_TYPE_WHISPER,
     DEFAULT_WORLD_RELAY_URL,
     evaluate_compiled_acl_with_owner,
     did_root as core_did_root,
@@ -474,13 +433,15 @@ use ma_core::{
     humanize_text as core_humanize_text,
     normalize_endpoint_id as core_normalize_endpoint_id,
     normalize_relay_url as core_normalize_relay_url,
+    IpfsPublishDidRequest,
+    IpfsPublishDidResponse,
     parse_capability_acl_text,
     parse_message,
     MessageEnvelope,
     resolve_inbox_endpoint_id as core_resolve_inbox_endpoint_id,
     resolve_alias_input as core_resolve_alias_input,
     RoomEvent, WorldCommand, WorldRequest, WorldResponse,
-    BROADCAST_ALPN, INBOX_ALPN, PRESENCE_ALPN, WHISPER_ALPN,
+    BROADCAST_ALPN, INBOX_ALPN, IPFS_ALPN, PRESENCE_ALPN, WHISPER_ALPN,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -966,10 +927,6 @@ pub async fn disconnect_world() {
         cached.endpoint.close().await;
     }
 
-    if let Some(cached) = take_closet_endpoint_cache() {
-        cached.endpoint.close().await;
-    }
-
     let state = INBOX_STATE.with(|slot| slot.borrow_mut().take());
     if let Some(listener) = state {
         let _ = listener.router.shutdown().await;
@@ -1238,10 +1195,6 @@ fn build_signed_world_request(
         return Err(js_err("actor_name is required for DID fragment"));
     }
 
-    let from_did = Did::try_from(plain.document.id.as_str())
-        .and_then(|did| did.with_fragment(actor_name))
-        .map_err(js_err)?;
-
     let contextual_world_did = plain
         .document
         .ma
@@ -1263,13 +1216,48 @@ fn build_signed_world_request(
             .unwrap_or_else(|_| plain.document.id.clone()),
     };
 
-    let signing_key = restore_signing_key(&plain.ipns, &plain.signing_private_key_hex)?;
     let content = serde_json::to_vec(&command).map_err(js_err)?;
-    
-    // Create message with custom timestamp from JavaScript (in milliseconds, convert to seconds)
+    build_signed_request_from_content(
+        passphrase,
+        encrypted_bundle_json,
+        actor_name,
+        target_world_did.as_str(),
+        content_type,
+        content,
+        timestamp_ms,
+        ttl_seconds,
+    )
+}
+
+fn build_signed_request_from_content(
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+    actor_name: &str,
+    target_did: &str,
+    content_type: &str,
+    content: Vec<u8>,
+    timestamp_ms: u64,
+    ttl_seconds: u64,
+) -> Result<WorldRequest, JsValue> {
+    let encrypted: EncryptedIdentityBundle = serde_json::from_str(encrypted_bundle_json)
+        .map_err(|e| js_err(format!("invalid bundle JSON: {e}")))?;
+    let plain_bytes = decrypt_bundle(passphrase, &encrypted).map_err(js_err)?;
+    let plain: IdentityBundlePlain = serde_json::from_slice(&plain_bytes)
+        .map_err(|e| js_err(format!("bundle corrupted: {e}")))?;
+
+    let actor_name = actor_name.trim();
+    if actor_name.is_empty() {
+        return Err(js_err("actor_name is required for DID fragment"));
+    }
+
+    let from_did = Did::try_from(plain.document.id.as_str())
+        .and_then(|did| did.with_fragment(actor_name))
+        .map_err(js_err)?;
+
+    let signing_key = restore_signing_key(&plain.ipns, &plain.signing_private_key_hex)?;
     let message = build_signed_message_with_js_time(
         from_did.id().to_string(),
-        target_world_did,
+        target_did.trim().to_string(),
         content_type.to_string(),
         content,
         &signing_key,
@@ -1879,7 +1867,7 @@ pub fn clear_bundle_presence_hint(
     }, false)
 }
 
-/// Stamp DID lifecycle metadata immediately before explicit closet send/publish.
+/// Stamp DID lifecycle metadata immediately before explicit DID publish/send.
 /// Returns JSON: `{ encrypted_bundle, did, ipns, document_json }`
 #[wasm_bindgen]
 pub fn set_bundle_updated_for_send(
@@ -1907,13 +1895,20 @@ pub async fn connect_world_with_relay(endpoint_id: &str, relay_url: &str) -> Res
     Ok(())
 }
 
-async fn send_closet_request(endpoint_id: &str, request: ClosetRequest) -> Result<ClosetResponse, JsValue> {
+async fn send_ipfs_publish_request(
+    endpoint_id: &str,
+    request: WorldRequest,
+) -> Result<IpfsPublishDidResponse, JsValue> {
     let target: EndpointId = endpoint_id
         .trim()
         .parse()
         .map_err(|e| js_err(format!("invalid endpoint id: {e}")))?;
 
-    let endpoint = get_or_create_closet_endpoint(endpoint_id).await?;
+    let endpoint = Endpoint::builder(presets::N0)
+        .bind()
+        .await
+        .map_err(|e| js_err(format!("endpoint bind failed: {e}")))?;
+    let _ = endpoint.online().await;
 
     let relay_source = core_normalize_relay_url(DEFAULT_WORLD_RELAY_URL);
     let relay_url: RelayUrl = relay_source
@@ -1921,121 +1916,84 @@ async fn send_closet_request(endpoint_id: &str, request: ClosetRequest) -> Resul
         .map_err(|e| js_err(format!("relay URL parse failed for '{}': {}", relay_source, e)))?;
     let endpoint_addr = EndpointAddr::new(target).with_relay_url(relay_url);
 
-    core_send_closet_request(&endpoint, endpoint_addr, request)
+    let connection = endpoint
+        .connect(endpoint_addr, IPFS_ALPN)
         .await
-        .map_err(|e| js_err(format!("closet request failed: {e}")))
+        .map_err(|e| js_err(format!("ipfs endpoint.connect() failed: {}", e)))?;
+
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|e| js_err(format!("ipfs connection.open_bi() failed: {}", e)))?;
+
+    let payload = serde_json::to_vec(&request).map_err(js_err)?;
+    send.write_u32(payload.len() as u32).await.map_err(js_err)?;
+    send.write_all(&payload).await.map_err(js_err)?;
+    send.flush().await.map_err(js_err)?;
+
+    let frame_len = recv.read_u32().await.map_err(js_err)? as usize;
+    if frame_len > 512 * 1024 {
+        return Err(js_err(format!("ipfs response frame too large: {}", frame_len)));
+    }
+    let mut bytes = vec![0u8; frame_len];
+    recv.read_exact(&mut bytes).await.map_err(js_err)?;
+
+    let _ = send.finish();
+    connection.close(0u32.into(), b"ok");
+    endpoint.close().await;
+
+    serde_json::from_slice::<IpfsPublishDidResponse>(&bytes).map_err(js_err)
 }
 
 #[wasm_bindgen]
-pub async fn closet_start(endpoint_id: &str) -> Result<String, JsValue> {
-    let response = send_closet_request(endpoint_id, ClosetRequest::Start).await?;
-    serde_json::to_string(&response).map_err(js_err)
-}
-
-#[wasm_bindgen]
-pub async fn closet_command(
+pub async fn publish_did_document_via_world_ipfs(
     endpoint_id: &str,
-    session_id: &str,
-    input: &str,
-) -> Result<String, JsValue> {
-    let response = send_closet_request(
-        endpoint_id,
-        ClosetRequest::Command {
-            session_id: session_id.trim().to_string(),
-            input: input.to_string(),
-        },
-    )
-    .await?;
-    serde_json::to_string(&response).map_err(js_err)
-}
-
-#[wasm_bindgen]
-pub async fn closet_hear_lobby(
-    endpoint_id: &str,
-    session_id: &str,
-    since_sequence: u64,
-) -> Result<String, JsValue> {
-    let response = send_closet_request(
-        endpoint_id,
-        ClosetRequest::HearLobby {
-            session_id: session_id.trim().to_string(),
-            since_sequence,
-        },
-    )
-    .await?;
-    serde_json::to_string(&response).map_err(js_err)
-}
-
-#[wasm_bindgen]
-pub async fn closet_answer(
-    endpoint_id: &str,
-    session_id: &str,
-    field: &str,
-    value: &str,
-) -> Result<String, JsValue> {
-    let response = send_closet_request(
-        endpoint_id,
-        ClosetRequest::Answer {
-            session_id: session_id.trim().to_string(),
-            field: field.trim().to_string(),
-            value: value.to_string(),
-        },
-    )
-    .await?;
-    serde_json::to_string(&response).map_err(js_err)
-}
-
-#[wasm_bindgen]
-pub async fn closet_submit_citizenship(
-    endpoint_id: &str,
-    session_id: &str,
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+    actor_name: &str,
     ipns_private_key_base64: &str,
     desired_fragment: &str,
 ) -> Result<String, JsValue> {
-    let response = send_closet_request(
-        endpoint_id,
-        ClosetRequest::SubmitCitizenship {
-            session_id: session_id.trim().to_string(),
-            ipns_private_key_base64: ipns_private_key_base64.trim().to_string(),
-            desired_fragment: {
-                let fragment = desired_fragment.trim();
-                if fragment.is_empty() {
-                    None
-                } else {
-                    Some(fragment.to_string())
-                }
-            },
-        },
-    )
-    .await?;
-    serde_json::to_string(&response).map_err(js_err)
-}
+    let encrypted: EncryptedIdentityBundle = serde_json::from_str(encrypted_bundle_json)
+        .map_err(|e| js_err(format!("invalid bundle JSON: {e}")))?;
+    let plain_bytes = decrypt_bundle(passphrase, &encrypted).map_err(js_err)?;
+    let plain: IdentityBundlePlain = serde_json::from_slice(&plain_bytes)
+        .map_err(|e| js_err(format!("bundle corrupted: {e}")))?;
 
-#[wasm_bindgen]
-pub async fn closet_publish_did_document(
-    endpoint_id: &str,
-    session_id: &str,
-    did_document_json: &str,
-    ipns_private_key_base64: &str,
-    desired_fragment: &str,
-) -> Result<String, JsValue> {
-    let response = send_closet_request(
-        endpoint_id,
-        ClosetRequest::PublishDidDocument {
-            session_id: session_id.trim().to_string(),
-            did_document_json: did_document_json.to_string(),
-            ipns_private_key_base64: ipns_private_key_base64.trim().to_string(),
-            desired_fragment: {
-                let fragment = desired_fragment.trim();
-                if fragment.is_empty() {
-                    None
-                } else {
-                    Some(fragment.to_string())
-                }
-            },
+    let did_document_json = plain
+        .document
+        .marshal()
+        .map_err(|e| js_err(format!("failed to marshal DID document: {e}")))?;
+
+    let target_did = Did::try_from(plain.document.id.as_str())
+        .map(|did| did.without_fragment().id())
+        .unwrap_or_else(|_| plain.document.id.clone());
+
+    let payload = IpfsPublishDidRequest {
+        did_document_json,
+        ipns_private_key_base64: ipns_private_key_base64.trim().to_string(),
+        desired_fragment: {
+            let fragment = desired_fragment.trim();
+            if fragment.is_empty() {
+                None
+            } else {
+                Some(fragment.trim_start_matches('#').to_string())
+            }
         },
-    )
-    .await?;
+    };
+
+    let request = build_signed_request_from_content(
+        passphrase,
+        encrypted_bundle_json,
+        actor_name,
+        target_did.as_str(),
+        CONTENT_TYPE_DOC,
+        serde_json::to_vec(&payload).map_err(js_err)?,
+        js_sys::Date::now() as u64,
+        DEFAULT_MESSAGE_TTL_SECS,
+    )?;
+
+    let response = send_ipfs_publish_request(endpoint_id, request).await?;
     serde_json::to_string(&response).map_err(js_err)
 }
 

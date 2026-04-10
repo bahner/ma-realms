@@ -1,9 +1,9 @@
 .PHONY: build build-dev build-release cid show-cid serve publish release test-web clean distclean
 
 HOME_RS := $(shell find src -type f -name '*.rs')
-DID_MA_RS := $(shell find ../../ma/src -type f -name '*.rs')
+DID_MA_RS := $(shell find ../../did/src -type f -name '*.rs')
 MA_CORE_RS := $(shell find ../core/src -type f -name '*.rs')
-BUILD_INPUTS := Makefile Cargo.toml Cargo.lock ../../ma/Cargo.toml ../../ma/Cargo.lock ../core/Cargo.toml $(HOME_RS) $(DID_MA_RS) $(MA_CORE_RS)
+BUILD_INPUTS := Makefile Cargo.toml Cargo.lock ../../did/Cargo.toml ../../did/Cargo.lock ../core/Cargo.toml $(HOME_RS) $(DID_MA_RS) $(MA_CORE_RS)
 WEB_JS_SOURCES := $(shell find www -type f \( -name '*.js' -o -name '*.mjs' \) 2>/dev/null)
 TEST_WEB_INPUTS := $(BUILD_INPUTS) $(WEB_JS_SOURCES)
 

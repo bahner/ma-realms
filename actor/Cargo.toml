@@ -12,7 +12,7 @@ js-sys = "0.3"
 wasm-bindgen-futures = "0.4"
 tokio = { version = "1.37", features = ["io-util", "sync"] }
 
-did-ma = { path = "../../ma" }
+did-ma = { package = "ma-did", path = "../../did" }
 ma-core = { path = "../core" }
 iroh = { version = "0.97.0" }
 

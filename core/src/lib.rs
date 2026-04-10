@@ -2,10 +2,8 @@
 
 pub mod addressing;
 pub mod bootstrap_identity;
-pub mod closet_client;
-pub mod closet_domain;
-pub mod closet_policy;
 pub mod capability_acl;
+pub mod command_syntax;
 pub mod domain;
 pub mod interfaces;
 pub mod object_runtime;
@@ -30,28 +28,11 @@ pub use capability_acl::{
     parse_capability_acl_text, parse_object_local_capability_acl,
     subject_has_capability, subject_has_capability_with_owner, validate_capability_acl,
 };
-pub use closet_client::{
-    closet_command, closet_start, closet_submit_citizenship, send_closet_request,
-};
-pub use closet_domain::{
-    CLOSET_EMPTY_MESSAGE,
-    CLOSET_HELP_MESSAGE,
-    CLOSET_HELP_PROMPT,
-    ClosetCommand,
-    ClosetProfileField,
-    ClosetRecoveryCommand,
-    parse_closet_command,
-};
-pub use closet_policy::{
-    ClosetDidPublishPlan,
-    ensure_issued_document_root_match,
-    ensure_session_document_root_match,
-    plan_closet_did_publish,
-};
+pub use command_syntax::{parse_property_command, parse_property_command_for_keys, PropertyCommand};
 pub use domain::{ActorType, AvatarActor, ExitData, ObjectData, RoomActor, WorldActor};
 pub use interfaces::{AclRuntime, DidPublisher, IpfsPublisher};
 pub use object_runtime::{
-    CLOSET_COMMANDS_INLINE, MAILBOX_COMMANDS_INLINE,
+    MAILBOX_COMMANDS_INLINE,
     ObjectCommandOutput, ObjectCommandResult, ObjectDefinition, ObjectInboxMessage,
     ObjectMessageIntent, ObjectMessageKind, ObjectMessageRetention, ObjectMessageTarget, ObjectPersistencePolicy,
     ObjectProgramRef, ObjectReceiverListener, ObjectRuntimeState, PendingEphemeralRequest,
@@ -62,10 +43,10 @@ pub use parser::{
 };
 pub use pinning::{PinUpdateOutcome, pin_update_add_rm};
 pub use protocol::{
-    ClosetRequest, ClosetResponse,
+    IpfsPublishDidRequest, IpfsPublishDidResponse,
     LaneCapability, PresenceAvatar, RoomEvent, TransportAck, TransportAckCode, WorldCommand,
     WorldLane, WorldRequest, WorldResponse,
-    BROADCAST_ALPN, CLOSET_ALPN, DEFAULT_WORLD_RELAY_URL, INBOX_ALPN, PRESENCE_ALPN,
+    BROADCAST_ALPN, DEFAULT_WORLD_RELAY_URL, INBOX_ALPN, IPFS_ALPN, PRESENCE_ALPN,
     WHISPER_ALPN,
     DEFAULT_CONTENT_TYPE, CONTENT_TYPE_CHAT, CONTENT_TYPE_PRESENCE,
     CONTENT_TYPE_WORLD, CONTENT_TYPE_BROADCAST,

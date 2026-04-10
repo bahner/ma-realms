@@ -70,7 +70,7 @@ log_level: info
 log_file: /tmp/ma-world.log
 actor_web_version: 0.1.0
 actor_web_cid: bafy...
-actor_web_dir: /home/user/src/rust-ma/ma-actor/www
+actor_web_dir: /home/user/src/ma/rust/ma-realms/actor/www
 actor_web_listen: 127.0.0.1:8081
 actor_web_cache_dir: /home/user/.local/share/ma/actor-web
 actor_web_ipns_key: ma-actor
@@ -93,7 +93,7 @@ cargo run --manifest-path ma-world/Cargo.toml -- --world-slug <slug> --cid <bafy
 Actor web metadata/CID resolution priority:
 
 - explicit runtime override `actor_web_cid`
-- automatic local build from `actor_web_dir` (or sibling `../ma-actor/www`) when `actor_web_auto_build: true`
+- automatic local build from `actor_web_dir` (or sibling `../actor/www`) when `actor_web_auto_build: true`
 - authored `world_manifest.yaml` active actor web CID
 - fallback resolve from Kubo IPNS key `actor_web_ipns_key`
 
@@ -433,7 +433,7 @@ CORS is open (`*`) so `ma-actor` can fetch status from the browser.
 | Crate | Role |
 | ------- | ------ |
 | `iroh 0.97` | P2P endpoint and protocol routing |
-| `did-ma` | DID/Document/Message types, signing, verification |
+| `ma-did` | DID/Document/Message types, signing, verification |
 | `ma-actor` | Shared ALPN constants, wire types, command dispatch |
 | `axum` + `tower-http` | Status page HTTP server with CORS |
 | `reqwest` | Kubo HTTP API client |
@@ -442,7 +442,7 @@ CORS is open (`*`) so `ma-actor` can fetch status from the browser.
 | `serde_yaml` | Config and room definition serialisation |
 | `tracing` | Structured logging |
 
-- **did-ma**: DID primitives (local path dependency)
+- **ma-did**: DID primitives (local path dependency)
 - **tracing**: Structured logging
 - **serde_json**: JSON serialization
 - **reqwest**: HTTP client (for Kubo integration)

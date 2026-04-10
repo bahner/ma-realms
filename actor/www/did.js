@@ -64,7 +64,7 @@ export async function resolveEndpointWithTypePolicy({
   const worldHintRoot = worldHintRaw ? didRoot(worldHintRaw) : '';
   const localEndpoint = extractWorldEndpointFromDidDoc(targetDoc);
 
-  const transportKinds = new Set(['world', 'agent', 'bot', 'object']);
+  const transportKinds = new Set(['world', 'agent', 'object']);
   const worldPointerKinds = new Set(['avatar', 'room', 'exit']);
   const knownType = Boolean(kind);
 

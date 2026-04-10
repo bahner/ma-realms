@@ -1,6 +1,8 @@
 export function normalizeLanguageOrder(value, fallback = 'nb_NO:en_UK') {
   const normalized = String(value || '')
-    .split(/[:;,]+/)
+    // Backward compatibility: migrate old separators to GNU LANGUAGE style.
+    .replace(/[;,]+/g, ':')
+    .split(/:+/)
     .map((entry) => String(entry || '').trim())
     .filter(Boolean)
     .join(':');

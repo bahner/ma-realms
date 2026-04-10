@@ -17,6 +17,7 @@ import init, {
   send_world_whisper_with_ttl,
   send_world_cmd,
   send_world_cmd_with_ttl,
+  publish_did_document_via_world_ipfs,
   decode_chat_event_message,
   decode_whisper_event_message,
   start_inbox_listener,
@@ -33,7 +34,6 @@ import init, {
 } from './pkg/ma_actor.js';
 import { createInboundDispatcher, createInboxTransport } from './inbox.js';
 import { createAliasFlow, isPrintableAliasLabel, isValidAliasName } from './alias.js';
-import { createClosetFlow } from './closet.js';
 import { createDialogWriter } from './dialog-writer.js';
 import { createIdentityFlow, createIdentityLineFlow, createIdentityStore } from './identity.js';
 import { createEditorUi } from './editor.js';
@@ -121,6 +121,7 @@ const LAST_ACTIVE_HOME_KEY_PREFIX = `${STORAGE_PREFIX}.lastActiveHome`;
 const BLOCKLIST_KEY_PREFIX = `${STORAGE_PREFIX}.blockedDidRoots`;
 const LAST_PUBLISHED_IPNS_KEY = `${STORAGE_PREFIX}.lastPublishedIpns`;
 const LAST_PUBLISHED_CID_KEY = `${STORAGE_PREFIX}.lastPublishedCid`;
+const IPNS_PRIVATE_KEY_B64_KEY = `${STORAGE_PREFIX}.ipnsPrivateKeyB64`;
 const LEGACY_ALIAS_KEY = 'ma.identity.v2.alias';
 const DEFAULT_UI_LANG = 'en';
 const DEFAULT_LANGUAGE_ORDER = 'nb_NO:en_UK';
@@ -214,11 +215,6 @@ const state = {
   activeObjectTargetAlias: '',
   activeObjectTargetDid: '',
   activeObjectTargetRequirement: 'none',
-  closetSessionId: '',
-  closetSessionDid: '',
-  closetEndpointId: '',
-  closetLobbySeq: 0,
-  closetPendingIpnsPrivateKeyB64: '',
   didPublishPromise: null,
   didPublishError: '',
   didPublishPendingCache: new Map(),
@@ -466,9 +462,7 @@ async function restoreActiveHomeAfterUnlock() {
 
   appendMessage('system', `Restoring last location: ${snapshot.target}`);
   try {
-    await enterHome(snapshot.target, snapshot.room || null, {
-      allowClosetFallback: false,
-    });
+    await enterHome(snapshot.target, snapshot.room || null);
   } catch (error) {
     appendMessage('system', `Could not restore last location: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -1609,7 +1603,7 @@ async function saveEditorChanges() {
     setEditorStatus(`Sending YAML for exit '${exitId}' to world...`, 'working');
     try {
       const payload = encodeUtf8Base64(yamlText);
-      const reply = await sendWorldCommandQuery(`@here set exit-content-b64 ${exitId} ${payload}`);
+      const reply = await sendWorldCommandQuery(`@here.exit-content-b64 ${exitId} ${payload}`);
       const exitCidMatch = reply.match(/published as\s+([A-Za-z0-9]+)/i);
       const roomCidMatch = reply.match(/updated to\s+([A-Za-z0-9]+)/i);
       if (exitCidMatch && exitCidMatch[1]) {
@@ -1642,7 +1636,7 @@ async function saveEditorChanges() {
 
     const safeRoomYaml = sanitizeRoomYamlForEdit(yamlText);
     const payload = encodeUtf8Base64(safeRoomYaml);
-    const reply = await sendWorldCommandQuery(`@here set content-b64 ${payload}`);
+    const reply = await sendWorldCommandQuery(`@here.content-b64 ${payload}`);
     const cidMatch = reply.match(/as\s+([A-Za-z0-9]+)/i);
     if (cidMatch && cidMatch[1]) {
       state.editSession.sourceCid = cidMatch[1];
@@ -2094,27 +2088,6 @@ const { fetchCurrentRoomInspectData, inspectExitByQuery } = createRoomInspectFlo
   uiText,
   appendMessage,
 });
-
-const closetFlow = createClosetFlow({
-  state,
-  byId,
-  appendMessage,
-  didRoot,
-  didPublishPendingTtlMs: DID_PUBLISH_PENDING_TTL_MS,
-  isValidAliasName,
-  saveIdentityRecord,
-  updateIdentityLine,
-  ensureBundleIrohSecret: ensure_bundle_iroh_secret,
-});
-
-const {
-  isClosetRequiredMessage,
-  isClosetBootstrapFailureMessage,
-  normalizeClosetInput,
-  renderClosetResponse,
-  closetStartSessionForEndpoint,
-  closetCommandForCurrentWorld,
-} = closetFlow;
 
 // Logging system: always visible in browser console; mirrored in chat when debug mode is enabled.
 const logger = {
@@ -3084,7 +3057,6 @@ async function enterHome(target, preferredRoom = null) {
   const options = (typeof arguments[2] === 'object' && arguments[2] !== null) ? arguments[2] : {};
   const silent = Boolean(options.silent);
   const skipLocalDidProbe = Boolean(options.skipLocalDidProbe);
-  const allowClosetFallback = options.allowClosetFallback !== false;
   if (!state.identity) {
     throw new Error('Load or create an identity before entering a home.');
   }
@@ -3197,63 +3169,53 @@ async function enterHome(target, preferredRoom = null) {
   }
 
   const localDidRoot = didRoot(String(state.identity?.did || '').trim());
-  const hasActiveClosetForEndpoint = Boolean(
-    String(state.closetSessionId || '').trim()
-    && String(state.closetEndpointId || '').trim() === endpointId
-  );
-  if (localDidRoot && !hasActiveClosetForEndpoint && !skipLocalDidProbe) {
-    fetchDidDocumentJsonByDid(localDidRoot, {
-      forceRefresh: true,
-      localOnly: true,
-      timeoutMs: 2000,
-    }).catch((error) => {
+  if (localDidRoot && !skipLocalDidProbe) {
+    let didPublishedInIpfs = false;
+    try {
+      await fetchDidDocumentJsonByDid(localDidRoot, {
+        forceRefresh: true,
+        timeoutMs: 3000,
+      });
+      didPublishedInIpfs = true;
+    } catch (error) {
       logger.log(
         'connect.home',
-        `local DID preflight ignored (non-blocking): ${error instanceof Error ? error.message : String(error)}`
+        `local DID preflight missing in IPFS: ${error instanceof Error ? error.message : String(error)}`
       );
-    });
-  } else if (localDidRoot && hasActiveClosetForEndpoint) {
-    logger.log('connect.home', 'skipping local DID probe during active closet reconnect flow');
+    }
+
+    if (!didPublishedInIpfs) {
+      try {
+        appendMessage('system', 'Local DID not found in IPFS. Sending DID document to trusted world (ma/ipfs/1).');
+        const raw = await withTimeout(
+          publish_did_document_via_world_ipfs(
+            endpointId,
+            state.passphrase,
+            state.encryptedBundle,
+            currentActorFragment(),
+            String(localStorage.getItem(IPNS_PRIVATE_KEY_B64_KEY) || '').trim(),
+            currentActorFragment()
+          ),
+          10000,
+          'ma/ipfs/1 publish request timed out'
+        );
+        const response = JSON.parse(String(raw || '{}'));
+        if (response?.ok) {
+          appendMessage('system', response.message || 'DID document cached by trusted world.');
+        } else {
+          appendMessage('system', response?.message || 'Trusted world DID cache request failed.');
+        }
+      } catch (error) {
+        appendMessage(
+          'system',
+          `Trusted world DID publish request failed (continuing): ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
   }
 
   if (!silent) {
     appendMessage('system', `Connecting to ${endpointId}...`);
-  }
-
-  async function enterClosetOnboardingFallback(reasonText) {
-    const reason = String(reasonText || '').trim();
-    if (reason) {
-      appendMessage('system', reason);
-    }
-
-    const tryStart = async (attempt) => {
-      try {
-        const closet = await closetStartSessionForEndpoint(endpointId);
-        logger.log(
-          'connect.home',
-          `closet onboarding session started (attempt ${attempt}): ${closet.session_id || state.closetSessionId || '(missing session id)'}`
-        );
-        appendMessage('system', `Closet session: ${closet.session_id || state.closetSessionId}`);
-        renderClosetResponse(closet);
-        return true;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        logger.warn('connect.home', `closet onboarding start failed (attempt ${attempt}): ${message}`);
-        return false;
-      }
-    };
-
-    if (await tryStart(1)) {
-      return true;
-    }
-
-    await delay(250);
-    if (await tryStart(2)) {
-      return true;
-    }
-
-    appendMessage('system', 'Could not start closet onboarding session right now. Try go <world> again.');
-    return false;
   }
 
   const requestedRoom = effectivePreferredRoom;
@@ -3275,31 +3237,12 @@ async function enterHome(target, preferredRoom = null) {
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (isClosetBootstrapFailureMessage(message)) {
-      if (!allowClosetFallback) {
-        throw new Error(message || 'Closet onboarding required.');
-      }
-      await enterClosetOnboardingFallback(
-        'No avatar available for this DID yet, or DID publish is not ready. Entering closet onboarding.'
-      );
-      return;
-    }
     throw error;
   }
   logger.log('connect.home', `result ok=${result.ok} room=${result.room} endpoint=${result.endpoint_id?.slice(0, 8)}... latest_seq=${result.latest_event_sequence || 0}`);
 
   if (!result.ok) {
     logger.warn('connect.home', `world enter returned ok=false: ${String(result.message || '(empty message)')}`);
-    if (isClosetRequiredMessage(result.message) || isClosetBootstrapFailureMessage(result.message)) {
-      if (!allowClosetFallback) {
-        throw new Error(result.message || 'Closet onboarding required.');
-      }
-      logger.log('connect.home', 'starting closet onboarding fallback after world rejection');
-      await enterClosetOnboardingFallback(
-        result.message || 'No avatar profile is ready yet. Closet onboarding is required first.'
-      );
-      return;
-    }
     throw new Error(result.message || 'enter failed');
   }
 
@@ -3318,10 +3261,6 @@ async function enterHome(target, preferredRoom = null) {
     lastEventSequence: toSequenceNumber(result.latest_event_sequence || 0),
     handle: result.handle || state.aliasName
   };
-  state.closetSessionId = '';
-  state.closetSessionDid = '';
-  state.closetEndpointId = '';
-  state.closetLobbySeq = 0;
   primeDidLookupCacheFromRoomObjectDids(result.room_object_dids);
   saveLastRoom(endpointId, activeRoom);
   saveActiveHomeSnapshot();
@@ -3369,9 +3308,6 @@ const tryHandleDidTargetMetaPoll = createDidTargetMetaPollHandler({
 worldDispatchFlow = createWorldDispatchFlow({
   state,
   appendMessage,
-  normalizeClosetInput,
-  closetCommandForCurrentWorld,
-  renderClosetResponse,
   enterHome,
   isLikelyIrohAddress,
   normalizeIrohAddress,

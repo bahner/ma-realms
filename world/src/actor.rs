@@ -50,6 +50,7 @@ pub struct Avatar {
     pub object_shortcuts: HashMap<String, String>,
     pub acl: ActorAcl,
     pub joined_at: std::time::SystemTime,
+    pub last_seen_at: std::time::SystemTime,
 }
 
 impl Avatar {
@@ -65,7 +66,12 @@ impl Avatar {
             object_shortcuts: HashMap::new(),
             acl: ActorAcl::open(),
             joined_at: std::time::SystemTime::now(),
+            last_seen_at: std::time::SystemTime::now(),
         }
+    }
+
+    pub fn touch_presence(&mut self) {
+        self.last_seen_at = std::time::SystemTime::now();
     }
 
     fn normalize_shortcut(alias: &str) -> Option<String> {

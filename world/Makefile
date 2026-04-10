@@ -15,12 +15,12 @@ help:
 
 build: $(STAMP)
 
-$(STAMP): Cargo.toml src/*.rs ../../ma/src/*.rs ../core/src/*.rs
+$(STAMP): Cargo.toml src/*.rs ../../did/src/*.rs ../core/src/*.rs
 	MA_WORLD_VERSION="$(MA_WORLD_VERSION)" cargo build
 	@mkdir -p $(dir $(STAMP))
 	@touch $(STAMP)
 
-release: Cargo.toml src/*.rs ../../ma/src/*.rs ../core/src/*.rs
+release: Cargo.toml src/*.rs ../../did/src/*.rs ../core/src/*.rs
 	MA_WORLD_VERSION="$(MA_WORLD_VERSION)" cargo build --release
 	@echo "🏗️  Release binary at $(RELEASE_BINARY)"
 
