@@ -53,7 +53,12 @@ Merk: full world message runtime (`poll/send/ack`) er ikke implementert i dagens
 
 - POST /api/v0/agents/{id}/poll
 - POST /api/v0/agents/{id}/ack
+
+## 5.1 Implemented send route
+
 - POST /api/v0/agents/{id}/send
+- Supports `mode=command|chat`
+- Resolves target world endpoint from `to` DID root (or uses agent world root when omitted)
 
 ## 6. MCP bridge (stdio)
 

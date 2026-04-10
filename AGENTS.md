@@ -47,3 +47,17 @@ Make sure to supplement did:ma og ma-core with new functions that have general v
 Don't mutate data that's is badly formed. Raise an error instead.
 
 When validating input always check if input is valid and else fail. You should mot explicitly search for previously mention errors and just raise an error for arbitrary values, unless this is required. Don't create a set of error values, but of valid values and check for membership in that else fail.
+
+Actor runtime invariants (chat/input routing):
+
+- `@` in user input means target routing. Resolve aliases behind `@...` to DID before evaluation.
+- Explicit DID targets (`@did:ma:...`) must be preserved as typed in send paths and must not be rewritten to alias labels.
+- For DID path routing:
+	- `@did:ma:<world>.<method>` routes as world method (`@world.<method>` semantics).
+	- `@did:ma:<world>.<object>.<method>` routes as object method (`did root + #object` target).
+- DID/object commands should work statelessly (without requiring active room presence state). Avatar/room presence commands may still require presence.
+- Dynamic special aliases are system-managed and auto-refreshed on enter/room changes:
+	- `@world`, `@here`, `@me`, `@avatar`
+	- These must appear in `.aliases`.
+	- Users should not manually manage these aliases; runtime may overwrite them at any time.
+- Error text for target resolution should prefer raw DID visibility over alias-humanized display when debugging unknown-target failures.

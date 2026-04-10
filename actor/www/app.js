@@ -1178,9 +1178,6 @@ async function resolveCommandTargetDidOrToken(targetToken) {
     cacheRoomDidLookup(raw, activeDid);
     return activeDid;
   }
-  if (isBuiltinTargetToken(raw)) {
-    return raw;
-  }
   if (isMaDid(raw)) {
     return raw;
   }
@@ -1248,6 +1245,10 @@ async function resolveCommandTargetDidOrToken(targetToken) {
   if (isMaDid(didByEndpoint)) {
     cacheRoomDidLookup(raw, didByEndpoint);
     return didByEndpoint;
+  }
+
+  if (isBuiltinTargetToken(raw)) {
+    return raw;
   }
 
   return await lookupDidInCurrentRoom(raw);

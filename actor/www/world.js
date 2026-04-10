@@ -482,6 +482,10 @@ export function createWorldDispatchFlow({
     if (fragment) {
       return fragment;
     }
+    const roomHandle = String(state.currentHome?.handle || '').trim();
+    if (roomHandle) {
+      return roomHandle;
+    }
     return String(state.aliasName || 'actor').trim();
   }
 
@@ -517,11 +521,6 @@ export function createWorldDispatchFlow({
       return text;
     }
     if (!text.trim() || text.trim().startsWith("'")) {
-      return text;
-    }
-
-    // Preserve explicit DID targets exactly as typed.
-    if (/^\s*@did:ma:/iu.test(text)) {
       return text;
     }
 
@@ -571,6 +570,29 @@ export function createWorldDispatchFlow({
         return all;
       }
       return `${prefix}${normalized}${String(suffix || '')}`;
+    });
+
+    out = out.replace(/^(\s*@\S+)(\s+.+)$/u, (all, head, tail) => {
+      const parts = String(tail || '').trim().split(/\s+/u);
+      const rewritten = parts.map((token) => {
+        const raw = String(token || '').trim();
+        if (!raw) {
+          return raw;
+        }
+        if (raw.includes('"') || raw.includes("'")) {
+          return raw;
+        }
+
+        const direct = resolveAliasTarget(raw, aliases);
+        const stripped = resolveAliasTarget(raw.replace(/^@+/, ''), aliases);
+        const resolved = String(direct || stripped || '').trim();
+        if (!resolved || !isMaDid(resolved)) {
+          return raw;
+        }
+        return resolved;
+      });
+
+      return `${head} ${rewritten.join(' ')}`;
     });
 
     return out;

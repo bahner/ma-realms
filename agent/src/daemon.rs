@@ -9,12 +9,13 @@ use axum::{
 };
 use chrono::{SecondsFormat, Utc};
 use did_ma::{Did, Document, EncryptionKey, SigningKey, VerificationMethod};
-use iroh::{EndpointId, SecretKey};
-use ma_core::{INBOX_ALPN, default_ma_config_root};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey, endpoint::presets};
+use ma_core::{CONTENT_TYPE_WORLD, DEFAULT_WORLD_RELAY_URL, INBOX_ALPN, MessageEnvelope, WorldCommand, WorldRequest, WorldResponse, default_ma_config_root, normalize_relay_url, parse_message, resolve_inbox_endpoint_id};
 use rand::RngCore;
 use reqwest::multipart;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 use tokio::time::{Duration, sleep};
 
@@ -153,6 +154,15 @@ struct AppendLogRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct SendAgentRequest {
+    room: Option<String>,
+    to: Option<String>,
+    mode: Option<String>,
+    body: String,
+    ttl_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct UpdateConfigRequest {
     kubo_key_alias: Option<String>,
     lock_ttl: Option<u64>,
@@ -167,6 +177,14 @@ struct ValidateAliasQuery {
 struct GenericResponse {
     ok: bool,
     message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SendAgentResponse {
+    ok: bool,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    world_response: Option<WorldResponse>,
 }
 
 #[derive(Debug, Serialize)]
@@ -256,6 +274,7 @@ pub async fn run_daemon(
         .route("/api/v0/agents/{id}", delete(delete_agent))
         .route("/api/v0/agents/{id}/logs", get(get_logs))
         .route("/api/v0/agents/{id}/log", post(append_log))
+        .route("/api/v0/agents/{id}/send", post(send_agent))
         .with_state(state.clone());
 
     let cfg_now = state.cfg.read().await.clone();
@@ -1443,4 +1462,293 @@ async fn append_log(
         ok: true,
         message: format!("log appended for '{}'", id),
     })
+}
+
+fn world_root_from_did_text(input: &str) -> Option<String> {
+    let did = Did::try_from(input.trim()).ok()?;
+    Some(did.without_fragment().id())
+}
+
+fn build_agent_signing_key(root_did: &str, sig_private: &[u8]) -> Result<SigningKey> {
+    let key_id = root_did
+        .trim()
+        .strip_prefix("did:ma:")
+        .ok_or_else(|| anyhow!("invalid world DID root '{}'", root_did))?;
+    let signing_did = Did::new(key_id, "sig")?;
+    let key_bytes: [u8; 32] = sig_private
+        .try_into()
+        .map_err(|_| anyhow!("invalid signing key length"))?;
+    SigningKey::from_private_key_bytes(signing_did, key_bytes).map_err(|e| anyhow!(e.to_string()))
+}
+
+async fn resolve_world_endpoint_id_from_did(kubo_url: &str, world_root_did: &str) -> Result<String> {
+    let root = world_root_from_did_text(world_root_did)
+        .ok_or_else(|| anyhow!("invalid world DID '{}'", world_root_did))?;
+    let ipns_id = root
+        .strip_prefix("did:ma:")
+        .ok_or_else(|| anyhow!("invalid world DID root '{}'", root))?;
+    let resolved = kubo_name_resolve(kubo_url, &format!("/ipns/{}", ipns_id)).await?;
+    let doc = resolved_root_did_document(kubo_url, &resolved, &root)
+        .await?
+        .ok_or_else(|| anyhow!("resolved DID document mismatch for {}", root))?;
+
+    let endpoint = doc
+        .ma
+        .as_ref()
+        .and_then(|ma| {
+            resolve_inbox_endpoint_id(
+                ma.current_inbox.as_deref(),
+                ma.presence_hint.as_deref(),
+                ma.transports.as_ref(),
+            )
+        })
+        .ok_or_else(|| anyhow!("world DID '{}' has no inbox endpoint", root))?;
+    Ok(endpoint)
+}
+
+async fn send_world_request_over_iroh(endpoint_id: &str, request: WorldRequest) -> Result<WorldResponse> {
+    let target: EndpointId = endpoint_id
+        .trim()
+        .parse()
+        .map_err(|e| anyhow!("invalid endpoint id: {}", e))?;
+
+    let endpoint = Endpoint::builder(presets::N0)
+        .bind()
+        .await
+        .map_err(|e| anyhow!("endpoint bind failed: {}", e))?;
+    let _ = endpoint.online().await;
+
+    let relay_source = normalize_relay_url(DEFAULT_WORLD_RELAY_URL);
+    let relay_url: RelayUrl = relay_source
+        .parse()
+        .map_err(|e| anyhow!("relay URL parse failed for '{}': {}", relay_source, e))?;
+    let endpoint_addr = EndpointAddr::new(target).with_relay_url(relay_url);
+
+    let connection = endpoint
+        .connect(endpoint_addr, INBOX_ALPN)
+        .await
+        .map_err(|e| anyhow!("endpoint.connect() failed: {}", e))?;
+
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|e| anyhow!("connection.open_bi() failed: {}", e))?;
+
+    let payload = serde_json::to_vec(&request)?;
+    send.write_u32(payload.len() as u32).await?;
+    send.write_all(&payload).await?;
+    send.flush().await?;
+
+    let frame_len = recv.read_u32().await? as usize;
+    if frame_len > 1024 * 1024 {
+        return Err(anyhow!("world response frame too large: {}", frame_len));
+    }
+    let mut bytes = vec![0u8; frame_len];
+    recv.read_exact(&mut bytes).await?;
+
+    let _ = send.finish();
+    connection.close(0u32.into(), b"ok");
+    endpoint.close().await;
+
+    let response = serde_json::from_slice::<WorldResponse>(&bytes)
+        .map_err(|e| anyhow!("invalid world response: {}", e))?;
+    Ok(response)
+}
+
+async fn send_agent(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<SendAgentRequest>,
+) -> Json<SendAgentResponse> {
+    let id = id.trim().to_string();
+    if !is_valid_agent_id(&id) {
+        return Json(SendAgentResponse {
+            ok: false,
+            message: format!("invalid agent id '{}'", id),
+            world_response: None,
+        });
+    }
+
+    let mut meta = match load_agent_meta(&state, &id) {
+        Ok(meta) => meta,
+        Err(_) => {
+            return Json(SendAgentResponse {
+                ok: false,
+                message: format!("agent '{}' not found", id),
+                world_response: None,
+            });
+        }
+    };
+
+    let body = req.body.trim();
+    if body.is_empty() {
+        return Json(SendAgentResponse {
+            ok: false,
+            message: "body must not be empty".to_string(),
+            world_response: None,
+        });
+    }
+
+    let mode = req.mode.as_deref().unwrap_or("command").trim().to_ascii_lowercase();
+    if mode != "command" && mode != "chat" {
+        return Json(SendAgentResponse {
+            ok: false,
+            message: format!("unsupported mode '{}': expected command|chat", mode),
+            world_response: None,
+        });
+    }
+
+    let cfg = state.cfg.read().await.clone();
+    let sender_world_root = if !cfg.world_did_root.trim().is_empty() {
+        cfg.world_did_root.trim().to_string()
+    } else {
+        match ensure_world_root_did_published(&state).await {
+            Ok(root) => root,
+            Err(err) => {
+                return Json(SendAgentResponse {
+                    ok: false,
+                    message: format!("failed ensuring world DID root: {}", err),
+                    world_response: None,
+                });
+            }
+        }
+    };
+
+    let sender_did = format!("{}#{}", sender_world_root, id);
+    if meta.did != sender_did {
+        meta.did = sender_did.clone();
+        meta.updated_at = Utc::now().to_rfc3339();
+        let _ = save_agent_meta(&state, &meta);
+    }
+
+    let target_world_root = req
+        .to
+        .as_deref()
+        .and_then(world_root_from_did_text)
+        .unwrap_or_else(|| sender_world_root.clone());
+
+    let endpoint_id = match resolve_world_endpoint_id_from_did(&cfg.kubo_api_url, &target_world_root).await {
+        Ok(value) => value,
+        Err(err) => {
+            return Json(SendAgentResponse {
+                ok: false,
+                message: format!("failed resolving world endpoint: {}", err),
+                world_response: None,
+            });
+        }
+    };
+
+    let room = req.room.unwrap_or_else(|| "lobby".to_string()).trim().to_string();
+    let envelope = if mode == "chat" {
+        MessageEnvelope::Chatter {
+            text: body.to_string(),
+        }
+    } else {
+        let command_text = if body.starts_with('@') {
+            body.to_string()
+        } else if let Some(to) = req.to.as_deref() {
+            format!("@{} {}", to.trim(), body)
+        } else {
+            body.to_string()
+        };
+        parse_message(&command_text)
+    };
+
+    let content = match serde_json::to_vec(&WorldCommand::Message { room, envelope }) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return Json(SendAgentResponse {
+                ok: false,
+                message: format!("failed encoding world command: {}", err),
+                world_response: None,
+            });
+        }
+    };
+
+    let secret_paths = match ensure_daemon_secret_files_for(&cfg, &state.config_path) {
+        Ok(paths) => paths,
+        Err(err) => {
+            return Json(SendAgentResponse {
+                ok: false,
+                message: format!("failed loading daemon secrets: {}", err),
+                world_response: None,
+            });
+        }
+    };
+    let signing_secret = match ensure_secret_file(&secret_paths.sig_path, 32, "agent signing secret") {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return Json(SendAgentResponse {
+                ok: false,
+                message: format!("failed reading signing secret: {}", err),
+                world_response: None,
+            });
+        }
+    };
+    let signing_key = match build_agent_signing_key(&sender_world_root, &signing_secret) {
+        Ok(key) => key,
+        Err(err) => {
+            return Json(SendAgentResponse {
+                ok: false,
+                message: format!("failed preparing signing key: {}", err),
+                world_response: None,
+            });
+        }
+    };
+
+    let ttl = req.ttl_seconds.unwrap_or(60);
+    let message = match did_ma::Message::new_with_ttl(
+        sender_did.clone(),
+        target_world_root.clone(),
+        CONTENT_TYPE_WORLD,
+        content,
+        ttl,
+        &signing_key,
+    ) {
+        Ok(msg) => msg,
+        Err(err) => {
+            return Json(SendAgentResponse {
+                ok: false,
+                message: format!("failed building signed message: {}", err),
+                world_response: None,
+            });
+        }
+    };
+
+    let request = match message.to_cbor() {
+        Ok(message_cbor) => WorldRequest { message_cbor },
+        Err(err) => {
+            return Json(SendAgentResponse {
+                ok: false,
+                message: format!("failed encoding message cbor: {}", err),
+                world_response: None,
+            });
+        }
+    };
+
+    match send_world_request_over_iroh(&endpoint_id, request).await {
+        Ok(world_response) => {
+            let _ = append_agent_log_line(
+                &state,
+                &id,
+                &format!(
+                    "sent mode={} to={} endpoint={} ok={}",
+                    mode,
+                    target_world_root,
+                    endpoint_id,
+                    world_response.ok
+                ),
+            );
+            Json(SendAgentResponse {
+                ok: true,
+                message: "send ok".to_string(),
+                world_response: Some(world_response),
+            })
+        }
+        Err(err) => Json(SendAgentResponse {
+            ok: false,
+            message: format!("send failed: {}", err),
+            world_response: None,
+        }),
+    }
 }
