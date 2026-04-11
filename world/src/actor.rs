@@ -54,14 +54,13 @@ pub struct Avatar {
 }
 
 impl Avatar {
-    pub fn new(inbox: String, agent_did: Did, agent_endpoint: String, language_order: String) -> Self {
-        let owner = agent_did.without_fragment().id();
+    pub fn new(inbox: String, agent_did: Did, agent_endpoint: String, language_order: String, owner: String) -> Self {
         Self {
             inbox,
             agent_did,
             agent_endpoint,
             language_order,
-            owner: owner.clone(),
+            owner,
             descriptions: HashMap::new(),
             object_shortcuts: HashMap::new(),
             acl: ActorAcl::open(),

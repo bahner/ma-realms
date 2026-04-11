@@ -175,7 +175,10 @@ export function createWorldFlow({
 }) {
   function isNotRegisteredInRoomMessage(message) {
     const text = String(message || '').toLowerCase();
-    return text.includes('not registered in room');
+    return (
+      text.includes('not registered in room')
+      || (text.includes('unknown avatar @') && text.includes(' in room '))
+    );
   }
 
   function isActiveTargetGoneMessage(message) {
@@ -477,16 +480,48 @@ export function createWorldDispatchFlow({
     return value.slice(idx + 1).trim();
   }
 
+  function normalizeActorFragmentCandidate(value) {
+    const raw = String(value || '').trim().replace(/^@+/, '');
+    if (!raw) {
+      return '';
+    }
+    if (!/^[A-Za-z0-9_-]+$/.test(raw)) {
+      return '';
+    }
+    return raw;
+  }
+
   function activeActorName() {
-    const fragment = actorFragmentFromDid(state.identity?.did);
+    const fragment = normalizeActorFragmentCandidate(actorFragmentFromDid(state.identity?.did));
     if (fragment) {
       return fragment;
     }
-    const roomHandle = String(state.currentHome?.handle || '').trim();
-    if (roomHandle) {
-      return roomHandle;
+
+    const aliasFragment = normalizeActorFragmentCandidate(state.aliasName);
+    if (aliasFragment) {
+      return aliasFragment;
     }
-    return String(state.aliasName || 'actor').trim();
+
+    return 'actor';
+  }
+
+  function activeAvatarDid() {
+    const aliasAvatar = String(state.aliasBook?.['@avatar'] || state.aliasBook?.avatar || '').trim();
+    if (isMaDid(aliasAvatar) && aliasAvatar.includes('#')) {
+      return aliasAvatar;
+    }
+
+    const worldRoot = String(
+      state.currentHome?.roomDid
+      || state.aliasBook?.['@world']
+      || state.aliasBook?.world
+      || ''
+    ).trim().split('#')[0];
+    const handle = String(state.currentHome?.handle || '').trim().replace(/^@+/, '');
+    if (isMaDid(worldRoot) && handle && !/\s/u.test(handle)) {
+      return `${worldRoot}#${handle}`;
+    }
+    return '';
   }
 
   function aliasTargetMap() {
@@ -517,9 +552,6 @@ export function createWorldDispatchFlow({
 
   function rewriteAliasesToDid(input) {
     const text = String(input || '');
-    if (!state.aliasRewriteEnabled) {
-      return text;
-    }
     if (!text.trim() || text.trim().startsWith("'")) {
       return text;
     }
@@ -598,10 +630,71 @@ export function createWorldDispatchFlow({
     return out;
   }
 
+  async function normalizeOutgoingAtTarget(commandText) {
+    const trimmed = String(commandText || '').trim();
+    if (!trimmed.startsWith('@')) {
+      return trimmed;
+    }
+
+    const spaceIdx = trimmed.indexOf(' ');
+    const rawTarget = (spaceIdx === -1
+      ? trimmed.substring(1)
+      : trimmed.substring(1, spaceIdx)).trim();
+    const remainder = (spaceIdx === -1
+      ? ''
+      : trimmed.substring(spaceIdx + 1)).trim();
+
+    if (!rawTarget) {
+      return trimmed;
+    }
+
+    const dotIdx = rawTarget.indexOf('.');
+    const baseRaw = String(dotIdx === -1 ? rawTarget : rawTarget.slice(0, dotIdx)).trim();
+    const pathRaw = String(dotIdx === -1 ? '' : rawTarget.slice(dotIdx + 1)).trim();
+    if (!baseRaw) {
+      return trimmed;
+    }
+
+    const resolvedBase = isMaDid(baseRaw)
+      ? baseRaw
+      : await resolveCommandTargetDidOrToken(baseRaw);
+    const normalizedDid = String(resolvedBase || '').trim().replace(/^@+/, '');
+    if (!isMaDid(normalizedDid)) {
+      throw new Error('Target after @ must resolve to did:ma.');
+    }
+
+    const { targetDid, targetPath, routeWorld } = normalizeDidTargetPath(normalizedDid, pathRaw);
+    const normalizedTarget = routeWorld
+      ? `world.${targetPath}`
+      : (targetPath ? `${targetDid}.${targetPath}` : targetDid);
+
+    return remainder
+      ? `@${normalizedTarget} ${remainder}`
+      : `@${normalizedTarget}`;
+  }
+
+  function routeBareCommandToSelfDid(commandText) {
+    const trimmed = String(commandText || '').trim();
+    if (!trimmed || trimmed.startsWith('@') || trimmed.startsWith("'")) {
+      return trimmed;
+    }
+    const selfDid = String(state.identity?.did || '').trim();
+    if (!isMaDid(selfDid)) {
+      return trimmed;
+    }
+    return `@${selfDid} ${trimmed}`;
+  }
+
   async function sendWorldCommandQuery(commandText) {
     if (!state.identity || !state.currentHome) {
       throw new Error('Join a home before sending commands.');
     }
+
+    const rewritten = rewriteAliasesToDid(commandText);
+    const routed = routeBareCommandToSelfDid(rewritten);
+    const normalizedCommand = routed.startsWith('@')
+      ? await normalizeOutgoingAtTarget(routed)
+      : routed;
 
     const result = JSON.parse(
       await sendWorldCmdWithTtl(
@@ -609,8 +702,9 @@ export function createWorldDispatchFlow({
         state.passphrase,
         state.encryptedBundle,
         activeActorName(),
+        activeAvatarDid(),
         state.currentHome.room,
-        commandText,
+        normalizedCommand,
         BigInt(resolveTtlSeconds('cmd'))
       )
     );
@@ -755,6 +849,7 @@ export function createWorldDispatchFlow({
             state.passphrase,
             state.encryptedBundle,
             activeActorName(),
+            activeAvatarDid(),
             state.currentHome.room,
             payload,
             BigInt(resolveTtlSeconds('chat'))
@@ -845,6 +940,8 @@ export function createWorldDispatchFlow({
             state.passphrase,
             state.encryptedBundle,
             activeActorName(),
+            activeAvatarDid(),
+            activeAvatarDid(),
             state.currentHome.room,
             normalized,
             BigInt(resolveTtlSeconds('cmd'))
@@ -867,7 +964,8 @@ export function createWorldDispatchFlow({
       }
 
       const sendStart = Date.now();
-      logger.log('send.command', `room=${state.currentHome.room} actor=${activeActorName()} msg_len=${trimmedText.length}`);
+      const routedText = routeBareCommandToSelfDid(trimmedText);
+      logger.log('send.command', `room=${state.currentHome.room} actor=${activeActorName()} msg_len=${routedText.length}`);
 
       const result = JSON.parse(
         await sendWorldCmdWithTtl(
@@ -875,8 +973,9 @@ export function createWorldDispatchFlow({
           state.passphrase,
           state.encryptedBundle,
           activeActorName(),
+          activeAvatarDid(),
           state.currentHome.room,
-          trimmedText,
+          routedText,
           BigInt(resolveTtlSeconds('cmd'))
         )
       );

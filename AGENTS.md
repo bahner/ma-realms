@@ -53,11 +53,12 @@ Actor runtime invariants (chat/input routing):
 - `@` in user input means target routing. Resolve aliases behind `@...` to DID before evaluation.
 - Explicit DID targets (`@did:ma:...`) must be preserved as typed in send paths and must not be rewritten to alias labels.
 - For DID path routing:
-	- `@did:ma:<world>.<method>` routes as world method (`@world.<method>` semantics).
+	- `@did:ma:<world>.<method>` routes as world method.
 	- `@did:ma:<world>.<object>.<method>` routes as object method (`did root + #object` target).
 - DID/object commands should work statelessly (without requiring active room presence state). Avatar/room presence commands may still require presence.
-- Dynamic special aliases are system-managed and auto-refreshed on enter/room changes:
-	- `@world`, `@here`, `@me`, `@avatar`
-	- These must appear in `.aliases`.
-	- Users should not manually manage these aliases; runtime may overwrite them at any time.
+- Dynamic special aliases are actor-local conveniences only: `@world`, `@here`, `@me`, `@avatar`.
+	- They are system-managed and may be auto-refreshed in actor `.aliases`.
+	- World runtime must not parse, dispatch, or depend on these alias names.
+	- Actor must resolve them to DID targets before send.
+	- Actor must never send `@world/@here/@me/@avatar` (or any other alias label) over the wire; outbound targets must always be full `did:ma:...` values.
 - Error text for target resolution should prefer raw DID visibility over alias-humanized display when debugging unknown-target failures.

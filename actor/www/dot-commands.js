@@ -107,6 +107,7 @@ export function createDotCommands({
       appendSystemUi('  .edit [@here|@me|@exit <name>|did:ma:<world>#<room>] - open editor', '  .edit [@here|@me|@exit <navn>|did:ma:<world>#<room>] - åpne editor');
       appendSystemUi('  .eval <cid|alias>          - run script from IPFS CID or alias', '  .eval <cid|alias>          - kjør script fra IPFS CID eller alias');
       appendSystemUi('  .refresh                   - fetch latest room state and events now', '  .refresh                   - hent siste romtilstand og hendelser nå');
+      appendSystemUi('  .ping [@world|@here|@avatar]- local RTT ping via command path', '  .ping [@world|@here|@avatar]- lokal RTT-ping via kommandoløypa');
       appendSystemUi('  .mail [list|pick|reply|delete|clear] - inspect mailbox queue', '  .mail [list|pick|reply|delete|clear] - inspiser mailbox-kø');
       appendSystemUi('  .invite <did|alias> [note] - allow DID and send invite notice', '  .invite <did|alias> [note] - tillat DID og send invitasjonsmelding');
       appendSystemUi('  .smoke [alias]             - run connectivity smoke test', '  .smoke [alias]             - kjør enkel tilkoblingstest');
@@ -630,6 +631,28 @@ export function createDotCommands({
             `Refresh failed: ${err instanceof Error ? err.message : String(err)}`,
             `Oppdatering feilet: ${err instanceof Error ? err.message : String(err)}`
           ));
+        });
+      return true;
+    }
+
+    if (dotCommand === 'ping') {
+      const target = String(args[0] || '@world').trim().toLowerCase();
+      if (target !== '@world' && target !== '@here' && target !== '@avatar') {
+        appendMessage('system', 'Usage: .ping [@world|@here|@avatar]');
+        return true;
+      }
+
+      const command = `${target} ping`;
+      const started = Date.now();
+      sendWorldCommandQuery(command)
+        .then((message) => {
+          const elapsed = Date.now() - started;
+          const payload = String(message || '').trim() || '(empty response)';
+          appendMessage('system', `.ping ${target} -> ${elapsed}ms | ${payload}`);
+        })
+        .catch((error) => {
+          const elapsed = Date.now() - started;
+          appendMessage('system', `.ping ${target} failed after ${elapsed}ms: ${error instanceof Error ? error.message : String(error)}`);
         });
       return true;
     }

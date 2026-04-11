@@ -22,6 +22,7 @@ export function createInboundDispatcher(deps) {
     decodeChatEventMessage,
     decodeWhisperEventMessage,
     onPresenceEvent,
+    onPresenceRefreshRequest,
     didRoot
   } = deps;
 
@@ -162,6 +163,10 @@ export function createInboundDispatcher(deps) {
     }
     if (typeof onPresenceEvent === 'function') {
       await onPresenceEvent(payload, evt);
+    }
+    const kind = String(payload?.kind || '').trim();
+    if (kind === 'presence.refresh.request' && typeof onPresenceRefreshRequest === 'function') {
+      await onPresenceRefreshRequest(payload, evt);
     }
   }
 

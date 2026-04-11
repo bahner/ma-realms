@@ -1,4 +1,4 @@
-.PHONY: help core-build actor-build world-build actor-cid write-agent-version write-actor-version run-world dev dev-agent dev-agent-mcp check clean distclean
+.PHONY: help core-build actor-build world-build actor-cid write-agent-version write-actor-version run-world dev dev-agent dev-agent-mcp smoke-alpha check clean distclean
 
 WORLD_SLUG ?= ma
 WORLD_LISTEN ?=
@@ -6,6 +6,8 @@ WORLD_KUBO_URL ?=
 MA_AGENT_LISTEN ?=
 MA_AGENT_KUBO_KEY_ALIAS ?=
 MA_AGENTD_URL ?= http://127.0.0.1:5003
+SMOKE_AGENT_ADDR ?= 127.0.0.1:5003
+SMOKE_WORLD_STATUS_ADDR ?= 127.0.0.1:5002
 
 MA_ACTOR_VERSION_ORIGIN := $(origin MA_ACTOR_VERSION)
 
@@ -41,6 +43,7 @@ help:
 	@echo "  make dev                                     Alias for run-world"
 	@echo "  make dev-agent [MA_AGENT_LISTEN=ip:port] [MA_AGENT_KUBO_KEY_ALIAS=alias]"
 	@echo "  make dev-agent-mcp [MA_AGENTD_URL=url]      Start MCP bridge for ma-agentd"
+	@echo "  make smoke-alpha                              Start agent+world, run HTTP smoke, write logs to tmp/"
 	@echo "  make check                                   cargo check workspace"
 	@echo "  make clean                                   Clean sub-crate build artifacts"
 	@echo "  make distclean                               Deep clean across sub-crates"
@@ -114,6 +117,63 @@ dev-agent-mcp:
 	echo "Command: cargo run --manifest-path agent/Cargo.toml --bin ma-agent -- --mcp --agentd-url $(MA_AGENTD_URL)"; \
 	cargo run --manifest-path agent/Cargo.toml --bin ma-agent -- --mcp --agentd-url "$(MA_AGENTD_URL)"
 
+smoke-alpha: actor-build world-build
+	@set -euo pipefail; \
+	mkdir -p tmp; \
+	AGENT_LOG="tmp/smoke-agent.log"; \
+	WORLD_LOG="tmp/smoke-world.log"; \
+	REPORT="tmp/smoke-report.txt"; \
+	CID=$$(cat actor/.cid); \
+	: > "$$AGENT_LOG"; \
+	: > "$$WORLD_LOG"; \
+	: > "$$REPORT"; \
+	if ss -ltnp | rg -q ':5002|:5003'; then \
+		echo "[smoke] freeing ports 5002/5003" | tee -a "$$REPORT"; \
+		pkill -f 'target/debug/ma-agent --daemon' || true; \
+		pkill -f 'target/debug/ma-world run' || true; \
+	fi; \
+	PRE=$$(ss -ltnp | rg ':5002|:5003' || true); \
+	if [ -n "$$PRE" ]; then \
+		echo "[smoke] FAIL: ports still occupied before start" | tee -a "$$REPORT"; \
+		echo "$$PRE" | tee -a "$$REPORT"; \
+		exit 1; \
+	fi; \
+	nohup target/debug/ma-agent --daemon > "$$AGENT_LOG" 2>&1 & \
+	A_PID=$$!; \
+	nohup target/debug/ma-world run --world-slug $(WORLD_SLUG) --cid "$$CID" > "$$WORLD_LOG" 2>&1 & \
+	W_PID=$$!; \
+	cleanup() { kill $$W_PID $$A_PID 2>/dev/null || true; }; \
+	trap cleanup EXIT; \
+	agent_listen=FAIL; world_listen=FAIL; agent_http=FAIL; world_http=FAIL; \
+	for _ in $$(seq 1 100); do \
+		ss -ltnp | rg -q ':5003' && agent_listen=PASS && break; \
+		sleep 0.05; \
+	done; \
+	for _ in $$(seq 1 120); do \
+		ss -ltnp | rg -q ':5002' && world_listen=PASS && break; \
+		sleep 0.05; \
+	done; \
+	AGENT_HTTP_OUT=$$(curl -sS -m 3 -i http://$(SMOKE_AGENT_ADDR)/api/v0/health 2>&1 || true); \
+	WORLD_HTTP_OUT=$$(curl -sS -m 3 -i http://$(SMOKE_WORLD_STATUS_ADDR)/status 2>&1 || true); \
+	echo "$$AGENT_HTTP_OUT" | rg -q '^HTTP/' && agent_http=PASS || true; \
+	echo "$$WORLD_HTTP_OUT" | rg -q '^HTTP/' && world_http=PASS || true; \
+	{ \
+		echo "CHECK agent_listen=$$agent_listen"; \
+		echo "CHECK world_listen=$$world_listen"; \
+		echo "CHECK agent_health_http=$$agent_http"; \
+		echo "CHECK world_status_http=$$world_http"; \
+		echo "SNIP agent_http"; printf '%s\n' "$$AGENT_HTTP_OUT" | head -n 8; \
+		echo "SNIP world_http"; printf '%s\n' "$$WORLD_HTTP_OUT" | head -n 8; \
+		echo "SNIP agent_log"; rg -n 'listen|listening|started|ready|error|panic|fail' "$$AGENT_LOG" | head -n 20 || true; \
+		echo "SNIP world_log"; rg -n 'listen|listening|started|ready|error|panic|fail|world|status' "$$WORLD_LOG" | head -n 30 || true; \
+	} | tee -a "$$REPORT"; \
+	if [ "$$agent_listen" = PASS ] && [ "$$world_listen" = PASS ] && [ "$$agent_http" = PASS ] && [ "$$world_http" = PASS ]; then \
+		echo "VERDICT=PASS" | tee -a "$$REPORT"; \
+	else \
+		echo "VERDICT=FAIL" | tee -a "$$REPORT"; \
+		exit 1; \
+	fi
+
 check:
 	cargo check -q
 
@@ -121,6 +181,7 @@ clean:
 	$(MAKE) -C core clean
 	$(MAKE) -C actor clean
 	$(MAKE) -C world clean
+	rm -rf tmp
 
 distclean:
 	$(MAKE) -C core distclean

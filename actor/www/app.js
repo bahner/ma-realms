@@ -135,8 +135,10 @@ const IPFS_GATEWAY_FALLBACKS = [
 ];
 const LOCAL_EDIT_SCRIPT_KEY = `${STORAGE_PREFIX}.localEditScript`;
 const LEGACY_LOCAL_EDIT_SCRIPT_CID_KEY = `${STORAGE_PREFIX}.localEditScriptCid`;
+const DEFAULT_WORLD_ALIAS_PANTEIA = 'did:ma:k51qzi5uqu5dixac0j8lov7b977zgqg2v58lj0czyqny67419g3npu2dyifbem';
 
 const ROOM_POLL_INTERVAL_MS = 1500;
+const AVATAR_PING_INTERVAL_MS = 25_000;
 const DID_DOC_CACHE_TTL_MS = 60_000;
 const DEFAULT_CHAT_TTL_SECONDS = 60;
 const DEFAULT_CMD_TTL_SECONDS = 60;
@@ -194,6 +196,7 @@ const state = {
   aliasBook: {},
   currentHome: null,
   roomPollTimer: null,
+  avatarPingTimer: null,
   roomPollInFlight: false,
   inboxPollInFlight: false,
   pollErrorShown: false,
@@ -1342,6 +1345,34 @@ async function sendWorldCommandQuery(commandText) {
   return await worldDispatchFlow.sendWorldCommandQuery(commandText);
 }
 
+function currentWorldDidRoot() {
+  const roomDid = String(state.currentHome?.roomDid || '').trim();
+  if (roomDid.startsWith('did:ma:')) {
+    return didRoot(roomDid);
+  }
+  const aliasWorld = String(state.aliasBook?.['@world'] || state.aliasBook?.world || '').trim();
+  if (aliasWorld.startsWith('did:ma:')) {
+    return didRoot(aliasWorld);
+  }
+  const byEndpoint = didRoot(findDidByEndpoint(String(state.currentHome?.endpointId || '')) || '');
+  return byEndpoint;
+}
+
+async function sendCurrentHomePresencePing() {
+  if (!state.currentHome || !worldDispatchFlow) {
+    return;
+  }
+  const worldDidRoot = currentWorldDidRoot();
+  if (!worldDidRoot) {
+    return;
+  }
+  const roomDid = String(state.currentHome?.roomDid || '').trim();
+  const command = roomDid
+    ? `@${worldDidRoot}.ping ${roomDid}`
+    : `@${worldDidRoot}.ping`;
+  await sendWorldCommandQuery(command);
+}
+
 async function loadLocalScriptEditor() {
   localStorage.removeItem(LEGACY_LOCAL_EDIT_SCRIPT_CID_KEY);
   state.editSession = {
@@ -2006,11 +2037,25 @@ function actorFragmentFromDid(did) {
 }
 
 function currentActorFragment() {
-  const fragment = actorFragmentFromDid(state.identity?.did);
+  const fragment = actorFragmentFromDid(state.identity?.did).replace(/^@+/, '');
   if (fragment) {
     return fragment;
   }
-  return String(state.aliasName || 'actor').trim();
+  return String(state.aliasName || 'actor').trim().replace(/^@+/, '');
+}
+
+function currentAvatarDid() {
+  const aliasAvatar = String(state.aliasBook?.['@avatar'] || state.aliasBook?.avatar || '').trim();
+  if (aliasAvatar.startsWith('did:ma:') && aliasAvatar.includes('#')) {
+    return aliasAvatar;
+  }
+
+  const worldRoot = didRoot(String(state.currentHome?.roomDid || state.aliasBook?.['@world'] || '').trim());
+  const handle = String(state.currentHome?.handle || '').trim().replace(/^@+/, '');
+  if (worldRoot && handle && !/\s/u.test(handle)) {
+    return `${worldRoot}#${handle}`;
+  }
+  return '';
 }
 
 function setDialogIdStyle(style) {
@@ -2244,6 +2289,10 @@ function stopHomeEventPolling() {
     clearInterval(state.roomPollTimer);
     state.roomPollTimer = null;
   }
+  if (state.avatarPingTimer) {
+    clearInterval(state.avatarPingTimer);
+    state.avatarPingTimer = null;
+  }
   state.roomPollInFlight = false;
   state.inboxPollInFlight = false;
   state.pollErrorShown = false;
@@ -2258,6 +2307,13 @@ const inboundDispatcher = createInboundDispatcher({
   decodeChatEventMessage: decode_chat_event_message,
   decodeWhisperEventMessage: decode_whisper_event_message,
   onPresenceEvent: applyPresencePayload,
+  onPresenceRefreshRequest: async () => {
+    try {
+      await sendCurrentHomePresencePing();
+    } catch (error) {
+      logger.log('presence.refresh', `ping response failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  },
   didRoot
 });
 
@@ -2300,6 +2356,7 @@ async function pollCurrentHomeEvents() {
         state.passphrase,
         state.encryptedBundle,
         currentActorFragment(),
+        currentAvatarDid(),
         home.room,
         toSequenceBigInt(home.lastEventSequence || 0)
       )
@@ -2377,6 +2434,13 @@ async function pollCurrentHomeEvents() {
 
 function startHomeEventPolling() {
   stopHomeEventPolling();
+
+  state.avatarPingTimer = setInterval(() => {
+    sendCurrentHomePresencePing().catch((error) => {
+      logger.log('presence.ping', `failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }, AVATAR_PING_INTERVAL_MS);
+
   state.roomPollTimer = setInterval(() => {
     Promise.resolve()
       .then(() =>
@@ -2467,6 +2531,7 @@ async function runSmokeTest(targetAlias) {
         state.passphrase,
         state.encryptedBundle,
         currentActorFragment(),
+        currentAvatarDid(),
         state.currentHome.room,
         marker
       ),
@@ -3584,6 +3649,10 @@ function restoreSavedValues() {
   }
 
   state.aliasBook = loadAliasBook();
+  if (!String(state.aliasBook.panteia || '').trim()) {
+    state.aliasBook.panteia = DEFAULT_WORLD_ALIAS_PANTEIA;
+    saveAliasBook();
+  }
   state.debug = readStoredDebugFlag();
   state.messageTtl.chat = readStoredMessageTtl(MSG_CHAT_TTL_KEY, DEFAULT_CHAT_TTL_SECONDS);
   state.messageTtl.cmd = readStoredMessageTtl(MSG_CMD_TTL_KEY, DEFAULT_CMD_TTL_SECONDS);

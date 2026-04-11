@@ -94,6 +94,7 @@ const WORLD_ENTRY_ACL_ENV: &str = "MA_WORLD_ENTRY_ACL";
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:5002";
 const MAX_EVENTS: usize = 200;
 const MAX_KNOCK_INBOX: usize = 512;
+const MAX_AVATAR_LOCATION_CACHE: usize = 8192;
 const KNOCK_PENDING_TTL_SECS: i64 = 24 * 60 * 60;
 const KNOCK_DECIDED_TTL_SECS: i64 = 60 * 60;
 #[allow(dead_code)]
@@ -134,6 +135,7 @@ struct CachedDidDocument {
 #[derive(Clone, Debug)]
 pub(crate) struct AvatarRequest {
     pub did: Did,
+    pub owner_did: String,
     pub agent_endpoint: String,
     pub language_order: String,
 }
@@ -211,6 +213,15 @@ struct PresenceSnapshotEvent {
     ts: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct PresenceRefreshRequestEvent {
+    v: u8,
+    kind: String,
+    room: String,
+    room_did: String,
+    ts: String,
+}
+
 #[derive(Clone, Debug)]
 struct WorldProtocol {
     world: Arc<World>,
@@ -252,29 +263,6 @@ fn parse_room_inbox_symbol(symbol: &str) -> Option<&str> {
     } else {
         Some(object)
     }
-}
-
-fn parse_room_inbox_proxy(command: &str) -> Option<(String, String)> {
-    let trimmed = command.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let mut parts = trimmed.splitn(2, char::is_whitespace);
-    let head = parts.next().unwrap_or_default();
-    let rest = parts.next().unwrap_or_default().trim();
-    let object = head.strip_suffix(".inbox")?.trim();
-    if object.is_empty() {
-        return None;
-    }
-
-    let target = format!("room.{}.inbox", object);
-    let command = if rest.is_empty() {
-        "list".to_string()
-    } else {
-        rest.to_string()
-    };
-    Some((target, command))
 }
 
 fn parse_rfc3339_unix(value: &str) -> Option<i64> {
@@ -375,6 +363,14 @@ struct KnockMessage {
     decided_at: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AvatarLocationEntry {
+    did_root: String,
+    room: String,
+    endpoint: String,
+    seen_at: String,
+}
+
 #[derive(Debug)]
 pub struct World {
     rooms: Arc<RwLock<HashMap<String, Room>>>,
@@ -386,6 +382,8 @@ pub struct World {
     handle_to_did: Arc<RwLock<HashMap<String, String>>>,
     /// root DID → assigned handle.  Lets the same DID re-enter with the same handle.
     did_to_handle: Arc<RwLock<HashMap<String, String>>>,
+    /// Runtime-only index: root DID -> current room name.
+    avatar_room_index: Arc<RwLock<HashMap<String, String>>>,
     /// Actor runtime key material loaded from sealed actor bundles.
     actor_secrets: Arc<RwLock<HashMap<String, RuntimeActorSecret>>>,
     /// World owner root DID. Managed from status API.
@@ -434,6 +432,8 @@ pub struct World {
     knock_inbox: Arc<RwLock<TtlCache<u64, KnockMessage>>>,
     /// Monotonic knock id sequence.
     next_knock_id: Arc<RwLock<u64>>,
+    /// TTL-backed avatar location table keyed by root DID.
+    avatar_locations: Arc<RwLock<TtlCache<String, AvatarLocationEntry>>>,
     /// Fast lookup from object DID to room/object inbox route.
     object_inbox_index: Cache<String, InboxRoute>,
 }
@@ -708,6 +708,39 @@ fn sender_profile_from_document(document: &Document) -> String {
     "und".to_string()
 }
 
+fn extract_did_description_from_json(document_json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(document_json).ok()?;
+
+    let ma_desc = value
+        .get("ma")
+        .and_then(|ma| ma.get("description"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string);
+    if ma_desc.is_some() {
+        return ma_desc;
+    }
+
+    let top_desc = value
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string);
+    if top_desc.is_some() {
+        return top_desc;
+    }
+
+    value
+        .get("profile")
+        .and_then(|profile| profile.get("description"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ExitYamlDoc {
     kind: String,
@@ -770,6 +803,7 @@ impl World {
             entry_acl: Arc::new(RwLock::new(entry_acl)),
             handle_to_did: Arc::new(RwLock::new(HashMap::new())),
             did_to_handle: Arc::new(RwLock::new(HashMap::new())),
+            avatar_room_index: Arc::new(RwLock::new(HashMap::new())),
             actor_secrets: Arc::new(RwLock::new(HashMap::new())),
             owner_did: Arc::new(RwLock::new(None)),
             kubo_url: Arc::new(RwLock::new(kubo_url)),
@@ -798,6 +832,10 @@ impl World {
                 MAX_KNOCK_INBOX,
             ))),
             next_knock_id: Arc::new(RwLock::new(0)),
+            avatar_locations: Arc::new(RwLock::new(TtlCache::with_capacity(
+                Duration::from_secs(PRESENCE_STALE_AFTER_SECS_DEFAULT),
+                MAX_AVATAR_LOCATION_CACHE,
+            ))),
             object_inbox_index: Cache::new(OBJECT_INBOX_INDEX_CAPACITY),
         }
     }
@@ -809,7 +847,7 @@ impl World {
     async fn set_avatar_description_for_did(
         &self,
         room_name: &str,
-        did_root: &str,
+        did_id: &str,
         description: &str,
     ) -> bool {
         let mut rooms = self.rooms.write().await;
@@ -819,7 +857,7 @@ impl World {
 
         let mut updated = false;
         for avatar in room.avatars.values_mut() {
-            if avatar.agent_did.without_fragment().id() == did_root {
+            if avatar.agent_did.id() == did_id {
                 avatar.set_description(description.to_string());
                 updated = true;
             }
@@ -827,7 +865,7 @@ impl World {
         updated
     }
 
-    async fn touch_avatar_presence_for_did(&self, room_name: &str, did_root: &str) -> bool {
+    async fn touch_avatar_presence_for_did(&self, room_name: &str, did_id: &str) -> bool {
         let mut rooms = self.rooms.write().await;
         let Some(room) = rooms.get_mut(room_name) else {
             return false;
@@ -835,7 +873,7 @@ impl World {
 
         let mut updated = false;
         for avatar in room.avatars.values_mut() {
-            if avatar.agent_did.without_fragment().id() == did_root {
+            if avatar.agent_did.id() == did_id {
                 avatar.touch_presence();
                 updated = true;
             }
@@ -843,42 +881,142 @@ impl World {
         updated
     }
 
-    async fn avatar_language_order_for_did(&self, room_name: &str, did_root: &str) -> Option<String> {
+    async fn avatar_language_order_for_did(&self, room_name: &str, did_id: &str) -> Option<String> {
         let rooms = self.rooms.read().await;
         let room = rooms.get(room_name)?;
         room.avatars
             .values()
-            .find(|avatar| avatar.agent_did.without_fragment().id() == did_root)
+            .find(|avatar| avatar.agent_did.id() == did_id)
             .map(|avatar| avatar.language_order.clone())
             .filter(|value| !value.trim().is_empty())
     }
 
-    async fn avatar_handle_for_did(&self, room_name: &str, did_root: &str) -> Option<String> {
+    async fn avatar_handle_for_did(&self, room_name: &str, did_id: &str) -> Option<String> {
         let rooms = self.rooms.read().await;
         let room = rooms.get(room_name)?;
         room
             .avatars
             .iter()
-            .find(|(_, avatar)| avatar.agent_did.without_fragment().id() == did_root)
+            .find(|(_, avatar)| avatar.agent_did.id() == did_id)
             .map(|(handle, _)| handle.clone())
     }
 
-    async fn avatar_room_for_did(&self, did_root: &str) -> Option<String> {
+    async fn upsert_avatar_location(&self, room_name: &str, did_root: &str, endpoint: &str) {
+        let entry = AvatarLocationEntry {
+            did_root: did_root.to_string(),
+            room: room_name.to_string(),
+            endpoint: endpoint.to_string(),
+            seen_at: Utc::now().to_rfc3339(),
+        };
+        self.avatar_locations
+            .write()
+            .await
+            .insert(did_root.to_string(), entry);
+    }
+
+    async fn remove_avatar_location(&self, did_root: &str) {
+        self.avatar_locations
+            .write()
+            .await
+            .remove(&did_root.to_string());
+    }
+
+    async fn rebuild_avatar_room_index(&self) {
         let rooms = self.rooms.read().await;
-        rooms
-            .iter()
-            .find(|(_, room)| {
-                room
-                    .avatars
-                    .values()
-                    .any(|avatar| avatar.agent_did.without_fragment().id() == did_root)
-            })
-            .map(|(room_name, _)| room_name.clone())
+        let mut next = HashMap::new();
+        for (room_name, room) in rooms.iter() {
+            for avatar in room.avatars.values() {
+                next.insert(avatar.agent_did.id(), room_name.clone());
+            }
+        }
+        drop(rooms);
+        *self.avatar_room_index.write().await = next;
+    }
+
+    async fn find_avatar_presence_by_did(
+        &self,
+        did_query: &Did,
+    ) -> Option<(String, String, String, String, String)> {
+        let query_root = did_query.without_fragment().id();
+        let query_fragment = did_query.fragment.clone();
+
+        let rooms = self.rooms.read().await;
+        for (room_name, room) in rooms.iter() {
+            for (handle, avatar) in room.avatars.iter() {
+                let avatar_root = avatar.agent_did.without_fragment().id();
+                if avatar_root != query_root {
+                    continue;
+                }
+                if let Some(fragment) = query_fragment.as_ref() {
+                    if avatar.agent_did.fragment.as_ref() != Some(fragment) {
+                        continue;
+                    }
+                }
+                return Some((
+                    room_name.clone(),
+                    handle.clone(),
+                    avatar.agent_did.id(),
+                    avatar.agent_endpoint.clone(),
+                    avatar.description_or_default(),
+                ));
+            }
+        }
+        None
+    }
+
+    async fn did_description_fallback(&self, did_query: &Did) -> Option<String> {
+        let root = did_query.without_fragment();
+        let kubo_url = self.kubo_url().await;
+        let document = kubo::fetch_did_document(&kubo_url, &root).await.ok()?;
+        let raw = document.marshal().ok()?;
+        extract_did_description_from_json(&raw)
+    }
+
+    async fn avatar_room_for_did(&self, did_id: &str) -> Option<String> {
+        let indexed_room = self.avatar_room_index.read().await.get(did_id).cloned();
+        if let Some(room_name) = indexed_room {
+            let rooms = self.rooms.read().await;
+            let valid = rooms
+                .get(room_name.as_str())
+                .map(|room| {
+                    room
+                        .avatars
+                        .values()
+                        .any(|avatar| avatar.agent_did.id() == did_id)
+                })
+                .unwrap_or(false);
+            drop(rooms);
+            if valid {
+                return Some(room_name);
+            }
+        }
+
+        let discovered = {
+            let rooms = self.rooms.read().await;
+            rooms
+                .iter()
+                .find(|(_, room)| {
+                    room
+                        .avatars
+                        .values()
+                        .any(|avatar| avatar.agent_did.id() == did_id)
+                })
+                .map(|(room_name, _)| room_name.clone())
+        };
+
+        let mut index = self.avatar_room_index.write().await;
+        if let Some(room_name) = discovered.clone() {
+            index.insert(did_id.to_string(), room_name);
+        } else {
+            index.remove(did_id);
+        }
+        discovered
     }
 
     async fn prune_stale_avatars(&self, stale_after: Duration) -> Vec<String> {
         let now = SystemTime::now();
         let mut changed_rooms = Vec::new();
+        let mut removed_dids: Vec<String> = Vec::new();
 
         let mut rooms = self.rooms.write().await;
         for (room_name, room) in rooms.iter_mut() {
@@ -903,6 +1041,7 @@ impl World {
 
             for handle in stale_handles {
                 if let Some(avatar) = room.avatars.remove(&handle) {
+                    removed_dids.push(avatar.agent_did.without_fragment().id());
                     info!(
                         "[{}] removed stale avatar {} (endpoint={}, stale_after={}s)",
                         room_name,
@@ -914,6 +1053,15 @@ impl World {
             }
 
             changed_rooms.push(room_name.clone());
+        }
+
+        drop(rooms);
+
+        if !changed_rooms.is_empty() {
+            self.rebuild_avatar_room_index().await;
+            for did_root in removed_dids {
+                self.remove_avatar_location(&did_root).await;
+            }
         }
 
         changed_rooms
@@ -2395,36 +2543,107 @@ impl World {
         req: AvatarRequest,
         preferred_handle: Option<String>,
     ) -> Result<String> {
+        let did_id = req.did.id();
+        let previous_room = self.avatar_room_for_did(&did_id).await;
+
         let mut rooms = self.rooms.write().await;
+        let room_acl_allows = rooms
+            .get(room_name)
+            .ok_or_else(|| anyhow!("Room {} not found", room_name))?
+            .acl
+            .can_enter(&req.did.without_fragment().id());
+
+        // Check room-level ACL.
+        if !room_acl_allows {
+            return Err(anyhow!("room ACL denied entry for {}", req.did.id()));
+        }
+
+        // Enforce unique room membership per DID by moving from previous room when needed.
+        if let Some(prev_room_name) = previous_room
+            .as_ref()
+            .filter(|value| value.as_str() != room_name)
+        {
+            let moved = if let Some(prev_room) = rooms.get_mut(prev_room_name.as_str()) {
+                let previous_handle = prev_room
+                    .avatars
+                    .iter()
+                    .find(|(_, avatar)| avatar.agent_did.id() == did_id)
+                    .map(|(handle, _)| handle.clone());
+                previous_handle.and_then(|handle| prev_room.avatars.remove(handle.as_str()))
+            } else {
+                None
+            };
+
+            if let Some(mut avatar) = moved {
+                avatar.agent_endpoint = req.agent_endpoint.clone();
+                avatar.language_order = req.language_order.clone();
+                avatar.touch_presence();
+                let moved_handle = avatar.inbox.clone();
+
+                if let Some(room) = rooms.get_mut(room_name) {
+                    room.add_avatar(avatar);
+                }
+                drop(rooms);
+                self.rebuild_avatar_room_index().await;
+                self
+                    .upsert_avatar_location(room_name, &did_id, &req.agent_endpoint)
+                    .await;
+
+                info!(
+                    "[{}] {} moved from {} ({:?})",
+                    room_name,
+                    moved_handle,
+                    prev_room_name,
+                    req.did
+                );
+                self.record_event(format!(
+                    "[{room_name}] {} moved from {} with {}",
+                    moved_handle,
+                    prev_room_name,
+                    req.did.id(),
+                ))
+                .await;
+                self.record_room_event(
+                    room_name,
+                    "system",
+                    Some(moved_handle.clone()),
+                    Some(did_id.clone()),
+                    Some(req.agent_endpoint.clone()),
+                    format!("{} entered {}", moved_handle, room_name),
+                )
+                .await;
+                return Ok(moved_handle);
+            }
+        }
+
         let room = rooms
             .get_mut(room_name)
             .ok_or_else(|| anyhow!("Room {} not found", room_name))?;
-
-        let did_root = req.did.without_fragment().id();
-
-        // Check room-level ACL.
-        if !room.acl.can_enter(&did_root) {
-            return Err(anyhow!("room ACL denied entry for {}", did_root));
-        }
 
         // Same DID already present? Refresh endpoint/presence and return existing handle.
         if let Some((existing_handle, existing)) = room
             .avatars
             .iter_mut()
-            .find(|(_, avatar)| avatar.agent_did.without_fragment().id() == did_root)
+            .find(|(_, avatar)| avatar.agent_did.id() == did_id)
         {
             existing.agent_endpoint = req.agent_endpoint.clone();
             existing.language_order = req.language_order.clone();
             existing.touch_presence();
             info!("[{}] {} already present ({:?})", room_name, existing_handle, req.did);
-            return Ok(existing_handle.clone());
+            let existing_handle_value = existing_handle.clone();
+            drop(rooms);
+            self.rebuild_avatar_room_index().await;
+            self
+                .upsert_avatar_location(room_name, &did_id, &req.agent_endpoint)
+                .await;
+            return Ok(existing_handle_value);
         }
 
         drop(rooms);
 
         let did_fragment = req.did.fragment.clone().unwrap_or_default();
         let handle = self
-            .register_handle(&did_root, preferred_handle, &did_fragment)
+            .register_handle(&did_id, preferred_handle, &did_fragment)
             .await;
 
         let avatar = Avatar::new(
@@ -2432,6 +2651,7 @@ impl World {
             req.did.clone(),
             req.agent_endpoint.clone(),
             req.language_order.clone(),
+            req.owner_did.clone(),
         );
 
         let mut rooms = self.rooms.write().await;
@@ -2440,6 +2660,10 @@ impl World {
             .ok_or_else(|| anyhow!("Room {} not found", room_name))?;
         room.add_avatar(avatar);
         drop(rooms);
+        self.rebuild_avatar_room_index().await;
+        self
+            .upsert_avatar_location(room_name, &did_id, &req.agent_endpoint)
+            .await;
 
         info!("[{}] {} joined ({:?}) from {}", room_name, handle, req.did, req.agent_endpoint);
         self.record_event(format!(
@@ -2453,7 +2677,7 @@ impl World {
             room_name,
             "system",
             Some(handle.clone()),
-            Some(did_root.clone()),
+            Some(did_id.clone()),
             Some(req.agent_endpoint.clone()),
             format!("{} entered {}", handle, room_name),
         )
@@ -2470,16 +2694,20 @@ impl World {
         preferred: Option<String>,
         fragment: &str,
     ) -> String {
-        // Same DID already has a handle? Return it.
-        {
-            let d2h = self.did_to_handle.read().await;
-            if let Some(h) = d2h.get(did_root) {
-                return h.clone();
-            }
-        }
-
         let mut h2d = self.handle_to_did.write().await;
         let mut d2h = self.did_to_handle.write().await;
+
+        // Same DID already has a handle? Return it, normalizing legacy '@' prefixes.
+        if let Some(existing) = d2h.get(did_root).cloned() {
+            let normalized = existing.trim().trim_start_matches('@').to_string();
+            if !normalized.is_empty() && normalized != existing {
+                h2d.remove(existing.as_str());
+                h2d.insert(normalized.clone(), did_root.to_string());
+                d2h.insert(did_root.to_string(), normalized.clone());
+                return normalized;
+            }
+            return existing;
+        }
 
         let preferred_norm = preferred
             .as_deref()
@@ -2582,8 +2810,16 @@ impl World {
             .get_mut(room_name)
             .ok_or_else(|| anyhow!("Room {} not found", room_name))?;
 
+        let removed_did_root = room
+            .avatars
+            .get(actor_name)
+            .map(|avatar| avatar.agent_did.without_fragment().id());
         room.remove_avatar(actor_name);
         drop(rooms);
+        self.rebuild_avatar_room_index().await;
+        if let Some(did_root) = removed_did_root {
+            self.remove_avatar_location(&did_root).await;
+        }
 
         info!("[{}] {} left", room_name, actor_name);
         self.record_event(format!("[{room_name}] {actor_name} left")).await;
@@ -2607,7 +2843,7 @@ impl World {
         sender_profile: &str,
         envelope: MessageEnvelope,
     ) -> Result<(String, bool, String)> {
-        let sender_root = from_did.without_fragment().id();
+        let sender_did_id = from_did.id();
         let from_norm = from.trim().trim_start_matches('@').to_string();
         let sender_presence_required = match &envelope {
             MessageEnvelope::ActorCommand { target, .. } => {
@@ -2629,9 +2865,9 @@ impl World {
                 if let Some((handle, avatar)) = room
                     .avatars
                     .iter()
-                    .find(|(_, avatar)| avatar.agent_did.without_fragment().id() == sender_root)
+                    .find(|(_, avatar)| avatar.agent_did.id() == sender_did_id)
                 {
-                    if avatar.agent_did != from_did.without_fragment() {
+                    if avatar.agent_did.id() != sender_did_id {
                         return Err(anyhow!(
                             "sender DID mismatch for @{} in room {}",
                             from_norm,
@@ -2642,12 +2878,12 @@ impl World {
                 } else if !from_norm.is_empty() {
                     from_norm.clone()
                 } else {
-                    sender_root.clone()
+                    sender_did_id.clone()
                 }
             } else {
 
                 if let Some(avatar) = room.avatars.get(from_norm.as_str()) {
-                    if avatar.agent_did == from_did.without_fragment() {
+                    if avatar.agent_did.id() == sender_did_id {
                         from_norm.clone()
                     } else {
                         return Err(anyhow!(
@@ -2660,9 +2896,9 @@ impl World {
                     if let Some((handle, avatar)) = room
                         .avatars
                         .iter()
-                        .find(|(_, avatar)| avatar.agent_did.without_fragment().id() == sender_root)
+                        .find(|(_, avatar)| avatar.agent_did.id() == sender_did_id)
                     {
-                        if avatar.agent_did != from_did.without_fragment() {
+                        if avatar.agent_did.id() != sender_did_id {
                             return Err(anyhow!(
                                 "sender DID mismatch for @{} in room {}",
                                 from_norm,
@@ -2686,7 +2922,7 @@ impl World {
             let Some(avatar) = room.avatars.get(&sender_key) else {
                 return Err(anyhow!("unknown avatar @{} in room {}", from_norm, room_name));
             };
-            if avatar.agent_did != from_did.without_fragment() {
+            if avatar.agent_did.id() != sender_did_id {
                 return Err(anyhow!(
                     "sender DID mismatch for @{} in room {}",
                     from_norm,
@@ -2724,6 +2960,7 @@ impl World {
                 let (response, effective_room) = self
                     .handle_actor_command(room_name, &sender_key, from_did, sender_profile, &target, command)
                     .await;
+                self.rebuild_avatar_room_index().await;
                 info!("[{}] {} -> @{} -> {}", room_name, sender_key, target, response);
                 self.record_event(format!(
                     "[{room_name}] {sender_key} -> @{target} => {}",
@@ -2794,9 +3031,27 @@ impl World {
     }
 
     async fn room_avatars(&self, room_name: &str) -> Vec<PresenceAvatar> {
+        let active_dids: HashSet<String> = {
+            let locations = self.avatar_locations.read().await;
+            locations
+                .items()
+                .into_iter()
+                .filter_map(|(did_root, entry)| {
+                    if entry.room == room_name {
+                        Some(did_root.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
         let rooms = self.rooms.read().await;
         let Some(room) = rooms.get(room_name) else { return Vec::new() };
         let mut avatars: Vec<PresenceAvatar> = room.avatars.iter()
+            .filter(|(_, avatar)| {
+                let did_id = avatar.agent_did.id();
+                active_dids.contains(&did_id)
+            })
             .map(|(handle, avatar)| PresenceAvatar {
                 handle: handle.clone(),
                 did: avatar.agent_did.id(),
@@ -3328,8 +3583,8 @@ impl World {
                     avatar_did,
                     avatar_doc.agent_endpoint,
                     avatar_doc.language_order,
+                    avatar_doc.owner.clone(),
                 );
-                avatar.owner = avatar_doc.owner;
                 avatar.descriptions = avatar_doc.descriptions;
                 avatar.acl = avatar_doc.acl;
                 room.avatars.insert(avatar_doc.inbox, avatar);
@@ -3387,6 +3642,7 @@ impl World {
         *self.room_cids.write().await = state.room_cids;
         *self.lang_cid.write().await = state.lang_cid;
         *self.state_cid.write().await = Some(state_cid.to_string());
+        self.rebuild_avatar_room_index().await;
 
         self.ensure_lobby_intrinsic_objects().await;
 
@@ -3440,57 +3696,152 @@ impl World {
         target: &str,
         command: ActorCommand,
     ) -> (String, String) {
-        match target {
-            "here" | "room" => {
-                let room_cmd = match command {
-                    ActorCommand::Say { payload } => payload,
-                    ActorCommand::Raw { command } => command,
-                };
-                if let Some((inbox_target, inbox_command)) = parse_room_inbox_proxy(&room_cmd) {
-                    if let Some(result) = self
-                        .handle_object_method(
-                            room_name,
-                            from,
-                            from_did,
-                            sender_profile,
-                            &inbox_target,
-                            ActorCommand::Raw { command: inbox_command },
-                        )
-                        .await
-                    {
-                        return result;
+        let target = target.trim();
+        let target_lower = target.to_ascii_lowercase();
+        if matches!(target_lower.as_str(), "@here" | "here" | "room" | "@world" | "world" | "@me" | "me" | "self" | "@avatar" | "avatar") {
+            return (
+                "actor-local aliases (@here/@world/@me/@avatar) must be resolved to DID before send".to_string(),
+                room_name.to_string(),
+            );
+        }
+
+        let caller_root_did = from_did.without_fragment().id();
+        if let Ok(target_did) = Did::try_from(target) {
+            let target_root = target_did.without_fragment().id();
+
+            if self.is_local_world_root(&target_root).await {
+                if target_did.fragment.is_none() {
+                    let cmd = match &command {
+                        ActorCommand::Say { payload } => payload.trim().to_string(),
+                        ActorCommand::Raw { command } => command.trim().to_string(),
+                    };
+                    let effective_cmd = if cmd.is_empty() { "_list".to_string() } else { cmd };
+                    return (
+                        self
+                            .handle_world_command(room_name, from, from_did, sender_profile, &effective_cmd)
+                            .await,
+                        room_name.to_string(),
+                    );
+                }
+
+                if let Some(fragment) = target_did.fragment.clone() {
+                    let room_exists = {
+                        let rooms = self.rooms.read().await;
+                        rooms.contains_key(fragment.as_str())
+                    };
+                    if room_exists {
+                        let room_cmd = match &command {
+                            ActorCommand::Say { payload } => payload.trim().to_string(),
+                            ActorCommand::Raw { command } => command.trim().to_string(),
+                        };
+                        let effective_cmd = if room_cmd.is_empty() {
+                            "show".to_string()
+                        } else {
+                            room_cmd
+                        };
+                        return (
+                            self
+                                .room_command(
+                                    fragment.as_str(),
+                                    effective_cmd.as_str(),
+                                    from,
+                                    sender_profile,
+                                    Some(caller_root_did.as_str()),
+                                )
+                                .await,
+                            fragment,
+                        );
                     }
                 }
-                let caller_root_did = from_did.without_fragment().id();
-                (
-                    self
-                        .room_command(
-                            room_name,
-                            &room_cmd,
-                            from,
-                            sender_profile,
-                            Some(caller_root_did.as_str()),
-                        )
-                        .await,
-                    room_name.to_string(),
-                )
             }
-            "world" => {
-                let cmd = match command {
-                    ActorCommand::Say { payload } => payload,
-                    ActorCommand::Raw { command } => command,
-                };
-                (
-                    self
-                        .handle_world_command(room_name, from, from_did, sender_profile, &cmd)
-                        .await,
-                    room_name.to_string(),
-                )
+
+            if target_root == caller_root_did {
+                return self
+                    .handle_avatar_command(room_name, from, from_did, sender_profile, command)
+                    .await;
             }
-            "avatar" => self
-                .handle_avatar_command(room_name, from, from_did, sender_profile, command)
-                .await,
-            _ => {
+        }
+
+                if let Ok(target_did) = Did::try_from(target.trim()) {
+                    if let ActorCommand::Raw { command: raw } = &command {
+                        if raw.trim().eq_ignore_ascii_case("debug") {
+                            if let Some((room, handle, did, endpoint, description)) =
+                                self.find_avatar_presence_by_did(&target_did).await
+                            {
+                                return (
+                                    format!(
+                                        "@debug kind=avatar\n@debug did={}\n@debug room={}\n@debug handle={}\n@debug endpoint={}\n@debug description={}",
+                                        did,
+                                        room,
+                                        handle,
+                                        endpoint,
+                                        description
+                                    ),
+                                    room_name.to_string(),
+                                );
+                            }
+
+                            let target_root = target_did.without_fragment().id();
+                            if self.is_local_world_root(&target_root).await {
+                                if let Some(fragment) = target_did.fragment.clone() {
+                                    let world_owner = self.owner_did.read().await.clone();
+                                    let objects = self.room_objects.read().await;
+                                    for (candidate_room, room_map) in objects.iter() {
+                                        if let Some(object) = room_map.get(fragment.as_str()) {
+                                            let owner = object
+                                                .owner_did
+                                                .clone()
+                                                .or(world_owner.clone())
+                                                .unwrap_or_else(|| "(none)".to_string());
+                                            return (
+                                                format!(
+                                                    "@debug kind=object\n@debug did={}\n@debug room={}\n@debug object_id={}\n@debug name={}\n@debug type={}\n@debug owner={}\n@debug cid={}\n@debug holder={}\n@debug opened_by={}\n@debug durable={}\n@debug persistence={}",
+                                                    target_did.id(),
+                                                    candidate_room,
+                                                    object.id,
+                                                    object.name,
+                                                    object.kind,
+                                                    owner,
+                                                    object.cid.clone().unwrap_or_else(|| "(builtin)".to_string()),
+                                                    object.holder.clone().unwrap_or_else(|| "(none)".to_string()),
+                                                    object.opened_by.clone().unwrap_or_else(|| "(closed)".to_string()),
+                                                    object.durable,
+                                                    format!("{:?}", object.persistence).to_ascii_lowercase(),
+                                                ),
+                                                room_name.to_string(),
+                                            );
+                                        }
+                                    }
+                                    drop(objects);
+
+                                    let rooms = self.rooms.read().await;
+                                    for (candidate_room, room) in rooms.iter() {
+                                        if room.did == target_did.id() || room.name == fragment {
+                                            return (
+                                                format!(
+                                                    "@debug kind=room\n@debug did={}\n@debug room={}\n@debug title={}\n@debug description={}\n@debug avatars={}\n@debug exits={}",
+                                                    room.did,
+                                                    candidate_room,
+                                                    room.title_or_default(),
+                                                    room.description_or_default(),
+                                                    room.avatars.len(),
+                                                    room.exits.len(),
+                                                ),
+                                                room_name.to_string(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
+                            return (
+                                format!("@debug target not found for {}", target_did.id()),
+                                room_name.to_string(),
+                            );
+                        }
+                    }
+                }
+
                 let rooms = self.rooms.read().await;
                 let Some(room) = rooms.get(room_name) else {
                     return (format!("@here room '{}' not found", room_name), room_name.to_string());
@@ -3547,8 +3898,6 @@ impl World {
                         (format!("@{} is here. Try '@{} say \"...\"'. (got: {})", actor_target, actor_target, command), room_name.to_string())
                     }
                 }
-            }
-        }
     }
 
     async fn handle_object_method(
@@ -4473,6 +4822,13 @@ impl World {
             ActorCommand::Raw { command } => {
                 let trimmed = command.trim();
 
+                if trimmed.eq_ignore_ascii_case("ping") || trimmed.eq_ignore_ascii_case("ping?") {
+                    return (
+                        format!("pong room={} handle={}", room_name, from),
+                        room_name.to_string(),
+                    );
+                }
+
                 if let Some(rest) = trimmed.strip_prefix("prop ") {
                     let Some(property) = parse_property_command(rest) else {
                         return (
@@ -4868,6 +5224,13 @@ impl World {
                     return (base, room_name.to_string());
                 }
 
+                if trimmed.to_ascii_lowercase().starts_with("go ") {
+                    return (
+                        format!("No exit '{}' from '{}'.", direction, room_name),
+                        room_name.to_string(),
+                    );
+                }
+
                 if let Some(rest) = trimmed.strip_prefix("describe ") {
                     let description = normalize_spoken_text(rest).trim().to_string();
                     if description.is_empty() {
@@ -4990,7 +5353,7 @@ impl World {
             return tr_world(
                 active_lang,
                 "world.help.commands",
-                "@world commands: help | list | claim | knock list [all] | knock accept <id> | knock reject <id> [note] | knock delete <id> | invite <did> [note] | room <name> acl show|open|close|allow <did>|deny <did> | flush [knock|all] | migrate-index | save | load <cid> | dig <direction> [to|til <#dest|did>]",
+                "@world commands: help | ping [room] | list | claim | knock list [all] | knock accept <id> | knock reject <id> [note] | knock delete <id> | invite <did> [note] | room <name> acl show|open|close|allow <did>|deny <did> | flush [knock|all] | migrate-index | save | load <cid> | dig <direction> [to|til <#dest|did>]",
             );
         }
 
@@ -5125,6 +5488,29 @@ impl World {
 
         // Caller's root DID is directly available from from_did
         let caller_root_did = from_did.without_fragment().id();
+
+        if method == "ping" {
+            let room_hint = arg.trim().trim_start_matches('#');
+            let effective_room = if !room_hint.is_empty() {
+                let rooms = self.rooms.read().await;
+                if rooms.contains_key(room_hint) {
+                    room_hint.to_string()
+                } else {
+                    room_name.to_string()
+                }
+            } else {
+                room_name.to_string()
+            };
+            let touched = self
+                .touch_avatar_presence_for_did(&effective_room, &caller_root_did)
+                .await;
+            return format!(
+                "@world.ping ok room={} did={} touched={}",
+                effective_room,
+                caller_root_did,
+                touched
+            );
+        }
 
         // @world.claim — set world owner to caller DID if unclaimed.
         if method == "claim" {
@@ -5560,6 +5946,31 @@ impl World {
         };
 
         let trimmed = command.trim();
+        if trimmed.eq_ignore_ascii_case("ping") || trimmed.eq_ignore_ascii_case("ping?") {
+            let who = caller_root_did.unwrap_or(from);
+            return format!("@here pong room={} by={}", room_name, who);
+        }
+        if let Some(rest) = trimmed.strip_prefix("l ") {
+            let did_raw = rest.trim();
+            if did_raw.is_empty() {
+                return "@here usage: l <did:ma:...[#fragment]>".to_string();
+            }
+            let did_query = match Did::try_from(did_raw) {
+                Ok(did) => did,
+                Err(err) => return format!("@here invalid DID '{}': {}", did_raw, err),
+            };
+
+            if let Some((_room, _handle, _did, _endpoint, description)) =
+                self.find_avatar_presence_by_did(&did_query).await
+            {
+                return description;
+            }
+            if let Some(description) = self.did_description_fallback(&did_query).await {
+                return description;
+            }
+            return format!("@here no avatar found for {}", did_query.without_fragment().id());
+        }
+
         if let Some(rest) = trimmed.strip_prefix("id ") {
             let token = rest.trim().trim_start_matches('@');
             if token.is_empty() {
@@ -6305,6 +6716,82 @@ impl WorldProtocol {
         }
     }
 
+    async fn push_presence_refresh_request_to(
+        &self,
+        room_name: &str,
+        target_endpoint_id: &str,
+    ) {
+        let context = self.room_presence_context(room_name).await;
+        let (room_did, _room_title, _room_description, _avatars, _endpoints) = match context {
+            Ok(value) => value,
+            Err(err) => {
+                warn!("presence refresh context unavailable for room '{}': {}", room_name, err);
+                return;
+            }
+        };
+        let signing_key = match self.room_signing_key(&room_did).await {
+            Ok(key) => key,
+            Err(err) => {
+                warn!("presence refresh signing key unavailable for {}: {}", room_did, err);
+                return;
+            }
+        };
+
+        let payload = PresenceRefreshRequestEvent {
+            v: 1,
+            kind: "presence.refresh.request".to_string(),
+            room: room_name.to_string(),
+            room_did: room_did.clone(),
+            ts: Utc::now().to_rfc3339(),
+        };
+        let content = match serde_json::to_vec(&payload) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!("presence refresh encode failed for room '{}': {}", room_name, err);
+                return;
+            }
+        };
+        let message = match Message::new(
+            room_did.clone(),
+            room_did,
+            CONTENT_TYPE_PRESENCE,
+            content,
+            &signing_key,
+        ) {
+            Ok(msg) => msg,
+            Err(err) => {
+                warn!("presence refresh message build failed: {}", err);
+                return;
+            }
+        };
+        let cbor = match message.to_cbor() {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!("presence refresh cbor encode failed: {}", err);
+                return;
+            }
+        };
+
+        if let Err(err) = self.send_signed_push_to_endpoint(target_endpoint_id, cbor).await {
+            warn!("presence refresh push to {} failed: {}", target_endpoint_id, err);
+        }
+    }
+
+    async fn push_presence_refresh_request(&self, room_name: &str) {
+        let context = self.room_presence_context(room_name).await;
+        let (_room_did, _room_title, _room_description, _avatars, endpoints) = match context {
+            Ok(value) => value,
+            Err(err) => {
+                warn!("presence refresh context unavailable for room '{}': {}", room_name, err);
+                return;
+            }
+        };
+
+        for endpoint in endpoints {
+            self.push_presence_refresh_request_to(room_name, &endpoint).await;
+        }
+    }
+
     async fn process_request(&self, request: WorldRequest, agent_endpoint: String) -> WorldResponse {
         match self.handle_request(request, agent_endpoint).await {
             Ok(resp) => resp,
@@ -6497,8 +6984,7 @@ impl WorldProtocol {
         if let Some(method) = command.internal_method() {
             debug!("processing internal method '{}' on lane '{}'", method, self.lane.label());
         }
-        let sender_root = sender_did.without_fragment().id();
-        self.handle_command(command, &message, &sender_did, sender_document, agent_endpoint, &sender_root).await
+        self.handle_command(command, &message, &sender_did, sender_document, agent_endpoint).await
     }
 
     async fn handle_command(
@@ -6508,7 +6994,6 @@ impl WorldProtocol {
         sender_did: &Did,
         sender_document: Document,
         agent_endpoint: String,
-        sender_root: &str,
     ) -> Result<WorldResponse> {
         let sender_profile = sender_profile_from_document(&sender_document);
 
@@ -6516,14 +7001,6 @@ impl WorldProtocol {
             WorldCommand::Enter { room, preferred_handle } => {
                 let room = room.unwrap_or_else(|| DEFAULT_ROOM.to_string());
                 let root_did = sender_did.without_fragment();
-                let root_did_id = root_did.id();
-                let is_first_enter = self
-                    .world
-                    .did_to_handle
-                    .read()
-                    .await
-                    .get(&root_did_id)
-                    .is_none();
 
                 if !self.world.can_enter(&root_did).await {
                     let (allow_all, allow_owner, allow_count, owner_did, acl_source) =
@@ -6608,8 +7085,32 @@ impl WorldProtocol {
                         }),
                     });
                 };
+                let world_root = self
+                    .world
+                    .local_world_did_root()
+                    .await
+                    .unwrap_or_else(|| "did:ma:unconfigured".to_string());
+                let avatar_fragment = selected_handle
+                    .clone()
+                    .or_else(|| sender_did.fragment.clone())
+                    .unwrap_or_else(|| "avatar".to_string())
+                    .trim()
+                    .trim_start_matches('@')
+                    .to_string();
+                let avatar_did = Did::try_from(format!("{}#{}", world_root, avatar_fragment).as_str())
+                    .map_err(|err| anyhow!("invalid derived avatar DID: {}", err))?;
+                let avatar_did_id = avatar_did.id();
+                let is_first_enter = self
+                    .world
+                    .did_to_handle
+                    .read()
+                    .await
+                    .get(&avatar_did_id)
+                    .is_none();
+
                 let avatar_req = AvatarRequest {
-                    did: root_did,
+                    did: avatar_did,
+                    owner_did: sender_did.id(),
                     agent_endpoint: agent_endpoint.clone(),
                     language_order: collapsed_language_order,
                 };
@@ -6617,7 +7118,7 @@ impl WorldProtocol {
                 if is_first_enter {
                     let _ = self
                         .world
-                        .set_avatar_description_for_did(&room, &root_did_id, "skeleton avatar")
+                        .set_avatar_description_for_did(&room, &avatar_did_id, "skeleton avatar")
                         .await;
                 }
                 self.push_presence_snapshot(&room).await;
@@ -6639,27 +7140,56 @@ impl WorldProtocol {
                     transport_ack: None,
                 })
             }
-            WorldCommand::Message { room, envelope } => {
+            WorldCommand::Message { room, avatar, envelope } => {
+                let avatar_did = Did::try_from(avatar.trim())
+                    .map_err(|err| anyhow!("invalid avatar DID '{}': {}", avatar, err))?;
+                if avatar_did.fragment.is_none() {
+                    return Err(anyhow!("avatar DID must include fragment: {}", avatar_did.id()));
+                }
                 let route_room = match &envelope {
                     MessageEnvelope::ActorCommand { target, .. }
                         if target.eq_ignore_ascii_case("avatar") =>
                     {
                         self.world
-                            .avatar_room_for_did(sender_root)
+                            .avatar_room_for_did(&avatar_did.id())
                             .await
                             .unwrap_or_else(|| room.clone())
                     }
                     _ => room.clone(),
                 };
 
+                let avatar_owner_ok = {
+                    let rooms = self.world.rooms.read().await;
+                    rooms
+                        .get(route_room.as_str())
+                        .and_then(|r| {
+                            r.avatars
+                                .values()
+                                .find(|a| a.agent_did.id() == avatar_did.id())
+                                .map(|a| a.owner == sender_did.id())
+                        })
+                        .unwrap_or(false)
+                };
+                if !avatar_owner_ok {
+                    return Err(anyhow!(
+                        "avatar owner mismatch: avatar={} owner!=from {}",
+                        avatar_did.id(),
+                        sender_did.id()
+                    ));
+                }
+
                 let _ = self
                     .world
-                    .touch_avatar_presence_for_did(&route_room, sender_root)
+                    .touch_avatar_presence_for_did(&route_room, &avatar_did.id())
+                    .await;
+                self
+                    .world
+                    .upsert_avatar_location(&route_room, &avatar_did.id(), &agent_endpoint)
                     .await;
                 let method = ROOM_METHOD_BROADCAST_SEND;
                 let effective_sender_profile = self
                     .world
-                    .avatar_language_order_for_did(&route_room, sender_root)
+                    .avatar_language_order_for_did(&route_room, &avatar_did.id())
                     .await
                     .unwrap_or_else(|| "nb_NO:en_UK".to_string());
                 let is_world_admin = matches!(
@@ -6679,12 +7209,12 @@ impl WorldProtocol {
                 // Route command envelopes using the active room handle bound to sender DID.
                 let actor_name = self
                     .world
-                    .avatar_handle_for_did(&route_room, sender_root)
+                    .avatar_handle_for_did(&route_room, &avatar_did.id())
                     .await
-                    .unwrap_or_else(|| sender_root.to_string());
+                    .unwrap_or_else(|| avatar_did.id());
                 let (message, broadcasted, effective_room) = self
                     .world
-                    .send_message(&route_room, &actor_name, sender_did, &effective_sender_profile, envelope)
+                    .send_message(&route_room, &actor_name, &avatar_did, &effective_sender_profile, envelope)
                     .await?;
                 if effective_room != route_room {
                     self.push_presence_snapshot(&route_room).await;
@@ -6708,10 +7238,38 @@ impl WorldProtocol {
                     transport_ack: None,
                 })
             }
-            WorldCommand::RoomEvents { room, since_sequence } => {
+            WorldCommand::RoomEvents { room, avatar, since_sequence } => {
+                let avatar_did = Did::try_from(avatar.trim())
+                    .map_err(|err| anyhow!("invalid avatar DID '{}': {}", avatar, err))?;
+                if avatar_did.fragment.is_none() {
+                    return Err(anyhow!("avatar DID must include fragment: {}", avatar_did.id()));
+                }
+                let avatar_owner_ok = {
+                    let rooms = self.world.rooms.read().await;
+                    rooms
+                        .get(room.as_str())
+                        .and_then(|r| {
+                            r.avatars
+                                .values()
+                                .find(|a| a.agent_did.id() == avatar_did.id())
+                                .map(|a| a.owner == sender_did.id())
+                        })
+                        .unwrap_or(false)
+                };
+                if !avatar_owner_ok {
+                    return Err(anyhow!(
+                        "avatar owner mismatch: avatar={} owner!=from {}",
+                        avatar_did.id(),
+                        sender_did.id()
+                    ));
+                }
                 let _ = self
                     .world
-                    .touch_avatar_presence_for_did(&room, sender_root)
+                    .touch_avatar_presence_for_did(&room, &avatar_did.id())
+                    .await;
+                self
+                    .world
+                    .upsert_avatar_location(&room, &avatar_did.id(), &agent_endpoint)
                     .await;
                 let (events, latest_event_sequence) = self.world.room_events_since(&room, since_sequence).await?;
                 Ok(WorldResponse {
@@ -8122,6 +8680,59 @@ async fn main() -> Result<()> {
 
     world.create_room(DEFAULT_ROOM.to_string()).await?;
 
+    // Best-effort local auto-unlock for single-user dev/test flow.
+    // If authoring + key material are present, start in unlocked mode without status-page interaction.
+    if let Ok(loaded_for_unlock) = load_world_authoring(&authored_world_dir) {
+        let master_key_rel = PathBuf::from(loaded_for_unlock.config.crypto.world_master_key_file.clone());
+        let master_key_path = if master_key_rel.is_absolute() {
+            master_key_rel
+        } else {
+            loaded_for_unlock.world_dir.join(master_key_rel)
+        };
+
+        world
+            .set_unlock_context(loaded_for_unlock.world_dir.clone(), master_key_path.clone())
+            .await;
+
+        match fs::read(&master_key_path) {
+            Ok(bytes) => {
+                let master_key: Result<[u8; 32], _> = bytes.as_slice().try_into();
+                match master_key {
+                    Ok(key) => {
+                        world.set_world_master_key(key).await;
+                        match unlock_actor_secret_bundles(&loaded_for_unlock) {
+                            Ok(bundles) => {
+                                let count = bundles.len();
+                                if let Err(err) = world.install_actor_secrets(&bundles).await {
+                                    warn!("auto-unlock: failed installing actor secrets: {}", err);
+                                } else {
+                                    *world.unlocked.write().await = true;
+                                    info!("auto-unlock: enabled with {} actor bundles", count);
+                                }
+                            }
+                            Err(err) => {
+                                warn!("auto-unlock: failed unlocking actor secret bundles: {}", err);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        warn!(
+                            "auto-unlock: world master key must be 32 bytes in {}",
+                            master_key_path.display()
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(
+                    "auto-unlock: could not read world master key {}: {}",
+                    master_key_path.display(),
+                    err
+                );
+            }
+        }
+    }
+
     // Bind status listener before iroh endpoint setup so listen failures abort early.
     let listener = bind_status_listener(&listen_addr).await?;
     let status_addr = listener.local_addr()?;
@@ -8475,6 +9086,11 @@ async fn main() -> Result<()> {
             .unwrap_or(PRESENCE_STALE_AFTER_SECS_DEFAULT)
             .max(presence_probe_secs + 1);
 
+        {
+            let mut locations = world.avatar_locations.write().await;
+            locations.set_default_max_cache(Duration::from_secs(presence_stale_secs));
+        }
+
         let inbox_presence = inbox_protocol.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(presence_probe_secs));
@@ -8485,6 +9101,18 @@ async fn main() -> Result<()> {
                 for room_name in changed_rooms {
                     inbox_presence.push_presence_snapshot(&room_name).await;
                 }
+            }
+        });
+
+        let refresh_protocol = inbox_protocol.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let room_names = {
+                let rooms = refresh_protocol.world.rooms.read().await;
+                rooms.keys().cloned().collect::<Vec<_>>()
+            };
+            for room_name in room_names {
+                refresh_protocol.push_presence_refresh_request(&room_name).await;
             }
         });
 
@@ -8639,6 +9267,101 @@ fn parse_entry_acl(raw: &str) -> Result<EntryAcl> {
         allowed_dids,
         source: raw.trim().to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn test_world() -> World {
+        World::new(
+            EntryAcl {
+                allow_all: true,
+                allow_owner: false,
+                allowed_dids: HashSet::new(),
+                source: "test".to_string(),
+            },
+            "http://127.0.0.1:5001".to_string(),
+            "test-world".to_string(),
+        )
+    }
+
+    #[test]
+    fn extracts_did_description_from_supported_paths() {
+        let ma_json = r#"{"ma":{"description":"hello from ma"}}"#;
+        assert_eq!(
+            extract_did_description_from_json(ma_json),
+            Some("hello from ma".to_string())
+        );
+
+        let top_json = r#"{"description":"hello top"}"#;
+        assert_eq!(
+            extract_did_description_from_json(top_json),
+            Some("hello top".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn join_room_keeps_avatar_in_single_room() {
+        let world = test_world();
+        world.create_room("lobby".to_string()).await.unwrap();
+        world.create_room("hall".to_string()).await.unwrap();
+
+        let did = Did::try_from("did:ma:k51test#pixie").unwrap();
+        let req = AvatarRequest {
+            did: did.clone(),
+            agent_endpoint: "ep-1".to_string(),
+            language_order: "nb_NO:en_UK".to_string(),
+        };
+        world.join_room("lobby", req, Some("pixie".to_string())).await.unwrap();
+
+        let req2 = AvatarRequest {
+            did,
+            agent_endpoint: "ep-2".to_string(),
+            language_order: "nb_NO:en_UK".to_string(),
+        };
+        world.join_room("hall", req2, Some("pixie".to_string())).await.unwrap();
+
+        assert_eq!(
+            world.avatar_room_for_did("did:ma:k51test").await,
+            Some("hall".to_string())
+        );
+
+        let rooms = world.rooms.read().await;
+        let lobby = rooms.get("lobby").unwrap();
+        let hall = rooms.get("hall").unwrap();
+        assert!(lobby.avatars.is_empty());
+        assert_eq!(hall.avatars.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn prune_stale_avatars_clears_membership_index() {
+        let world = test_world();
+        world.create_room("lobby".to_string()).await.unwrap();
+
+        let did = Did::try_from("did:ma:k51stale#agent").unwrap();
+        let req = AvatarRequest {
+            did,
+            agent_endpoint: "ep-stale".to_string(),
+            language_order: "nb_NO:en_UK".to_string(),
+        };
+        world.join_room("lobby", req, Some("agent".to_string())).await.unwrap();
+
+        {
+            let mut rooms = world.rooms.write().await;
+            let lobby = rooms.get_mut("lobby").unwrap();
+            for avatar in lobby.avatars.values_mut() {
+                avatar.last_seen_at = SystemTime::now()
+                    .checked_sub(Duration::from_secs(90))
+                    .unwrap();
+            }
+        }
+
+        let changed = world.prune_stale_avatars(Duration::from_secs(25)).await;
+        assert!(changed.iter().any(|room| room == "lobby"));
+        assert_eq!(world.avatar_room_for_did("did:ma:k51stale").await, None);
+    }
 }
 
 fn load_persisted_iroh_secret_key(path: &PathBuf) -> Result<Option<SecretKey>> {

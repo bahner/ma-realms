@@ -126,6 +126,9 @@ publish:
 test-web:
 	@$(MAKE) --no-print-directory $(TEST_WEB_STAMP)
 
+web: build-release
+	scp -r www atlas:/home/ma/
+
 clean:
 	rm -rf www/pkg
 	rm -rf pkg

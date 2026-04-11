@@ -1654,7 +1654,11 @@ async fn send_agent(
         parse_message(&command_text)
     };
 
-    let content = match serde_json::to_vec(&WorldCommand::Message { room, envelope }) {
+    let content = match serde_json::to_vec(&WorldCommand::Message {
+        room,
+        avatar: sender_did.clone(),
+        envelope,
+    }) {
         Ok(bytes) => bytes,
         Err(err) => {
             return Json(SendAgentResponse {
