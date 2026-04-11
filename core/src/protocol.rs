@@ -182,12 +182,10 @@ pub enum WorldCommand {
     },
     Message {
         room: String,
-        avatar: String,
         envelope: crate::parser::MessageEnvelope,
     },
     RoomEvents {
         room: String,
-        avatar: String,
         since_sequence: u64,
     },
 }

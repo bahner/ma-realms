@@ -2051,7 +2051,6 @@ pub async fn send_world_chat(
     passphrase: &str,
     encrypted_bundle_json: &str,
     actor_name: &str,
-    avatar_did: &str,
     room: &str,
     text: &str,
 ) -> Result<String, JsValue> {
@@ -2060,7 +2059,6 @@ pub async fn send_world_chat(
         passphrase,
         encrypted_bundle_json,
         actor_name,
-        avatar_did,
         room,
         text,
         DEFAULT_MESSAGE_TTL_SECS,
@@ -2076,7 +2074,6 @@ pub async fn send_world_chat_with_ttl(
     passphrase: &str,
     encrypted_bundle_json: &str,
     actor_name: &str,
-    avatar_did: &str,
     room: &str,
     text: &str,
     ttl_seconds: u64,
@@ -2088,7 +2085,6 @@ pub async fn send_world_chat_with_ttl(
         actor_name,
         WorldCommand::Message {
             room: room.trim().to_string(),
-            avatar: avatar_did.trim().to_string(),
             envelope: MessageEnvelope::Chatter {
                 text: text.to_string(),
             },
@@ -2238,7 +2234,6 @@ pub async fn send_world_message(
     passphrase: &str,
     encrypted_bundle_json: &str,
     actor_name: &str,
-    avatar_did: &str,
     room: &str,
     text: &str,
 ) -> Result<String, JsValue> {
@@ -2247,7 +2242,6 @@ pub async fn send_world_message(
         passphrase,
         encrypted_bundle_json,
         actor_name,
-        avatar_did,
         room,
         text,
         DEFAULT_MESSAGE_TTL_SECS,
@@ -2263,7 +2257,6 @@ pub async fn send_world_message_with_ttl(
     passphrase: &str,
     encrypted_bundle_json: &str,
     actor_name: &str,
-    avatar_did: &str,
     room: &str,
     text: &str,
     ttl_seconds: u64,
@@ -2281,7 +2274,6 @@ pub async fn send_world_message_with_ttl(
         actor_name,
         WorldCommand::Message {
             room: room.trim().to_string(),
-            avatar: avatar_did.trim().to_string(),
             envelope,
         },
         CONTENT_TYPE_WORLD,
@@ -2305,7 +2297,6 @@ pub async fn send_world_cmd(
     passphrase: &str,
     encrypted_bundle_json: &str,
     actor_name: &str,
-    avatar_did: &str,
     room: &str,
     text: &str,
 ) -> Result<String, JsValue> {
@@ -2314,7 +2305,6 @@ pub async fn send_world_cmd(
         passphrase,
         encrypted_bundle_json,
         actor_name,
-        avatar_did,
         room,
         text,
         DEFAULT_MESSAGE_TTL_SECS,
@@ -2330,7 +2320,6 @@ pub async fn send_world_cmd_with_ttl(
     passphrase: &str,
     encrypted_bundle_json: &str,
     actor_name: &str,
-    avatar_did: &str,
     room: &str,
     text: &str,
     ttl_seconds: u64,
@@ -2345,7 +2334,6 @@ pub async fn send_world_cmd_with_ttl(
         actor_name,
         WorldCommand::Message {
             room: room.trim().to_string(),
-            avatar: avatar_did.trim().to_string(),
             envelope,
         },
         CONTENT_TYPE_WORLD,
@@ -2369,7 +2357,6 @@ pub async fn poll_world_events(
     passphrase: &str,
     encrypted_bundle_json: &str,
     actor_name: &str,
-    avatar_did: &str,
     room: &str,
     since_sequence: u64,
 ) -> Result<String, JsValue> {
@@ -2380,7 +2367,6 @@ pub async fn poll_world_events(
         actor_name,
         WorldCommand::RoomEvents {
             room: room.trim().to_string(),
-            avatar: avatar_did.trim().to_string(),
             since_sequence,
         },
         CONTENT_TYPE_WORLD,

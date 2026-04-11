@@ -393,7 +393,6 @@ function syncSpecialAliasesFromCurrentHome() {
   const identityDid = String(state.identity?.did || '').trim();
   if (isMaDid(identityDid)) {
     next['@me'] = identityDid;
-    next['@avatar'] = identityDid;
   }
 
   const roomDid = String(state.currentHome?.roomDid || '').trim();
@@ -409,6 +408,11 @@ function syncSpecialAliasesFromCurrentHome() {
   }
   if (worldDidRoot) {
     next['@world'] = worldDidRoot;
+  }
+
+  const handle = String(state.currentHome?.handle || '').trim().replace(/^@+/, '');
+  if (worldDidRoot && handle && !/\s/u.test(handle)) {
+    next['@avatar'] = `${worldDidRoot}#${handle}`;
   }
 
   let hereDid = '';
@@ -2356,7 +2360,6 @@ async function pollCurrentHomeEvents() {
         state.passphrase,
         state.encryptedBundle,
         currentActorFragment(),
-        currentAvatarDid(),
         home.room,
         toSequenceBigInt(home.lastEventSequence || 0)
       )
@@ -2531,7 +2534,6 @@ async function runSmokeTest(targetAlias) {
         state.passphrase,
         state.encryptedBundle,
         currentActorFragment(),
-        currentAvatarDid(),
         state.currentHome.room,
         marker
       ),

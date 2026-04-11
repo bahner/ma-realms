@@ -702,7 +702,6 @@ export function createWorldDispatchFlow({
         state.passphrase,
         state.encryptedBundle,
         activeActorName(),
-        activeAvatarDid(),
         state.currentHome.room,
         normalizedCommand,
         BigInt(resolveTtlSeconds('cmd'))
@@ -849,7 +848,6 @@ export function createWorldDispatchFlow({
             state.passphrase,
             state.encryptedBundle,
             activeActorName(),
-            activeAvatarDid(),
             state.currentHome.room,
             payload,
             BigInt(resolveTtlSeconds('chat'))
@@ -940,8 +938,6 @@ export function createWorldDispatchFlow({
             state.passphrase,
             state.encryptedBundle,
             activeActorName(),
-            activeAvatarDid(),
-            activeAvatarDid(),
             state.currentHome.room,
             normalized,
             BigInt(resolveTtlSeconds('cmd'))
@@ -973,7 +969,6 @@ export function createWorldDispatchFlow({
           state.passphrase,
           state.encryptedBundle,
           activeActorName(),
-          activeAvatarDid(),
           state.currentHome.room,
           routedText,
           BigInt(resolveTtlSeconds('cmd'))

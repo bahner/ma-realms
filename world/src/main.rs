@@ -901,6 +901,20 @@ impl World {
             .map(|(handle, _)| handle.clone())
     }
 
+    /// Find the avatar DID owned by `owner_did` anywhere in this world.
+    /// Returns `None` if the owner has no avatar (i.e. has not entered).
+    async fn resolve_avatar_did_for_owner(&self, owner_did: &str) -> Option<Did> {
+        let rooms = self.rooms.read().await;
+        for room in rooms.values() {
+            for avatar in room.avatars.values() {
+                if avatar.owner == owner_did {
+                    return Some(avatar.agent_did.clone());
+                }
+            }
+        }
+        None
+    }
+
     async fn upsert_avatar_location(&self, room_name: &str, did_root: &str, endpoint: &str) {
         let entry = AvatarLocationEntry {
             did_root: did_root.to_string(),
@@ -7140,12 +7154,9 @@ impl WorldProtocol {
                     transport_ack: None,
                 })
             }
-            WorldCommand::Message { room, avatar, envelope } => {
-                let avatar_did = Did::try_from(avatar.trim())
-                    .map_err(|err| anyhow!("invalid avatar DID '{}': {}", avatar, err))?;
-                if avatar_did.fragment.is_none() {
-                    return Err(anyhow!("avatar DID must include fragment: {}", avatar_did.id()));
-                }
+            WorldCommand::Message { room, envelope } => {
+                let avatar_did = self.world.resolve_avatar_did_for_owner(&sender_did.id()).await
+                    .ok_or_else(|| anyhow!("no avatar found for sender {}", sender_did.id()))?;
                 let route_room = match &envelope {
                     MessageEnvelope::ActorCommand { target, .. }
                         if target.eq_ignore_ascii_case("avatar") =>
@@ -7157,26 +7168,6 @@ impl WorldProtocol {
                     }
                     _ => room.clone(),
                 };
-
-                let avatar_owner_ok = {
-                    let rooms = self.world.rooms.read().await;
-                    rooms
-                        .get(route_room.as_str())
-                        .and_then(|r| {
-                            r.avatars
-                                .values()
-                                .find(|a| a.agent_did.id() == avatar_did.id())
-                                .map(|a| a.owner == sender_did.id())
-                        })
-                        .unwrap_or(false)
-                };
-                if !avatar_owner_ok {
-                    return Err(anyhow!(
-                        "avatar owner mismatch: avatar={} owner!=from {}",
-                        avatar_did.id(),
-                        sender_did.id()
-                    ));
-                }
 
                 let _ = self
                     .world
@@ -7238,31 +7229,9 @@ impl WorldProtocol {
                     transport_ack: None,
                 })
             }
-            WorldCommand::RoomEvents { room, avatar, since_sequence } => {
-                let avatar_did = Did::try_from(avatar.trim())
-                    .map_err(|err| anyhow!("invalid avatar DID '{}': {}", avatar, err))?;
-                if avatar_did.fragment.is_none() {
-                    return Err(anyhow!("avatar DID must include fragment: {}", avatar_did.id()));
-                }
-                let avatar_owner_ok = {
-                    let rooms = self.world.rooms.read().await;
-                    rooms
-                        .get(room.as_str())
-                        .and_then(|r| {
-                            r.avatars
-                                .values()
-                                .find(|a| a.agent_did.id() == avatar_did.id())
-                                .map(|a| a.owner == sender_did.id())
-                        })
-                        .unwrap_or(false)
-                };
-                if !avatar_owner_ok {
-                    return Err(anyhow!(
-                        "avatar owner mismatch: avatar={} owner!=from {}",
-                        avatar_did.id(),
-                        sender_did.id()
-                    ));
-                }
+            WorldCommand::RoomEvents { room, since_sequence } => {
+                let avatar_did = self.world.resolve_avatar_did_for_owner(&sender_did.id()).await
+                    .ok_or_else(|| anyhow!("no avatar found for sender {}", sender_did.id()))?;
                 let _ = self
                     .world
                     .touch_avatar_presence_for_did(&room, &avatar_did.id())
@@ -9311,6 +9280,7 @@ mod tests {
         let did = Did::try_from("did:ma:k51test#pixie").unwrap();
         let req = AvatarRequest {
             did: did.clone(),
+            owner_did: "did:ma:k51test".to_string(),
             agent_endpoint: "ep-1".to_string(),
             language_order: "nb_NO:en_UK".to_string(),
         };
@@ -9318,6 +9288,7 @@ mod tests {
 
         let req2 = AvatarRequest {
             did,
+            owner_did: "did:ma:k51test".to_string(),
             agent_endpoint: "ep-2".to_string(),
             language_order: "nb_NO:en_UK".to_string(),
         };
@@ -9343,6 +9314,7 @@ mod tests {
         let did = Did::try_from("did:ma:k51stale#agent").unwrap();
         let req = AvatarRequest {
             did,
+            owner_did: "did:ma:k51stale".to_string(),
             agent_endpoint: "ep-stale".to_string(),
             language_order: "nb_NO:en_UK".to_string(),
         };
