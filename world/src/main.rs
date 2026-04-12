@@ -30,7 +30,7 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use ma_core::{
-    ActorCommand, BROADCAST_ALPN,
+    ActorCommand, AVATAR_ALPN, BROADCAST_ALPN,
     CONTENT_TYPE_PRESENCE, CONTENT_TYPE_WORLD, CompiledCapabilityAcl,
     CONTENT_TYPE_DOC, DEFAULT_WORLD_RELAY_URL,
     ExitData, LaneCapability, MessageEnvelope, ObjectDefinition, ObjectInboxMessage,
@@ -138,6 +138,8 @@ pub(crate) struct AvatarRequest {
     pub owner_did: String,
     pub agent_endpoint: String,
     pub language_order: String,
+    pub signing_secret: actor::AvatarSigningSecret,
+    pub encryption_pubkey_multibase: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -649,6 +651,8 @@ struct AvatarStateDoc {
     owner: String,
     descriptions: HashMap<String, String>,
     acl: actor::ActorAcl,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encryption_pubkey_multibase: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2666,6 +2670,8 @@ impl World {
             req.agent_endpoint.clone(),
             req.language_order.clone(),
             req.owner_did.clone(),
+            req.signing_secret,
+            req.encryption_pubkey_multibase.clone(),
         );
 
         let mut rooms = self.rooms.write().await;
@@ -3174,6 +3180,7 @@ impl World {
                         owner: avatar.owner.clone(),
                         descriptions: avatar.descriptions.clone(),
                         acl: avatar.acl.clone(),
+                        encryption_pubkey_multibase: avatar.encryption_pubkey_multibase.clone(),
                     })
                     .collect::<Vec<_>>();
 
@@ -3598,6 +3605,8 @@ impl World {
                     avatar_doc.agent_endpoint,
                     avatar_doc.language_order,
                     avatar_doc.owner.clone(),
+                    [0u8; 32], // Restored avatars have no signing key — agent must re-Enter.
+                    avatar_doc.encryption_pubkey_multibase,
                 );
                 avatar.descriptions = avatar_doc.descriptions;
                 avatar.acl = avatar_doc.acl;
@@ -7012,7 +7021,10 @@ impl WorldProtocol {
         let sender_profile = sender_profile_from_document(&sender_document);
 
         match command {
-            WorldCommand::Enter { room, preferred_handle } => {
+            WorldCommand::Enter { .. } if self.lane == WorldLane::Avatar => {
+                return Err(anyhow!("Enter must be sent on ma/inbox/1, not ma/avatar/1"));
+            }
+            WorldCommand::Enter { room, preferred_handle, encryption_pubkey_multibase } => {
                 let room = room.unwrap_or_else(|| DEFAULT_ROOM.to_string());
                 let root_did = sender_did.without_fragment();
 
@@ -7122,11 +7134,19 @@ impl WorldProtocol {
                     .get(&avatar_did_id)
                     .is_none();
 
+                // Generate a fresh Ed25519 signing key for this avatar.
+                // The world holds this key and signs outbound messages on behalf of the avatar.
+                let avatar_signing_key = SigningKey::generate(avatar_did.clone())
+                    .map_err(|e| anyhow!("failed to generate avatar signing key: {}", e))?;
+                let avatar_signing_secret = avatar_signing_key.private_key_bytes();
+
                 let avatar_req = AvatarRequest {
                     did: avatar_did,
                     owner_did: sender_did.id(),
                     agent_endpoint: agent_endpoint.clone(),
                     language_order: collapsed_language_order,
+                    signing_secret: avatar_signing_secret,
+                    encryption_pubkey_multibase,
                 };
                 let handle = self.world.join_room(&room, avatar_req, selected_handle).await?;
                 if is_first_enter {
@@ -7153,6 +7173,9 @@ impl WorldProtocol {
                     room_object_dids: self.world.room_object_did_map(&room).await,
                     transport_ack: None,
                 })
+            }
+            WorldCommand::Message { .. } if self.lane == WorldLane::Inbox => {
+                return Err(anyhow!("Message must be sent on ma/avatar/1, not ma/inbox/1"));
             }
             WorldCommand::Message { room, envelope } => {
                 let avatar_did = self.world.resolve_avatar_did_for_owner(&sender_did.id()).await
@@ -7228,6 +7251,9 @@ impl WorldProtocol {
                     room_object_dids: self.world.room_object_did_map(&effective_room).await,
                     transport_ack: None,
                 })
+            }
+            WorldCommand::RoomEvents { .. } if self.lane == WorldLane::Inbox => {
+                return Err(anyhow!("RoomEvents must be sent on ma/avatar/1, not ma/inbox/1"));
             }
             WorldCommand::RoomEvents { room, since_sequence } => {
                 let avatar_did = self.world.resolve_avatar_did_for_owner(&sender_did.id()).await
@@ -8935,12 +8961,20 @@ async fn main() -> Result<()> {
             did_cache: did_cache.clone(),
             lane: WorldLane::Inbox,
         };
+        let avatar_protocol = WorldProtocol {
+            world: world.clone(),
+            endpoint: endpoint.clone(),
+            endpoint_id: endpoint_id.clone(),
+            did_cache: did_cache.clone(),
+            lane: WorldLane::Avatar,
+        };
         let ipfs_protocol = IpfsProtocol {
             world: world.clone(),
             did_cache: did_cache.clone(),
         };
         let router = Router::builder(endpoint.clone())
             .accept(INBOX_ALPN, inbox_protocol.clone())
+            .accept(AVATAR_ALPN, avatar_protocol)
             .accept(IPFS_ALPN, ipfs_protocol)
             .spawn();
         let online_started = Instant::now();
@@ -8977,6 +9011,7 @@ async fn main() -> Result<()> {
             started_at: Utc::now().to_rfc3339(),
             capabilities: vec![
                 LaneCapability::for_lane(WorldLane::Inbox),
+                LaneCapability::for_lane(WorldLane::Avatar),
             ],
             actor_web: None,
         };
@@ -9283,6 +9318,8 @@ mod tests {
             owner_did: "did:ma:k51test".to_string(),
             agent_endpoint: "ep-1".to_string(),
             language_order: "nb_NO:en_UK".to_string(),
+            signing_secret: [0u8; 32],
+            encryption_pubkey_multibase: None,
         };
         world.join_room("lobby", req, Some("pixie".to_string())).await.unwrap();
 
@@ -9291,6 +9328,8 @@ mod tests {
             owner_did: "did:ma:k51test".to_string(),
             agent_endpoint: "ep-2".to_string(),
             language_order: "nb_NO:en_UK".to_string(),
+            signing_secret: [0u8; 32],
+            encryption_pubkey_multibase: None,
         };
         world.join_room("hall", req2, Some("pixie".to_string())).await.unwrap();
 
@@ -9317,6 +9356,8 @@ mod tests {
             owner_did: "did:ma:k51stale".to_string(),
             agent_endpoint: "ep-stale".to_string(),
             language_order: "nb_NO:en_UK".to_string(),
+            signing_secret: [0u8; 32],
+            encryption_pubkey_multibase: None,
         };
         world.join_room("lobby", req, Some("agent".to_string())).await.unwrap();
 

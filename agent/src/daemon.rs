@@ -10,7 +10,7 @@ use axum::{
 use chrono::{SecondsFormat, Utc};
 use did_ma::{Did, Document, EncryptionKey, SigningKey, VerificationMethod};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey, endpoint::presets};
-use ma_core::{CONTENT_TYPE_WORLD, DEFAULT_WORLD_RELAY_URL, INBOX_ALPN, MessageEnvelope, WorldCommand, WorldRequest, WorldResponse, default_ma_config_root, normalize_relay_url, parse_message, resolve_inbox_endpoint_id};
+use ma_core::{AVATAR_ALPN, CONTENT_TYPE_WORLD, DEFAULT_WORLD_RELAY_URL, INBOX_ALPN, MessageEnvelope, WorldCommand, WorldRequest, WorldResponse, default_ma_config_root, normalize_relay_url, parse_message, resolve_inbox_endpoint_id};
 use rand::RngCore;
 use reqwest::multipart;
 use serde::{Deserialize, Serialize};
@@ -894,7 +894,10 @@ async fn resolved_root_did_document(kubo_url: &str, resolved_path: &str, root_di
 }
 
 fn expected_agent_transports(endpoint_id: &str) -> serde_json::Value {
-    let lanes = [String::from_utf8_lossy(INBOX_ALPN).to_string()];
+    let lanes = [
+        String::from_utf8_lossy(INBOX_ALPN).to_string(),
+        String::from_utf8_lossy(AVATAR_ALPN).to_string(),
+    ];
     serde_json::Value::Array(
         lanes
             .into_iter()
@@ -1506,7 +1509,7 @@ async fn resolve_world_endpoint_id_from_did(kubo_url: &str, world_root_did: &str
     Ok(endpoint)
 }
 
-async fn send_world_request_over_iroh(endpoint_id: &str, request: WorldRequest) -> Result<WorldResponse> {
+async fn send_world_request_over_iroh(endpoint_id: &str, request: WorldRequest, alpn: &'static [u8]) -> Result<WorldResponse> {
     let target: EndpointId = endpoint_id
         .trim()
         .parse()
@@ -1525,7 +1528,7 @@ async fn send_world_request_over_iroh(endpoint_id: &str, request: WorldRequest) 
     let endpoint_addr = EndpointAddr::new(target).with_relay_url(relay_url);
 
     let connection = endpoint
-        .connect(endpoint_addr, INBOX_ALPN)
+        .connect(endpoint_addr, alpn)
         .await
         .map_err(|e| anyhow!("endpoint.connect() failed: {}", e))?;
 
@@ -1729,7 +1732,7 @@ async fn send_agent(
         }
     };
 
-    match send_world_request_over_iroh(&endpoint_id, request).await {
+    match send_world_request_over_iroh(&endpoint_id, request, AVATAR_ALPN).await {
         Ok(world_response) => {
             let _ = append_agent_log_line(
                 &state,

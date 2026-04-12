@@ -1,6 +1,9 @@
 use did_ma::Did;
 use std::collections::HashMap;
 
+/// 32-byte Ed25519 private key for avatar signing, held by the world.
+pub type AvatarSigningSecret = [u8; 32];
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ActorAcl {
     pub allow_all: bool,
@@ -51,10 +54,22 @@ pub struct Avatar {
     pub acl: ActorAcl,
     pub joined_at: std::time::SystemTime,
     pub last_seen_at: std::time::SystemTime,
+    /// Ed25519 private key bytes — world signs on behalf of the avatar.
+    pub signing_secret: AvatarSigningSecret,
+    /// Actor's X25519 encryption public key (multibase), for keyAgreement.
+    pub encryption_pubkey_multibase: Option<String>,
 }
 
 impl Avatar {
-    pub fn new(inbox: String, agent_did: Did, agent_endpoint: String, language_order: String, owner: String) -> Self {
+    pub fn new(
+        inbox: String,
+        agent_did: Did,
+        agent_endpoint: String,
+        language_order: String,
+        owner: String,
+        signing_secret: AvatarSigningSecret,
+        encryption_pubkey_multibase: Option<String>,
+    ) -> Self {
         Self {
             inbox,
             agent_did,
@@ -66,6 +81,8 @@ impl Avatar {
             acl: ActorAcl::open(),
             joined_at: std::time::SystemTime::now(),
             last_seen_at: std::time::SystemTime::now(),
+            signing_secret,
+            encryption_pubkey_multibase,
         }
     }
 

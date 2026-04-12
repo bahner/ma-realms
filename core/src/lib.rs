@@ -46,7 +46,7 @@ pub use protocol::{
     IpfsPublishDidRequest, IpfsPublishDidResponse,
     LaneCapability, PresenceAvatar, RoomEvent, TransportAck, TransportAckCode, WorldCommand,
     WorldLane, WorldRequest, WorldResponse,
-    BROADCAST_ALPN, DEFAULT_WORLD_RELAY_URL, INBOX_ALPN, IPFS_ALPN, PRESENCE_ALPN,
+    AVATAR_ALPN, BROADCAST_ALPN, DEFAULT_WORLD_RELAY_URL, INBOX_ALPN, IPFS_ALPN, PRESENCE_ALPN,
     WHISPER_ALPN,
     DEFAULT_CONTENT_TYPE, CONTENT_TYPE_CHAT, CONTENT_TYPE_PRESENCE,
     CONTENT_TYPE_WORLD, CONTENT_TYPE_BROADCAST,

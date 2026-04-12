@@ -58,6 +58,10 @@ pub const REQUIREMENT_SIGNATURES: &[RequirementSignature] = &[
         name: "room.in",
         arg_arity: RequirementArgArity::Optional,
     },
+    RequirementSignature {
+        name: "avatar.present",
+        arg_arity: RequirementArgArity::None,
+    },
 ];
 
 const CONTRADICTIONS: &[(&str, &str)] = &[

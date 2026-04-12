@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub const BROADCAST_ALPN: &[u8] = b"ma/broadcast/1";
 pub const PRESENCE_ALPN: &[u8] = b"ma/presence/1";
 pub const INBOX_ALPN: &[u8] = b"ma/inbox/1";
+pub const AVATAR_ALPN: &[u8] = b"ma/avatar/1";
 pub const WHISPER_ALPN: &[u8] = b"ma/whisper/1";
 pub const IPFS_ALPN: &[u8] = b"ma/ipfs/1";
 pub const DEFAULT_WORLD_RELAY_URL: &str = "https://euc1-1.relay.n0.iroh-canary.iroh.link/";
@@ -54,29 +55,33 @@ pub const ROOM_METHOD_PRESENCE_LIST: &str = "room.presence.list";
 #[serde(rename_all = "snake_case")]
 pub enum WorldLane {
     Inbox,
+    Avatar,
 }
 
 impl WorldLane {
     pub fn alpn(self) -> &'static [u8] {
         match self {
             Self::Inbox => INBOX_ALPN,
+            Self::Avatar => AVATAR_ALPN,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Inbox => "inbox",
+            Self::Avatar => "avatar",
         }
     }
 
     pub fn supports_request(self, request: &WorldRequest) -> bool {
         let _ = request;
-        matches!(self, Self::Inbox)
+        matches!(self, Self::Inbox | Self::Avatar)
     }
 
     pub fn signed_content_type(self) -> Option<&'static str> {
         match self {
             Self::Inbox => Some(CONTENT_TYPE_WORLD),
+            Self::Avatar => Some(CONTENT_TYPE_WORLD),
         }
     }
 }
@@ -112,7 +117,7 @@ impl LaneCapability {
         Self {
             lane,
             alpn: String::from_utf8_lossy(lane.alpn()).to_string(),
-            supports_signed: matches!(lane, WorldLane::Inbox),
+            supports_signed: matches!(lane, WorldLane::Inbox | WorldLane::Avatar),
             supports_chat: false,
             supports_whisper: false,
         }
@@ -179,6 +184,8 @@ pub enum WorldCommand {
         room: Option<String>,
         #[serde(default)]
         preferred_handle: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encryption_pubkey_multibase: Option<String>,
     },
     Message {
         room: String,

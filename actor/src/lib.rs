@@ -107,18 +107,21 @@ struct WorldConnCache {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorldTransportKind {
     Inbox,
+    Avatar,
 }
 
 impl WorldTransportKind {
     fn alpn(self) -> &'static [u8] {
         match self {
             WorldTransportKind::Inbox => INBOX_ALPN,
+            WorldTransportKind::Avatar => AVATAR_ALPN,
         }
     }
 }
 
 thread_local! {
     static WORLD_CONN_CACHE: RefCell<Option<WorldConnCache>> = RefCell::new(None);
+    static AVATAR_CONN_CACHE: RefCell<Option<WorldConnCache>> = RefCell::new(None);
     static ACL_COMPILED_CACHE: RefCell<HashMap<String, CompiledCapabilityAcl>> = RefCell::new(HashMap::new());
     static ROOM_DID_CACHE: RefCell<HashMap<String, CachedDidEntry>> = RefCell::new(HashMap::new());
     static ROOM_OBJECT_DID_CACHE: RefCell<HashMap<String, CachedDidEntry>> = RefCell::new(HashMap::new());
@@ -136,18 +139,21 @@ const ROOM_DID_CACHE_TTL_MS: f64 = 5.0 * 60.0 * 1000.0;
 fn take_conn_cache(kind: WorldTransportKind) -> Option<WorldConnCache> {
     match kind {
         WorldTransportKind::Inbox => WORLD_CONN_CACHE.with(|c| c.borrow_mut().take()),
+        WorldTransportKind::Avatar => AVATAR_CONN_CACHE.with(|c| c.borrow_mut().take()),
     }
 }
 
 fn store_conn_cache(kind: WorldTransportKind, cache: WorldConnCache) {
     match kind {
         WorldTransportKind::Inbox => WORLD_CONN_CACHE.with(|c| *c.borrow_mut() = Some(cache)),
+        WorldTransportKind::Avatar => AVATAR_CONN_CACHE.with(|c| *c.borrow_mut() = Some(cache)),
     }
 }
 
 fn clear_conn_cache(kind: WorldTransportKind) {
     match kind {
         WorldTransportKind::Inbox => WORLD_CONN_CACHE.with(|c| *c.borrow_mut() = None),
+        WorldTransportKind::Avatar => AVATAR_CONN_CACHE.with(|c| *c.borrow_mut() = None),
     }
 }
 
@@ -441,7 +447,7 @@ use ma_core::{
     resolve_inbox_endpoint_id as core_resolve_inbox_endpoint_id,
     resolve_alias_input as core_resolve_alias_input,
     RoomEvent, WorldCommand, WorldRequest, WorldResponse,
-    BROADCAST_ALPN, INBOX_ALPN, IPFS_ALPN, PRESENCE_ALPN, WHISPER_ALPN,
+    AVATAR_ALPN, BROADCAST_ALPN, INBOX_ALPN, IPFS_ALPN, PRESENCE_ALPN, WHISPER_ALPN,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -899,19 +905,27 @@ fn decrypt_bundle(passphrase: &str, bundle: &EncryptedIdentityBundle) -> Result<
 }
 
 async fn send_world_request(endpoint_id: &str, request: WorldRequest) -> Result<WorldResponse, JsValue> {
+    send_world_request_on_lane(endpoint_id, request, WorldTransportKind::Inbox).await
+}
+
+async fn send_world_request_on_avatar(endpoint_id: &str, request: WorldRequest) -> Result<WorldResponse, JsValue> {
+    send_world_request_on_lane(endpoint_id, request, WorldTransportKind::Avatar).await
+}
+
+async fn send_world_request_on_lane(endpoint_id: &str, request: WorldRequest, lane: WorldTransportKind) -> Result<WorldResponse, JsValue> {
     let mut last_error: Option<JsValue> = None;
     for _ in 0..2 {
-        let mut cache = get_or_create_stream_cache(endpoint_id, WorldTransportKind::Inbox).await?;
+        let mut cache = get_or_create_stream_cache(endpoint_id, lane).await?;
         match exchange_on_stream(&mut cache, &request).await {
             Ok(response) => {
-                store_conn_cache(WorldTransportKind::Inbox, cache);
+                store_conn_cache(lane, cache);
                 return Ok(response);
             }
             Err(err) => {
                 last_error = Some(err);
                 cache.connection.close(0u32.into(), b"stream error");
                 cache.endpoint.close().await;
-                clear_conn_cache(WorldTransportKind::Inbox);
+                clear_conn_cache(lane);
             }
         }
     }
@@ -923,6 +937,10 @@ async fn send_world_request(endpoint_id: &str, request: WorldRequest) -> Result<
 #[wasm_bindgen]
 pub async fn disconnect_world() {
     if let Some(cached) = take_conn_cache(WorldTransportKind::Inbox) {
+        cached.connection.close(0u32.into(), b"bye");
+        cached.endpoint.close().await;
+    }
+    if let Some(cached) = take_conn_cache(WorldTransportKind::Avatar) {
         cached.connection.close(0u32.into(), b"bye");
         cached.endpoint.close().await;
     }
@@ -2029,6 +2047,7 @@ pub async fn enter_world(
                 Some(room.to_string())
             },
             preferred_handle: Some(actor_name.trim().to_string()),
+            encryption_pubkey_multibase: None,
         },
         CONTENT_TYPE_WORLD,
         timestamp_ms,
@@ -2093,7 +2112,7 @@ pub async fn send_world_chat_with_ttl(
         timestamp_ms,
         ttl_seconds,
     )?;
-    let response = send_world_request(endpoint_id, request).await?;
+    let response = send_world_request_on_avatar(endpoint_id, request).await?;
     update_room_did_cache_from_response(&response);
 
     serde_json::to_string(&WorldActionResult {
@@ -2340,7 +2359,7 @@ pub async fn send_world_cmd_with_ttl(
         timestamp_ms,
         ttl_seconds,
     )?;
-    let response = send_world_request(endpoint_id, request).await?;
+    let response = send_world_request_on_avatar(endpoint_id, request).await?;
     update_room_did_cache_from_response(&response);
 
     serde_json::to_string(&WorldActionResult {
@@ -2373,7 +2392,7 @@ pub async fn poll_world_events(
         timestamp_ms,
         DEFAULT_MESSAGE_TTL_SECS,
     )?;
-    let response = send_world_request(endpoint_id, request).await?;
+    let response = send_world_request_on_avatar(endpoint_id, request).await?;
     update_room_did_cache_from_response(&response);
 
     serde_json::to_string(&WorldActionResult {
