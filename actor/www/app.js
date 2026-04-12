@@ -2685,7 +2685,8 @@ const {
   cacheRoomDidLookup,
   setActiveObjectTarget,
   dropCachedRoomDidLookup,
-  clearActiveObjectTarget,\n});
+  clearActiveObjectTarget,
+});
 
 const { parseDot } = createDotCommands({
   state,

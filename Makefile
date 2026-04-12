@@ -9,8 +9,6 @@ MA_AGENTD_URL ?= http://127.0.0.1:5003
 SMOKE_AGENT_ADDR ?= 127.0.0.1:5003
 SMOKE_WORLD_STATUS_ADDR ?= 127.0.0.1:5002
 
-MA_ACTOR_VERSION_ORIGIN := $(origin MA_ACTOR_VERSION)
-
 AGENT_VERSION_FILE := agent/.generated/agent-version.txt
 ACTOR_VERSION_FILE := actor/www/pkg/build-version.js
 ACTOR_VERSION_JSON_FILE := actor/www/pkg/build-version.json
@@ -67,14 +65,10 @@ write-agent-version:
 	@echo "Wrote $(AGENT_VERSION_FILE): $(MA_AGENT_VERSION)"
 
 write-actor-version:
-ifeq ($(MA_ACTOR_VERSION_ORIGIN), undefined)
-	@echo "MA_ACTOR_VERSION is not set; skipping $(ACTOR_VERSION_FILE)"
-else
 	@mkdir -p $(dir $(ACTOR_VERSION_FILE))
 	@printf "globalThis.MA_ACTOR_VERSION = '%s';\n" "$(MA_ACTOR_VERSION)" > $(ACTOR_VERSION_FILE)
 	@printf '{\n  "ma_actor_version": "%s"\n}\n' "$(MA_ACTOR_VERSION)" > $(ACTOR_VERSION_JSON_FILE)
 	@echo "Wrote $(ACTOR_VERSION_FILE): $(MA_ACTOR_VERSION)"
-endif
 
 run-world: core-build actor-build world-build
 	@set -e; \
