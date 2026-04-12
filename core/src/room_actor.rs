@@ -29,7 +29,7 @@ pub struct RoomActorContext<'a> {
     pub things: Vec<String>,
     pub acl_owner_did: Option<&'a str>,
     pub acl_summary: &'a str,
-    pub caller_root_did: Option<&'a str>,
+    pub caller_did: Option<&'a str>,
     pub description: &'a str,
     pub title: &'a str,
     pub did: Option<&'a str>,
@@ -47,13 +47,13 @@ fn room_not_found(ctx: &RoomActorContext<'_>) -> RoomActorResult {
 
 fn is_owner(ctx: &RoomActorContext<'_>) -> bool {
     ctx.acl_owner_did
-        .zip(ctx.caller_root_did)
+        .zip(ctx.caller_did)
         .map(|(owner, caller)| owner == caller)
         .unwrap_or(false)
 }
 
 fn is_owner_or_unclaimed(ctx: &RoomActorContext<'_>) -> bool {
-    match (ctx.acl_owner_did, ctx.caller_root_did) {
+    match (ctx.acl_owner_did, ctx.caller_did) {
         (None, _) => true,
         (Some(owner), Some(caller)) => owner == caller,
         _ => false,
@@ -359,7 +359,7 @@ mod tests {
             things: Vec::new(),
             acl_owner_did: Some("did:ma:owner"),
             acl_summary: "*",
-            caller_root_did: Some("did:ma:owner"),
+            caller_did: Some("did:ma:owner"),
             title: "Lobby",
             description: "Welcome",
             did: Some("did:ma:world#lobby"),

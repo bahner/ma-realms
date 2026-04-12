@@ -8,7 +8,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use chrono::{SecondsFormat, Utc};
-use did_ma::{Did, Document, EncryptionKey, SigningKey, VerificationMethod};
+use did_ma::{DID_PREFIX, Did, Document, EncryptionKey, SigningKey, VerificationMethod};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey, endpoint::presets};
 use ma_core::{AVATAR_ALPN, CONTENT_TYPE_WORLD, DEFAULT_WORLD_RELAY_URL, INBOX_ALPN, MessageEnvelope, WorldCommand, WorldRequest, WorldResponse, default_ma_config_root, normalize_relay_url, parse_message, resolve_inbox_endpoint_id};
 use rand::RngCore;
@@ -968,7 +968,7 @@ async fn ensure_world_root_did_published(state: &AppState) -> Result<String> {
         }
     };
 
-    let root_did = format!("did:ma:{}", key_id);
+    let root_did = format!("{DID_PREFIX}{}", key_id);
     let ipns_path = format!("/ipns/{}", key_id);
     let mut existing_created: Option<String> = None;
     if let Ok(resolved) = kubo_name_resolve(kubo_url, &ipns_path).await {
@@ -1475,7 +1475,7 @@ fn world_root_from_did_text(input: &str) -> Option<String> {
 fn build_agent_signing_key(root_did: &str, sig_private: &[u8]) -> Result<SigningKey> {
     let key_id = root_did
         .trim()
-        .strip_prefix("did:ma:")
+        .strip_prefix(DID_PREFIX)
         .ok_or_else(|| anyhow!("invalid world DID root '{}'", root_did))?;
     let signing_did = Did::new_root(key_id)?;
     let key_bytes: [u8; 32] = sig_private
@@ -1488,7 +1488,7 @@ async fn resolve_world_endpoint_id_from_did(kubo_url: &str, world_root_did: &str
     let root = world_root_from_did_text(world_root_did)
         .ok_or_else(|| anyhow!("invalid world DID '{}'", world_root_did))?;
     let ipns_id = root
-        .strip_prefix("did:ma:")
+        .strip_prefix(DID_PREFIX)
         .ok_or_else(|| anyhow!("invalid world DID root '{}'", root))?;
     let resolved = kubo_name_resolve(kubo_url, &format!("/ipns/{}", ipns_id)).await?;
     let doc = resolved_root_did_document(kubo_url, &resolved, &root)

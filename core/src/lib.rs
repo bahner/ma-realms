@@ -6,6 +6,7 @@ pub use ma_core::addressing;
 pub use ma_core::bootstrap_identity;
 pub use ma_core::capability_acl;
 pub use ma_core::command_syntax;
+#[cfg(not(target_arch = "wasm32"))]
 pub use ma_core::kubo;
 pub use ma_core::pinning;
 pub use ma_core::ttl_cache;
@@ -20,7 +21,8 @@ pub mod requirements;
 pub mod room_actor;
 
 pub use ma_core::{
-    did_root, find_alias_for_address, find_did_by_endpoint, humanize_identifier, humanize_text,
+    create_world_did, did_root, find_alias_for_address, find_did_by_endpoint,
+    humanize_identifier, humanize_text,
     normalize_endpoint_id, normalize_iroh_address, normalize_relay_url, resolve_alias_input,
     endpoint_id_from_address, endpoint_id_from_transport_value, resolve_inbox_endpoint_id,
 };
@@ -36,7 +38,9 @@ pub use ma_core::{
 pub use ma_core::{parse_property_command, parse_property_command_for_keys, PropertyCommand};
 pub use ma_core::{DidPublisher, IpfsPublisher};
 pub use ma_core::{PinUpdateOutcome, pin_update_add_rm};
-pub use ma_core::{KuboKey, TtlCache};
+#[cfg(not(target_arch = "wasm32"))]
+pub use ma_core::KuboKey;
+pub use ma_core::TtlCache;
 pub use domain::{ActorType, AvatarActor, ExitData, ObjectData, RoomActor, WorldActor};
 pub use interfaces::AclRuntime;
 pub use object_runtime::{

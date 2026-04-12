@@ -62,3 +62,5 @@ Actor runtime invariants (chat/input routing):
 	- Actor must resolve them to DID targets before send.
 	- Actor must never send `@world/@here/@me/@avatar` (or any other alias label) over the wire; outbound targets must always be full `did:ma:...` values.
 - Error text for target resolution should prefer raw DID visibility over alias-humanized display when debugging unknown-target failures.
+
+DIDs are always fully qualified. You might need to get the .ipns for ipfs feature or to veridy the ipns key or things like that, but that is backoffice stuff. Plumbing. The ma-realms never uses root_cid ir base_id's. They are not a thing. There is no real "identity" behind anything. Each did is discreet, in the greater scheme of things. The fact that we share ipns is incidental and just an implementation detail for world, where we don't want so many keys. DIDs should still be treated as full identities nontheless.

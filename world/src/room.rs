@@ -31,14 +31,14 @@ impl RoomAcl {
         }
     }
 
-    /// Returns `true` if `did_root` is allowed to enter this room.
-    pub fn can_enter(&self, did_root: &str) -> bool {
+    /// Returns `true` if `did` is allowed to enter this room.
+    pub fn can_enter(&self, did: &str) -> bool {
         // Explicit deny takes priority.
-        if self.deny.contains(did_root) {
+        if self.deny.contains(did) {
             return false;
         }
         // Wildcard allow or explicit allow.
-        self.allow.contains("*") || self.allow.contains(did_root)
+        self.allow.contains("*") || self.allow.contains(did)
     }
 
     /// Human-readable summary for status / log display.

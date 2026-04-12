@@ -55,7 +55,7 @@ pub struct Avatar {
     pub joined_at: std::time::SystemTime,
     pub last_seen_at: std::time::SystemTime,
     /// Ed25519 private key bytes — world signs on behalf of the avatar.
-    pub signing_secret: AvatarSigningSecret,
+    pub _signing_secret: AvatarSigningSecret,
     /// Actor's X25519 encryption public key (multibase), for keyAgreement.
     pub encryption_pubkey_multibase: Option<String>,
 }
@@ -81,7 +81,7 @@ impl Avatar {
             acl: ActorAcl::open(),
             joined_at: std::time::SystemTime::now(),
             last_seen_at: std::time::SystemTime::now(),
-            signing_secret,
+            _signing_secret: signing_secret,
             encryption_pubkey_multibase,
         }
     }
