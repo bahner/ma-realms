@@ -1548,23 +1548,18 @@ fn actor_version_id() -> String {
 
 fn initialize_document_lifecycle_metadata(document: &mut Document, bundle_created_at_secs: u64) {
     let created = iso_utc_from_unix_secs(bundle_created_at_secs);
-    document.set_ma_created(created.clone());
-    document.set_ma_updated(created);
-    document.set_ma_version_id(actor_version_id());
+    document.set_created(created.clone());
+    document.set_updated(created);
+    document.set_ma_version(actor_version_id());
 }
 
 fn bump_document_lifecycle_metadata(document: &mut Document, bundle_created_at_secs: u64) {
     let now = now_iso_utc();
-    if document
-        .ma
-        .as_ref()
-        .and_then(|ma| ma.created.as_ref())
-        .is_none()
-    {
-        document.set_ma_created(iso_utc_from_unix_secs(bundle_created_at_secs));
+    if document.created.is_none() {
+        document.set_created(iso_utc_from_unix_secs(bundle_created_at_secs));
     }
-    document.set_ma_updated(now);
-    document.set_ma_version_id(actor_version_id());
+    document.set_updated(now);
+    document.set_ma_version(actor_version_id());
 }
 
 // ── Exported WASM functions ────────────────────────────────────────────────────

@@ -9018,8 +9018,9 @@ async fn main() -> Result<()> {
 
         let status_world = world.clone();
         let status_info = world_info.clone();
+        let status_www_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("www");
         tokio::spawn(async move {
-            if let Err(err) = status::serve(listener, status_world, status_info).await {
+            if let Err(err) = status::serve(listener, status_world, status_info, status_www_root).await {
                 error!("status server failed: {}", err);
             }
         });

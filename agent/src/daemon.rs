@@ -932,8 +932,8 @@ fn did_doc_has_required_ma_fields(doc: &Document) -> bool {
         .and_then(|value| value.as_array())
         .map(|entries| !entries.is_empty())
         .unwrap_or(false);
-    let has_created = ma.created.as_ref().map(|v| !v.trim().is_empty()).unwrap_or(false);
-    let has_updated = ma.updated.as_ref().map(|v| !v.trim().is_empty()).unwrap_or(false);
+    let has_created = doc.created.as_ref().map(|v| !v.trim().is_empty()).unwrap_or(false);
+    let has_updated = doc.updated.as_ref().map(|v| !v.trim().is_empty()).unwrap_or(false);
 
     has_transports && has_created && has_updated
 }
@@ -984,9 +984,8 @@ async fn ensure_world_root_did_published(state: &AppState) -> Result<String> {
                 }
 
                 existing_created = existing
-                    .ma
+                    .created
                     .as_ref()
-                    .and_then(|ma| ma.created.as_ref())
                     .map(|value| value.trim().to_string())
                     .filter(|value| !value.is_empty());
                 eprintln!(
@@ -1055,10 +1054,10 @@ async fn ensure_world_root_did_published(state: &AppState) -> Result<String> {
     document.set_ma_type("agent")?;
     let now = now_zulu();
     document.set_ma_transports(expected_agent_transports(&iroh_endpoint_id));
-    document.set_ma_created(existing_created.unwrap_or_else(|| now.clone()));
-    document.set_ma_updated(now);
+    document.set_created(existing_created.unwrap_or_else(|| now.clone()));
+    document.set_updated(now);
     if let Some(version) = read_agent_version() {
-        document.set_ma_version_id(version);
+        document.set_ma_version(version);
     }
     document.sign(&signing_key, &assertion_vm)?;
     let document_json = document.marshal()
