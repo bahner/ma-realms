@@ -17,6 +17,7 @@
     </header>
 
     <div id="session-tools" class="session-tools hidden" aria-label="Session tools">
+      <button id="btn-help" type="button">Hjelp</button>
       <button id="btn-alias" type="button" aria-pressed="true">Aliasing</button>
       <button id="btn-log" type="button">Logg</button>
       <button id="btn-export" type="button">Export Bundle</button>
@@ -146,6 +147,87 @@
       <div class="matrix-actions">
         <button id="matrix-refresh" type="button">Refresh</button>
         <button id="matrix-close" class="primary" type="button">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="help-modal" class="help-modal hidden" role="dialog" aria-modal="true" aria-hidden="true" aria-label="Getting started guide">
+    <div class="help-card">
+      <header class="help-head">
+        <h2>間 — Kom i gang</h2>
+      </header>
+      <div class="help-body">
+        <section>
+          <h3>Hva er 間?</h3>
+          <p>間 er en desentralisert tekstverdenen. Du oppretter en lokal identitet,
+          kobler deg til en verden via IPFS, og snakker med andre tilstede i samme rom.
+          Alt foregår med enkle tekstkommandoer.</p>
+        </section>
+
+        <section>
+          <h3>1. Opprett identitet</h3>
+          <p>Skriv inn et <strong>lokalt alias</strong> (et navn for denne enheten) og en
+          <strong>passphrase</strong> (minst 8 tegn). Trykk <em>Create Local Identity</em>.
+          Du får en kryptert bundle som lagres i nettleseren. Passordet låser opp bundelen.</p>
+          <p>BIP39-ordene er din <strong>gjenopprettingsnøkkel</strong> — ta vare på dem.
+          Bundelen kan eksporteres som backup med <em>Export Bundle</em>-knappen.</p>
+        </section>
+
+        <section>
+          <h3>2. Koble til en verden</h3>
+          <p>Skriv inn en verden-DID i kommandolinjen, for eksempel:</p>
+          <pre>@did:ma:k2k4r8k...abc</pre>
+          <p>Aktøren kobler seg til verden og plasserer deg i lobbyen.</p>
+        </section>
+
+        <section>
+          <h3>3. Snakk og utforsk</h3>
+          <ul>
+            <li><code>'hei alle</code> — si noe i rommet (legg til <code>'</code> foran)</li>
+            <li><code>@alice 'hei</code> — hvisker til en spesifikk person</li>
+            <li><code>.help</code> — vis alle lokale dot-kommandoer</li>
+            <li><code>.aliases</code> — vis aliaslisten din</li>
+          </ul>
+        </section>
+
+        <section>
+          <h3>4. Publiser identiteten din</h3>
+          <p>For at andre skal finne deg, publiser DID-dokumentet ditt til verden:</p>
+          <pre>.identity.publish did:ma:&lt;world&gt;</pre>
+          <p>Dette ber verdens IPFS-node om å pinne dokumentet ditt og gjøre det
+          tilgjengelig via IPNS.</p>
+        </section>
+
+        <section class="trust-section">
+          <h3>Hvem stoler du på?</h3>
+          <p>Når du kjører <code>.identity.publish</code>, sender du DID-dokumentet ditt
+          til verdens IPFS-node. Det betyr:</p>
+          <ul>
+            <li><strong>Verden ser dokumentet ditt</strong> — den pinnes på verdens node
+            og publiseres under din IPNS-nøkkel.</li>
+            <li><strong>Du stoler på verden</strong> for å publisere dokumentet korrekt
+            og ikke endre innholdet.</li>
+            <li><strong>Privat nøkkel forblir lokal</strong> — bare det signerte dokumentet
+            forlater enheten. Passordet og nøklene forblir i nettleseren.</li>
+            <li><strong>Verdensoperatøren</strong> kan i teorien se hvilke transportendepunkter
+            du annonserer, men kan ikke signere noe på dine vegne.</li>
+          </ul>
+          <p>Kort sagt: du trenger en verden du stoler på for publisering,
+          men identiteten din er kryptografisk din.</p>
+        </section>
+
+        <section>
+          <h3>Nyttige knapper</h3>
+          <ul>
+            <li><strong>Aliasing</strong> — slå av/på alias-visning i dialogen</li>
+            <li><strong>Logg</strong> — se rå I/O-logg for feilsøking</li>
+            <li><strong>Export Bundle</strong> — last ned kryptert identitetsbundle</li>
+            <li><strong>Lock</strong> — lås økten (klikk for å gå tilbake til setup)</li>
+          </ul>
+        </section>
+      </div>
+      <div class="help-actions">
+        <button id="help-close" class="primary" type="button">Lukk</button>
       </div>
     </div>
   </div>

@@ -58,7 +58,9 @@ import {
   createDidDocFlow,
   createDidRoot,
   createDidRuntimeHelpers,
+  didWithFragment,
   isMaDid,
+  isMaDidTarget,
   isUnconfiguredDidTarget,
   parseDidDocument as parseDidDocumentUtil,
   resolveEndpointWithTypePolicy,
@@ -118,7 +120,6 @@ const MSG_WHISPER_TTL_KEY = `${STORAGE_PREFIX}.actor.msg.whisper.ttl`;
 const LEGACY_BUNDLE_KEY = 'ma.identity.v2.bundle';
 const LAST_ROOM_KEY_PREFIX = `${STORAGE_PREFIX}.lastRoom`;
 const LAST_ACTIVE_HOME_KEY_PREFIX = `${STORAGE_PREFIX}.lastActiveHome`;
-const BLOCKLIST_KEY_PREFIX = `${STORAGE_PREFIX}.blockedDidRoots`;
 const LAST_PUBLISHED_IPNS_KEY = `${STORAGE_PREFIX}.lastPublishedIpns`;
 const LAST_PUBLISHED_CID_KEY = `${STORAGE_PREFIX}.lastPublishedCid`;
 const IPNS_PRIVATE_KEY_B64_KEY = `${STORAGE_PREFIX}.ipnsPrivateKeyB64`;
@@ -204,7 +205,6 @@ const state = {
   roomDidLookupCache: new Map(),
   roomDidLookupInFlight: new Map(),
   didEndpointMap: {},
-  blockedDidRoots: new Set(),
   didDocCache: new Map(),
   inboxEndpointId: '',
   mailbox: [],
@@ -220,7 +220,10 @@ const state = {
   didPublishPromise: null,
   didPublishError: '',
   didPublishPendingCache: new Map(),
-  transparentReentryPromise: null,
+  worldPingIntervalMs: null,
+  reentryInProgress: null,
+  reentryFibPrev: 3000,
+  reentryFibCurr: 3000,
   editSession: null,
   editBusy: false,
   lockOverlayAnimationId: 0,
@@ -271,7 +274,6 @@ function updateIdentityLine(...args) {
   return updateIdentityLineImpl(...args);
 }
 
-const RECONNECT_DELAY_MS = 3000;
 const ROOM_DID_CACHE_TTL_MS = 30000;
 
 const { saveLastRoom, loadLastRoom } = createRoomStorage({
@@ -280,9 +282,9 @@ const { saveLastRoom, loadLastRoom } = createRoomStorage({
 });
 
 function activeHomeKey(identityDid) {
-  const rootDid = didRoot(identityDid || '');
-  if (!rootDid) return '';
-  return `${LAST_ACTIVE_HOME_KEY_PREFIX}.${rootDid}`;
+  const did = String(identityDid || '').trim();
+  if (!isMaDid(did)) return '';
+  return `${LAST_ACTIVE_HOME_KEY_PREFIX}.${did}`;
 }
 
 function buildCurrentHomeResumeTarget() {
@@ -295,10 +297,10 @@ function buildCurrentHomeResumeTarget() {
     return roomDid;
   }
 
-  const worldDid = didRoot(findDidByEndpoint(state.currentHome.endpointId) || '');
+  const worldDid = currentWorldDid();
   if (worldDid) {
     const room = String(state.currentHome.room || 'lobby').trim() || 'lobby';
-    return `${worldDid}#${room}`;
+    return didWithFragment(worldDid, room);
   }
 
   return String(state.currentHome.endpointId || '').trim();
@@ -390,34 +392,28 @@ function syncSpecialAliasesFromCurrentHome() {
   const next = {};
 
   const identityDid = String(state.identity?.did || '').trim();
-  if (isMaDid(identityDid)) {
+  if (isMaDidTarget(identityDid)) {
     next['@me'] = identityDid;
   }
 
   const roomDid = String(state.currentHome?.roomDid || '').trim();
   const room = String(state.currentHome?.room || '').trim();
-  const worldDidFull = String(state.currentHome?.worldDid || '').trim();
+  const worldDid = String(state.currentHome?.worldDid || '').trim();
 
-  let worldDidRoot = '';
-  if (isMaDid(worldDidFull)) {
-    worldDidRoot = didRoot(worldDidFull);
-  } else if (isMaDid(roomDid)) {
-    worldDidRoot = didRoot(roomDid);
-  }
-  if (isMaDid(worldDidFull) && worldDidFull.includes('#')) {
-    next['@world'] = worldDidFull;
+  if (isMaDidTarget(worldDid)) {
+    next['@world'] = worldDid;
   }
 
   const handle = String(state.currentHome?.handle || '').trim().replace(/^@+/, '');
-  if (worldDidRoot && handle && !/\s/u.test(handle)) {
-    next['@avatar'] = `${worldDidRoot}#${handle}`;
+  if (isMaDidTarget(worldDid) && handle && !/\s/u.test(handle)) {
+    next['@avatar'] = didWithFragment(worldDid, handle);
   }
 
   let hereDid = '';
-  if (isMaDid(roomDid) && !isUnconfiguredDidTarget(roomDid)) {
+  if (isMaDidTarget(roomDid) && !isUnconfiguredDidTarget(roomDid)) {
     hereDid = roomDid;
-  } else if (worldDidRoot && room) {
-    hereDid = `${worldDidRoot}#${room}`;
+  } else if (isMaDidTarget(worldDid) && room) {
+    hereDid = didWithFragment(worldDid, room);
   }
   if (hereDid) {
     next['@here'] = hereDid;
@@ -465,12 +461,8 @@ function normalizeLegacySnapshotTarget(snapshot) {
   }
 
   if (isMaDid(resolved)) {
-    const resolvedRoot = didRoot(resolved);
-    if (!resolvedRoot) {
-      return '';
-    }
     const room = String(fragment || '').trim();
-    return room ? `${resolvedRoot}#${room}` : resolved;
+    return room ? didWithFragment(resolved, room) : resolved;
   }
 
   const endpoint = normalizeIrohAddress(resolved);
@@ -526,39 +518,6 @@ async function restoreActiveHomeAfterUnlock() {
     await enterHome(snapshot.target, snapshot.room || null);
   } catch (error) {
     appendMessage('system', `Could not restore last location: ${error instanceof Error ? error.message : String(error)}`);
-  }
-}
-
-function blocklistKey(identityDid) {
-  const rootDid = didRoot(identityDid || '');
-  if (!rootDid) return '';
-  return `${BLOCKLIST_KEY_PREFIX}.${rootDid}`;
-}
-
-function loadBlockedDidRootsForIdentity(identityDid) {
-  const key = blocklistKey(identityDid);
-  if (!key) {
-    state.blockedDidRoots = new Set();
-    return;
-  }
-  try {
-    const raw = localStorage.getItem(key);
-    if (!raw) {
-      state.blockedDidRoots = new Set();
-      return;
-    }
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) {
-      state.blockedDidRoots = new Set();
-      return;
-    }
-    state.blockedDidRoots = new Set(
-      parsed
-        .map((value) => didRoot(String(value || '')))
-        .filter((value) => isMaDid(value))
-    );
-  } catch {
-    state.blockedDidRoots = new Set();
   }
 }
 
@@ -1354,32 +1313,45 @@ async function sendWorldCommandQuery(commandText) {
   return await worldDispatchFlow.sendWorldCommandQuery(commandText);
 }
 
-function currentWorldDidRoot() {
+function currentWorldDid() {
+  const worldAlias = String(state.aliasBook?.['@world'] || '').trim();
+  if (isMaDidTarget(worldAlias)) {
+    return worldAlias;
+  }
+  const worldDid = String(state.currentHome?.worldDid || '').trim();
+  if (isMaDidTarget(worldDid)) {
+    return worldDid;
+  }
   const roomDid = String(state.currentHome?.roomDid || '').trim();
-  if (roomDid.startsWith('did:ma:')) {
-    return didRoot(roomDid);
+  if (isMaDidTarget(roomDid)) {
+    return roomDid;
   }
-  const aliasWorld = String(state.aliasBook?.['@world'] || state.aliasBook?.world || '').trim();
-  if (aliasWorld.startsWith('did:ma:')) {
-    return didRoot(aliasWorld);
-  }
-  const byEndpoint = didRoot(findDidByEndpoint(String(state.currentHome?.endpointId || '')) || '');
-  return byEndpoint;
+  return '';
 }
 
 async function sendCurrentHomePresencePing() {
   if (!state.currentHome || !worldDispatchFlow) {
     return;
   }
-  const worldDidRoot = currentWorldDidRoot();
-  if (!worldDidRoot) {
+  const worldDid = currentWorldDid();
+  if (!worldDid) {
     return;
   }
   const roomDid = String(state.currentHome?.roomDid || '').trim();
   const command = roomDid
-    ? `@${worldDidRoot}.ping ${roomDid}`
-    : `@${worldDidRoot}.ping`;
-  await sendWorldCommandQuery(command);
+    ? `@${worldDid}.ping ${roomDid}`
+    : `@${worldDid}.ping`;
+  const response = await sendWorldCommandQuery(command);
+
+  const match = String(response || '').match(/room_did=(\S+)/);
+  if (match) {
+    const serverRoomDid = match[1];
+    const localRoomDid = String(state.currentHome?.roomDid || '').trim();
+    if (localRoomDid && serverRoomDid && serverRoomDid !== localRoomDid) {
+      logger.log('presence.ping', `room drift detected: local=${localRoomDid} server=${serverRoomDid}`);
+      requestReentry('room drift');
+    }
+  }
 }
 
 async function loadLocalScriptEditor() {
@@ -2055,14 +2027,14 @@ function currentActorFragment() {
 
 function currentAvatarDid() {
   const aliasAvatar = String(state.aliasBook?.['@avatar'] || state.aliasBook?.avatar || '').trim();
-  if (aliasAvatar.startsWith('did:ma:') && aliasAvatar.includes('#')) {
+  if (isMaDidTarget(aliasAvatar)) {
     return aliasAvatar;
   }
 
-  const worldRoot = didRoot(String(state.currentHome?.roomDid || state.aliasBook?.['@world'] || '').trim());
+  const worldDid = currentWorldDid();
   const handle = String(state.currentHome?.handle || '').trim().replace(/^@+/, '');
-  if (worldRoot && handle && !/\s/u.test(handle)) {
-    return `${worldRoot}#${handle}`;
+  if (worldDid && handle && !/\s/u.test(handle)) {
+    return didWithFragment(worldDid, handle);
   }
   return '';
 }
@@ -2137,6 +2109,20 @@ function openMatrixModal() {
 
 function closeMatrixModal() {
   const modal = byId('matrix-modal');
+  if (!modal) return;
+  modal.classList.add('hidden');
+  modal.setAttribute('aria-hidden', 'true');
+}
+
+function openHelpModal() {
+  const modal = byId('help-modal');
+  if (!modal) return;
+  modal.classList.remove('hidden');
+  modal.setAttribute('aria-hidden', 'false');
+}
+
+function closeHelpModal() {
+  const modal = byId('help-modal');
   if (!modal) return;
   modal.classList.add('hidden');
   modal.setAttribute('aria-hidden', 'true');
@@ -2272,6 +2258,7 @@ const worldFlow = createWorldFlow({
   clearActiveObjectTarget,
   buildCurrentHomeResumeTarget,
   enterHome,
+  requestReentry,
 });
 
 const {
@@ -2440,6 +2427,57 @@ async function pollCurrentHomeEvents() {
   }
 }
 
+function requestReentry(reason) {
+  if (state.reentryInProgress) {
+    return state.reentryInProgress;
+  }
+
+  if (!state.currentHome) {
+    return Promise.resolve();
+  }
+
+  const home = state.currentHome;
+  const fallbackTarget = buildCurrentHomeResumeTarget() || home.endpointId;
+  const room = String(home.room || '').trim() || 'lobby';
+  const delayMs = state.reentryFibCurr;
+
+  stopHomeEventPolling();
+  logger.log('reconnect', `reentry requested (${reason || 'unknown'}) delay=${delayMs}ms endpoint=${home.endpointId.slice(0, 8)}...`);
+
+  if (!state.pollErrorShown) {
+    appendSystemUi(
+      'Connection lost. Attempting re-entry...',
+      'Mistet forbindelse. Forsøker re-entry...'
+    );
+    state.pollErrorShown = true;
+  }
+
+  const work = delay(delayMs)
+    .then(() => enterHome(fallbackTarget, room, { silent: true }))
+    .then(() => {
+      state.reentryFibPrev = 3000;
+      state.reentryFibCurr = 3000;
+      state.pollErrorShown = false;
+      logger.log('reconnect', 're-entry complete');
+      appendSystemUi('Re-entry complete.', 'Re-entry fullført.');
+    })
+    .catch((err) => {
+      const next = Math.min(state.reentryFibPrev + state.reentryFibCurr, 30000);
+      state.reentryFibPrev = state.reentryFibCurr;
+      state.reentryFibCurr = next;
+      logger.log('reconnect', `re-entry failed (next delay=${next}ms): ${err instanceof Error ? err.message : String(err)}`);
+      startHomeEventPolling();
+    })
+    .finally(() => {
+      if (state.reentryInProgress === work) {
+        state.reentryInProgress = null;
+      }
+    });
+
+  state.reentryInProgress = work;
+  return work;
+}
+
 function startHomeEventPolling() {
   stopHomeEventPolling();
 
@@ -2447,7 +2485,7 @@ function startHomeEventPolling() {
     sendCurrentHomePresencePing().catch((error) => {
       logger.log('presence.ping', `failed: ${error instanceof Error ? error.message : String(error)}`);
     });
-  }, AVATAR_PING_INTERVAL_MS);
+  }, state.worldPingIntervalMs ?? AVATAR_PING_INTERVAL_MS);
 
   state.roomPollTimer = setInterval(() => {
     Promise.resolve()
@@ -2461,31 +2499,8 @@ function startHomeEventPolling() {
       if (state.debug) {
         logger.log('poll.error', `room event poll failed: ${error instanceof Error ? error.message : String(error)}`);
       }
-      const home = state.currentHome;
-      if (home) {
-        stopHomeEventPolling();
-        logger.log('reconnect', `poll failed, attempting re-entry to ${home.endpointId.slice(0, 8)}...`);
-        if (!state.pollErrorShown) {
-          appendSystemUi(
-            'Connection lost. Attempting re-entry...',
-            'Mistet forbindelse. Forsøker re-entry...'
-          );
-          state.pollErrorShown = true;
-        }
-        const fallbackTarget = buildCurrentHomeResumeTarget() || home.endpointId;
-        delay(RECONNECT_DELAY_MS)
-          .then(() => enterHome(fallbackTarget, home.room))
-          .then(() => {
-            state.pollErrorShown = false;
-            appendSystemUi('Re-entry complete.', 'Re-entry fullført.');
-          })
-          .catch(err => {
-            appendMessage('system', uiText(
-              `Re-entry failed: ${err instanceof Error ? err.message : String(err)}`,
-              `Re-entry feilet: ${err instanceof Error ? err.message : String(err)}`
-            ));
-            startHomeEventPolling();
-          });
+      if (state.currentHome) {
+        requestReentry('poll failure');
       } else {
         appendMessage('system', `Room sync failed: ${error instanceof Error ? error.message : String(error)}`);
         state.pollErrorShown = true;
@@ -2577,14 +2592,14 @@ function resolveCurrentPositionTarget() {
   }
 
   const roomDid = String(state.currentHome.roomDid || '').trim();
-  if (isMaDid(roomDid) && !isUnconfiguredDidTarget(roomDid)) {
+  if (isMaDidTarget(roomDid) && !isUnconfiguredDidTarget(roomDid)) {
     return roomDid;
   }
 
-  const worldDid = didRoot(findDidByEndpoint(state.currentHome.endpointId) || '');
+  const worldDid = currentWorldDid();
   if (worldDid) {
     const room = String(state.currentHome.room || 'lobby').trim() || 'lobby';
-    return `${worldDid}#${room}`;
+    return didWithFragment(worldDid, room);
   }
 
   return '';
@@ -2660,8 +2675,6 @@ Object.assign(aliasFlowBridge, {
 });
 
 const {
-  saveBlockedDidRoots,
-  resolveTargetDidRoot,
   primeDidLookupCacheFromWorldMessage,
   primeDidLookupCacheFromRoomObjectDids,
 } = createDidRuntimeHelpers({
@@ -2672,9 +2685,7 @@ const {
   cacheRoomDidLookup,
   setActiveObjectTarget,
   dropCachedRoomDidLookup,
-  clearActiveObjectTarget,
-  blocklistKey,
-});
+  clearActiveObjectTarget,\n});
 
 const { parseDot } = createDotCommands({
   state,
@@ -2701,8 +2712,6 @@ const { parseDot } = createDotCommands({
   batchStatusLine,
   onAliasBookChanged: refreshDialogAndPresenceFormatting,
   didRoot,
-  resolveTargetDidRoot,
-  saveBlockedDidRoots,
   onDotEdit,
   onDotEval,
   onDotInspect,
@@ -2768,7 +2777,6 @@ async function publishIdentityToWorldDid(worldDid) {
 
   const relayHint = await lookupWorldRelayHint(endpointId).catch(() => '');
   const fragment = currentActorFragment();
-  const ipnsKey = String(localStorage.getItem(IPNS_PRIVATE_KEY_B64_KEY) || '').trim();
 
   const raw = await withTimeout(
     publish_did_document_via_world_ipfs(
@@ -2777,7 +2785,7 @@ async function publishIdentityToWorldDid(worldDid) {
       state.passphrase,
       state.encryptedBundle,
       fragment,
-      ipnsKey,
+      '',
       fragment
     ),
     20000,
@@ -2819,7 +2827,6 @@ const identityFlow = createIdentityFlow({
   defaultLanguageOrder: DEFAULT_LANGUAGE_ORDER,
   defaultUiLang: DEFAULT_UI_LANG,
   setUiLanguage,
-  loadBlockedDidRootsForIdentity,
   setCurrentPublishInfo,
   showChat,
   restoreActiveHomeAfterUnlock,
@@ -3086,9 +3093,9 @@ async function ensureHeldRequirementSatisfied(alias, objectDid) {
   const response = await sendWorldCommandQuery(`@${normalizedDid} show`);
   const kv = parseKeyValuePairs(response);
   const holder = String(kv.holder || '').trim();
-  const currentDidRoot = didRoot(state.identity?.did || '');
+  const currentDid = String(state.identity?.did || '').trim();
   const aliasLabel = String(alias || '').trim() || '@object';
-  if (!holder || holder === '(none)' || !currentDidRoot || holder !== currentDidRoot) {
+  if (!holder || holder === '(none)' || !currentDid || holder !== currentDid) {
     throw new Error(uiText(
       `${aliasLabel}: you are not holding this object yet. Pick it up first.`,
       `${aliasLabel}: du har ikke plukket opp denne tingen enda. Plukk den opp først.`
@@ -3253,7 +3260,6 @@ async function enterWorldWithRetry(endpointId, actorName, room) {
 async function enterHome(target, preferredRoom = null) {
   const options = (typeof arguments[2] === 'object' && arguments[2] !== null) ? arguments[2] : {};
   const silent = Boolean(options.silent);
-  const skipLocalDidProbe = Boolean(options.skipLocalDidProbe);
   if (!state.identity) {
     throw new Error('Load or create an identity before entering a home.');
   }
@@ -3289,53 +3295,60 @@ async function enterHome(target, preferredRoom = null) {
   if (aliasRoomFragment) {
     const room = String(aliasRoomFragment || '').trim();
     if (isMaDid(resolvedBase)) {
-      resolvedInput = `${didRoot(resolvedBase)}#${room}`;
+      resolvedInput = didWithFragment(resolvedBase, room);
     }
   }
 
-  const resolvedDidRoot = isMaDid(String(resolvedInput)) ? didRoot(resolvedInput) : '';
+  const resolvedDid = isMaDidTarget(String(resolvedInput)) ? String(resolvedInput).trim() : '';
   const resolvedDidFragment = aliasRoomFragment || (String(resolvedInput).includes('#') ? String(resolvedInput).split('#')[1] : '');
   let endpointId = '';
   if (!isMaDid(String(resolvedInput))) {
     endpointId = normalizeIrohAddress(resolvedBase);
   }
 
-  if (resolvedDidRoot) {
+  if (resolvedDid) {
     if (!silent) {
-      appendMessage('system', `Resolving DID target ${resolvedDidRoot}...`);
+      appendMessage('system', `Resolving DID target ${resolvedDid}...`);
     }
 
     let targetDocJson = '';
     let localResolveError = '';
     try {
       targetDocJson = await withTimeout(
-        fetchDidDocumentJsonByDid(resolvedDidRoot, {
+        fetchDidDocumentJsonByDid(resolvedDid, {
           localOnly: true,
           timeoutMs: 2500,
         }),
         3000,
-        `local DID resolve timed out for ${resolvedDidRoot}`
+        `local DID resolve timed out for ${resolvedDid}`
       );
     } catch (localError) {
       localResolveError = localError instanceof Error ? localError.message : String(localError);
       targetDocJson = await withTimeout(
-        fetchDidDocumentJsonByDid(resolvedDidRoot, {
+        fetchDidDocumentJsonByDid(resolvedDid, {
           forceRefresh: true,
           timeoutMs: 3500,
         }),
         4500,
-        `gateway DID resolve timed out for ${resolvedDidRoot}`
+        `gateway DID resolve timed out for ${resolvedDid}`
       );
     }
 
     const targetDoc = parseDidDocumentUtil(targetDocJson);
     if (!targetDoc || typeof targetDoc !== 'object') {
-      throw new Error(`Resolved DID document is invalid JSON for ${resolvedDidRoot}.`);
+      throw new Error(`Resolved DID document is invalid JSON for ${resolvedDid}.`);
+    }
+
+    const rawPingInterval = targetDoc?.ma?.pingIntervalSecs;
+    if (typeof rawPingInterval === 'number' && rawPingInterval > 0) {
+      state.worldPingIntervalMs = rawPingInterval * 1000;
+    } else {
+      state.worldPingIntervalMs = null;
     }
 
     endpointId = await withTimeout(
       resolveEndpointWithTypePolicy({
-        targetRoot: resolvedDidRoot,
+        targetRoot: resolvedDid,
         targetDoc,
         fetchDidDocumentJsonByDid,
         didRoot,
@@ -3343,7 +3356,7 @@ async function enterHome(target, preferredRoom = null) {
         extractWorldEndpointFromDidDoc,
       }),
       4000,
-      `endpoint extraction timed out for ${resolvedDidRoot}`
+      `endpoint extraction timed out for ${resolvedDid}`
     );
 
     if (!endpointId && localResolveError) {
@@ -3355,62 +3368,14 @@ async function enterHome(target, preferredRoom = null) {
   logger.log('connect.home', `alias=${alias} resolved=${resolvedInput} endpoint=${endpointId.slice(0, 8)}...`);
   
   if (!isLikelyIrohAddress(endpointId)) {
-    if (resolvedDidRoot) {
+    if (resolvedDid) {
       throw new Error(
-        `DID ${resolvedDidRoot} did not resolve to a valid iroh endpoint. Ensure its DID document has ma.transports, ma.currentInbox, or ma.presenceHint with /ma-iroh/<endpoint-id>/... or /iroh/<endpoint-id>.`
+        `DID ${resolvedDid} did not resolve to a valid iroh endpoint. Ensure its DID document has ma.transports, ma.currentInbox, or ma.presenceHint with /ma-iroh/<endpoint-id>/... or /iroh/<endpoint-id>.`
       );
     }
     throw new Error(
       `Alias ${alias} is not a valid endpoint id (expected 64 hex chars, got ${endpointId.length}).`
     );
-  }
-
-  const localDidRoot = didRoot(String(state.identity?.did || '').trim());
-  if (localDidRoot && !skipLocalDidProbe) {
-    let didPublishedInIpfs = false;
-    try {
-      await fetchDidDocumentJsonByDid(localDidRoot, {
-        forceRefresh: true,
-        timeoutMs: 3000,
-      });
-      didPublishedInIpfs = true;
-    } catch (error) {
-      logger.log(
-        'connect.home',
-        `local DID preflight missing in IPFS: ${error instanceof Error ? error.message : String(error)}`
-      );
-    }
-
-    if (!didPublishedInIpfs) {
-      const ipfsRelayHint = await lookupWorldRelayHint(endpointId).catch(() => null) || '';
-      try {
-        appendMessage('system', 'Local DID not found in IPFS. Sending DID document to trusted world (ma/ipfs/1).');
-        const raw = await withTimeout(
-          publish_did_document_via_world_ipfs(
-            endpointId,
-            ipfsRelayHint,
-            state.passphrase,
-            state.encryptedBundle,
-            currentActorFragment(),
-            String(localStorage.getItem(IPNS_PRIVATE_KEY_B64_KEY) || '').trim(),
-            currentActorFragment()
-          ),
-          20000,
-          'ma/ipfs/1 publish request timed out'
-        );
-        const response = JSON.parse(String(raw || '{}'));
-        if (response?.ok) {
-          appendMessage('system', response.message || 'DID document cached by trusted world.');
-        } else {
-          appendMessage('system', response?.message || 'Trusted world DID cache request failed.');
-        }
-      } catch (error) {
-        appendMessage(
-          'system',
-          `Trusted world DID publish request failed (continuing): ${error instanceof Error ? error.message : String(error)}`
-        );
-      }
-    }
   }
 
   if (!silent) {
@@ -3481,8 +3446,8 @@ async function enterHome(target, preferredRoom = null) {
   syncBundleTransportsFromEndpoint(inboxEndpointId);
   updateIdentityLine();
 
-  startHomeEventPolling();
   await pollCurrentHomeEvents();
+  startHomeEventPolling();
 
   if (!silent) {
     appendMessage('system', `Entered ${humanizeIdentifier(endpointId)}.`);
@@ -3734,6 +3699,13 @@ async function main() {
   byId('btn-alias').addEventListener('click', toggleAliasRenderEnabled);
   byId('btn-log').addEventListener('click', openMatrixModal);
   byId('btn-export').addEventListener('click', exportBundle);
+  byId('btn-help').addEventListener('click', openHelpModal);
+  byId('help-close').addEventListener('click', closeHelpModal);
+  byId('help-modal').addEventListener('click', (event) => {
+    if (event.target === byId('help-modal')) {
+      closeHelpModal();
+    }
+  });
   byId('matrix-close').addEventListener('click', closeMatrixModal);
   byId('matrix-refresh').addEventListener('click', renderMatrixView);
   byId('matrix-modal').addEventListener('click', (event) => {

@@ -12,12 +12,14 @@ use chacha20poly1305::{
 use did_ma::{
     DEFAULT_MESSAGE_TTL_SECS, Did, Document, EncryptionKey, Message, SigningKey,
 };
+use cid::{Cid, multibase::Base, multihash::Multihash};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey,
     endpoint::{Connection, RecvStream, SendStream, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use js_sys;
+use libp2p_identity::Keypair;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -471,6 +473,8 @@ struct IdentityBundlePlain {
     signing_private_key_hex: String,
     encryption_private_key_hex: String,
     #[serde(default)]
+    ipns_private_key_b64: String,
+    #[serde(default)]
     iroh_secret_key_hex: Option<String>,
     document: Document,
 }
@@ -480,6 +484,7 @@ struct CreateResult {
     encrypted_bundle: String,
     did: String,
     ipns: String,
+    ipns_private_key_b64: String,
     document_json: String,
 }
 
@@ -487,6 +492,7 @@ struct CreateResult {
 struct UnlockResult {
     did: String,
     ipns: String,
+    ipns_private_key_b64: String,
     document_json: String,
 }
 
@@ -495,6 +501,7 @@ struct UpdateResult {
     encrypted_bundle: String,
     did: String,
     ipns: String,
+    ipns_private_key_b64: String,
     document_json: String,
 }
 
@@ -658,12 +665,21 @@ fn random_bytes<const N: usize>() -> Result<[u8; N], String> {
     Ok(buf)
 }
 
-fn generate_ipns_id() -> Result<String, String> {
-    // Produces a k51-style identifier (alphanumeric, 59 chars) compatible with Did::new
-    const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    let rand = random_bytes::<56>()?;
-    let suffix: String = rand.iter().map(|b| CHARS[(*b as usize) % 36] as char).collect();
-    Ok(format!("k51{suffix}"))
+const LIBP2P_KEY_CODEC: u64 = 0x72;
+
+fn generate_ipns_identity() -> Result<(String, String), String> {
+    let keypair = Keypair::generate_ed25519();
+    let key_bytes = keypair
+        .to_protobuf_encoding()
+        .map_err(|e| format!("failed to encode IPNS private key: {}", e))?;
+    let peer_id = keypair.public().to_peer_id();
+    let multihash = Multihash::<64>::from_bytes(&peer_id.to_bytes())
+        .map_err(|e| format!("failed to derive peer multihash: {}", e))?;
+    let cid = Cid::new_v1(LIBP2P_KEY_CODEC, multihash);
+    let ipns = cid
+        .to_string_of_base(Base::Base36Lower)
+        .map_err(|e| format!("failed to encode IPNS id: {}", e))?;
+    Ok((ipns, B64.encode(key_bytes)))
 }
 
 fn now_unix_secs() -> u64 {
@@ -1009,6 +1025,7 @@ pub fn ensure_bundle_iroh_secret(
         encrypted_bundle: serde_json::to_string(&encrypted).map_err(js_err)?,
         did: plain.document.id.clone(),
         ipns: plain.ipns,
+        ipns_private_key_b64: plain.ipns_private_key_b64.clone(),
         document_json,
     };
 
@@ -1040,6 +1057,7 @@ pub fn rotate_bundle_iroh_secret(
         encrypted_bundle: serde_json::to_string(&encrypted).map_err(js_err)?,
         did: plain.document.id.clone(),
         ipns: plain.ipns,
+        ipns_private_key_b64: plain.ipns_private_key_b64.clone(),
         document_json,
     };
 
@@ -1463,6 +1481,7 @@ where
         encrypted_bundle: serde_json::to_string(&encrypted).map_err(js_err)?,
         did: plain.document.id.clone(),
         ipns: plain.ipns,
+        ipns_private_key_b64: plain.ipns_private_key_b64.clone(),
         document_json,
     };
 
@@ -1564,7 +1583,12 @@ fn bump_document_lifecycle_metadata(document: &mut Document, bundle_created_at_s
 
 // ── Exported WASM functions ────────────────────────────────────────────────────
 
-fn create_identity_internal(passphrase: &str, ipns: &str, actor_slug: &str) -> Result<String, JsValue> {
+fn create_identity_internal(
+    passphrase: &str,
+    ipns: &str,
+    actor_slug: &str,
+    ipns_private_key_b64: String,
+) -> Result<String, JsValue> {
     let actor_slug = actor_slug.trim().trim_start_matches('@');
     if actor_slug.is_empty() {
         return Err(js_err("actor slug is required for DID fragment"));
@@ -1591,6 +1615,7 @@ fn create_identity_internal(passphrase: &str, ipns: &str, actor_slug: &str) -> R
         ipns: ipns.to_string(),
         signing_private_key_hex: hex::encode(generated.signing_private_key),
         encryption_private_key_hex: hex::encode(generated.encryption_private_key),
+        ipns_private_key_b64: ipns_private_key_b64.clone(),
         iroh_secret_key_hex: Some(hex::encode(iroh_secret_key.to_bytes())),
         document: generated.document,
     };
@@ -1603,6 +1628,7 @@ fn create_identity_internal(passphrase: &str, ipns: &str, actor_slug: &str) -> R
         encrypted_bundle: serde_json::to_string(&encrypted).map_err(js_err)?,
         did: generated.root_did.id(),
         ipns: ipns.to_string(),
+        ipns_private_key_b64,
         document_json,
     };
 
@@ -1613,8 +1639,8 @@ fn create_identity_internal(passphrase: &str, ipns: &str, actor_slug: &str) -> R
 /// Returns JSON: `{ encrypted_bundle, did, ipns }`
 #[wasm_bindgen]
 pub fn create_identity(passphrase: &str, actor_slug: &str) -> Result<String, JsValue> {
-    let ipns = generate_ipns_id().map_err(js_err)?;
-    create_identity_internal(passphrase, &ipns, actor_slug)
+    let (ipns, ipns_private_key_b64) = generate_ipns_identity().map_err(js_err)?;
+    create_identity_internal(passphrase, &ipns, actor_slug, ipns_private_key_b64)
 }
 
 /// Generate a new identity bound to an existing IPNS identifier from an IPFS key.
@@ -1625,7 +1651,7 @@ pub fn create_identity_with_ipns(passphrase: &str, ipns: &str, actor_slug: &str)
     if ipns.is_empty() {
         return Err(js_err("ipns is required"));
     }
-    create_identity_internal(passphrase, ipns, actor_slug)
+    create_identity_internal(passphrase, ipns, actor_slug, String::new())
 }
 
 /// Decrypt an encrypted bundle with `passphrase`.
@@ -1643,6 +1669,7 @@ pub fn unlock_identity(passphrase: &str, encrypted_bundle_json: &str) -> Result<
     let result = UnlockResult {
         did: plain.document.id.clone(),
         ipns: plain.ipns.clone(),
+        ipns_private_key_b64: plain.ipns_private_key_b64.clone(),
         document_json: plain.document.marshal().map_err(js_err)?,
     };
 
@@ -1994,6 +2021,17 @@ pub async fn publish_did_document_via_world_ipfs(
     let plain: IdentityBundlePlain = serde_json::from_slice(&plain_bytes)
         .map_err(|e| js_err(format!("bundle corrupted: {e}")))?;
 
+    let effective_ipns_private_key_b64 = if ipns_private_key_base64.trim().is_empty() {
+        plain.ipns_private_key_b64.clone()
+    } else {
+        ipns_private_key_base64.trim().to_string()
+    };
+    if effective_ipns_private_key_b64.trim().is_empty() {
+        return Err(js_err(
+            "identity bundle has no real IPNS private key; this legacy identity cannot be published. Create a new identity or bind an existing IPNS key first"
+        ));
+    }
+
     let did_document_json = plain
         .document
         .marshal()
@@ -2005,7 +2043,7 @@ pub async fn publish_did_document_via_world_ipfs(
 
     let payload = IpfsPublishDidRequest {
         did_document_json,
-        ipns_private_key_base64: ipns_private_key_base64.trim().to_string(),
+        ipns_private_key_base64: effective_ipns_private_key_b64,
         desired_fragment: {
             let fragment = desired_fragment.trim();
             if fragment.is_empty() {
@@ -2485,6 +2523,7 @@ mod tests {
             ipns: ipns.to_string(),
             signing_private_key_hex: hex::encode(generated.signing_private_key),
             encryption_private_key_hex: hex::encode(generated.encryption_private_key),
+            ipns_private_key_b64: String::new(),
             iroh_secret_key_hex: None,
             document: generated.document,
         };
@@ -2508,6 +2547,10 @@ mod tests {
         let mutated_encrypted =
             encrypt_bundle(passphrase, &mutated_plain_json).expect("encrypt mutated bundle");
         serde_json::to_string(&mutated_encrypted).expect("serialize mutated encrypted")
+    }
+
+    fn generate_ipns_id() -> Result<String, String> {
+        generate_ipns_identity().map(|(ipns, _)| ipns)
     }
 
     #[test]

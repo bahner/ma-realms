@@ -223,7 +223,6 @@ export function createIdentityFlow({
   defaultLanguageOrder,
   defaultUiLang,
   setUiLanguage,
-  loadBlockedDidRootsForIdentity,
   setCurrentPublishInfo,
   showChat,
   restoreActiveHomeAfterUnlock,
@@ -309,7 +308,6 @@ export function createIdentityFlow({
       state.aliasName = aliasName;
       applyBundleLanguagePreference(languageOrder);
       setUiLanguage(defaultUiLang);
-      loadBlockedDidRootsForIdentity(result.did);
       setCurrentPublishInfo({ ipns: result.ipns || '' });
 
       byId('bundle-text').value = result.encrypted_bundle;
@@ -344,7 +342,6 @@ export function createIdentityFlow({
       state.aliasName = aliasName;
       applyBundleLanguagePreference(languageOrder);
       setUiLanguage(defaultUiLang);
-      loadBlockedDidRootsForIdentity(updated.did);
       setCurrentPublishInfo({ ipns: updated.ipns || '' });
 
       byId('bundle-text').value = updated.encrypted_bundle;
@@ -384,7 +381,6 @@ export function createIdentityFlow({
     state.passphrase = '';
     state.currentHome = null;
     state.didDocCache.clear();
-    state.blockedDidRoots = new Set();
     clearRoomPresence();
     byId('transcript').innerHTML = '';
     setSetupStatus('Session locked. Bundle remains stored unless removed manually.');

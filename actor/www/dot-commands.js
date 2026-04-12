@@ -24,9 +24,6 @@ export function createDotCommands({
   runBatchCommands,
   batchStatusLine,
   onAliasBookChanged,
-  didRoot,
-  resolveTargetDidRoot,
-  saveBlockedDidRoots,
   onDotEdit,
   onDotEval,
   onDotInspect,
@@ -111,11 +108,7 @@ export function createDotCommands({
       appendSystemUi('  .refresh                   - fetch latest room state and events now', '  .refresh                   - hent siste romtilstand og hendelser nå');
       appendSystemUi('  .ping [@world|@here|@avatar]- local RTT ping via command path', '  .ping [@world|@here|@avatar]- lokal RTT-ping via kommandoløypa');
       appendSystemUi('  .mail [list|pick|reply|delete|clear] - inspect mailbox queue', '  .mail [list|pick|reply|delete|clear] - inspiser mailbox-kø');
-      appendSystemUi('  .invite <did|alias> [note] - allow DID and send invite notice', '  .invite <did|alias> [note] - tillat DID og send invitasjonsmelding');
       appendSystemUi('  .smoke [alias]             - run connectivity smoke test', '  .smoke [alias]             - kjør enkel tilkoblingstest');
-      appendSystemUi('  .block <did|alias|handle>  - block sender DID root', '  .block <did|alias|handle>  - blokker avsenders DID-root');
-      appendSystemUi('  .unblock <did|alias|handle>- remove sender from block list', '  .unblock <did|alias|handle>- fjern avsender fra blokkeringslisten');
-      appendSystemUi('  .blocks                    - list blocked sender DID roots', '  .blocks                    - list blokkerte avsender-DID-rooter');
       appendSystemUi('  .debug [on|off]            - toggle debug logs', '  .debug [on|off]            - slå debuglogger av/på');
       appendSystemUi('  .log                       - show log settings', '  .log                       - vis logginnstillinger');
       appendSystemUi('  .log.enabled [true|false]  - get/set console logging enabled', '  .log.enabled [true|false]  - hent/sett om konsoll-logging er aktiv');
@@ -519,62 +512,6 @@ export function createDotCommands({
       return true;
     }
 
-    if (dotCommand === 'blocks') {
-      const blocked = Array.from(state.blockedDidRoots || []).sort();
-      if (!blocked.length) {
-        appendMessage('system', 'No blocked senders.');
-        return true;
-      }
-      appendMessage('system', `Blocked senders (${blocked.length}):`);
-      for (const did of blocked) {
-        appendMessage('system', `  ${did}`);
-      }
-      return true;
-    }
-
-    if (dotCommand === 'block') {
-      if (args.length !== 1) {
-        appendMessage('system', 'Usage: .block <did|alias|handle>');
-        return true;
-      }
-      try {
-        const root = resolveTargetDidRoot(args[0]);
-        if (state.identity && didRoot(state.identity.did) === root) {
-          appendMessage('system', 'Refusing to block your own DID root.');
-          return true;
-        }
-        const before = state.blockedDidRoots.size;
-        state.blockedDidRoots.add(root);
-        if (state.blockedDidRoots.size !== before) {
-          saveBlockedDidRoots();
-        }
-        appendMessage('system', `Blocked sender: ${root}`);
-      } catch (error) {
-        appendMessage('system', error instanceof Error ? error.message : String(error));
-      }
-      return true;
-    }
-
-    if (dotCommand === 'unblock') {
-      if (args.length !== 1) {
-        appendMessage('system', 'Usage: .unblock <did|alias|handle>');
-        return true;
-      }
-      try {
-        const root = resolveTargetDidRoot(args[0]);
-        const removed = state.blockedDidRoots.delete(root);
-        if (removed) {
-          saveBlockedDidRoots();
-          appendMessage('system', `Unblocked sender: ${root}`);
-        } else {
-          appendMessage('system', `Sender not blocked: ${root}`);
-        }
-      } catch (error) {
-        appendMessage('system', error instanceof Error ? error.message : String(error));
-      }
-      return true;
-    }
-
     if (dotCommand === 'edit') {
       onDotEdit(tail);
       return true;
@@ -780,35 +717,6 @@ export function createDotCommands({
       }
 
       appendMessage('system', 'Usage: .mail [list|pick <id>|reply <id> <text>|delete <id>|clear]');
-      return true;
-    }
-
-    if (dotCommand === 'invite') {
-      if (args.length < 1) {
-        appendMessage('system', 'Usage: .invite <did|alias|handle> [note]');
-        return true;
-      }
-      let targetRoot = '';
-      try {
-        targetRoot = resolveTargetDidRoot(args[0]);
-      } catch (error) {
-        appendMessage('system', error instanceof Error ? error.message : String(error));
-        return true;
-      }
-      const note = args.slice(1).join(' ').trim();
-      const inviteText = note || 'Your knock request was accepted. You may enter now.';
-      const command = `@world invite ${targetRoot} ${inviteText}`;
-      sendWorldCommandQuery(command)
-        .then((message) => {
-          appendMessage('system', message || `Invited ${targetRoot}.`);
-          return sendWhisperToDid(targetRoot, `invite accepted: ${inviteText}`);
-        })
-        .then(() => {
-          appendMessage('system', `Invite notice sent to ${humanizeIdentifier(targetRoot)}.`);
-        })
-        .catch((error) => {
-          appendMessage('system', `Invite failed: ${error instanceof Error ? error.message : String(error)}`);
-        });
       return true;
     }
 

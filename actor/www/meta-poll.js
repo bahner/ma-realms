@@ -45,7 +45,7 @@ export function createDidTargetMetaPollHandler(deps) {
     const targetWorldRoot = didRoot(resolved);
     const currentWorldRoot = didRoot(String(state.currentHome?.roomDid || '').trim());
     if (currentWorldRoot && targetWorldRoot && currentWorldRoot !== targetWorldRoot) {
-      throw new Error(`poll target must be in current world (${currentWorldRoot}), got ${targetWorldRoot}`);
+      throw new Error(`poll target must be in current world (${state.currentHome?.roomDid || currentWorldRoot}), got ${resolved}`);
     }
 
     if (state.currentHome && state.currentHome.room === roomFragment) {

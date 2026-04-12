@@ -172,6 +172,7 @@ export function createWorldFlow({
   clearActiveObjectTarget,
   buildCurrentHomeResumeTarget,
   enterHome,
+  requestReentry,
 }) {
   function isNotRegisteredInRoomMessage(message) {
     const text = String(message || '').toLowerCase();
@@ -221,38 +222,11 @@ export function createWorldFlow({
   }
 
   async function performTransparentReentry(reason) {
-    if (state.transparentReentryPromise) {
-      return await state.transparentReentryPromise;
-    }
-
-    if (!state.currentHome) {
-      throw new Error('Not connected to a world.');
-    }
-
-    const home = state.currentHome;
-    const endpointId = String(home.endpointId || '').trim();
-    const room = String(home.room || '').trim() || 'lobby';
     const activeAlias = String(state.activeObjectTargetAlias || '').trim();
     const activeDid = String(state.activeObjectTargetDid || '').trim();
-    const resumeTarget = buildCurrentHomeResumeTarget() || endpointId;
 
-    const work = (async () => {
-      logger.log(
-        'reconnect',
-        `transparent re-entry triggered (${reason || 'unknown reason'}) endpoint=${endpointId.slice(0, 8)}... room=${room}`
-      );
-      await enterHome(resumeTarget, room, { silent: true });
-      await restoreActiveObjectTargetAfterReentry(activeAlias, activeDid);
-    })();
-
-    state.transparentReentryPromise = work;
-    try {
-      await work;
-    } finally {
-      if (state.transparentReentryPromise === work) {
-        state.transparentReentryPromise = null;
-      }
-    }
+    await requestReentry(reason);
+    await restoreActiveObjectTargetAfterReentry(activeAlias, activeDid);
   }
 
   return {
@@ -299,12 +273,12 @@ export function createWorldDispatchFlow({
     return 60;
   }
 
-  function actorRootDidFromState() {
+  function actorDidFromState() {
     const did = String(state.identity?.did || '').trim();
-    if (!isMaDid(did)) {
+    if (!isMaDid(did) || !did.includes('#')) {
       return '';
     }
-    return String(did.split('#')[0] || '').trim();
+    return did;
   }
 
   function roomHintFromDidTarget(targetDid) {
@@ -393,14 +367,14 @@ export function createWorldDispatchFlow({
 
     const { targetDid, targetPath, routeWorld } = normalizeDidTargetPath(normalizedDid, pathRaw);
 
-    const worldDidRoot = String(targetDid.split('#')[0] || '').trim();
-    if (!worldDidRoot) {
+    const ipnsKey = String(targetDid.split('#')[0] || '').trim();
+    if (!ipnsKey) {
       return false;
     }
 
-    const endpointId = await resolveWorldEndpointForDid(worldDidRoot);
+    const endpointId = await resolveWorldEndpointForDid(ipnsKey);
     if (!isLikelyIrohAddress(endpointId)) {
-      throw new Error(`DID ${worldDidRoot} did not resolve to a valid iroh endpoint.`);
+      throw new Error(`DID ${targetDid} did not resolve to a valid iroh endpoint.`);
     }
 
     const normalizedTarget = routeWorld
@@ -410,7 +384,7 @@ export function createWorldDispatchFlow({
       ? `@${normalizedTarget} ${remainder}`
       : `@${normalizedTarget}`;
     const roomHint = roomHintFromDidTarget(targetDid);
-    const sender = actorRootDidFromState() || activeActorName();
+    const sender = actorDidFromState() || activeActorName();
 
     const sendStart = Date.now();
     logger.log('send.command.stateless', `room=${roomHint} sender=${sender} msg_len=${normalizedInput.length}`);
@@ -768,10 +742,8 @@ export function createWorldDispatchFlow({
         if (bootstrapAttempt < 1 && atTarget && atTarget.startsWith('did:ma:')) {
           const dotIdx = atTarget.indexOf('.');
           const didToken = String(dotIdx === -1 ? atTarget : atTarget.slice(0, dotIdx)).trim();
-          const hashIdx = didToken.indexOf('#');
-          const worldDidRoot = String(hashIdx === -1 ? didToken : didToken.slice(0, hashIdx)).trim();
-          if (worldDidRoot) {
-            await enterHome(worldDidRoot, null, { silent: true });
+          if (didToken) {
+            await enterHome(didToken, null, { silent: true });
             return await sendCurrentWorldMessage(text, {
               attempt,
               bootstrapAttempt: bootstrapAttempt + 1,
@@ -860,7 +832,6 @@ export function createWorldDispatchFlow({
           throw new Error(result.message || 'chat failed');
         }
 
-        renderLocalBroadcastMessage(payload);
         await pollCurrentHomeEvents();
         appendAmbientProseAfterSpeech().catch((err) => {
           logger.log('ambient.prose', `failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -986,9 +957,6 @@ export function createWorldDispatchFlow({
         return;
       }
 
-      if (trimmedText.startsWith("'")) {
-        renderLocalBroadcastMessage(trimmedText.substring(1));
-      }
       await pollCurrentHomeEvents();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

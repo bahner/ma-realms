@@ -60,6 +60,7 @@ use tracing_subscriber::prelude::*;
 
 mod actor;
 mod actor_web;
+mod avatar_commands;
 mod bootstrap;
 mod content_validation;
 mod kubo;
@@ -105,6 +106,7 @@ const MAILBOX_LOCK_SECS: u64 = 600;
 const OBJECT_WASHER_INTERVAL_SECS: u64 = 20;
 const PRESENCE_PROBE_INTERVAL_SECS_DEFAULT: u64 = 10;
 const PRESENCE_STALE_AFTER_SECS_DEFAULT: u64 = 25;
+const WORLD_PING_INTERVAL_SECS: u32 = 30;
 const RELAY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_WORLD_SLUG: &str = "ma";
 const DEFAULT_KUBO_API_URL: &str = "http://127.0.0.1:5001";
@@ -1663,23 +1665,34 @@ impl World {
     }
 
     async fn is_world_target_did(&self, target: &str) -> bool {
-        let parsed = match Did::try_from(target) {
-            Ok(did) => did,
-            Err(_) => return false,
-        };
+        let target = target.trim();
+        if target.is_empty() {
+            return false;
+        }
 
-        // Check by IPNS key (same namespace) or full DID (exact match).
-        let configured_ipns = self.world_ipns.read().await.clone();
+        let _configured_ipns = self.world_ipns.read().await.clone();
         let configured_full = self.world_did.read().await.clone();
 
-        configured_ipns
-            .as_ref()
-            .map(|v| v == &parsed.ipns)
+        // Strict match against configured full DID.
+        if configured_full
+            .as_deref()
+            .map(|full| full == target)
             .unwrap_or(false)
-            || configured_full
-                .as_ref()
-                .map(|v| v == &parsed.id())
-                .unwrap_or(false)
+        {
+            return true;
+        }
+
+        // Postel-tolerant: accept configured DID root as @world alias.
+        if configured_full
+            .as_deref()
+            .and_then(|full| full.split('#').next())
+            .map(|root| root == target)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+
+        false
     }
 
     pub(crate) async fn install_actor_secrets(
@@ -3768,6 +3781,23 @@ impl World {
                     .handle_avatar_command(room_name, from, from_did, sender_profile, command)
                     .await;
             }
+
+            // Postel's law: actor sent its own DID (not the world-derived avatar DID).
+            // Check if any avatar in the room is owned by target_did → treat as self-targeting.
+            {
+                let rooms = self.rooms.read().await;
+                if let Some(room) = rooms.get(room_name) {
+                    let is_owner_match = room.avatars.get(from)
+                        .map(|a| a.owner == target_did.id())
+                        .unwrap_or(false);
+                    if is_owner_match {
+                        drop(rooms);
+                        return self
+                            .handle_avatar_command(room_name, from, from_did, sender_profile, command)
+                            .await;
+                    }
+                }
+            }
         }
 
                 if let Ok(target_did) = Did::try_from(target.trim()) {
@@ -5144,98 +5174,6 @@ impl World {
                     };
                 }
 
-                // Movement: `go <direction>` or bare direction name.
-                let direction = trimmed
-                    .strip_prefix("go ")
-                    .map(str::trim)
-                    .unwrap_or(trimmed);
-
-                let caller_did = from_did.id();
-
-                let move_target = {
-                    let rooms = self.rooms.read().await;
-                    rooms.get(room_name).and_then(|room| {
-                        room.exits
-                            .iter()
-                            .find(|e| e.matches_for_preferences(direction, &["und".to_string()]))
-                            .cloned()
-                    })
-                };
-
-                if let Some(exit) = move_target {
-                    let exit_name = exit.name_for_preferences(&["und".to_string()]);
-                    if exit.locked {
-                        return (format!("The way {} is locked.", exit_name), room_name.to_string());
-                    }
-
-                    if !exit.can_use(&caller_did) {
-                        return (format!("You are not allowed to use exit '{}'.", exit_name), room_name.to_string());
-                    }
-
-                    let destination = exit.to.clone();
-                    let travel_text = exit.travel_text_for_preferences(&["und".to_string()]);
-
-                    // Exit destinations may be local room fragments or full room DIDs.
-                    // If the DID root is not this world, we hand off via /enter.
-                    let (local_destination, external_destination) = match Did::try_from(destination.as_str()) {
-                        Ok(did) => {
-                            if self.is_local_world_ipns(&did.ipns).await {
-                                (did.fragment.clone(), None)
-                            } else {
-                                (None, Some(did.id()))
-                            }
-                        }
-                        Err(_) => (Some(destination.clone()), None),
-                    };
-
-                    let mut rooms = self.rooms.write().await;
-                    let avatar = rooms
-                        .get_mut(room_name)
-                        .and_then(|r| r.avatars.remove(from));
-                    if let Some(avatar) = avatar {
-                        if let Some(external_did) = external_destination {
-                            if let Some(src) = rooms.get_mut(room_name) {
-                                src.add_avatar(avatar);
-                            }
-                            let base = travel_text
-                                .clone()
-                                .unwrap_or_else(|| format!("{} goes {}.", from, exit_name));
-                            return (format!("{} go {}", base, external_did), room_name.to_string());
-                        }
-
-                        let Some(local_destination) = local_destination else {
-                            if let Some(src) = rooms.get_mut(room_name) {
-                                src.add_avatar(avatar);
-                            }
-                            return (format!("Destination '{}' is not a room DID (missing fragment).", destination), room_name.to_string());
-                        };
-
-                        if rooms.contains_key(&local_destination) {
-                            rooms.get_mut(&local_destination).unwrap().add_avatar(avatar);
-                            let base = travel_text
-                                .clone()
-                                .unwrap_or_else(|| format!("{} goes {}.", from, exit_name));
-                            return (base, local_destination);
-                        }
-
-                        // Destination vanished — put avatar back.
-                        if let Some(src) = rooms.get_mut(room_name) {
-                            src.add_avatar(avatar);
-                        }
-                        return (format!("Destination '{}' no longer exists.", local_destination), room_name.to_string());
-                    }
-                    let base = travel_text
-                        .unwrap_or_else(|| format!("{} goes {}.", from, exit_name));
-                    return (base, room_name.to_string());
-                }
-
-                if trimmed.to_ascii_lowercase().starts_with("go ") {
-                    return (
-                        format!("No exit '{}' from '{}'.", direction, room_name),
-                        room_name.to_string(),
-                    );
-                }
-
                 if let Some(rest) = trimmed.strip_prefix("describe ") {
                     let description = normalize_spoken_text(rest).trim().to_string();
                     if description.is_empty() {
@@ -5326,7 +5264,41 @@ impl World {
                     );
                 }
 
-                // Unqualified input is gameplay-first: unknown avatar commands are treated as room commands.
+                // ── Avatar gameplay commands (look, go, inspect) ────────
+                let caller_did = from_did.id();
+                let avatar_ctx = {
+                    let rooms = self.rooms.read().await;
+                    let things = self.room_object_names(room_name).await;
+                    rooms.get(room_name).map(|room| {
+                        avatar_commands::AvatarCommandContext {
+                            room_name: room_name.to_string(),
+                            room_title: room.title_or_default(),
+                            room_description: room.description_or_default(),
+                            exits: room.exits.clone(),
+                            avatars: room.avatars.keys().cloned().collect(),
+                            things,
+                            sender_profile: sender_profile.to_string(),
+                            caller_did: caller_did.clone(),
+                        }
+                    })
+                };
+
+                if let Some(ref ctx) = avatar_ctx {
+                    if let Some(result) = avatar_commands::execute_avatar_command(trimmed, ctx) {
+                        match result.action {
+                            avatar_commands::AvatarAction::None => {
+                                return (result.response, room_name.to_string());
+                            }
+                            avatar_commands::AvatarAction::Move { exit } => {
+                                return self
+                                    .execute_avatar_move(room_name, from, &caller_did, sender_profile, &exit)
+                                    .await;
+                            }
+                        }
+                    }
+                }
+
+                // Unqualified input: fall through to room commands.
                 (
                     self
                         .room_command(
@@ -5341,6 +5313,82 @@ impl World {
                 )
             }
         }
+    }
+
+    async fn execute_avatar_move(
+        &self,
+        room_name: &str,
+        from: &str,
+        _caller_did: &str,
+        sender_profile: &str,
+        exit: &ma_core::ExitData,
+    ) -> (String, String) {
+        let prefs: Vec<String> = sender_profile
+            .split(';')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let exit_name = exit.name_for_preferences(&prefs);
+        let destination = exit.to.clone();
+        let travel_text = exit.travel_text_for_preferences(&prefs);
+
+        let (local_destination, external_destination) = match Did::try_from(destination.as_str()) {
+            Ok(did) => {
+                if self.is_local_world_ipns(&did.ipns).await {
+                    (did.fragment.clone(), None)
+                } else {
+                    (None, Some(did.id()))
+                }
+            }
+            Err(_) => (Some(destination.clone()), None),
+        };
+
+        let mut rooms = self.rooms.write().await;
+        let avatar = rooms
+            .get_mut(room_name)
+            .and_then(|r| r.avatars.remove(from));
+        let Some(avatar) = avatar else {
+            let base = travel_text
+                .unwrap_or_else(|| format!("{} goes {}.", from, exit_name));
+            return (base, room_name.to_string());
+        };
+
+        if let Some(external_did) = external_destination {
+            if let Some(src) = rooms.get_mut(room_name) {
+                src.add_avatar(avatar);
+            }
+            let base = travel_text
+                .clone()
+                .unwrap_or_else(|| format!("{} goes {}.", from, exit_name));
+            return (format!("{} go {}", base, external_did), room_name.to_string());
+        }
+
+        let Some(local_destination) = local_destination else {
+            if let Some(src) = rooms.get_mut(room_name) {
+                src.add_avatar(avatar);
+            }
+            return (
+                format!("Destination '{}' is not a room DID (missing fragment).", destination),
+                room_name.to_string(),
+            );
+        };
+
+        if rooms.contains_key(&local_destination) {
+            rooms.get_mut(&local_destination).unwrap().add_avatar(avatar);
+            let base = travel_text
+                .clone()
+                .unwrap_or_else(|| format!("{} goes {}.", from, exit_name));
+            return (base, local_destination);
+        }
+
+        // Destination vanished — put avatar back.
+        if let Some(src) = rooms.get_mut(room_name) {
+            src.add_avatar(avatar);
+        }
+        (
+            format!("Destination '{}' no longer exists.", local_destination),
+            room_name.to_string(),
+        )
     }
 
     async fn handle_world_command(
@@ -5513,10 +5561,10 @@ impl World {
             let touched = self
                 .touch_avatar_presence_for_did(&effective_room, &caller_did)
                 .await;
+            let room_did = self.build_room_did(&effective_room).await;
             return format!(
-                "@world.ping ok room={} did={} touched={}",
-                effective_room,
-                caller_did,
+                "pong room_did={} touched={}",
+                room_did,
                 touched
             );
         }
@@ -6494,7 +6542,10 @@ async fn best_effort_publish_did_document_to_kubo(
     }
 
     let Some(key_name) = key_name else {
-        return Ok((None, None));
+        return Err(anyhow!(
+            "no matching Kubo key for DID ipns '{}' and no importable private key provided",
+            document_ipns_id
+        ));
     };
 
     let document_cid = ipfs_add(&kubo_url, did_document_json.into_bytes()).await?;
@@ -7408,37 +7459,20 @@ impl IpfsProtocol {
             );
         }
 
-        let world = self.world.clone();
-        let did_document_json = request_payload.did_document_json.clone();
-        let ipns_private_key_base64 = request_payload.ipns_private_key_base64.clone();
-        let desired_fragment = request_payload.desired_fragment.clone();
-        tokio::spawn(async move {
-            match best_effort_publish_did_document_to_kubo(
-                world,
-                did_document_json,
-                ipns_private_key_base64,
-                desired_fragment,
-            )
-            .await
-            {
-                Ok((key_name, cid)) => {
-                    info!(
-                        "ma/ipfs publish best-effort finished: key_name={:?} cid={:?}",
-                        key_name, cid
-                    );
-                }
-                Err(err) => {
-                    warn!("ma/ipfs publish best-effort failed: {}", err);
-                }
-            }
-        });
+        let (key_name, cid) = best_effort_publish_did_document_to_kubo(
+            self.world.clone(),
+            request_payload.did_document_json.clone(),
+            request_payload.ipns_private_key_base64.clone(),
+            request_payload.desired_fragment.clone(),
+        )
+        .await?;
 
         Ok(IpfsPublishDidResponse {
             ok: true,
-            message: "did document cached locally; background publish started".to_string(),
+            message: "did document published via ma/ipfs/1".to_string(),
             did: Some(document_did.id()),
-            key_name: None,
-            cid: None,
+            key_name,
+            cid,
         })
     }
 }
@@ -7784,6 +7818,7 @@ async fn ensure_world_did_document(
             .map(serde_json::Value::String)
             .collect(),
     ));
+    document.set_ma_ping_interval_secs(WORLD_PING_INTERVAL_SECS);
     document.sign(&signing_key, &assertion_vm)?;
 
     let document_json = document

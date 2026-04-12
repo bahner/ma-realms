@@ -24,6 +24,12 @@ export function isConfiguredMaDidTarget(value) {
   return isMaDidTarget(value) && !isUnconfiguredDidTarget(value);
 }
 
+export function didWithFragment(did, fragment) {
+  const root = String(did || '').trim().split('#')[0];
+  if (!root) return '';
+  return `${root}#${fragment}`;
+}
+
 export function didToIpnsName(did, didRoot) {
   const root = didRoot(did);
   const prefix = DID_MA_PREFIX;
@@ -123,37 +129,7 @@ export function createDidRuntimeHelpers({
   setActiveObjectTarget,
   dropCachedRoomDidLookup,
   clearActiveObjectTarget,
-  blocklistKey,
 }) {
-  function saveBlockedDidRoots() {
-    if (!state.identity?.did) {
-      return;
-    }
-    const key = blocklistKey(state.identity.did);
-    if (!key) {
-      return;
-    }
-    const entries = Array.from(state.blockedDidRoots || []).sort();
-    localStorage.setItem(key, JSON.stringify(entries));
-  }
-
-  function resolveTargetDidRoot(token) {
-    const key = String(token || '').trim();
-    if (!key) {
-      throw new Error('Usage: .block <did|alias|handle>');
-    }
-    const resolved = resolveAliasInput(key);
-    const mappedDid = state.handleDidMap[key] || state.handleDidMap[resolved] || '';
-    const candidate = isMaDid(key)
-      ? key
-      : (isMaDid(resolved) ? resolved : (mappedDid || findDidByEndpoint(resolved) || resolved));
-    const root = didRoot(candidate);
-    if (!isMaDid(root)) {
-      throw new Error(`Could not resolve a did:ma target from '${key}'.`);
-    }
-    return root;
-  }
-
   function primeDidLookupCacheFromWorldMessage(message) {
     const text = String(message || '').trim();
     if (!text) return;
@@ -198,8 +174,6 @@ export function createDidRuntimeHelpers({
   }
 
   return {
-    saveBlockedDidRoots,
-    resolveTargetDidRoot,
     primeDidLookupCacheFromWorldMessage,
     primeDidLookupCacheFromRoomObjectDids,
   };
