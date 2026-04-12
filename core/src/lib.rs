@@ -13,6 +13,7 @@ pub use ma_core::ttl_cache;
 
 // Realms-specific modules stay here.
 pub mod domain;
+pub mod identity;
 pub mod interfaces;
 pub mod object_runtime;
 pub mod parser;
@@ -42,6 +43,11 @@ pub use ma_core::{PinUpdateOutcome, pin_update_add_rm};
 pub use ma_core::KuboKey;
 pub use ma_core::TtlCache;
 pub use domain::{ActorType, AvatarActor, ExitData, ObjectData, RoomActor, WorldActor};
+pub use identity::{
+    GeneratedAgentIdentity,
+    create_agent_identity,
+    create_agent_identity_from_private_keys,
+};
 pub use interfaces::AclRuntime;
 pub use object_runtime::{
     MAILBOX_COMMANDS_INLINE,

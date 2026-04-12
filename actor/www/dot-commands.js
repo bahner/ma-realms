@@ -40,6 +40,7 @@ export function createDotCommands({
   pollDirectInbox,
   pollCurrentHomeEvents,
   prepareIdentityDocumentForSend,
+  publishIdentityToWorldDid,
   sendWhisperToDid,
   runSmokeTest,
 }) {
@@ -94,6 +95,7 @@ export function createDotCommands({
       appendSystemUi('Dot commands:', 'Punktkommandoer:');
       appendSystemUi('  .help                      - this message', '  .help                      - denne meldingen');
       appendSystemUi('  .identity                  - show local pre-publish DID document as raw JSON', '  .identity                  - vis lokalt DID-dokument (før publisering) som rå JSON');
+      appendSystemUi('  .identity.publish <did:ma:world> - publish DID document to world via ma/ipfs/1', '  .identity.publish <did:ma:world> - publiser DID-dokument til verden via ma/ipfs/1');
       appendSystemUi('  .aliases add <name> <target> - add/update alias (no spaces in target)', '  .aliases add <navn> <mål> - legg til/oppdater alias (ingen mellomrom i mål)');
       appendSystemUi('    note: @here/@me/@world/@avatar are updated automatically', '    merk: @here/@me/@world/@avatar oppdateres automatisk');
       appendSystemUi('  .set home [did:ma:...#room]- set home target (or current position)', '  .set home [did:ma:...#room]- sett home-mål (eller nåværende posisjon)');
@@ -167,6 +169,32 @@ export function createDotCommands({
         })
         .catch((error) => {
           appendMessage('system', `Identity prepare failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
+      return true;
+    }
+
+    if (dotCommand === 'identity.publish') {
+      if (!state.identity) {
+        appendSystemUi('No identity loaded. Create or unlock an identity first.', 'Ingen identitet lastet. Opprett eller lås opp en identitet først.');
+        return true;
+      }
+      if (args.length !== 1 || !isMaDid(String(args[0] || ''))) {
+        appendMessage('system', 'Usage: .identity.publish <did:ma:world>');
+        return true;
+      }
+      const worldDid = String(args[0]).trim();
+      appendMessage('system', `Publishing identity to ${worldDid} via ma/ipfs/1...`);
+      Promise.resolve()
+        .then(async () => {
+          const result = await publishIdentityToWorldDid(worldDid);
+          if (result?.ok) {
+            appendMessage('system', result.message || 'DID document published successfully.');
+          } else {
+            appendMessage('system', result?.message || 'Publish failed (world returned ok=false).');
+          }
+        })
+        .catch((error) => {
+          appendMessage('system', `Identity publish failed: ${error instanceof Error ? error.message : String(error)}`);
         });
       return true;
     }

@@ -300,7 +300,7 @@ export function createIdentityFlow({
       localStorage.setItem(apiStorageKey, normalizeIpfsGatewayBase(getApiBase()));
       setActiveAlias(aliasName);
 
-      const created = JSON.parse(createIdentity(passphrase));
+      const created = JSON.parse(createIdentity(passphrase, aliasName));
       const result = JSON.parse(ensureBundleIrohSecret(passphrase, created.encrypted_bundle));
 
       state.identity = result;

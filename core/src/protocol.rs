@@ -168,6 +168,8 @@ pub struct WorldResponse {
     pub room_title: String,
     #[serde(default)]
     pub room_did: String,
+        #[serde(default)]
+        pub world_did: String,
     #[serde(default)]
     pub avatars: Vec<PresenceAvatar>,
     #[serde(default)]

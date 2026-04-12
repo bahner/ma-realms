@@ -1048,6 +1048,7 @@ export function createWorldResponseFlow({
       const previousRoom = state.currentHome.room;
       state.currentHome.room = nextRoom;
       if (result.room_did) state.currentHome.roomDid = result.room_did;
+      if (result.world_did) state.currentHome.worldDid = result.world_did;
       if (result.room_title) state.currentHome.roomTitle = result.room_title;
       if (typeof result.room_description === 'string') state.currentHome.roomDescription = result.room_description;
       saveLastRoom(state.currentHome.endpointId, nextRoom);

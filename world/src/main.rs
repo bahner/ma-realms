@@ -6822,6 +6822,7 @@ impl WorldProtocol {
                     room_description: String::new(),
                     room_title: String::new(),
                     room_did: String::new(),
+                    world_did: String::new(),
                     avatars: Vec::new(),
                     room_object_dids: HashMap::new(),
                     transport_ack: Some(TransportAck {
@@ -7052,6 +7053,7 @@ impl WorldProtocol {
                         room_description: String::new(),
                         room_title: String::new(),
                         room_did: String::new(),
+                        world_did: String::new(),
                         avatars: Vec::new(),
                         room_object_dids: HashMap::new(),
                         transport_ack: Some(TransportAck {
@@ -7079,6 +7081,7 @@ impl WorldProtocol {
                         room_description: String::new(),
                         room_title: String::new(),
                         room_did: String::new(),
+                        world_did: String::new(),
                         avatars: Vec::new(),
                         room_object_dids: HashMap::new(),
                         transport_ack: Some(TransportAck {
@@ -7146,6 +7149,7 @@ impl WorldProtocol {
                     room_description: self.world.room_description(&room).await,
                     room_title: self.world.room_title(&room).await,
                     room_did: self.world.room_did(&room).await,
+                    world_did: self.world.world_did.read().await.clone().unwrap_or_default(),
                     avatars: self.world.room_avatars(&room).await,
                     room_object_dids: self.world.room_object_did_map(&room).await,
                     transport_ack: None,
@@ -7217,6 +7221,7 @@ impl WorldProtocol {
                     room_description: self.world.room_description(&effective_room).await,
                     room_title: self.world.room_title(&effective_room).await,
                     room_did: self.world.room_did(&effective_room).await,
+                    world_did: self.world.world_did.read().await.clone().unwrap_or_default(),
                     avatars: self.world.room_avatars(&effective_room).await,
                     room: effective_room.clone(),
                     message,
@@ -7256,6 +7261,7 @@ impl WorldProtocol {
                     room_description: self.world.room_description(&room).await,
                     room_title: self.world.room_title(&room).await,
                     room_did: self.world.room_did(&room).await,
+                    world_did: self.world.world_did.read().await.clone().unwrap_or_default(),
                     avatars: self.world.room_avatars(&room).await,
                     room_object_dids: self.world.room_object_did_map(&room).await,
                     transport_ack: None,
@@ -7305,6 +7311,7 @@ impl ProtocolHandler for WorldProtocol {
                     room_description: String::new(),
                     room_title: String::new(),
                     room_did: String::new(),
+                    world_did: String::new(),
                     avatars: Vec::new(),
                     room_object_dids: HashMap::new(),
                     transport_ack: Some(TransportAck {

@@ -11,7 +11,6 @@ use chacha20poly1305::{
 };
 use did_ma::{
     DEFAULT_MESSAGE_TTL_SECS, Did, Document, EncryptionKey, Message, SigningKey,
-    generate_agent_identity,
 };
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey,
@@ -433,6 +432,7 @@ use ma_core::{
     DEFAULT_WORLD_RELAY_URL,
     evaluate_compiled_acl_with_owner,
     did_root as core_did_root,
+    create_agent_identity,
     find_alias_for_address as core_find_alias_for_address,
     find_did_by_endpoint as core_find_did_by_endpoint,
     humanize_identifier as core_humanize_identifier,
@@ -1564,11 +1564,16 @@ fn bump_document_lifecycle_metadata(document: &mut Document, bundle_created_at_s
 
 // ── Exported WASM functions ────────────────────────────────────────────────────
 
-fn create_identity_internal(passphrase: &str, ipns: &str) -> Result<String, JsValue> {
-    let mut generated = generate_agent_identity(ipns).map_err(js_err)?;
+fn create_identity_internal(passphrase: &str, ipns: &str, actor_slug: &str) -> Result<String, JsValue> {
+    let actor_slug = actor_slug.trim().trim_start_matches('@');
+    if actor_slug.is_empty() {
+        return Err(js_err("actor slug is required for DID fragment"));
+    }
+
+    let mut generated = create_agent_identity(ipns, actor_slug).map_err(js_err)?;
     let created_at = now_unix_secs();
     initialize_document_lifecycle_metadata(&mut generated.document, created_at);
-    let signing_key = restore_signing_key(ipns, &generated.signing_private_key_hex)?;
+    let signing_key = restore_signing_key(ipns, &hex::encode(generated.signing_private_key))?;
     let assertion_method = generated
         .document
         .get_verification_method_by_id(&generated.document.assertion_method)
@@ -1584,8 +1589,8 @@ fn create_identity_internal(passphrase: &str, ipns: &str) -> Result<String, JsVa
         version: 1,
         created_at,
         ipns: ipns.to_string(),
-        signing_private_key_hex: generated.signing_private_key_hex,
-        encryption_private_key_hex: generated.encryption_private_key_hex,
+        signing_private_key_hex: hex::encode(generated.signing_private_key),
+        encryption_private_key_hex: hex::encode(generated.encryption_private_key),
         iroh_secret_key_hex: Some(hex::encode(iroh_secret_key.to_bytes())),
         document: generated.document,
     };
@@ -1607,20 +1612,20 @@ fn create_identity_internal(passphrase: &str, ipns: &str) -> Result<String, JsVa
 /// Generate a new identity, encrypt the bundle with `passphrase`.
 /// Returns JSON: `{ encrypted_bundle, did, ipns }`
 #[wasm_bindgen]
-pub fn create_identity(passphrase: &str) -> Result<String, JsValue> {
+pub fn create_identity(passphrase: &str, actor_slug: &str) -> Result<String, JsValue> {
     let ipns = generate_ipns_id().map_err(js_err)?;
-    create_identity_internal(passphrase, &ipns)
+    create_identity_internal(passphrase, &ipns, actor_slug)
 }
 
 /// Generate a new identity bound to an existing IPNS identifier from an IPFS key.
 /// Use this when you already have an IPFS key and want DID/IPNS to match exactly.
 #[wasm_bindgen]
-pub fn create_identity_with_ipns(passphrase: &str, ipns: &str) -> Result<String, JsValue> {
+pub fn create_identity_with_ipns(passphrase: &str, ipns: &str, actor_slug: &str) -> Result<String, JsValue> {
     let ipns = ipns.trim();
     if ipns.is_empty() {
         return Err(js_err("ipns is required"));
     }
-    create_identity_internal(passphrase, ipns)
+    create_identity_internal(passphrase, ipns, actor_slug)
 }
 
 /// Decrypt an encrypted bundle with `passphrase`.
@@ -1919,6 +1924,7 @@ pub async fn connect_world_with_relay(endpoint_id: &str, relay_url: &str) -> Res
 
 async fn send_ipfs_publish_request(
     endpoint_id: &str,
+    relay_url_hint: &str,
     request: WorldRequest,
 ) -> Result<IpfsPublishDidResponse, JsValue> {
     let target: EndpointId = endpoint_id
@@ -1932,7 +1938,12 @@ async fn send_ipfs_publish_request(
         .map_err(|e| js_err(format!("endpoint bind failed: {e}")))?;
     let _ = endpoint.online().await;
 
-    let relay_source = core_normalize_relay_url(DEFAULT_WORLD_RELAY_URL);
+    let relay_base = if relay_url_hint.trim().is_empty() {
+        DEFAULT_WORLD_RELAY_URL
+    } else {
+        relay_url_hint.trim()
+    };
+    let relay_source = core_normalize_relay_url(relay_base);
     let relay_url: RelayUrl = relay_source
         .parse()
         .map_err(|e| js_err(format!("relay URL parse failed for '{}': {}", relay_source, e)))?;
@@ -1970,6 +1981,7 @@ async fn send_ipfs_publish_request(
 #[wasm_bindgen]
 pub async fn publish_did_document_via_world_ipfs(
     endpoint_id: &str,
+    relay_url_hint: &str,
     passphrase: &str,
     encrypted_bundle_json: &str,
     actor_name: &str,
@@ -2015,7 +2027,7 @@ pub async fn publish_did_document_via_world_ipfs(
         DEFAULT_MESSAGE_TTL_SECS,
     )?;
 
-    let response = send_ipfs_publish_request(endpoint_id, request).await?;
+    let response = send_ipfs_publish_request(endpoint_id, relay_url_hint, request).await?;
     serde_json::to_string(&response).map_err(js_err)
 }
 
@@ -2193,6 +2205,7 @@ pub async fn send_world_whisper_with_ttl(
             room_description: String::new(),
             room_title: String::new(),
             room_did: String::new(),
+            world_did: String::new(),
             avatars: Vec::new(),
             room_object_dids: HashMap::new(),
             transport_ack: None,
@@ -2453,8 +2466,8 @@ mod tests {
     use super::*;
 
     fn build_valid_bundle(passphrase: &str, ipns: &str) -> String {
-        let mut generated = generate_agent_identity(ipns).expect("generate identity");
-        let signing_key = restore_signing_key_internal(ipns, &generated.signing_private_key_hex)
+        let mut generated = create_agent_identity(ipns, "tester").expect("generate identity");
+        let signing_key = restore_signing_key_internal(ipns, &hex::encode(generated.signing_private_key))
             .expect("restore signing key");
         let assertion_method = generated
             .document
@@ -2470,8 +2483,8 @@ mod tests {
             version: 1,
             created_at: 0,
             ipns: ipns.to_string(),
-            signing_private_key_hex: generated.signing_private_key_hex,
-            encryption_private_key_hex: generated.encryption_private_key_hex,
+            signing_private_key_hex: hex::encode(generated.signing_private_key),
+            encryption_private_key_hex: hex::encode(generated.encryption_private_key),
             iroh_secret_key_hex: None,
             document: generated.document,
         };
@@ -2562,8 +2575,8 @@ mod tests {
         let passphrase = "test-passphrase";
         let ipns = generate_ipns_id().expect("ipns id");
         let encrypted_bundle_json = build_valid_bundle(passphrase, &ipns);
-        let other_identity = generate_agent_identity(&ipns).expect("other identity");
-        let mismatched_signing_key_hex = other_identity.signing_private_key_hex;
+        let other_identity = create_agent_identity(&ipns, "tester").expect("other identity");
+        let mismatched_signing_key_hex = hex::encode(other_identity.signing_private_key);
         let mutated = mutate_bundle_plain(passphrase, &encrypted_bundle_json, |plain| {
             plain.signing_private_key_hex = mismatched_signing_key_hex;
         });

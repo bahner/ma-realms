@@ -8,9 +8,9 @@ use axum::{
     routing::{delete, get, post},
 };
 use chrono::{SecondsFormat, Utc};
-use did_ma::{DID_PREFIX, Did, Document, EncryptionKey, SigningKey, VerificationMethod};
+use did_ma::{DID_PREFIX, Did, Document, SigningKey};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey, endpoint::presets};
-use ma_core::{AVATAR_ALPN, CONTENT_TYPE_WORLD, DEFAULT_WORLD_RELAY_URL, INBOX_ALPN, MessageEnvelope, WorldCommand, WorldRequest, WorldResponse, default_ma_config_root, normalize_relay_url, parse_message, resolve_inbox_endpoint_id};
+use ma_core::{AVATAR_ALPN, CONTENT_TYPE_WORLD, DEFAULT_WORLD_RELAY_URL, INBOX_ALPN, MessageEnvelope, WorldCommand, WorldRequest, WorldResponse, create_agent_identity_from_private_keys, default_ma_config_root, normalize_relay_url, parse_message, resolve_inbox_endpoint_id};
 use rand::RngCore;
 use reqwest::multipart;
 use serde::{Deserialize, Serialize};
@@ -1012,46 +1012,21 @@ async fn ensure_world_root_did_published(state: &AppState) -> Result<String> {
     let signing_bytes = ensure_secret_file(&secret_paths.sig_path, 32, "agent signing secret")?;
     let encryption_bytes = ensure_secret_file(&secret_paths.enc_path, 32, "agent encryption secret")?;
 
-    let root_did_struct = Did::new(&key_id, "agent")?;
-    let signing_did = Did::new_root(&key_id)?;
-    let encryption_did = Did::new_root(&key_id)?;
-
-    let signing_key = SigningKey::from_private_key_bytes(
-        signing_did,
-        signing_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow!("invalid signing key length in {}", secret_paths.sig_path.display()))?,
+    let signing_private_key = signing_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("invalid signing key length in {}", secret_paths.sig_path.display()))?;
+    let encryption_private_key = encryption_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("invalid encryption key length in {}", secret_paths.enc_path.display()))?;
+    let generated = create_agent_identity_from_private_keys(
+        &key_id,
+        "agent",
+        signing_private_key,
+        encryption_private_key,
     )?;
-    let encryption_key = EncryptionKey::from_private_key_bytes(
-        encryption_did,
-        encryption_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow!("invalid encryption key length in {}", secret_paths.enc_path.display()))?,
-    )?;
-
-    let mut document = Document::new(&root_did_struct, &root_did_struct);
-    let assertion_vm = VerificationMethod::new(
-        root_did_struct.base_id(),
-        root_did_struct.base_id(),
-        signing_key.key_type.clone(),
-        signing_key.did.fragment.as_deref().unwrap_or_default(),
-        signing_key.public_key_multibase.clone(),
-    )?;
-    let key_agreement_vm = VerificationMethod::new(
-        root_did_struct.base_id(),
-        root_did_struct.base_id(),
-        encryption_key.key_type.clone(),
-        encryption_key.did.fragment.as_deref().unwrap_or_default(),
-        encryption_key.public_key_multibase.clone(),
-    )?;
-    let assertion_vm_id = assertion_vm.id.clone();
-    document.add_verification_method(assertion_vm.clone())?;
-    document.add_verification_method(key_agreement_vm.clone())?;
-    document.assertion_method = assertion_vm_id;
-    document.key_agreement = key_agreement_vm.id.clone();
-    document.set_ma_type("agent")?;
+    let mut document = generated.document;
     let now = now_zulu();
     document.set_ma_transports(expected_agent_transports(&iroh_endpoint_id));
     document.set_created(existing_created.unwrap_or_else(|| now.clone()));
@@ -1059,7 +1034,6 @@ async fn ensure_world_root_did_published(state: &AppState) -> Result<String> {
     if let Some(version) = read_agent_version() {
         document.set_ma_version(version);
     }
-    document.sign(&signing_key, &assertion_vm)?;
     let document_json = document.marshal()
         .map_err(|e| anyhow!("failed to marshal world root DID document: {}", e))?;
     let cid = kubo_ipfs_add(kubo_url, document_json.into_bytes()).await?;

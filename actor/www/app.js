@@ -135,7 +135,6 @@ const IPFS_GATEWAY_FALLBACKS = [
 ];
 const LOCAL_EDIT_SCRIPT_KEY = `${STORAGE_PREFIX}.localEditScript`;
 const LEGACY_LOCAL_EDIT_SCRIPT_CID_KEY = `${STORAGE_PREFIX}.localEditScriptCid`;
-const DEFAULT_WORLD_ALIAS_PANTEIA = 'did:ma:k51qzi5uqu5dixac0j8lov7b977zgqg2v58lj0czyqny67419g3npu2dyifbem';
 
 const ROOM_POLL_INTERVAL_MS = 1500;
 const AVATAR_PING_INTERVAL_MS = 25_000;
@@ -396,18 +395,17 @@ function syncSpecialAliasesFromCurrentHome() {
   }
 
   const roomDid = String(state.currentHome?.roomDid || '').trim();
-  const endpointId = String(state.currentHome?.endpointId || '').trim();
   const room = String(state.currentHome?.room || '').trim();
+  const worldDidFull = String(state.currentHome?.worldDid || '').trim();
 
   let worldDidRoot = '';
-  if (isMaDid(roomDid)) {
+  if (isMaDid(worldDidFull)) {
+    worldDidRoot = didRoot(worldDidFull);
+  } else if (isMaDid(roomDid)) {
     worldDidRoot = didRoot(roomDid);
   }
-  if (!worldDidRoot && endpointId) {
-    worldDidRoot = didRoot(findDidByEndpoint(endpointId) || '');
-  }
-  if (worldDidRoot) {
-    next['@world'] = worldDidRoot;
+  if (isMaDid(worldDidFull) && worldDidFull.includes('#')) {
+    next['@world'] = worldDidFull;
   }
 
   const handle = String(state.currentHome?.handle || '').trim().replace(/^@+/, '');
@@ -1178,6 +1176,13 @@ async function resolveCommandTargetDidOrToken(targetToken) {
   const raw = String(targetToken || '').trim().replace(/^@+/, '');
   if (!raw) {
     throw new Error('Usage: @target <command>');
+  }
+  if (raw.toLowerCase() === 'world') {
+    const worldDid = String(state.currentHome?.worldDid || state.aliasBook?.['@world'] || '').trim();
+    if (isMaDid(worldDid) && worldDid.includes('#') && !isUnconfiguredDidTarget(worldDid)) {
+      return worldDid;
+    }
+    throw new Error('@world requires a full did:ma target with fragment. Reconnect to refresh world DID.');
   }
   const activeAliasRaw = String(state.activeObjectTargetAlias || '').trim().replace(/^@+/, '');
   const activeDid = String(state.activeObjectTargetDid || '').trim();
@@ -2711,6 +2716,7 @@ const { parseDot } = createDotCommands({
   pollDirectInbox,
   pollCurrentHomeEvents,
   prepareIdentityDocumentForSend,
+  publishIdentityToWorldDid,
   sendWhisperToDid,
   runSmokeTest,
 });
@@ -2745,6 +2751,40 @@ async function prepareIdentityDocumentForSend() {
   if (isValidAliasName(state.aliasName || '')) {
     saveIdentityRecord(state.aliasName, updated.encrypted_bundle);
   }
+}
+
+async function publishIdentityToWorldDid(worldDid) {
+  if (!state.passphrase || !state.encryptedBundle) {
+    throw new Error('Identity is locked. Unlock it first.');
+  }
+
+  await prepareIdentityDocumentForSend();
+
+  const endpointId = await withTimeout(
+    resolveWorldEndpointForDid(worldDid),
+    5000,
+    `endpoint resolve timed out for ${worldDid}`
+  );
+
+  const relayHint = await lookupWorldRelayHint(endpointId).catch(() => '');
+  const fragment = currentActorFragment();
+  const ipnsKey = String(localStorage.getItem(IPNS_PRIVATE_KEY_B64_KEY) || '').trim();
+
+  const raw = await withTimeout(
+    publish_did_document_via_world_ipfs(
+      endpointId,
+      relayHint || '',
+      state.passphrase,
+      state.encryptedBundle,
+      fragment,
+      ipnsKey,
+      fragment
+    ),
+    20000,
+    'ma/ipfs/1 publish request timed out'
+  );
+
+  return JSON.parse(String(raw || '{}'));
 }
 
 function saveIdentityRecord(aliasName, encryptedBundle) {
@@ -3342,18 +3382,20 @@ async function enterHome(target, preferredRoom = null) {
     }
 
     if (!didPublishedInIpfs) {
+      const ipfsRelayHint = await lookupWorldRelayHint(endpointId).catch(() => null) || '';
       try {
         appendMessage('system', 'Local DID not found in IPFS. Sending DID document to trusted world (ma/ipfs/1).');
         const raw = await withTimeout(
           publish_did_document_via_world_ipfs(
             endpointId,
+            ipfsRelayHint,
             state.passphrase,
             state.encryptedBundle,
             currentActorFragment(),
             String(localStorage.getItem(IPNS_PRIVATE_KEY_B64_KEY) || '').trim(),
             currentActorFragment()
           ),
-          10000,
+          20000,
           'ma/ipfs/1 publish request timed out'
         );
         const response = JSON.parse(String(raw || '{}'));
@@ -3415,6 +3457,7 @@ async function enterHome(target, preferredRoom = null) {
     roomTitle: result.room_title || humanRoomTitle(activeRoom),
     roomDescription: result.room_description || '',
     roomDid: result.room_did || '',
+    worldDid: result.world_did || '',
     lastEventSequence: toSequenceNumber(result.latest_event_sequence || 0),
     handle: result.handle || state.aliasName
   };
@@ -3651,10 +3694,6 @@ function restoreSavedValues() {
   }
 
   state.aliasBook = loadAliasBook();
-  if (!String(state.aliasBook.panteia || '').trim()) {
-    state.aliasBook.panteia = DEFAULT_WORLD_ALIAS_PANTEIA;
-    saveAliasBook();
-  }
   state.debug = readStoredDebugFlag();
   state.messageTtl.chat = readStoredMessageTtl(MSG_CHAT_TTL_KEY, DEFAULT_CHAT_TTL_SECONDS);
   state.messageTtl.cmd = readStoredMessageTtl(MSG_CMD_TTL_KEY, DEFAULT_CMD_TTL_SECONDS);
