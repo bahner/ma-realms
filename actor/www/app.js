@@ -1868,20 +1868,10 @@ function didParts(value) {
   };
 }
 
-function didRootText(value) {
-  const source = String(value || '').trim();
-  if (!source.startsWith('did:ma:')) {
-    return '';
-  }
-  const hash = source.indexOf('#');
-  return hash === -1 ? source : source.slice(0, hash);
-}
-
-function aliasForDid(rootDid) {
+function aliasForDid(did) {
   const entries = Object.entries(state.aliasBook || {});
   for (const [alias, address] of entries) {
-    const resolvedRoot = didRootText(address);
-    if (resolvedRoot && resolvedRoot === rootDid) {
+    if (address === did) {
       return alias;
     }
   }
@@ -1897,22 +1887,10 @@ function formatDidForDialog(value) {
     return source;
   }
 
-  // Alias mode only rewrites values that have an explicit alias mapping.
+  // Alias mode: exact full-DID match only.
   if (state.dialogIdStyle === 'alias') {
-    const root = didRootText(source);
-    if (!root) {
-      return source;
-    }
-    const alias = aliasForDid(root);
-    if (!alias) {
-      return source;
-    }
-    const hash = source.indexOf('#');
-    const fragment = hash === -1 ? '' : source.slice(hash + 1);
-    if (fragment && fragment.toLowerCase() !== alias.toLowerCase()) {
-      return `${alias}#${fragment}`;
-    }
-    return alias;
+    const alias = aliasForDid(source);
+    return alias || source;
   }
 
   const parts = didParts(source);
