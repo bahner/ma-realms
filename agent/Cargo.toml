@@ -11,7 +11,7 @@ chrono = "0.4"
 hex = "0.4"
 iroh = { version = "0.97.0" }
 libp2p-identity = { version = "0.2", features = ["ed25519", "peerid", "rand"] }
-ma-core = { path = "../core" }
+ma-core = { package = "ma-realms-core", path = "../core" }
 did-ma = { package = "ma-did", path = "../../did" }
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 nanoid = "0.4"

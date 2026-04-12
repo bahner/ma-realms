@@ -1013,9 +1013,9 @@ async fn ensure_world_root_did_published(state: &AppState) -> Result<String> {
     let signing_bytes = ensure_secret_file(&secret_paths.sig_path, 32, "agent signing secret")?;
     let encryption_bytes = ensure_secret_file(&secret_paths.enc_path, 32, "agent encryption secret")?;
 
-    let root_did_struct = Did::new_root(&key_id)?;
-    let signing_did = Did::new(&key_id, "sig")?;
-    let encryption_did = Did::new(&key_id, "enc")?;
+    let root_did_struct = Did::new(&key_id, "agent")?;
+    let signing_did = Did::new_root(&key_id)?;
+    let encryption_did = Did::new_root(&key_id)?;
 
     let signing_key = SigningKey::from_private_key_bytes(
         signing_did,
@@ -1037,14 +1037,14 @@ async fn ensure_world_root_did_published(state: &AppState) -> Result<String> {
         root_did_struct.base_id(),
         root_did_struct.base_id(),
         signing_key.key_type.clone(),
-        "sig",
+        signing_key.did.fragment.as_deref().unwrap_or_default(),
         signing_key.public_key_multibase.clone(),
     )?;
     let key_agreement_vm = VerificationMethod::new(
         root_did_struct.base_id(),
         root_did_struct.base_id(),
         encryption_key.key_type.clone(),
-        "enc",
+        encryption_key.did.fragment.as_deref().unwrap_or_default(),
         encryption_key.public_key_multibase.clone(),
     )?;
     let assertion_vm_id = assertion_vm.id.clone();
@@ -1469,7 +1469,7 @@ async fn append_log(
 
 fn world_root_from_did_text(input: &str) -> Option<String> {
     let did = Did::try_from(input.trim()).ok()?;
-    Some(did.without_fragment().id())
+    Some(did.base_id())
 }
 
 fn build_agent_signing_key(root_did: &str, sig_private: &[u8]) -> Result<SigningKey> {
@@ -1477,7 +1477,7 @@ fn build_agent_signing_key(root_did: &str, sig_private: &[u8]) -> Result<Signing
         .trim()
         .strip_prefix("did:ma:")
         .ok_or_else(|| anyhow!("invalid world DID root '{}'", root_did))?;
-    let signing_did = Did::new(key_id, "sig")?;
+    let signing_did = Did::new_root(key_id)?;
     let key_bytes: [u8; 32] = sig_private
         .try_into()
         .map_err(|_| anyhow!("invalid signing key length"))?;

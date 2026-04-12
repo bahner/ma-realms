@@ -1,36 +1,44 @@
 #![forbid(unsafe_code)]
 
-pub mod addressing;
-pub mod bootstrap_identity;
-pub mod capability_acl;
-pub mod command_syntax;
+// Re-export generic modules from ma-core so existing consumers keep working.
+pub use ma_core::addressing;
+#[cfg(not(target_arch = "wasm32"))]
+pub use ma_core::bootstrap_identity;
+pub use ma_core::capability_acl;
+pub use ma_core::command_syntax;
+pub use ma_core::kubo;
+pub use ma_core::pinning;
+pub use ma_core::ttl_cache;
+
+// Realms-specific modules stay here.
 pub mod domain;
 pub mod interfaces;
 pub mod object_runtime;
 pub mod parser;
-pub mod pinning;
 pub mod protocol;
 pub mod requirements;
 pub mod room_actor;
-pub mod ttl_cache;
 
-pub use addressing::{
+pub use ma_core::{
     did_root, find_alias_for_address, find_did_by_endpoint, humanize_identifier, humanize_text,
     normalize_endpoint_id, normalize_iroh_address, normalize_relay_url, resolve_alias_input,
     endpoint_id_from_address, endpoint_id_from_transport_value, resolve_inbox_endpoint_id,
 };
 #[cfg(not(target_arch = "wasm32"))]
-pub use bootstrap_identity::{default_ma_config_root, ensure_local_ipns_key_file};
-pub use capability_acl::{
+pub use ma_core::{default_ma_config_root, ensure_local_ipns_key_file};
+pub use ma_core::{
     CapabilityAcl, CompiledCapabilityAcl, CompiledSubjectAcl,
     capability_pattern_matches, compile_acl, compile_acl_from_text,
     evaluate_compiled_acl, evaluate_compiled_acl_with_owner,
     parse_capability_acl_text, parse_object_local_capability_acl,
     subject_has_capability, subject_has_capability_with_owner, validate_capability_acl,
 };
-pub use command_syntax::{parse_property_command, parse_property_command_for_keys, PropertyCommand};
+pub use ma_core::{parse_property_command, parse_property_command_for_keys, PropertyCommand};
+pub use ma_core::{DidPublisher, IpfsPublisher};
+pub use ma_core::{PinUpdateOutcome, pin_update_add_rm};
+pub use ma_core::{KuboKey, TtlCache};
 pub use domain::{ActorType, AvatarActor, ExitData, ObjectData, RoomActor, WorldActor};
-pub use interfaces::{AclRuntime, DidPublisher, IpfsPublisher};
+pub use interfaces::AclRuntime;
 pub use object_runtime::{
     MAILBOX_COMMANDS_INLINE,
     ObjectCommandOutput, ObjectCommandResult, ObjectDefinition, ObjectInboxMessage,
@@ -41,7 +49,6 @@ pub use object_runtime::{
 pub use parser::{
     ActorCommand, MessageEnvelope, normalize_spoken_text, parse_actor_command, parse_message,
 };
-pub use pinning::{PinUpdateOutcome, pin_update_add_rm};
 pub use protocol::{
     IpfsPublishDidRequest, IpfsPublishDidResponse,
     LaneCapability, PresenceAvatar, RoomEvent, TransportAck, TransportAckCode, WorldCommand,
@@ -63,7 +70,6 @@ pub use requirements::{
 pub use room_actor::{
     execute_room_actor_command, RoomActorAction, RoomActorContext, RoomActorResult,
 };
-pub use ttl_cache::TtlCache;
 
 #[cfg(test)]
 mod tests {

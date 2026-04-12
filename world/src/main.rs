@@ -955,13 +955,13 @@ impl World {
         &self,
         did_query: &Did,
     ) -> Option<(String, String, String, String, String)> {
-        let query_root = did_query.without_fragment().id();
+        let query_root = did_query.base_id();
         let query_fragment = did_query.fragment.clone();
 
         let rooms = self.rooms.read().await;
         for (room_name, room) in rooms.iter() {
             for (handle, avatar) in room.avatars.iter() {
-                let avatar_root = avatar.agent_did.without_fragment().id();
+                let avatar_root = avatar.agent_did.base_id();
                 if avatar_root != query_root {
                     continue;
                 }
@@ -983,9 +983,8 @@ impl World {
     }
 
     async fn did_description_fallback(&self, did_query: &Did) -> Option<String> {
-        let root = did_query.without_fragment();
         let kubo_url = self.kubo_url().await;
-        let document = kubo::fetch_did_document(&kubo_url, &root).await.ok()?;
+        let document = kubo::fetch_did_document(&kubo_url, did_query).await.ok()?;
         let raw = document.marshal().ok()?;
         extract_did_description_from_json(&raw)
     }
@@ -1059,7 +1058,7 @@ impl World {
 
             for handle in stale_handles {
                 if let Some(avatar) = room.avatars.remove(&handle) {
-                    removed_dids.push(avatar.agent_did.without_fragment().id());
+                    removed_dids.push(avatar.agent_did.base_id());
                     info!(
                         "[{}] removed stale avatar {} (endpoint={}, stale_after={}s)",
                         room_name,
@@ -1164,7 +1163,7 @@ impl World {
         }
 
         if let Ok(did) = Did::try_from(raw) {
-            let root = did.without_fragment().id();
+            let root = did.base_id();
             if !self.is_local_world_root(&root).await {
                 return None;
             }
@@ -1543,12 +1542,11 @@ impl World {
     }
 
     pub async fn set_world_did_root(&self, world_did: &str) -> Result<()> {
-        let root = Did::try_from(world_did)
-            .map_err(|e| anyhow!("invalid world DID '{}': {}", world_did, e))?
-            .without_fragment()
-            .id();
+        let parsed = Did::try_from(world_did)
+            .map_err(|e| anyhow!("invalid world DID '{}': {}", world_did, e))?;
+        let base = parsed.base_id();
 
-        *self.world_did_root.write().await = Some(root.clone());
+        *self.world_did_root.write().await = Some(base.clone());
         *self.world_did.write().await = Some(world_did.to_string());
 
         // Keep runtime rooms aligned with the configured world DID root.
@@ -1556,7 +1554,7 @@ impl World {
         {
             let mut rooms = self.rooms.write().await;
             for (room_name, room) in rooms.iter_mut() {
-                room.did = format!("{}#{}", root, room_name);
+                room.did = format!("{}#{}", base, room_name);
             }
         }
 
@@ -1565,8 +1563,8 @@ impl World {
         // This keeps entry ACL policy-driven while avoiding owner lockout.
         let owner_missing = self.owner_did.read().await.is_none();
         if owner_missing {
-            *self.owner_did.write().await = Some(root.clone());
-            self.allow_entry_did(&root).await;
+            *self.owner_did.write().await = Some(base.clone());
+            self.allow_entry_did(&base).await;
         }
 
         Ok(())
@@ -1677,7 +1675,7 @@ impl World {
             Err(_) => return false,
         };
         let target_full = parsed.id();
-        let target_root = parsed.without_fragment().id();
+        let target_root = parsed.base_id();
 
         let configured_root = self.world_did_root.read().await.clone();
         let configured_full = self.world_did.read().await.clone();
@@ -1720,7 +1718,7 @@ impl World {
     }
 
     pub async fn can_enter(&self, did: &Did) -> bool {
-        let did_root = did.without_fragment().id();
+        let did_root = did.base_id();
         // Entry decisions are ACL-driven only.
         let acl = self.entry_acl.read().await;
         if acl.allow_all {
@@ -1773,7 +1771,7 @@ impl World {
 
     fn parse_invite_root_did_arg(target_did_raw: &str) -> Result<String, String> {
         Did::try_from(target_did_raw)
-            .map(|did| did.without_fragment().id())
+            .map(|did| did.base_id())
             .map_err(|err| format!("invalid DID '{}': {}", target_did_raw, err))
     }
 
@@ -2569,7 +2567,7 @@ impl World {
             .get(room_name)
             .ok_or_else(|| anyhow!("Room {} not found", room_name))?
             .acl
-            .can_enter(&req.did.without_fragment().id());
+            .can_enter(&req.did.base_id());
 
         // Check room-level ACL.
         if !room_acl_allows {
@@ -2833,7 +2831,7 @@ impl World {
         let removed_did_root = room
             .avatars
             .get(actor_name)
-            .map(|avatar| avatar.agent_did.without_fragment().id());
+            .map(|avatar| avatar.agent_did.base_id());
         room.remove_avatar(actor_name);
         drop(rooms);
         self.rebuild_avatar_room_index().await;
@@ -2962,7 +2960,7 @@ impl World {
                 (rendered, true, room_name.to_string())
             }
             MessageEnvelope::RoomCommand { command } => {
-                let caller_root_did = from_did.without_fragment().id();
+                let caller_root_did = from_did.base_id();
                 let response = self
                     .room_command(room_name, &command, &sender_key, sender_profile, Some(caller_root_did.as_str()))
                     .await;
@@ -3088,7 +3086,7 @@ impl World {
     pub async fn set_owner_did(&self, did_raw: &str) -> Result<String> {
         let parsed = Did::try_from(did_raw.trim())
             .map_err(|e| anyhow!("invalid owner DID '{}': {}", did_raw, e))?;
-        let root = parsed.without_fragment().id();
+        let root = parsed.base_id();
         *self.owner_did.write().await = Some(root.clone());
         self.allow_entry_did(&root).await;
         info!("World owner set to {}", root);
@@ -3154,10 +3152,9 @@ impl World {
             .local_world_did_root()
             .await
             .ok_or_else(|| anyhow!("world DID root is not configured"))?;
-        let signer_did = Did::try_from(world_root.as_str())
-            .map_err(|e| anyhow!("invalid configured world DID root '{}': {}", world_root, e))?
-            .without_fragment()
-            .with_fragment("sig")
+        let world_did_parsed = Did::try_from(world_root.as_str())
+            .map_err(|e| anyhow!("invalid configured world DID root '{}': {}", world_root, e))?;
+        let signer_did = Did::new_root(&world_did_parsed.ipns)
             .map_err(|e| anyhow!("failed building state signer DID: {}", e))?;
         let signing_key = SigningKey::from_private_key_bytes(
             signer_did.clone(),
@@ -3517,10 +3514,9 @@ impl World {
             .local_world_did_root()
             .await
             .ok_or_else(|| anyhow!("world DID root is not configured"))?;
-        let signer_did = Did::try_from(world_root.as_str())
-            .map_err(|e| anyhow!("invalid configured world DID root '{}': {}", world_root, e))?
-            .without_fragment()
-            .with_fragment("sig")
+        let world_did_parsed = Did::try_from(world_root.as_str())
+            .map_err(|e| anyhow!("invalid configured world DID root '{}': {}", world_root, e))?;
+        let signer_did = Did::new_root(&world_did_parsed.ipns)
             .map_err(|e| anyhow!("failed building state signer DID: {}", e))?;
         let signing_key = SigningKey::from_private_key_bytes(signer_did, secrets.world_signing_private_key)
             .map_err(|e| anyhow!("failed restoring state signing key: {}", e))?;
@@ -3728,9 +3724,9 @@ impl World {
             );
         }
 
-        let caller_root_did = from_did.without_fragment().id();
+        let caller_root_did = from_did.base_id();
         if let Ok(target_did) = Did::try_from(target) {
-            let target_root = target_did.without_fragment().id();
+            let target_root = target_did.base_id();
 
             if self.is_local_world_root(&target_root).await {
                 if target_did.fragment.is_none() {
@@ -3804,7 +3800,7 @@ impl World {
                                 );
                             }
 
-                            let target_root = target_did.without_fragment().id();
+                            let target_root = target_did.base_id();
                             if self.is_local_world_root(&target_root).await {
                                 if let Some(fragment) = target_did.fragment.clone() {
                                     let world_owner = self.owner_did.read().await.clone();
@@ -3876,11 +3872,11 @@ impl World {
                 let mut actor_target = target.to_string();
                 let mut actor_exists = room.avatars.contains_key(target) || target == from;
                 if let Ok(did) = Did::try_from(target) {
-                    let target_root = did.without_fragment().id();
+                    let target_root = did.base_id();
                     if let Some((handle, _)) = room
                         .avatars
                         .iter()
-                        .find(|(_, avatar)| avatar.agent_did.without_fragment().id() == target_root)
+                        .find(|(_, avatar)| avatar.agent_did.base_id() == target_root)
                     {
                         actor_target = handle.clone();
                         actor_exists = true;
@@ -3932,7 +3928,7 @@ impl World {
         target: &str,
         command: ActorCommand,
     ) -> Option<(String, String)> {
-        let caller_root = from_did.without_fragment().id();
+        let caller_root = from_did.base_id();
         let now_secs = Utc::now().timestamp().max(0) as u64;
         let mut active_room = room_name.to_string();
 
@@ -3942,7 +3938,7 @@ impl World {
         {
             inbox_object_id
         } else if let Ok(did) = Did::try_from(target.trim()) {
-            let world_root = did.without_fragment().id();
+            let world_root = did.base_id();
             if !self.is_local_world_root(&world_root).await {
                 return None;
             }
@@ -4959,7 +4955,7 @@ impl World {
                         };
                     }
 
-                    let caller_root = from_did.without_fragment().id();
+                    let caller_root = from_did.base_id();
                     let can_mutate = target_avatar.owner == caller_root;
                     if !can_mutate {
                         return (
@@ -5042,7 +5038,7 @@ impl World {
                             }
                         };
 
-                        let root = object_did.without_fragment().id();
+                        let root = object_did.base_id();
                         if !self.is_local_world_root(&root).await {
                             return (
                                 format!("object DID '{}' is not in this world", object_did.id()),
@@ -5168,7 +5164,7 @@ impl World {
                     .map(str::trim)
                     .unwrap_or(trimmed);
 
-                let caller_root_did = from_did.without_fragment().id();
+                let caller_root_did = from_did.base_id();
 
                 let move_target = {
                     let rooms = self.rooms.read().await;
@@ -5197,7 +5193,7 @@ impl World {
                     // If the DID root is not this world, we hand off via /enter.
                     let (local_destination, external_destination) = match Did::try_from(destination.as_str()) {
                         Ok(did) => {
-                            if self.is_local_world_root(&did.without_fragment().id()).await {
+                            if self.is_local_world_root(&did.base_id()).await {
                                 (did.fragment.clone(), None)
                             } else {
                                 (None, Some(did.id()))
@@ -5391,7 +5387,7 @@ impl World {
             let path = property.key;
             let value = property.value.unwrap_or_default();
 
-            let caller_root_did = from_did.without_fragment().id();
+            let caller_root_did = from_did.base_id();
 
             if value.is_empty() {
                 match path.as_str() {
@@ -5510,7 +5506,7 @@ impl World {
         }
 
         // Caller's root DID is directly available from from_did
-        let caller_root_did = from_did.without_fragment().id();
+        let caller_root_did = from_did.base_id();
 
         if method == "ping" {
             let room_hint = arg.trim().trim_start_matches('#');
@@ -5773,7 +5769,7 @@ impl World {
 
             match Did::try_from(destination_input.as_str()) {
                 Ok(did) => {
-                    if self.is_local_world_root(&did.without_fragment().id()).await {
+                    if self.is_local_world_root(&did.base_id()).await {
                         let Some(fragment) = did.fragment.clone() else {
                             return "@world usage: @world.dig <direction> [to <#dest|did:ma:...#room>]".to_string();
                         };
@@ -5882,7 +5878,7 @@ impl World {
                         return format!("@world usage: @world.room {} acl allow <did>", room_name_arg);
                     }
                     let target_root = match Did::try_from(acl_arg.as_str()) {
-                        Ok(d) => d.without_fragment().id(),
+                        Ok(d) => d.base_id(),
                         Err(e) => return format!("@world invalid DID '{}': {}", acl_arg, e),
                     };
                     let mut rooms = self.rooms.write().await;
@@ -5900,7 +5896,7 @@ impl World {
                         return format!("@world usage: @world.room {} acl deny <did>", room_name_arg);
                     }
                     let target_root = match Did::try_from(acl_arg.as_str()) {
-                        Ok(d) => d.without_fragment().id(),
+                        Ok(d) => d.base_id(),
                         Err(e) => return format!("@world invalid DID '{}': {}", acl_arg, e),
                     };
                     let mut rooms = self.rooms.write().await;
@@ -5991,7 +5987,7 @@ impl World {
             if let Some(description) = self.did_description_fallback(&did_query).await {
                 return description;
             }
-            return format!("@here no avatar found for {}", did_query.without_fragment().id());
+            return format!("@here no avatar found for {}", did_query.base_id());
         }
 
         if let Some(rest) = trimmed.strip_prefix("id ") {
@@ -6030,7 +6026,7 @@ impl World {
                 if let Some(avatar) = room.avatars.get(token) {
                     return format!(
                         "did={} source=avatar handle={}",
-                        avatar.agent_did.without_fragment().id(),
+                        avatar.agent_did.base_id(),
                         token
                     );
                 }
@@ -6061,7 +6057,7 @@ impl World {
                     } else {
                         room.acl.deny.insert(did.clone());
                         room.acl.allow.remove(&did);
-                        room.avatars.retain(|_, av| av.agent_did.without_fragment().id() != did);
+                        room.avatars.retain(|_, av| av.agent_did.base_id() != did);
                         changed_rooms.push(room_name.to_string());
                     }
                 }
@@ -6077,7 +6073,7 @@ impl World {
                     "owner" => {
                         let normalized = value.trim();
                         let did = match Did::try_from(normalized) {
-                            Ok(d) => d.without_fragment().id(),
+                            Ok(d) => d.base_id(),
                             Err(e) => {
                                 response = format!("@here invalid owner DID '{}': {}", value, e);
                                 return response;
@@ -6323,7 +6319,7 @@ impl World {
 
                 match Did::try_from(destination_input.as_str()) {
                     Ok(did) => {
-                        if self.is_local_world_root(&did.without_fragment().id()).await {
+                        if self.is_local_world_root(&did.base_id()).await {
                             let Some(fragment) = did.fragment.clone() else {
                                 response = "@here usage: @here dig <direction> [to <#dest|did:ma:...#room>]".to_string();
                                 return response;
@@ -6538,13 +6534,9 @@ impl WorldProtocol {
             return Err(anyhow!("missing room actor secret for {}", room_did));
         };
 
-        let room_root = Did::try_from(room_did)
-            .map_err(|e| anyhow!("invalid room did '{}': {}", room_did, e))?
-            .without_fragment()
-            .id();
-        let signing_did = Did::try_from(room_root.as_str())
-            .map_err(|e| anyhow!("invalid room root did '{}': {}", room_root, e))?
-            .with_fragment("sig")
+        let room_did_parsed = Did::try_from(room_did)
+            .map_err(|e| anyhow!("invalid room did '{}': {}", room_did, e))?;
+        let signing_did = Did::new_root(&room_did_parsed.ipns)
             .map_err(|e| anyhow!("invalid signing did for room {}: {}", room_did, e))?;
         SigningKey::from_private_key_bytes(signing_did, secret.signing_key)
             .map_err(|e| anyhow!("failed to restore signing key for {}: {}", room_did, e))
@@ -6854,7 +6846,7 @@ impl WorldProtocol {
     }
 
     async fn get_sender_document(&self, sender_root: &Did, force_refresh: bool) -> Result<(Document, bool, bool)> {
-        let cache_key = sender_root.id();
+        let cache_key = sender_root.base_id();
 
         if !force_refresh {
             let cache = self.did_cache.read().await;
@@ -6884,7 +6876,7 @@ impl WorldProtocol {
     }
 
     async fn set_sender_dirty(&self, sender_root: &Did, dirty: bool) {
-        let cache_key = sender_root.id();
+        let cache_key = sender_root.base_id();
         let mut cache = self.did_cache.write().await;
         if let Some(cached) = cache.get_mut(&cache_key) {
             cached.dirty = dirty;
@@ -6894,8 +6886,6 @@ impl WorldProtocol {
     async fn verify_message(&self, message_cbor: Vec<u8>) -> Result<(Message, Did, Document)> {
         let message = Message::from_cbor(&message_cbor)?;
         let sender_did = Did::try_from(message.from.as_str())?;
-        let sender_root = sender_did.without_fragment();
-
         let as_onboarding_did_error = |source: &anyhow::Error| {
             let detail = source.to_string();
             let lowered = detail.to_ascii_lowercase();
@@ -6906,7 +6896,7 @@ impl WorldProtocol {
             {
                 anyhow!(
                     "did document is not published yet for {} (submit document via ma/ipfs/1): {}",
-                    sender_root.id(),
+                    sender_did.base_id(),
                     detail
                 )
             } else {
@@ -6915,42 +6905,42 @@ impl WorldProtocol {
         };
 
         let t0 = std::time::Instant::now();
-        let (sender_document, fetched_from_kubo, is_dirty) = self.get_sender_document(&sender_root, false).await
+        let (sender_document, fetched_from_kubo, is_dirty) = self.get_sender_document(&sender_did, false).await
             .map_err(|e| {
-                warn!("DID doc fetch failed for {} after {:?}: {}", sender_root.id(), t0.elapsed(), e);
+                warn!("DID doc fetch failed for {} after {:?}: {}", sender_did.base_id(), t0.elapsed(), e);
                 as_onboarding_did_error(&e)
             })?;
         if fetched_from_kubo {
-            info!("DID doc for {} fetched via Kubo in {:?}", sender_root.id(), t0.elapsed());
+            info!("DID doc for {} fetched via Kubo in {:?}", sender_did.base_id(), t0.elapsed());
         } else {
-            debug!("DID doc for {} served from cache in {:?}", sender_root.id(), t0.elapsed());
+            debug!("DID doc for {} served from cache in {:?}", sender_did.base_id(), t0.elapsed());
         }
         if is_dirty {
-            warn!("DID {} is marked dirty; using cached document", sender_root.id());
+            warn!("DID {} is marked dirty; using cached document", sender_did.base_id());
         }
 
         if message.verify_with_document(&sender_document).is_ok() {
             if is_dirty {
-                self.set_sender_dirty(&sender_root, false).await;
-                info!("DID {} cleared from dirty state after successful verification", sender_root.id());
+                self.set_sender_dirty(&sender_did, false).await;
+                info!("DID {} cleared from dirty state after successful verification", sender_did.base_id());
             }
             return Ok((message, sender_did, sender_document));
         }
 
         warn!(
             "signature verification failed with cached DID doc for {}; retrying fresh fetch",
-            sender_root.id()
+            sender_did.base_id()
         );
 
         let refresh_t0 = std::time::Instant::now();
         let (refreshed_document, refreshed_from_kubo, _) =
-            match self.get_sender_document(&sender_root, true).await {
+            match self.get_sender_document(&sender_did, true).await {
                 Ok(value) => value,
                 Err(e) => {
-                    self.set_sender_dirty(&sender_root, true).await;
+                    self.set_sender_dirty(&sender_did, true).await;
                     warn!(
                         "forced DID doc refetch failed for {} after {:?}: {}",
-                        sender_root.id(),
+                        sender_did.base_id(),
                         refresh_t0.elapsed(),
                         e
                     );
@@ -6960,25 +6950,25 @@ impl WorldProtocol {
         if refreshed_from_kubo {
             info!(
                 "DID doc for {} force-fetched via Kubo in {:?}",
-                sender_root.id(),
+                sender_did.base_id(),
                 refresh_t0.elapsed()
             );
         }
 
         if message.verify_with_document(&refreshed_document).is_ok() {
-            self.set_sender_dirty(&sender_root, false).await;
+            self.set_sender_dirty(&sender_did, false).await;
             return Ok((message, sender_did, refreshed_document));
         }
 
-        self.set_sender_dirty(&sender_root, true).await;
+        self.set_sender_dirty(&sender_did, true).await;
         warn!(
             "DID {} marked dirty: signature verification still failed after forced refresh",
-            sender_root.id()
+            sender_did.base_id()
         );
 
         Err(anyhow!(
             "message signature verification failed for {} (cached and refreshed DID document)",
-            sender_root.id()
+            sender_did.base_id()
         ))
     }
 
@@ -7026,16 +7016,14 @@ impl WorldProtocol {
             }
             WorldCommand::Enter { room, preferred_handle, encryption_pubkey_multibase } => {
                 let room = room.unwrap_or_else(|| DEFAULT_ROOM.to_string());
-                let root_did = sender_did.without_fragment();
-
-                if !self.world.can_enter(&root_did).await {
+                if !self.world.can_enter(&sender_did).await {
                     let (allow_all, allow_owner, allow_count, owner_did, acl_source) =
                         self.world.entry_acl_debug().await;
                     let (knock_id, duplicate) = self
                         .world
                         .enqueue_knock(
                             &room,
-                            &root_did.id(),
+                            &sender_did.base_id(),
                             &agent_endpoint,
                             preferred_handle.clone(),
                         )
@@ -7043,7 +7031,7 @@ impl WorldProtocol {
                     let detail = if duplicate {
                         format!(
                             "entry denied by ACL for {}; existing knock request id={} is pending (acl_source='{}' allow_all={} allow_owner={} allow_count={} owner_did={})",
-                            root_did.id(),
+                            sender_did.base_id(),
                             knock_id,
                             acl_source,
                             allow_all,
@@ -7054,7 +7042,7 @@ impl WorldProtocol {
                     } else {
                         format!(
                             "entry denied by ACL for {}; knock request queued with id={} (acl_source='{}' allow_all={} allow_owner={} allow_count={} owner_did={})",
-                            root_did.id(),
+                            sender_did.base_id(),
                             knock_id,
                             acl_source,
                             allow_all,
@@ -7384,7 +7372,7 @@ impl IpfsProtocol {
 
         let sender_did = Did::try_from(message.from.as_str())
             .map_err(|e| anyhow!("invalid sender did '{}': {}", message.from, e))?;
-        let sender_root = sender_did.without_fragment().id();
+        let sender_root = sender_did.base_id();
 
         let request_payload: IpfsPublishDidRequest = serde_json::from_slice(&message.content)
             .map_err(|e| anyhow!("invalid IPFS publish payload: {}", e))?;
@@ -7400,7 +7388,7 @@ impl IpfsProtocol {
 
         let document_did = Did::try_from(document.id.as_str())
             .map_err(|e| anyhow!("invalid document DID '{}': {}", document.id, e))?;
-        let document_root = document_did.without_fragment().id();
+        let document_root = document_did.base_id();
         if document_root != sender_root {
             return Err(anyhow!(
                 "sender DID root '{}' does not match document DID root '{}'",
@@ -7568,8 +7556,7 @@ async fn ensure_kubo_key_id(kubo_url: &str, key_name: &str) -> Result<String> {
 
 async fn resolve_world_pointer_from_did(kubo_url: &str, world_did: &str) -> Result<(Option<String>, Option<String>)> {
     let world = Did::try_from(world_did)
-        .map_err(|e| anyhow!("invalid world DID '{}': {}", world_did, e))?
-        .without_fragment();
+        .map_err(|e| anyhow!("invalid world DID '{}': {}", world_did, e))?;
     let document = kubo::fetch_did_document(kubo_url, &world).await?;
     let Some(ma) = document.ma.as_ref() else {
         return Ok((None, None));
@@ -7615,8 +7602,7 @@ async fn resolve_world_root_cid_from_did_pointer(kubo_url: &str, world_did: &str
 
 async fn resolve_world_root_cid_from_did_inline(kubo_url: &str, world_did: &str) -> Result<Option<String>> {
     let world = Did::try_from(world_did)
-        .map_err(|e| anyhow!("invalid world DID '{}': {}", world_did, e))?
-        .without_fragment();
+        .map_err(|e| anyhow!("invalid world DID '{}': {}", world_did, e))?;
     let document = kubo::fetch_did_document(kubo_url, &world).await?;
     let Some(ma) = document.ma.as_ref() else {
         return Ok(None);
@@ -7641,10 +7627,11 @@ async fn publish_world_did_runtime_ma(
 ) -> Result<()> {
     let world_key_name = normalize_world_key_name(world_slug);
     let did_identifier = ensure_kubo_key_id(kubo_url, &world_key_name).await?;
-    let world_did = Did::new_root(&did_identifier)
+    let world_did = Did::new(&did_identifier, world_slug)
         .map_err(|e| anyhow!("failed to build world DID from key id '{}': {}", did_identifier, e))?;
 
-    let signing_did = Did::new(&did_identifier, "sig")?;
+    let signing_did = Did::new_root(&did_identifier)
+        .map_err(|e| anyhow!("failed to build signing DID: {}", e))?;
     let signing_key = SigningKey::from_private_key_bytes(
         signing_did,
         derive_world_signing_private_key(&world_master_key),
@@ -7732,8 +7719,8 @@ async fn ensure_world_did_document(
             key_name
         ))?;
 
-    let world_did = Did::new_root(&did_identifier)
-        .map_err(|e| anyhow!("failed to build world DID from IPNS key Id '{}': {}", did_identifier, e))?;
+    let world_did = Did::new(&did_identifier, world_slug)
+        .map_err(|e| anyhow!("failed to build world DID from IPNS key '{}' slug '{}': {}", did_identifier, world_slug, e))?;
 
     let state_ipns_id = if pointer_mode {
         let state_key_name = runtime_state_key_name(world_slug);
@@ -7742,14 +7729,16 @@ async fn ensure_world_did_document(
         None
     };
 
-    let signing_did = Did::new(&did_identifier, "sig")?;
+    let signing_did = Did::new_root(&did_identifier)
+        .map_err(|e| anyhow!("failed to build signing DID: {}", e))?;
     let signing_key = SigningKey::from_private_key_bytes(
         signing_did,
         derive_world_signing_private_key(&world_master_key),
     )
         .map_err(|e| anyhow!("failed to restore world signing key: {}", e))?;
 
-    let key_agreement_did = Did::new(&did_identifier, "enc")?;
+    let key_agreement_did = Did::new_root(&did_identifier)
+        .map_err(|e| anyhow!("failed to build key-agreement DID: {}", e))?;
     let key_agreement_key = EncryptionKey::from_private_key_bytes(
         key_agreement_did,
         derive_world_encryption_private_key(&world_master_key),
@@ -7762,7 +7751,7 @@ async fn ensure_world_did_document(
         world_did.base_id(),
         world_did.base_id(),
         signing_key.key_type.clone(),
-        "sig",
+        signing_key.did.fragment.as_deref().unwrap_or_default(),
         signing_key.public_key_multibase.clone(),
     )
     .map_err(|e| anyhow!("failed building world assertion method: {}", e))?;
@@ -7771,7 +7760,7 @@ async fn ensure_world_did_document(
         world_did.base_id(),
         world_did.base_id(),
         key_agreement_key.key_type.clone(),
-        "enc",
+        key_agreement_key.did.fragment.as_deref().unwrap_or_default(),
         key_agreement_key.public_key_multibase.clone(),
     )
     .map_err(|e| anyhow!("failed building world keyAgreement method: {}", e))?;
@@ -8788,7 +8777,7 @@ async fn main() -> Result<()> {
         .await?;
 
     // Ensure Kubo API is online before DID/IPNS bootstrap.
-    wait_for_kubo_api(&kubo_url, 8, Duration::from_millis(1000)).await?;
+    wait_for_kubo_api(&kubo_url, 8).await?;
 
     if let Some(global_acl_cid) = authored_global_acl_cid.as_deref() {
         match world.load_global_capability_acl_from_cid(global_acl_cid).await {
@@ -9255,7 +9244,7 @@ fn parse_entry_acl(raw: &str) -> Result<EntryAcl> {
         }
 
         let did = Did::try_from(token)?;
-        allowed_dids.insert(did.without_fragment().id());
+        allowed_dids.insert(did.base_id());
     }
 
     if !allow_all && allowed_dids.is_empty() && !owner_token_present {
@@ -9334,7 +9323,7 @@ mod tests {
         world.join_room("hall", req2, Some("pixie".to_string())).await.unwrap();
 
         assert_eq!(
-            world.avatar_room_for_did("did:ma:k51test").await,
+            world.avatar_room_for_did("did:ma:k51test#pixie").await,
             Some("hall".to_string())
         );
 
@@ -9373,7 +9362,7 @@ mod tests {
 
         let changed = world.prune_stale_avatars(Duration::from_secs(25)).await;
         assert!(changed.iter().any(|room| room == "lobby"));
-        assert_eq!(world.avatar_room_for_did("did:ma:k51stale").await, None);
+        assert_eq!(world.avatar_room_for_did("did:ma:k51stale#agent").await, None);
     }
 }
 

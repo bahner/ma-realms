@@ -1,5 +1,5 @@
 [package]
-name = "ma-core"
+name = "ma-realms-core"
 version = "0.1.0"
 edition = "2021"
 
@@ -10,6 +10,7 @@ serde_json = "1.0"
 serde_yaml = "0.9"
 did-ma = { package = "ma-did", path = "../../did" }
 iroh = { version = "0.97.0" }
+ma-core = { path = "../../ma-core" }
 tokio = { version = "1.37", features = ["io-util"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

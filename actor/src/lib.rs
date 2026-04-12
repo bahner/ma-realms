@@ -1225,7 +1225,7 @@ fn build_signed_world_request(
         WorldCommand::Message { envelope, .. } => match envelope {
             ma_core::MessageEnvelope::ActorCommand { target, .. } => Did::try_from(target.trim())
                 .ok()
-                .map(|did| did.without_fragment().id()),
+                .map(|did| did.base_id()),
             _ => None,
         },
         _ => None,
@@ -1240,7 +1240,7 @@ fn build_signed_world_request(
         }
         (_, Some(value)) => value,
         (_, None) => Did::try_from(plain.document.id.as_str())
-            .map(|did| did.without_fragment().id())
+            .map(|did| did.base_id())
             .unwrap_or_else(|_| plain.document.id.clone()),
     };
 
@@ -1327,7 +1327,7 @@ fn build_signed_message_with_js_time(
 }
 
 fn restore_signing_key_internal(ipns: &str, private_key_hex: &str) -> Result<SigningKey, String> {
-    let sign_did = Did::new(ipns, "sig").map_err(|e| e.to_string())?;
+    let sign_did = Did::new_root(ipns).map_err(|e| e.to_string())?;
     let private_key_vec = hex::decode(private_key_hex).map_err(|e| e.to_string())?;
     let private_key: [u8; 32] = private_key_vec
         .try_into()
@@ -1341,7 +1341,7 @@ fn restore_signing_key(ipns: &str, private_key_hex: &str) -> Result<SigningKey, 
 }
 
 fn restore_encryption_key_internal(ipns: &str, private_key_hex: &str) -> Result<EncryptionKey, String> {
-    let enc_did = Did::new(ipns, "enc").map_err(|e| e.to_string())?;
+    let enc_did = Did::new_root(ipns).map_err(|e| e.to_string())?;
     let private_key_vec = hex::decode(private_key_hex).map_err(|e| e.to_string())?;
     let private_key: [u8; 32] = private_key_vec
         .try_into()
@@ -1370,7 +1370,7 @@ fn cached_world_target_did() -> Option<String> {
         map.retain(|_, entry| entry.expires_at_ms > now);
         let did_text = map.get(&active_room)?.did.clone();
         let did = Did::try_from(did_text.as_str()).ok()?;
-        Some(did.without_fragment().id())
+        Some(did.base_id())
     })
 }
 
@@ -1472,20 +1472,19 @@ where
 fn validate_full_did_key_references(document: &Document) -> Result<(), String> {
     let doc_root = Did::try_from(document.id.as_str())
         .map_err(|e| format!("invalid document DID '{}': {}", document.id, e))?
-        .without_fragment()
-        .id();
+        .base_id();
 
     for method in &document.verification_method {
         let method_id = method.id.trim();
         if method_id.starts_with('#') {
             return Err(format!(
-                "invalid verificationMethod.id '{}': fragment-only ids are not allowed; expected full DID id like '{}#sig'",
+                "invalid verificationMethod.id '{}': fragment-only ids are not allowed; expected full DID id like '{}#<fragment>'",
                 method.id, doc_root
             ));
         }
         let parsed = Did::try_from(method_id)
             .map_err(|e| format!("invalid verificationMethod.id '{}': {}", method.id, e))?;
-        if parsed.without_fragment().id() != doc_root {
+        if parsed.base_id() != doc_root {
             return Err(format!(
                 "invalid verificationMethod.id '{}': method root DID must match document root '{}'",
                 method.id, doc_root
@@ -1504,13 +1503,13 @@ fn validate_full_did_key_references(document: &Document) -> Result<(), String> {
         }
         if reference.starts_with('#') {
             return Err(format!(
-                "invalid {} '{}': fragment-only references are not allowed; expected full DID id like '{}#sig'",
+                "invalid {} '{}': fragment-only references are not allowed; expected full DID id like '{}#<fragment>'",
                 label, value, doc_root
             ));
         }
         let parsed = Did::try_from(reference)
             .map_err(|e| format!("invalid {} '{}': {}", label, value, e))?;
-        if parsed.without_fragment().id() != doc_root {
+        if parsed.base_id() != doc_root {
             return Err(format!(
                 "invalid {} '{}': reference root DID must match document root '{}'",
                 label, value, doc_root
@@ -1994,7 +1993,7 @@ pub async fn publish_did_document_via_world_ipfs(
         .map_err(|e| js_err(format!("failed to marshal DID document: {e}")))?;
 
     let target_did = Did::try_from(plain.document.id.as_str())
-        .map(|did| did.without_fragment().id())
+        .map(|did| did.base_id())
         .unwrap_or_else(|_| plain.document.id.clone());
 
     let payload = IpfsPublishDidRequest {

@@ -17,7 +17,7 @@ tracing-appender = "0.2"
 anyhow = "1.0"
 thiserror = "1.0"
 did-ma = { package = "ma-did", path = "../../did" }
-ma-core = { path = "../core" }
+ma-core = { package = "ma-realms-core", path = "../core" }
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 chrono = "0.4"
 uuid = { version = "1.6", features = ["v4"] }

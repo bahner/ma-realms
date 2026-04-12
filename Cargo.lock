@@ -2107,8 +2107,8 @@ dependencies = [
  "hex",
  "iroh",
  "js-sys",
- "ma-core",
  "ma-did",
+ "ma-realms-core",
  "serde",
  "serde_json",
  "tokio",
@@ -2128,8 +2128,8 @@ dependencies = [
  "hex",
  "iroh",
  "libp2p-identity",
- "ma-core",
  "ma-did",
+ "ma-realms-core",
  "nanoid",
  "rand 0.8.5",
  "reqwest",
@@ -2148,10 +2148,12 @@ dependencies = [
  "libp2p-identity",
  "ma-did",
  "moka",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2177,6 +2179,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ma-realms-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "iroh",
+ "libp2p-identity",
+ "ma-core",
+ "ma-did",
+ "moka",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+]
+
+[[package]]
 name = "ma-world"
 version = "0.1.0"
 dependencies = [
@@ -2187,8 +2205,8 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "iroh",
- "ma-core",
  "ma-did",
+ "ma-realms-core",
  "moka",
  "nanoid",
  "rand 0.8.5",
