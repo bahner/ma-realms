@@ -80,7 +80,7 @@ async fn status_json(State(state): State<StatusState>) -> Json<StatusDocument> {
     let runtime = RuntimeStatus {
         unlocked: state.world.is_unlocked().await,
         kubo_url: state.world.kubo_url().await,
-        owner_did: state.world.owner_did().await,
+        owner: state.world.owner_did().await,
         world_cid: state.world.world_cid().await,
         state_cid: state.world.state_cid().await,
         lang_cid: state.world.lang_cid().await,
@@ -225,9 +225,9 @@ async fn openapi_json() -> Json<serde_json::Value> {
                             "application/x-www-form-urlencoded": {
                                 "schema": {
                                     "type": "object",
-                                    "required": ["owner_did"],
+                                    "required": ["owner"],
                                     "properties": {
-                                        "owner_did": { "type": "string" }
+                                        "owner": { "type": "string" }
                                     }
                                 }
                             }
@@ -356,29 +356,29 @@ async fn update_world_owner(
     State(state): State<StatusState>,
     Form(form): Form<WorldOwnerForm>,
 ) -> Json<WorldOwnerResponse> {
-    match state.world.set_owner_did(&form.owner_did).await {
-        Ok(owner_did) => match state.world.save_encrypted_state().await {
+    match state.world.set_owner_did(&form.owner).await {
+        Ok(owner) => match state.world.save_encrypted_state().await {
             Ok((state_cid, root_cid)) => Json(WorldOwnerResponse {
                 ok: true,
                 message: format!(
                     "world owner set to '{}' and persisted (state_cid={}, root_cid={})",
-                    owner_did, state_cid, root_cid
+                    owner, state_cid, root_cid
                 ),
-                owner_did: Some(owner_did),
+                owner: Some(owner),
             }),
             Err(err) => Json(WorldOwnerResponse {
                 ok: false,
                 message: format!(
                     "world owner set to '{}' in runtime but persist failed: {}",
-                    owner_did, err
+                    owner, err
                 ),
-                owner_did: Some(owner_did),
+                owner: Some(owner),
             }),
         },
         Err(err) => Json(WorldOwnerResponse {
             ok: false,
             message: format!("world owner update failed: {}", err),
-            owner_did: None,
+            owner: None,
         }),
     }
 }
@@ -458,7 +458,7 @@ struct StatusStats {
 struct RuntimeStatus {
     unlocked: bool,
     kubo_url: String,
-    owner_did: Option<String>,
+    owner: Option<String>,
     world_cid: Option<String>,
     state_cid: Option<String>,
     lang_cid: Option<String>,
@@ -504,7 +504,7 @@ struct KuboApiResponse {
 struct WorldOwnerResponse {
     ok: bool,
     message: String,
-    owner_did: Option<String>,
+    owner: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -546,7 +546,7 @@ struct KuboApiForm {
 
 #[derive(serde::Deserialize)]
 struct WorldOwnerForm {
-    owner_did: String,
+    owner: String,
 }
 
 #[derive(serde::Deserialize)]

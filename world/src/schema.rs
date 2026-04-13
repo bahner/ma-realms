@@ -268,19 +268,19 @@ struct SealedActorEnvelope {
 }
 
 pub fn default_world_dir(world_slug: &str) -> PathBuf {
-    worlds_data_root().join("worlds").join(world_slug)
+    worlds_data_root().join(world_slug)
 }
 
 pub fn worlds_data_root() -> PathBuf {
-    if let Some(value) = std::env::var_os("XDG_DATA_HOME") {
+    if let Some(value) = std::env::var_os("XDG_CONFIG_HOME") {
         return PathBuf::from(value).join("ma");
     }
 
     if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".local").join("share").join("ma");
+        return PathBuf::from(home).join(".config").join("ma");
     }
 
-    PathBuf::from(".ma-data")
+    PathBuf::from(".config").join("ma")
 }
 
 pub fn validate_world_authoring(world_dir: &Path) -> Result<ValidationReport> {

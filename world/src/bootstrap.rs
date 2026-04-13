@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -7,14 +7,16 @@ pub fn print_cli_help() {
     println!("ma-world");
     println!();
     println!("Usage:");
-    println!("  ma-world run [--world-slug <slug>] [--listen <ip:port>] [--kubo-url <url>] [--cid <cid>] [--log-level <level>] [--log-file <path>]");
-    println!("  ma-world publish-world --world-slug <slug> [--kubo-url <url>] [--skip-ipns] [--allow-partial-ipns] [--ipns-timeout-ms <ms>] [--ipns-retries <n>] [--ipns-backoff-ms <ms>] [--actor-web-cid <cid>]");
-    println!("  ma-world set-kubo-url [--world-slug <slug>] --kubo-url <url>");
-    println!("  ma-world ensure-world [--world-slug <slug>] [--kubo-url <url>] [--skip-ipns] [--allow-partial-ipns] [--ipns-timeout-ms <ms>] [--ipns-retries <n>] [--ipns-backoff-ms <ms>] [--actor-web-cid <cid>]");
-    println!("  ma-world --gen-iroh-secret [--world-slug <slug>] [<path>]");
+    println!("  ma-world run [--slug <slug>] [--listen <ip:port>] [--kubo-url <url>] [--owner <did>] [--cid <cid>] [--no-actor] [--log-level <level>] [--log-file <path>]");
+    println!("  ma-world publish-world --slug <slug> [--kubo-url <url>] [--skip-ipns] [--allow-partial-ipns] [--ipns-timeout-ms <ms>] [--ipns-retries <n>] [--ipns-backoff-ms <ms>] [--actor-web-cid <cid>]");
+    println!("  ma-world set-kubo-url [--slug <slug>] --kubo-url <url>");
+    println!("  ma-world ensure-world [--slug <slug>] [--kubo-url <url>] [--skip-ipns] [--allow-partial-ipns] [--ipns-timeout-ms <ms>] [--ipns-retries <n>] [--ipns-backoff-ms <ms>] [--actor-web-cid <cid>]");
+    println!("  ma-world --gen-iroh-secret [--slug <slug>] [<path>]");
+    println!("  ma-world create-unlock-bundle --slug <slug> --passphrase <passphrase> [--out <path>]");
+    println!("  ma-world --gen-headless-config --slug <slug> [--passphrase <passphrase>]");
     println!();
     println!("publish-world options:");
-    println!("  --world-slug <slug>");
+    println!("  --slug <slug>");
     println!("  --kubo-url <url>");
     println!("  --actor-web-cid <cid>");
     println!("  --skip-ipns");
@@ -24,30 +26,35 @@ pub fn print_cli_help() {
     println!("  --ipns-backoff-ms <ms>");
     println!();
     println!("run options (server mode):");
-    println!("  --world-slug <slug>    Required world slug (e.g. panteia)");
+    println!("  --slug <slug>          Required slug (e.g. panteia)");
     println!("  --listen <ip:port>");
     println!("  --kubo-url <url>");
+    println!("  --owner <did>          Set world owner DID at startup");
     println!("  --cid <cid>            Override actor web CID for this run");
+    println!("  --no-actor             Disable actor web runtime for this run");
     println!("  --log-level <level>    Log level: trace, debug, info (default), warn, error");
     println!("  --log-file <path>      Write logs to file (appends to existing file)");
     println!("  runtime config file:   $XDG_CONFIG_HOME/ma/<slug>.yaml (or ~/.config/ma/<slug>.yaml)");
-    println!("  iroh secret default:   $XDG_DATA_HOME/ma/iroh_<slug>_secret.bin");
+    println!("  iroh secret default:   $XDG_CONFIG_HOME/ma/<slug>_iroh.bin (or ~/.config/ma/<slug>_iroh.bin)");
     println!();
     println!("Environment variables:");
     println!("  MA_KUBO_API_URL               Kubo API URL");
     println!("  MA_LISTEN                     HTTP status listen socket");
+    println!("  MA_WORLD_OWNER                World owner DID for 'run' command");
     println!("  MA_LOG_LEVEL                  Log level for 'run' command");
     println!("  MA_LOG_FILE                   Log file path for 'run' command");
     println!();
     println!("Precedence (highest to lowest): CLI args > runtime config file > env vars > defaults");
 }
 
-#[derive(Clone, Debug, Deserialize, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct RuntimeFileConfig {
     #[serde(default)]
     pub kubo_api_url: Option<String>,
     #[serde(default)]
     pub listen: Option<String>,
+    #[serde(default)]
+    pub owner: Option<String>,
     #[serde(default)]
     pub iroh_secret: Option<String>,
     #[serde(default)]
@@ -66,6 +73,8 @@ pub struct RuntimeFileConfig {
     pub actor_web_cache_dir: Option<String>,
     #[serde(default)]
     pub actor_web_ipns_key: Option<String>,
+    #[serde(default)]
+    pub actor_web_enabled: Option<bool>,
     #[serde(default)]
     pub actor_web_auto_build: Option<bool>,
     #[serde(default)]
@@ -103,9 +112,9 @@ pub fn runtime_config_path(world_slug: &str) -> PathBuf {
 }
 
 pub fn runtime_iroh_secret_default_path(world_slug: &str) -> PathBuf {
-    xdg_data_home()
+    xdg_config_home()
         .join("ma")
-        .join(format!("iroh_{}_secret.bin", world_slug))
+        .join(format!("{}_iroh.bin", world_slug))
 }
 
 fn default_workspace_actor_web_dir() -> Option<PathBuf> {

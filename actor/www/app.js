@@ -404,9 +404,10 @@ function syncSpecialAliasesFromCurrentHome() {
 
   const roomDid = String(state.currentHome?.roomDid || '').trim();
   const room = String(state.currentHome?.room || '').trim();
-  const worldDid = String(state.currentHome?.worldDid || '').trim();
+  const worldDidRaw = String(state.currentHome?.worldDid || '').trim();
+  const worldDid = didRoot(worldDidRaw);
 
-  if (isMaDidTarget(worldDid)) {
+  if (isMaDid(worldDid)) {
     next['@world'] = worldDid;
   }
 
@@ -1143,11 +1144,12 @@ async function resolveCommandTargetDidOrToken(targetToken) {
     throw new Error('Usage: @target <command>');
   }
   if (raw.toLowerCase() === 'world') {
-    const worldDid = String(state.currentHome?.worldDid || state.aliasBook?.['@world'] || '').trim();
-    if (isMaDid(worldDid) && worldDid.includes('#') && !isUnconfiguredDidTarget(worldDid)) {
+    const worldDidRaw = String(state.currentHome?.worldDid || state.aliasBook?.['@world'] || '').trim();
+    const worldDid = didRoot(worldDidRaw);
+    if (isMaDid(worldDid) && !isUnconfiguredDidTarget(worldDid)) {
       return worldDid;
     }
-    throw new Error('@world requires a full did:ma target with fragment. Reconnect to refresh world DID.');
+    throw new Error('@world requires a valid world did:ma root. Reconnect to refresh world DID.');
   }
   const activeAliasRaw = String(state.activeObjectTargetAlias || '').trim().replace(/^@+/, '');
   const activeDid = String(state.activeObjectTargetDid || '').trim();
@@ -2606,6 +2608,9 @@ function startHomeEventPolling() {
   }, state.worldPingIntervalMs ?? AVATAR_PING_INTERVAL_MS);
 
   state.roomPollTimer = setInterval(() => {
+    pollCurrentHomeEvents().catch((error) => {
+      logger.log('poll.events', `non-fatal room poll failure: ${error instanceof Error ? error.message : String(error)}`);
+    });
     pollDirectInbox().catch((error) => {
       logger.log('inbox.poll', `non-fatal inbox poll failure: ${error instanceof Error ? error.message : String(error)}`);
     });

@@ -10,6 +10,8 @@ pub enum RoomActorAction {
     /// `destination` is the room name/fragment (without `#`).
     /// If `None`, the world auto-names the destination.
     Dig { exit_name: String, destination: Option<String> },
+    /// Remove a named exit from the current room.
+    Bury { exit_name: String },
     /// Set room attribute using a key/value pair.
     /// Supported keys: owner, title, description, cid, content-b64, exit-content-b64.
     SetAttribute { key: String, value: String },
@@ -30,6 +32,7 @@ pub struct RoomActorContext<'a> {
     pub acl_owner_did: Option<&'a str>,
     pub acl_summary: &'a str,
     pub caller_did: Option<&'a str>,
+    pub caller_owner_did: Option<&'a str>,
     pub description: &'a str,
     pub title: &'a str,
     pub did: Option<&'a str>,
@@ -46,16 +49,23 @@ fn room_not_found(ctx: &RoomActorContext<'_>) -> RoomActorResult {
 }
 
 fn is_owner(ctx: &RoomActorContext<'_>) -> bool {
-    ctx.acl_owner_did
-        .zip(ctx.caller_did)
-        .map(|(owner, caller)| owner == caller)
-        .unwrap_or(false)
+    let Some(owner) = ctx.acl_owner_did else {
+        return false;
+    };
+
+    ctx.caller_did.map(|caller| caller == owner).unwrap_or(false)
+        || ctx
+            .caller_owner_did
+            .map(|caller_owner| caller_owner == owner)
+            .unwrap_or(false)
 }
 
 fn is_owner_or_unclaimed(ctx: &RoomActorContext<'_>) -> bool {
-    match (ctx.acl_owner_did, ctx.caller_did) {
-        (None, _) => true,
-        (Some(owner), Some(caller)) => owner == caller,
+    match (ctx.acl_owner_did, ctx.caller_did, ctx.caller_owner_did) {
+        (None, _, _) => true,
+        (Some(owner), Some(caller), caller_owner) => {
+            owner == caller || caller_owner.map(|value| value == owner).unwrap_or(false)
+        }
         _ => false,
     }
 }
@@ -85,6 +95,7 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "help", "who", "l", "acl", "describe", "show",
     "invite <did>", "deny <did>", "kick <handle>",
     "dig <direction> [to|til <#dest|did:ma:...#room>]",
+    "bury <direction>",
     "owner [did]", "title [value]", "description [value]",
     "cid [value]", "content-b64 [value]", "exit-content-b64 [value]",
 ];
@@ -182,6 +193,23 @@ fn cmd_dig(arg: &str, ctx: &RoomActorContext<'_>) -> RoomActorResult {
     RoomActorResult {
         response: format!("@here exit '{}' dug from '{}' → {}", exit_name, ctx.room_name, dest_display),
         action: RoomActorAction::Dig { exit_name, destination },
+    }
+}
+
+fn cmd_bury(arg: &str, ctx: &RoomActorContext<'_>) -> RoomActorResult {
+    if !ctx.room_exists { return room_not_found(ctx); }
+    if !is_owner(ctx) {
+        return none_result(format!("@here only the room owner can bury exits in '{}'", ctx.room_name));
+    }
+    let exit_name = arg.trim();
+    if exit_name.is_empty() {
+        return none_result("@here usage: @here bury <direction>".to_string());
+    }
+    RoomActorResult {
+        response: format!("@here exit '{}' buried in '{}'", exit_name, ctx.room_name),
+        action: RoomActorAction::Bury {
+            exit_name: exit_name.to_string(),
+        },
     }
 }
 
@@ -333,6 +361,7 @@ pub fn execute_room_actor_command(command: &str, ctx: &RoomActorContext<'_>) -> 
     match method.as_str() {
         "invite" | "deny" | "kick" => return cmd_invite_deny_kick(&method, &arg, ctx),
         "dig"                      => return cmd_dig(&arg, ctx),
+        "bury"                     => return cmd_bury(&arg, ctx),
         _ => {}
     }
 
@@ -360,6 +389,7 @@ mod tests {
             acl_owner_did: Some("did:ma:owner"),
             acl_summary: "*",
             caller_did: Some("did:ma:owner"),
+            caller_owner_did: Some("did:ma:owner-root"),
             title: "Lobby",
             description: "Welcome",
             did: Some("did:ma:world#lobby"),
@@ -381,5 +411,14 @@ mod tests {
         let result = execute_room_actor_command("set owner did:ma:new-owner", &sample_ctx());
         assert!(result.response.contains("deprecated"));
         assert!(matches!(result.action, RoomActorAction::None));
+    }
+
+    #[test]
+    fn supports_bury_command() {
+        let result = execute_room_actor_command("bury north", &sample_ctx());
+        assert!(matches!(
+            result.action,
+            RoomActorAction::Bury { ref exit_name } if exit_name == "north"
+        ));
     }
 }

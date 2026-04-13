@@ -45,17 +45,18 @@ ALPN lanes imported from `ma-core`:
 
 ## Runtime Configuration
 
-Server mode requires `--world-slug <slug>`.
+Server mode requires `--slug <slug>`.
 
 Supported run flags:
 
 | Flag | Default | Purpose |
 | ------ | --------- | --------- |
-| `--world-slug` | (required) | world slug used for runtime naming/path resolution |
+| `--slug` | (required) | slug used for runtime naming/path resolution |
 | `--listen` | `127.0.0.1:5002` | Status HTTP bind address |
 | `--kubo-url` | `http://127.0.0.1:5001` | Kubo HTTP API base URL |
+| `--owner` | (none) | Set world owner DID at startup |
 | `--log-level` | `info` | tracing level |
-| `--log-file` | (none) | optional file sink for logs |
+| `--log-file` | `$XDG_DATA_HOME/ma/worlds/<slug>/ma-world.log` | optional file sink for logs |
 
 Runtime file config (optional):
 
@@ -65,29 +66,63 @@ Runtime file config (optional):
 ```yaml
 kubo_api_url: http://127.0.0.1:5001
 listen: 127.0.0.1:5002
-iroh_secret: /home/user/.local/share/ma/iroh_panteia_secret.bin
+owner: did:ma:...
+iroh_secret: /home/user/.config/ma/panteia_iroh.bin
 log_level: info
 log_file: /tmp/ma-world.log
 actor_web_version: 0.1.0
 actor_web_cid: bafy...
 actor_web_dir: /home/user/src/ma/rust/ma-realms/actor/www
 actor_web_listen: 127.0.0.1:8081
-actor_web_cache_dir: /home/user/.local/share/ma/actor-web
+actor_web_cache_dir: /home/user/.config/ma/actor-web
 actor_web_ipns_key: ma-actor
+actor_web_enabled: true
 actor_web_auto_build: true
 actor_web_auto_publish_ipns: true
 ```
 
+Set `actor_web_enabled: false` to run world without starting actor web runtime.
+
+Optional environment fallback for owner in run mode:
+
+- `MA_WORLD_OWNER=did:ma:...`
+
+Remote/CLI unlock bundle generation (no status page needed):
+
+```bash
+cargo run --manifest-path world/Cargo.toml -- create-unlock-bundle --slug <slug> --passphrase '<secret>'
+```
+
+Default output path is `~/.config/ma/<slug>_bundle.json`.
+Then set in runtime config:
+
+```yaml
+unlock_passphrase: <secret>
+unlock_bundle_file: /home/user/.config/ma/<slug>_bundle.json
+```
+
+One-shot remote/headless setup (writes config + iroh key + unlock bundle):
+
+```bash
+cargo run --manifest-path world/Cargo.toml -- --gen-headless-config --slug <slug>
+```
+
+This command writes:
+
+- `~/.config/ma/<slug>_iroh.bin`
+- `~/.config/ma/<slug>_bundle.json`
+- `~/.config/ma/<slug>.yaml`
+
 Quick one-off override at startup:
 
 ```bash
-cargo run --manifest-path ma-world/Cargo.toml -- run --world-slug <slug> --cid <bafy...>
+cargo run --manifest-path ma-world/Cargo.toml -- run --slug <slug> --cid <bafy...>
 ```
 
 Equivalent shorthand (top-level flags):
 
 ```bash
-cargo run --manifest-path ma-world/Cargo.toml -- --world-slug <slug> --cid <bafy...>
+cargo run --manifest-path ma-world/Cargo.toml -- --slug <slug> --cid <bafy...>
 ```
 
 Actor web metadata/CID resolution priority:
@@ -107,7 +142,7 @@ If `actor_web_auto_publish_ipns: true`, the new auto-built CID is also published
 `actor_web_dir` enables static serving on `actor_web_listen` (default `127.0.0.1:8081`).
 
 If an actor web CID is available, `ma-world` downloads and unpacks that CID at startup into
-`actor_web_cache_dir` (default: `$XDG_DATA_HOME/ma/actor-web`) and serves from the cached CID directory.
+`actor_web_cache_dir` (default: `$XDG_CONFIG_HOME/ma/actor-web`) and serves from the cached CID directory.
 On next startup (or CID change), the cached directory for that CID is refreshed.
 
 If no actor web source dir is available and no CID is configured, `ma-world` attempts to
@@ -115,19 +150,19 @@ resolve actor web CID from local Kubo IPNS key `actor_web_ipns_key` (default: `m
 
 Default iroh secret path when `iroh_secret` is not set:
 
-- `XDG_DATA_HOME/ma/iroh_<slug>_secret.bin` (or `~/.local/share/ma/iroh_<slug>_secret.bin`)
+- `XDG_CONFIG_HOME/ma/<slug>_iroh.bin` (or `~/.config/ma/<slug>_iroh.bin`)
 
 Generate iroh secret explicitly (required before server startup):
 
 ```bash
-ma-world --gen-iroh-secret ~/.config/ma/panteia_secret.bin
-ma-world --gen-iroh-secret --world-slug panteia
+ma-world --gen-iroh-secret ~/.config/ma/panteia_iroh.bin
+ma-world --gen-iroh-secret --slug panteia
 ```
 
 When path is omitted, `--gen-iroh-secret` resolves target path as:
 
 1. `iroh_secret` from `XDG_CONFIG_HOME/ma/<slug>.yaml` (or `~/.config/ma/<slug>.yaml`)
-2. fallback `XDG_DATA_HOME/ma/iroh_<slug>_secret.bin` (or `~/.local/share/ma/iroh_<slug>_secret.bin`)
+2. fallback `XDG_CONFIG_HOME/ma/<slug>_iroh.bin` (or `~/.config/ma/<slug>_iroh.bin`)
 
 `ma-world` does not auto-create the iroh secret at startup.
 
@@ -157,7 +192,7 @@ Server-side filesystem writes are intentionally minimal:
 
 - no automatic writes except optional log file output
 
-Unlock bundle creation returns bundle JSON through the API/UI and does not auto-write bundle files.
+Unlock bundle can be created via status API/UI or by CLI command (`create-unlock-bundle` / `--gen-headless-config`) which writes bundle files directly.
 
 `ma-world` does not auto-bootstrap a world directory during server startup.
 Moving world data between machines is supported at world-data level (CIDs/state),
@@ -189,8 +224,8 @@ make run            # debug + RUST_LOG
 
 # Or directly:
 cargo run --bin ma-world -- run --listen 127.0.0.1:5002 --kubo-url http://127.0.0.1:5001
-cargo run --bin ma-world -- run --world-slug panteia
-RUST_LOG=ma_world=debug cargo run --bin ma-world -- run --world-slug panteia
+cargo run --bin ma-world -- run --slug panteia
+RUST_LOG=ma_world=debug cargo run --bin ma-world -- run --slug panteia
 ```
 
 ## Language Pack Defaults
@@ -243,7 +278,7 @@ Optional signing/notarization hooks are enabled when secrets are present:
 
 On startup the server:
 
-1. Requires `--world-slug` and optionally reads `XDG_CONFIG_HOME/ma/<slug>.yaml`
+1. Requires `--slug` and optionally reads `XDG_CONFIG_HOME/ma/<slug>.yaml`
 2. Requires existing iroh secret file (create with `--gen-iroh-secret`)
 3. Initialises an iroh endpoint with that machine-local secret key
 4. Creates the default `lobby` room

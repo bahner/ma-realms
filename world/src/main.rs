@@ -5537,7 +5537,7 @@ impl World {
             return tr_world(
                 active_lang,
                 "world.help.commands",
-                "@world commands: help | ping [room] | list | claim | knock list [all] | knock accept <id> | knock reject <id> [note] | knock delete <id> | invite <did> [note] | room <name> acl show|open|close|allow <did>|deny <did> | flush [knock|all] | migrate-index | save | load <cid> | dig <direction> [to|til <#dest|did>]",
+                "@world commands: help | ping [room] | list | claim | knock list [all] | knock accept <id> | knock reject <id> [note] | knock delete <id> | invite <did> [note] | room <name> acl show|open|close|allow <did>|deny <did> | flush [knock|all] | migrate-index | save | load <cid> | dig <direction> [to|til <#dest|did>] | bury <direction>",
             );
         }
 
@@ -6102,7 +6102,7 @@ impl World {
         caller_did: Option<&str>,
     ) -> String {
 
-        let (room_exists, avatars, acl_owner, acl_summary, title, description, did) = {
+        let (room_exists, avatars, acl_owner, acl_summary, caller_owner, title, description, did) = {
             let rooms = self.rooms.read().await;
             if let Some(room) = rooms.get(room_name) {
                 (
@@ -6110,12 +6110,13 @@ impl World {
                     room.avatars.keys().cloned().collect::<Vec<_>>(),
                     room.acl.owner.clone(),
                     room.acl.summary(),
+                    room.avatars.get(from).map(|avatar| avatar.owner.clone()),
                     room.title_or_default(),
                     room.description_or_default(),
                     Some(room.did.clone()),
                 )
             } else {
-                (false, Vec::new(), None, "(none)".to_string(), String::new(), String::new(), None)
+                (false, Vec::new(), None, "(none)".to_string(), None, String::new(), String::new(), None)
             }
         };
         let things = self.room_object_names(room_name).await;
@@ -6128,6 +6129,7 @@ impl World {
             acl_owner_did: acl_owner.as_deref(),
             acl_summary: &acl_summary,
             caller_did,
+            caller_owner_did: caller_owner.as_deref(),
             title: &title,
             description: &description,
             did: did.as_deref(),
@@ -6586,6 +6588,19 @@ impl World {
                     changed_rooms.push(created_room);
                 }
                 room_update_announcement = Some(format!("new exit '{}' created by {}", exit_name, from));
+            }
+            RoomActorAction::Bury { exit_name } => {
+                let mut rooms = self.rooms.write().await;
+                if let Some(room) = rooms.get_mut(room_name) {
+                    let before = room.exits.len();
+                    room.exits.retain(|exit| !exit.matches(&exit_name));
+                    if room.exits.len() == before {
+                        response = format!("@here exit '{}' not found in '{}'", exit_name, room_name);
+                    } else {
+                        changed_rooms.push(room_name.to_string());
+                        room_update_announcement = Some(format!("exit '{}' buried by {}", exit_name, from));
+                    }
+                }
             }
         }
 
@@ -7983,7 +7998,9 @@ async fn main() -> Result<()> {
     let mut log_level: String = "info".to_string();
     let mut log_file: Option<PathBuf> = None;
     let mut world_slug_override: Option<String> = None;
+    let mut owner_override: Option<String> = None;
     let mut actor_web_cid_override: Option<String> = None;
+    let mut disable_actor_web = false;
 
     if args.len() >= 2 {
         match args[1].as_str() {
@@ -7997,17 +8014,17 @@ async fn main() -> Result<()> {
                 let mut idx = 2usize;
                 while idx < args.len() {
                     match args[idx].as_str() {
-                        "--world-slug" => {
+                        "--slug" => {
                             idx += 1;
                             if idx >= args.len() {
-                                return Err(anyhow!("missing value for --world-slug"));
+                                return Err(anyhow!("missing value for --slug"));
                             }
                             world_slug = args[idx].clone();
                         }
                         other => {
                             if explicit_path.is_some() {
                                 return Err(anyhow!(
-                                    "usage: ma-world --gen-iroh-secret [path] [--world-slug <slug>]"
+                                    "usage: ma-world --gen-iroh-secret [path] [--slug <slug>]"
                                 ));
                             }
                             explicit_path = Some(PathBuf::from(other));
@@ -8025,6 +8042,172 @@ async fn main() -> Result<()> {
 
                 generate_iroh_secret_file(&path)?;
                 println!("generated iroh secret: {}", path.display());
+                return Ok(());
+            }
+            "--gen-headless-config" => {
+                let mut world_slug: Option<String> = None;
+                let mut passphrase: Option<String> = None;
+                let mut idx = 2usize;
+                while idx < args.len() {
+                    match args[idx].as_str() {
+                        "--slug" => {
+                            idx += 1;
+                            if idx >= args.len() {
+                                return Err(anyhow!("missing value for --slug"));
+                            }
+                            world_slug = Some(args[idx].clone());
+                        }
+                        "--passphrase" => {
+                            idx += 1;
+                            if idx >= args.len() {
+                                return Err(anyhow!("missing value for --passphrase"));
+                            }
+                            passphrase = Some(args[idx].clone());
+                        }
+                        other => {
+                            return Err(anyhow!(
+                                "unknown argument '{}' for --gen-headless-config (supported: --slug, --passphrase)",
+                                other
+                            ));
+                        }
+                    }
+                    idx += 1;
+                }
+
+                let world_slug = world_slug
+                    .ok_or_else(|| anyhow!("--slug is required for --gen-headless-config"))?;
+                let normalized_slug = normalize_world_key_name(&world_slug);
+                let runtime_cfg_path = runtime_config_path(&normalized_slug);
+                let cfg_dir = runtime_cfg_path
+                    .parent()
+                    .map(PathBuf::from)
+                    .ok_or_else(|| anyhow!("invalid runtime config path {}", runtime_cfg_path.display()))?;
+                fs::create_dir_all(&cfg_dir)?;
+
+                let iroh_path = cfg_dir.join(format!("{}_iroh.bin", normalized_slug));
+                let bundle_path = cfg_dir.join(format!("{}_bundle.json", normalized_slug));
+                let config_path = cfg_dir.join(format!("{}.yaml", normalized_slug));
+
+                if config_path.exists() {
+                    return Err(anyhow!("config already exists at {}", config_path.display()));
+                }
+
+                let passphrase = passphrase.unwrap_or_else(|| nanoid!(32));
+
+                generate_iroh_secret_file(&iroh_path)?;
+
+                let secret_key = load_persisted_iroh_secret_key(&iroh_path)?
+                    .ok_or_else(|| anyhow!("failed loading generated iroh secret {}", iroh_path.display()))?;
+                let world_master_key = derive_world_master_key(&secret_key, &normalized_slug);
+
+                let world = World::new(
+                    EntryAcl {
+                        allow_all: true,
+                        allow_owner: true,
+                        allowed_dids: HashSet::new(),
+                        source: "*".to_string(),
+                    },
+                    DEFAULT_KUBO_API_URL.to_string(),
+                    normalized_slug.clone(),
+                );
+                world.set_world_master_key(world_master_key).await;
+                let bundle_json = world.create_unlock_bundle(&passphrase).await?;
+                fs::write(&bundle_path, bundle_json.as_bytes())?;
+
+                let cfg = bootstrap::RuntimeFileConfig {
+                    iroh_secret: Some(iroh_path.display().to_string()),
+                    unlock_passphrase: Some(passphrase.clone()),
+                    unlock_bundle_file: Some(bundle_path.display().to_string()),
+                    actor_web_enabled: Some(false),
+                    ..Default::default()
+                };
+                let yaml = serde_yaml::to_string(&cfg)?;
+                fs::write(&config_path, yaml.as_bytes())?;
+
+                println!("generated headless config artifacts for slug '{}':", normalized_slug);
+                println!("  iroh_secret: {}", iroh_path.display());
+                println!("  unlock_bundle_file: {}", bundle_path.display());
+                println!("  config: {}", config_path.display());
+                println!("  passphrase: {}", passphrase);
+                return Ok(());
+            }
+            "create-unlock-bundle" => {
+                let mut world_slug = DEFAULT_WORLD_SLUG.to_string();
+                let mut passphrase: Option<String> = None;
+                let mut out_path: Option<PathBuf> = None;
+                let mut idx = 2usize;
+                while idx < args.len() {
+                    match args[idx].as_str() {
+                        "--slug" => {
+                            idx += 1;
+                            if idx >= args.len() {
+                                return Err(anyhow!("missing value for --slug"));
+                            }
+                            world_slug = args[idx].clone();
+                        }
+                        "--passphrase" => {
+                            idx += 1;
+                            if idx >= args.len() {
+                                return Err(anyhow!("missing value for --passphrase"));
+                            }
+                            passphrase = Some(args[idx].clone());
+                        }
+                        "--out" => {
+                            idx += 1;
+                            if idx >= args.len() {
+                                return Err(anyhow!("missing value for --out"));
+                            }
+                            out_path = Some(PathBuf::from(&args[idx]));
+                        }
+                        other => {
+                            return Err(anyhow!(
+                                "unknown argument '{}' for create-unlock-bundle (supported: --slug, --passphrase, --out)",
+                                other
+                            ));
+                        }
+                    }
+                    idx += 1;
+                }
+
+                let passphrase = passphrase
+                    .ok_or_else(|| anyhow!("--passphrase is required for create-unlock-bundle"))?;
+                let normalized_slug = normalize_world_key_name(&world_slug);
+                let runtime_cfg_path = runtime_config_path(&normalized_slug);
+                let runtime_cfg = load_runtime_file_config(&runtime_cfg_path)?;
+                let iroh_path = runtime_cfg
+                    .iroh_secret
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| runtime_iroh_secret_default_path(&normalized_slug));
+                let secret_key = load_persisted_iroh_secret_key(&iroh_path)?
+                    .ok_or_else(|| anyhow!(
+                        "missing iroh secret at {}. Create it with: ma-world --gen-iroh-secret --slug {}",
+                        iroh_path.display(),
+                        normalized_slug
+                    ))?;
+                let world_master_key = derive_world_master_key(&secret_key, &normalized_slug);
+
+                let world = World::new(
+                    EntryAcl {
+                        allow_all: true,
+                        allow_owner: true,
+                        allowed_dids: HashSet::new(),
+                        source: "*".to_string(),
+                    },
+                    DEFAULT_KUBO_API_URL.to_string(),
+                    normalized_slug.clone(),
+                );
+                world.set_world_master_key(world_master_key).await;
+                let bundle_json = world.create_unlock_bundle(&passphrase).await?;
+
+                let out_path = out_path.unwrap_or_else(|| {
+                    runtime_config_path(&normalized_slug)
+                        .with_file_name(format!("{}_bundle.json", normalized_slug))
+                });
+                if let Some(parent) = out_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&out_path, bundle_json.as_bytes())?;
+                println!("created unlock bundle: {}", out_path.display());
                 return Ok(());
             }
             "run" => {
@@ -8046,12 +8229,22 @@ async fn main() -> Result<()> {
                             }
                             kubo_url_override = Some(args[idx].clone());
                         }
+                        "--owner" => {
+                            idx += 1;
+                            if idx >= args.len() {
+                                return Err(anyhow!("missing value for --owner"));
+                            }
+                            owner_override = Some(args[idx].clone());
+                        }
                         "--cid" => {
                             idx += 1;
                             if idx >= args.len() {
                                 return Err(anyhow!("missing value for --cid"));
                             }
                             actor_web_cid_override = Some(args[idx].clone());
+                        }
+                        "--no-actor" => {
+                            disable_actor_web = true;
                         }
                         "--log-level" => {
                             idx += 1;
@@ -8065,18 +8258,18 @@ async fn main() -> Result<()> {
                             if idx >= args.len() {
                                 return Err(anyhow!("missing value for --log-file"));
                             }
-                            log_file = Some(PathBuf::from(&args[idx]));
+                            log_file = Some(expand_tilde_path(&args[idx]));
                         }
-                        "--world-slug" => {
+                        "--slug" => {
                             idx += 1;
                             if idx >= args.len() {
-                                return Err(anyhow!("missing value for --world-slug"));
+                                return Err(anyhow!("missing value for --slug"));
                             }
                             world_slug_override = Some(args[idx].clone());
                         }
                         other => {
                             return Err(anyhow!(
-                                "unknown argument '{}' for run (supported: --world-slug, --listen, --kubo-url, --cid, --log-level, --log-file)",
+                                "unknown argument '{}' for run (supported: --slug, --listen, --kubo-url, --owner, --cid, --no-actor, --log-level, --log-file)",
                                 other
                             ));
                         }
@@ -8108,12 +8301,22 @@ async fn main() -> Result<()> {
                     }
                     kubo_url_override = Some(args[idx].clone());
                 }
+                "--owner" => {
+                    idx += 1;
+                    if idx >= args.len() {
+                        return Err(anyhow!("missing value for --owner"));
+                    }
+                    owner_override = Some(args[idx].clone());
+                }
                 "--cid" => {
                     idx += 1;
                     if idx >= args.len() {
                         return Err(anyhow!("missing value for --cid"));
                     }
                     actor_web_cid_override = Some(args[idx].clone());
+                }
+                "--no-actor" => {
+                    disable_actor_web = true;
                 }
                 "--log-level" => {
                     idx += 1;
@@ -8127,18 +8330,18 @@ async fn main() -> Result<()> {
                     if idx >= args.len() {
                         return Err(anyhow!("missing value for --log-file"));
                     }
-                    log_file = Some(PathBuf::from(&args[idx]));
+                    log_file = Some(expand_tilde_path(&args[idx]));
                 }
-                "--world-slug" => {
+                "--slug" => {
                     idx += 1;
                     if idx >= args.len() {
-                        return Err(anyhow!("missing value for --world-slug"));
+                        return Err(anyhow!("missing value for --slug"));
                     }
                     world_slug_override = Some(args[idx].clone());
                 }
                 other => {
                     return Err(anyhow!(
-                        "unknown top-level argument '{}'. Use 'publish-world' for publish flags like --skip-ipns, or use run/--world-slug/--listen/--kubo-url/--cid for server mode.",
+                        "unknown top-level argument '{}'. Use 'publish-world' for publish flags like --skip-ipns, or use run/--slug/--listen/--kubo-url/--owner/--cid/--no-actor for server mode.",
                         other
                     ));
                 }
@@ -8154,7 +8357,7 @@ async fn main() -> Result<()> {
         Some(
             world_slug_override
                 .clone()
-                .ok_or_else(|| anyhow!("--world-slug is required for server mode"))?,
+                .ok_or_else(|| anyhow!("--slug is required for server mode"))?,
         )
     } else {
         None
@@ -8182,6 +8385,22 @@ async fn main() -> Result<()> {
             }
         }
 
+        if owner_override.is_none() {
+            if let Some(cfg_owner) = runtime_file_config.owner.clone() {
+                owner_override = Some(cfg_owner);
+            } else if let Ok(env_owner) = std::env::var("MA_WORLD_OWNER") {
+                owner_override = Some(env_owner);
+            }
+        }
+
+        if !disable_actor_web {
+            if let Some(enabled) = runtime_file_config.actor_web_enabled {
+                if !enabled {
+                    disable_actor_web = true;
+                }
+            }
+        }
+
         if log_level == "info" {
             if let Some(cfg_level) = runtime_file_config.log_level.clone() {
                 log_level = cfg_level;
@@ -8192,9 +8411,17 @@ async fn main() -> Result<()> {
 
         if log_file.is_none() {
             if let Some(cfg_file) = runtime_file_config.log_file.clone() {
-                log_file = Some(PathBuf::from(cfg_file));
+                log_file = Some(expand_tilde_path(&cfg_file));
             } else if let Ok(env_file) = std::env::var("MA_LOG_FILE") {
-                log_file = Some(PathBuf::from(env_file));
+                log_file = Some(expand_tilde_path(&env_file));
+            } else {
+                log_file = Some(
+                    xdg_data_home()
+                        .join("ma")
+                        .join("worlds")
+                        .join(&normalized_slug)
+                        .join("ma-world.log"),
+                );
             }
         }
     }
@@ -8210,10 +8437,10 @@ async fn main() -> Result<()> {
         let mut idx = 2usize;
         while idx < args.len() {
             match args[idx].as_str() {
-                "--world-slug" => {
+                "--slug" => {
                     idx += 1;
                     if idx >= args.len() {
-                        return Err(anyhow!("missing value for --world-slug"));
+                        return Err(anyhow!("missing value for --slug"));
                     }
                     world_slug = args[idx].clone();
                 }
@@ -8260,7 +8487,7 @@ async fn main() -> Result<()> {
                 }
                 other => {
                     return Err(anyhow!(
-                        "unknown argument '{}' for check-kubo-ipns (supported: --world-slug, --world-dir, --key, --ipns-timeout-ms, --ipns-retries, --ipns-backoff-ms)",
+                        "unknown argument '{}' for check-kubo-ipns (supported: --slug, --world-dir, --key, --ipns-timeout-ms, --ipns-retries, --ipns-backoff-ms)",
                         other
                     ));
                 }
@@ -8322,10 +8549,10 @@ async fn main() -> Result<()> {
         let mut idx = 2usize;
         while idx < args.len() {
             match args[idx].as_str() {
-                "--world-slug" => {
+                "--slug" => {
                     idx += 1;
                     if idx >= args.len() {
-                        return Err(anyhow!("missing value for --world-slug"));
+                        return Err(anyhow!("missing value for --slug"));
                     }
                     world_slug = args[idx].clone();
                 }
@@ -8338,7 +8565,7 @@ async fn main() -> Result<()> {
                 }
                 other => {
                     return Err(anyhow!(
-                        "unknown argument '{}' for ensure-kubo-keys (supported: --world-slug, --world-dir)",
+                        "unknown argument '{}' for ensure-kubo-keys (supported: --slug, --world-dir)",
                         other
                     ));
                 }
@@ -8391,10 +8618,10 @@ async fn main() -> Result<()> {
         let mut idx = 2usize;
         while idx < args.len() {
             match args[idx].as_str() {
-                "--world-slug" => {
+                "--slug" => {
                     idx += 1;
                     if idx >= args.len() {
-                        return Err(anyhow!("missing value for --world-slug"));
+                        return Err(anyhow!("missing value for --slug"));
                     }
                     world_slug = args[idx].clone();
                 }
@@ -8407,7 +8634,7 @@ async fn main() -> Result<()> {
                 }
                 other => {
                     return Err(anyhow!(
-                        "unknown argument '{}' for check-kubo-keys (supported: --world-slug, --world-dir)",
+                        "unknown argument '{}' for check-kubo-keys (supported: --slug, --world-dir)",
                         other
                     ));
                 }
@@ -8462,10 +8689,10 @@ async fn main() -> Result<()> {
         let mut idx = 2usize;
         while idx < args.len() {
             match args[idx].as_str() {
-                "--world-slug" => {
+                "--slug" => {
                     idx += 1;
                     if idx >= args.len() {
-                        return Err(anyhow!("missing value for --world-slug"));
+                        return Err(anyhow!("missing value for --slug"));
                     }
                     world_slug = args[idx].clone();
                 }
@@ -8511,7 +8738,7 @@ async fn main() -> Result<()> {
                 }
                 other => {
                     return Err(anyhow!(
-                        "unknown argument '{}' for publish-world (supported: --world-slug, --world-dir, --skip-ipns, --allow-partial-ipns, --ipns-timeout-ms, --ipns-retries, --ipns-backoff-ms)",
+                        "unknown argument '{}' for publish-world (supported: --slug, --world-dir, --skip-ipns, --allow-partial-ipns, --ipns-timeout-ms, --ipns-retries, --ipns-backoff-ms)",
                         other
                     ));
                 }
@@ -8676,10 +8903,10 @@ async fn main() -> Result<()> {
         let mut idx = 2usize;
         while idx < args.len() {
             match args[idx].as_str() {
-                "--world-slug" => {
+                "--slug" => {
                     idx += 1;
                     if idx >= args.len() {
-                        return Err(anyhow!("missing value for --world-slug"));
+                        return Err(anyhow!("missing value for --slug"));
                     }
                     world_slug = args[idx].clone();
                 }
@@ -8692,7 +8919,7 @@ async fn main() -> Result<()> {
                 }
                 other => {
                     return Err(anyhow!(
-                        "unknown argument '{}' for validate-world (supported: --world-slug, --world-dir)",
+                        "unknown argument '{}' for validate-world (supported: --slug, --world-dir)",
                         other
                     ));
                 }
@@ -8786,7 +9013,7 @@ async fn main() -> Result<()> {
     }
 
     let runtime_slug = runtime_slug
-        .ok_or_else(|| anyhow!("--world-slug is required for server mode"))?;
+        .ok_or_else(|| anyhow!("--slug is required for server mode"))?;
     let world_slug = normalize_world_key_name(&runtime_slug);
     let runtime_cfg_path = runtime_config_path(&world_slug);
     let runtime_cfg = load_runtime_file_config(&runtime_cfg_path)?;
@@ -8816,6 +9043,10 @@ async fn main() -> Result<()> {
     ));
     info!("Runtime world slug: {}", world_slug);
     info!("Runtime config path: {}", runtime_cfg_path.display());
+
+    if let Some(owner) = owner_override.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        world.set_owner_did(owner).await?;
+    }
 
     world.create_room(DEFAULT_ROOM.to_string()).await?;
 
@@ -8882,7 +9113,7 @@ async fn main() -> Result<()> {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| {
                     runtime_config_path(&world_slug)
-                        .with_file_name(format!("{}.bundle.json", world_slug))
+                        .with_file_name(format!("{}_bundle.json", world_slug))
                 });
             match fs::read_to_string(&bundle_file) {
                 Ok(bundle_json) => {
@@ -8987,80 +9218,92 @@ async fn main() -> Result<()> {
         }
     }
 
-    if actor_web_cid.is_none() && actor_web_auto_build {
-        if let Some(source_dir) = actor_web_build_source_dir.as_deref() {
-            let maybe_ipns_key = if actor_web_auto_publish_ipns {
-                Some(actor_web_ipns_key.as_str())
+    let actor_web_runtime = if disable_actor_web {
+        info!("Actor web runtime disabled via CLI/config");
+        None
+    } else {
+        if actor_web_cid.is_none() && actor_web_auto_build {
+            if let Some(source_dir) = actor_web_build_source_dir.as_deref() {
+                let maybe_ipns_key = if actor_web_auto_publish_ipns {
+                    Some(actor_web_ipns_key.as_str())
+                } else {
+                    None
+                };
+                match publish_actor_web_from_dir(&kubo_url, source_dir, maybe_ipns_key).await {
+                    Ok(cid) => {
+                        info!(
+                            "Auto-built actor web CID {} from {}{}",
+                            cid,
+                            source_dir.display(),
+                            if actor_web_auto_publish_ipns {
+                                format!(" and published via key '{}'", actor_web_ipns_key)
+                            } else {
+                                String::new()
+                            }
+                        );
+                        actor_web_cid = Some(cid);
+                    }
+                    Err(err) => {
+                        warn!(
+                            "Actor web auto-build failed from {}: {}",
+                            source_dir.display(),
+                            err
+                        );
+                    }
+                }
             } else {
-                None
-            };
-            match publish_actor_web_from_dir(&kubo_url, source_dir, maybe_ipns_key).await {
-                Ok(cid) => {
-                    info!(
-                        "Auto-built actor web CID {} from {}{}",
-                        cid,
-                        source_dir.display(),
-                        if actor_web_auto_publish_ipns {
-                            format!(" and published via key '{}'", actor_web_ipns_key)
-                        } else {
-                            String::new()
-                        }
-                    );
-                    actor_web_cid = Some(cid);
-                }
-                Err(err) => {
-                    warn!(
-                        "Actor web auto-build failed from {}: {}",
-                        source_dir.display(),
-                        err
-                    );
-                }
+                warn!(
+                    "Actor web auto-build enabled, but no source dir found (set actor_web_dir or keep sibling ma-actor/www)"
+                );
             }
+        }
+
+        if actor_web_cid.is_none() {
+            actor_web_cid = authored_actor_web_cid;
+        }
+
+        if actor_web_cid.is_none() {
+            if let Some(cid) = resolve_actor_web_cid_from_ipns_key(&kubo_url, &actor_web_ipns_key).await? {
+                info!(
+                    "Resolved actor web CID {} from Kubo key '{}'",
+                    cid,
+                    actor_web_ipns_key
+                );
+                actor_web_cid = Some(cid);
+            }
+        }
+
+        if let Some(actor_web_cid) = actor_web_cid {
+            let cache_root = runtime_cfg
+                .actor_web_cache_dir
+                .clone()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    runtime_config_path(&world_slug)
+                        .parent()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| PathBuf::from(".config").join("ma"))
+                        .join("actor-web")
+                });
+            let actor_web_source_dir = materialize_actor_web_from_cid(&kubo_url, &actor_web_cid, &cache_root).await?;
+            info!(
+                "Actor web runtime materialized from CID {} into {}",
+                actor_web_cid,
+                actor_web_source_dir.display()
+            );
+
+            Some((
+                actor_web_source_dir,
+                actor_web_version.clone(),
+                Some(actor_web_cid),
+            ))
         } else {
             warn!(
-                "Actor web auto-build enabled, but no source dir found (set actor_web_dir or keep sibling ma-actor/www)"
+                "Actor web CID not configured/resolved; continuing without actor web runtime"
             );
+            None
         }
-    }
-
-    if actor_web_cid.is_none() {
-        actor_web_cid = authored_actor_web_cid;
-    }
-
-    if actor_web_cid.is_none() {
-        if let Some(cid) = resolve_actor_web_cid_from_ipns_key(&kubo_url, &actor_web_ipns_key).await? {
-            info!(
-                "Resolved actor web CID {} from Kubo key '{}'",
-                cid,
-                actor_web_ipns_key
-            );
-            actor_web_cid = Some(cid);
-        }
-    }
-
-    let actor_web_cid = actor_web_cid.ok_or_else(|| {
-        anyhow!(
-            "actor web CID is required at runtime but could not be resolved. Provide --cid, set actor_web_cid in runtime config, ensure actor web auto-build succeeds, or ensure actor_web_ipns_key resolves to /ipfs/<cid>."
-        )
-    })?;
-
-    let cache_root = runtime_cfg
-        .actor_web_cache_dir
-        .clone()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| xdg_data_home().join("ma").join("actor-web"));
-    let actor_web_source_dir = materialize_actor_web_from_cid(&kubo_url, &actor_web_cid, &cache_root).await?;
-    info!(
-        "Actor web runtime materialized from CID {} into {}",
-        actor_web_cid,
-        actor_web_source_dir.display()
-    );
-
-    let actor_web_runtime = Some((
-        actor_web_source_dir,
-        actor_web_version.clone(),
-        Some(actor_web_cid.clone()),
-    ));
+    };
 
     let run_result: Result<()> = async {
         let world_master_key = derive_world_master_key(endpoint.secret_key(), &world_slug);
@@ -9598,6 +9841,22 @@ fn load_persisted_iroh_secret_key(path: &PathBuf) -> Result<Option<SecretKey>> {
         .map_err(|_| anyhow!("invalid iroh secret key file length in {}", path.display()))?;
 
     Ok(Some(SecretKey::from_bytes(&key_bytes)))
+}
+
+fn expand_tilde_path(raw: &str) -> PathBuf {
+    let trimmed = raw.trim();
+    if trimmed == "~" {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home);
+        }
+        return PathBuf::from(trimmed);
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(trimmed)
 }
 
 fn generate_iroh_secret_file(path: &PathBuf) -> Result<()> {

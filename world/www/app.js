@@ -137,7 +137,7 @@
         // Populate form inputs
         setVal('slug-input', runtime.world_root_pin_name);
         setVal('kubo-url-input', runtime.kubo_url);
-        setVal('owner-did-input', runtime.owner_did || '');
+        setVal('owner-input', runtime.owner || '');
         setVal('state-cid-input', runtime.state_cid || '');
         setVal('root-cid-input', runtime.world_cid || '');
 
@@ -158,7 +158,7 @@
                 }
             }
             if (ok && _data.kubo_url) setKuboUrl(_data.kubo_url);
-            if (ok && _data.owner_did) setOwnerDid(_data.owner_did);
+            if (ok && _data.owner) setOwner(_data.owner);
             if (ok && _data.state_cid) setStateCid(_data.state_cid);
             if (ok && _data.root_cid) setRootCid(_data.root_cid);
         });
@@ -208,8 +208,8 @@
         setVal('kubo-url-input', value || '');
     }
 
-    function setOwnerDid(value) {
-        setVal('owner-did-input', value || '');
+    function setOwner(value) {
+        setVal('owner-input', value || '');
     }
 
     function setStateCid(value) {
