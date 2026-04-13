@@ -98,24 +98,6 @@ pub struct WorldManifestMeta {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ActorWebArtifact {
-    pub version: String,
-    pub cid: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ActorWebRegistry {
-    pub active_version: String,
-    pub artifacts: HashMap<String, ActorWebArtifact>,
-}
-
-impl ActorWebRegistry {
-    pub fn active_artifact(&self) -> Option<&ActorWebArtifact> {
-        self.artifacts.get(&self.active_version)
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorldManifest {
     pub kind: String,
     pub version: u32,
@@ -124,8 +106,6 @@ pub struct WorldManifest {
     pub entry_room_id: String,
     pub supported_evaluators: Vec<EvaluatorRef>,
     pub services: WorldServices,
-    #[serde(default)]
-    pub actor_web: Option<ActorWebRegistry>,
     pub refs: WorldManifestRefs,
     pub meta: WorldManifestMeta,
 }
@@ -355,10 +335,6 @@ pub fn load_world_authoring(world_dir: &Path) -> Result<LoadedWorldAuthoring> {
         ));
     }
 
-    if let Some(actor_web) = world_manifest.actor_web.as_ref() {
-        validate_actor_web_registry(actor_web)?;
-    }
-
     for actor in actors.values() {
         if actor.actor_type != "room" {
             continue;
@@ -527,33 +503,4 @@ where
     let value = serde_yaml::from_str::<T>(&raw)
         .map_err(|e| anyhow!("invalid YAML in {}: {}", path.display(), e))?;
     Ok(value)
-}
-
-fn validate_actor_web_registry(registry: &ActorWebRegistry) -> Result<()> {
-    let active = registry.active_version.trim();
-    if active.is_empty() {
-        return Err(anyhow!("world_manifest actor_web.active_version must not be empty"));
-    }
-    if registry.artifacts.is_empty() {
-        return Err(anyhow!("world_manifest actor_web.artifacts must not be empty"));
-    }
-    let Some(artifact) = registry.active_artifact() else {
-        return Err(anyhow!(
-            "world_manifest actor_web.active_version '{}' not found in actor_web.artifacts",
-            active
-        ));
-    };
-    if artifact.version.trim().is_empty() {
-        return Err(anyhow!(
-            "world_manifest actor_web artifact '{}' has empty version",
-            active
-        ));
-    }
-    if artifact.cid.trim().is_empty() {
-        return Err(anyhow!(
-            "world_manifest actor_web artifact '{}' has empty cid",
-            active
-        ));
-    }
-    Ok(())
 }

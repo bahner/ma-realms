@@ -72,15 +72,14 @@ write-actor-version:
 
 run-world: core-build actor-build world-build
 	@set -e; \
-	cid=$$(cat actor/.cid); \
-	args="run --world-slug $(WORLD_SLUG) --cid $$cid"; \
+	args="run --slug $(WORLD_SLUG)"; \
 	if [ -n "$(WORLD_LISTEN)" ]; then \
 		args="$$args --listen $(WORLD_LISTEN)"; \
 	fi; \
 	if [ -n "$(WORLD_KUBO_URL)" ]; then \
 		args="$$args --kubo-url $(WORLD_KUBO_URL)"; \
 	fi; \
-	echo "Starting ma-world with actor CID=$$cid"; \
+	echo "Starting ma-world"; \
 	echo "MA_REALMS_VERSION=$(MA_REALMS_VERSION)"; \
 	echo "MA_WORLD_VERSION=$(MA_WORLD_VERSION)"; \
 	echo "MA_ACTOR_VERSION=$(MA_ACTOR_VERSION)"; \
@@ -117,7 +116,6 @@ smoke-alpha: actor-build world-build
 	AGENT_LOG="tmp/smoke-agent.log"; \
 	WORLD_LOG="tmp/smoke-world.log"; \
 	REPORT="tmp/smoke-report.txt"; \
-	CID=$$(cat actor/.cid); \
 	: > "$$AGENT_LOG"; \
 	: > "$$WORLD_LOG"; \
 	: > "$$REPORT"; \
@@ -134,7 +132,7 @@ smoke-alpha: actor-build world-build
 	fi; \
 	nohup target/debug/ma-agent --daemon > "$$AGENT_LOG" 2>&1 & \
 	A_PID=$$!; \
-	nohup target/debug/ma-world run --world-slug $(WORLD_SLUG) --cid "$$CID" > "$$WORLD_LOG" 2>&1 & \
+	nohup target/debug/ma-world run --slug $(WORLD_SLUG) > "$$WORLD_LOG" 2>&1 & \
 	W_PID=$$!; \
 	cleanup() { kill $$W_PID $$A_PID 2>/dev/null || true; }; \
 	trap cleanup EXIT; \

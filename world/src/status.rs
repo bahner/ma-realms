@@ -26,7 +26,6 @@ pub async fn serve(listener: TcpListener, world: Arc<World>, world_info: WorldIn
     let app = Router::new()
         .route("/favicon.ico", get(favicon_ico))
         .route("/openapi.json", get(openapi_json))
-        .route("/actor/web/info", get(actor_web_info_json))
         .route("/unlock", post(unlock_runtime))
         .route("/bundle/create", post(create_unlock_bundle))
         .route("/world/kubo", post(update_kubo_api))
@@ -40,12 +39,6 @@ pub async fn serve(listener: TcpListener, world: Arc<World>, world_info: WorldIn
         .with_state(state)
         .fallback_service(ServeDir::new(www_root));
 
-    axum::serve(listener, app).await?;
-    Ok(())
-}
-
-pub async fn serve_actor_web(listener: TcpListener, web_root: PathBuf) -> Result<()> {
-    let app = Router::new().fallback_service(ServeDir::new(web_root));
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -103,22 +96,6 @@ async fn status_json(State(state): State<StatusState>) -> Json<StatusDocument> {
             recent_event_count,
         },
     })
-}
-
-async fn actor_web_info_json(State(state): State<StatusState>) -> Json<serde_json::Value> {
-    if let Some(actor_web) = state.world_info.actor_web.as_ref() {
-        Json(serde_json::json!({
-            "enabled": true,
-            "version": &actor_web.version,
-            "cid": &actor_web.cid,
-            "status_url": &actor_web.status_url,
-            "source_dir": &actor_web.source_dir,
-        }))
-    } else {
-        Json(serde_json::json!({
-            "enabled": false,
-        }))
-    }
 }
 
 async fn openapi_json() -> Json<serde_json::Value> {

@@ -16,7 +16,7 @@ use anyhow::{Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use bootstrap::{
-    load_runtime_file_config, print_cli_help, resolve_actor_web_source_dir, runtime_config_path,
+    load_runtime_file_config, print_cli_help, runtime_config_path,
     runtime_iroh_secret_default_path, xdg_data_home,
 };
 use chacha20poly1305::aead::Aead;
@@ -58,7 +58,6 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::prelude::*;
 
 mod actor;
-mod actor_web;
 mod avatar_commands;
 mod bootstrap;
 mod content_validation;
@@ -69,9 +68,6 @@ mod schema;
 mod status;
 
 use actor::Avatar;
-use actor_web::{
-    materialize_actor_web_from_cid, publish_actor_web_from_dir, resolve_actor_web_cid_from_ipns_key,
-};
 use lang::{
     collapse_world_language_order_strict,
     supported_world_languages_text,
@@ -181,15 +177,6 @@ pub struct WorldInfo {
     pub entry_acl: String,
     pub started_at: String,
     pub capabilities: Vec<LaneCapability>,
-    pub actor_web: Option<ActorWebInfo>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ActorWebInfo {
-    pub version: Option<String>,
-    pub cid: Option<String>,
-    pub status_url: String,
-    pub source_dir: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -7999,8 +7986,6 @@ async fn main() -> Result<()> {
     let mut log_file: Option<PathBuf> = None;
     let mut world_slug_override: Option<String> = None;
     let mut owner_override: Option<String> = None;
-    let mut actor_web_cid_override: Option<String> = None;
-    let mut disable_actor_web = false;
 
     if args.len() >= 2 {
         match args[1].as_str() {
@@ -8118,7 +8103,6 @@ async fn main() -> Result<()> {
                     iroh_secret: Some(iroh_path.display().to_string()),
                     unlock_passphrase: Some(passphrase.clone()),
                     unlock_bundle_file: Some(bundle_path.display().to_string()),
-                    actor_web_enabled: Some(false),
                     ..Default::default()
                 };
                 let yaml = serde_yaml::to_string(&cfg)?;
@@ -8236,16 +8220,6 @@ async fn main() -> Result<()> {
                             }
                             owner_override = Some(args[idx].clone());
                         }
-                        "--cid" => {
-                            idx += 1;
-                            if idx >= args.len() {
-                                return Err(anyhow!("missing value for --cid"));
-                            }
-                            actor_web_cid_override = Some(args[idx].clone());
-                        }
-                        "--no-actor" => {
-                            disable_actor_web = true;
-                        }
                         "--log-level" => {
                             idx += 1;
                             if idx >= args.len() {
@@ -8269,7 +8243,7 @@ async fn main() -> Result<()> {
                         }
                         other => {
                             return Err(anyhow!(
-                                "unknown argument '{}' for run (supported: --slug, --listen, --kubo-url, --owner, --cid, --no-actor, --log-level, --log-file)",
+                                "unknown argument '{}' for run (supported: --slug, --listen, --kubo-url, --owner, --log-level, --log-file)",
                                 other
                             ));
                         }
@@ -8308,16 +8282,6 @@ async fn main() -> Result<()> {
                     }
                     owner_override = Some(args[idx].clone());
                 }
-                "--cid" => {
-                    idx += 1;
-                    if idx >= args.len() {
-                        return Err(anyhow!("missing value for --cid"));
-                    }
-                    actor_web_cid_override = Some(args[idx].clone());
-                }
-                "--no-actor" => {
-                    disable_actor_web = true;
-                }
                 "--log-level" => {
                     idx += 1;
                     if idx >= args.len() {
@@ -8341,7 +8305,7 @@ async fn main() -> Result<()> {
                 }
                 other => {
                     return Err(anyhow!(
-                        "unknown top-level argument '{}'. Use 'publish-world' for publish flags like --skip-ipns, or use run/--slug/--listen/--kubo-url/--owner/--cid/--no-actor for server mode.",
+                        "unknown top-level argument '{}'. Use 'publish-world' for publish flags like --skip-ipns, or use run/--slug/--listen/--kubo-url/--owner/--log-level/--log-file for server mode.",
                         other
                     ));
                 }
@@ -8390,14 +8354,6 @@ async fn main() -> Result<()> {
                 owner_override = Some(cfg_owner);
             } else if let Ok(env_owner) = std::env::var("MA_WORLD_OWNER") {
                 owner_override = Some(env_owner);
-            }
-        }
-
-        if !disable_actor_web {
-            if let Some(enabled) = runtime_file_config.actor_web_enabled {
-                if !enabled {
-                    disable_actor_web = true;
-                }
             }
         }
 
@@ -9023,13 +8979,6 @@ async fn main() -> Result<()> {
         .as_ref()
         .and_then(|loaded| loaded.world_root.refs.global_acl_cid.clone())
         .filter(|cid| !cid.trim().is_empty());
-    let authored_actor_web = authored_world
-        .and_then(|loaded| loaded.world_manifest.actor_web)
-        .and_then(|registry| {
-            registry
-                .active_artifact()
-                .map(|artifact| (artifact.version.clone(), artifact.cid.clone()))
-        });
 
     let kubo_url = kubo_url_override
         .or_else(|| runtime_cfg.kubo_api_url.clone())
@@ -9150,42 +9099,6 @@ async fn main() -> Result<()> {
     let status_addr = listener.local_addr()?;
     let status_url = format!("http://{}", status_addr);
 
-    let actor_web_listen = runtime_cfg
-        .actor_web_listen
-        .clone()
-        .unwrap_or_else(|| "127.0.0.1:8081".to_string());
-    let actor_web_ipns_key = runtime_cfg
-        .actor_web_ipns_key
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "ma-actor".to_string());
-    let runtime_actor_web_version = runtime_cfg
-        .actor_web_version
-        .clone()
-        .filter(|value| !value.trim().is_empty());
-    let runtime_actor_web_cid = runtime_cfg
-        .actor_web_cid
-        .clone()
-        .filter(|value| !value.trim().is_empty());
-    let actor_web_auto_build = runtime_cfg.actor_web_auto_build.unwrap_or(true);
-    let actor_web_auto_publish_ipns = runtime_cfg.actor_web_auto_publish_ipns.unwrap_or(true);
-    let manual_actor_web_cid = actor_web_cid_override
-        .clone()
-        .or(runtime_actor_web_cid);
-    let authored_actor_web_version = authored_actor_web.as_ref().map(|(version, _)| version.clone());
-    let authored_actor_web_cid = authored_actor_web.as_ref().map(|(_, cid)| cid.clone());
-    let env_actor_web_version = std::env::var("MA_WORLD_VERSION")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let actor_web_version = runtime_actor_web_version
-        .or(authored_actor_web_version)
-        .or(env_actor_web_version)
-        .or_else(|| Some("local-dev".to_string()));
-
-    let mut actor_web_cid = manual_actor_web_cid;
-    let actor_web_build_source_dir = resolve_actor_web_source_dir(&runtime_cfg);
-
     let key_path = runtime_cfg
         .iroh_secret
         .as_deref()
@@ -9217,93 +9130,6 @@ async fn main() -> Result<()> {
             ),
         }
     }
-
-    let actor_web_runtime = if disable_actor_web {
-        info!("Actor web runtime disabled via CLI/config");
-        None
-    } else {
-        if actor_web_cid.is_none() && actor_web_auto_build {
-            if let Some(source_dir) = actor_web_build_source_dir.as_deref() {
-                let maybe_ipns_key = if actor_web_auto_publish_ipns {
-                    Some(actor_web_ipns_key.as_str())
-                } else {
-                    None
-                };
-                match publish_actor_web_from_dir(&kubo_url, source_dir, maybe_ipns_key).await {
-                    Ok(cid) => {
-                        info!(
-                            "Auto-built actor web CID {} from {}{}",
-                            cid,
-                            source_dir.display(),
-                            if actor_web_auto_publish_ipns {
-                                format!(" and published via key '{}'", actor_web_ipns_key)
-                            } else {
-                                String::new()
-                            }
-                        );
-                        actor_web_cid = Some(cid);
-                    }
-                    Err(err) => {
-                        warn!(
-                            "Actor web auto-build failed from {}: {}",
-                            source_dir.display(),
-                            err
-                        );
-                    }
-                }
-            } else {
-                warn!(
-                    "Actor web auto-build enabled, but no source dir found (set actor_web_dir or keep sibling ma-actor/www)"
-                );
-            }
-        }
-
-        if actor_web_cid.is_none() {
-            actor_web_cid = authored_actor_web_cid;
-        }
-
-        if actor_web_cid.is_none() {
-            if let Some(cid) = resolve_actor_web_cid_from_ipns_key(&kubo_url, &actor_web_ipns_key).await? {
-                info!(
-                    "Resolved actor web CID {} from Kubo key '{}'",
-                    cid,
-                    actor_web_ipns_key
-                );
-                actor_web_cid = Some(cid);
-            }
-        }
-
-        if let Some(actor_web_cid) = actor_web_cid {
-            let cache_root = runtime_cfg
-                .actor_web_cache_dir
-                .clone()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| {
-                    runtime_config_path(&world_slug)
-                        .parent()
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| PathBuf::from(".config").join("ma"))
-                        .join("actor-web")
-                });
-            let actor_web_source_dir = materialize_actor_web_from_cid(&kubo_url, &actor_web_cid, &cache_root).await?;
-            info!(
-                "Actor web runtime materialized from CID {} into {}",
-                actor_web_cid,
-                actor_web_source_dir.display()
-            );
-
-            Some((
-                actor_web_source_dir,
-                actor_web_version.clone(),
-                Some(actor_web_cid),
-            ))
-        } else {
-            warn!(
-                "Actor web CID not configured/resolved; continuing without actor web runtime"
-            );
-            None
-        }
-    };
 
     let run_result: Result<()> = async {
         let world_master_key = derive_world_master_key(endpoint.secret_key(), &world_slug);
@@ -9423,28 +9249,7 @@ async fn main() -> Result<()> {
                 LaneCapability::for_lane(WorldLane::Inbox),
                 LaneCapability::for_lane(WorldLane::Avatar),
             ],
-            actor_web: None,
         };
-
-        let mut world_info = world_info;
-        if let Some((source_dir, version, cid)) = actor_web_runtime.clone() {
-            let actor_listener = bind_status_listener(&actor_web_listen).await?;
-            let actor_addr = actor_listener.local_addr()?;
-            let actor_status_url = format!("http://{}", actor_addr);
-            let actor_info = ActorWebInfo {
-                version,
-                cid,
-                status_url: actor_status_url.clone(),
-                source_dir: source_dir.display().to_string(),
-            };
-            world_info.actor_web = Some(actor_info);
-
-            tokio::spawn(async move {
-                if let Err(err) = status::serve_actor_web(actor_listener, source_dir).await {
-                    error!("actor web server failed: {}", err);
-                }
-            });
-        }
 
         let status_world = world.clone();
         let status_info = world_info.clone();
@@ -9464,14 +9269,6 @@ async fn main() -> Result<()> {
         info!("World entry ACL: {}", world_info.entry_acl);
         info!("Optional DID field ma:presenceHint = {}", world_info.location_hint);
         info!("Iroh online readiness: {}", online_status);
-        if let Some(actor_web) = &world_info.actor_web {
-            info!(
-                "Actor web runtime: {} (dir={}, version={})",
-                actor_web.status_url,
-                actor_web.source_dir,
-                actor_web.version.as_deref().unwrap_or("unknown")
-            );
-        }
 
         for relay_url in &world_info.relay_urls {
             let probe = probe_relay(relay_url).await;
