@@ -70,6 +70,10 @@ pub struct RuntimeFileConfig {
     pub actor_web_auto_build: Option<bool>,
     #[serde(default)]
     pub actor_web_auto_publish_ipns: Option<bool>,
+    #[serde(default)]
+    pub unlock_passphrase: Option<String>,
+    #[serde(default)]
+    pub unlock_bundle_file: Option<String>,
 }
 
 fn xdg_config_home() -> PathBuf {

@@ -13,3 +13,10 @@
 
 ## BUG
 ma.deactivated is supposed to be a timestamp, not a boolean
+
+## Refactor: `use ... as @alias` skal ikke resolves lokalt
+- `@dings` er et target-token som skal sendes som-det-er til world
+- World resolver avatar-shortcut → object DID → dispatcher
+- Fjern `activeObjectTarget`-state, `maybePrefixActiveObjectTarget`, `setActiveObjectTarget` og all lokal magi
+- Klienten trenger ikke vite hva alias betyr — bare send `@dings <command>` rett til world
+- Klienten skal ikke parse eller rewrite `@alias`-tokens for shortcuts

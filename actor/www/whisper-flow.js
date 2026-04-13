@@ -29,7 +29,7 @@ export function createWhisperFlow({
       ? key
       : (isMaDid(resolved) ? resolved : (mappedDid || findDidByEndpoint(resolved) || resolved));
     if (!isMaDid(String(targetDid))) {
-      throw new Error(`Chat target must be a did:ma: DID, alias, or known handle mapped to a DID. Got: ${targetDid}`);
+      throw new Error(`Message target must be a did:ma DID, alias, or known handle mapped to a DID. Got: ${targetDid}`);
     }
 
     const recipientDocumentJson = await fetchDidDocumentJsonByDid(targetDid);
@@ -55,7 +55,7 @@ export function createWhisperFlow({
     );
 
     if (!result.ok) {
-      throw new Error(result.message || 'whisper failed');
+      throw new Error(result.message || 'direct message failed');
     }
   }
 

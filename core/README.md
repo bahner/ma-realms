@@ -21,7 +21,7 @@ Terminology used in parser/docs:
 
 Single source of truth for shared wire types and ALPN constants used by both client (`ma-actor`) and server (`ma-world`):
 
-- **ALPN identifiers:** `INBOX_ALPN` (primary signed ingress), plus auxiliary lanes `BROADCAST_ALPN`, `PRESENCE_ALPN`, `WHISPER_ALPN`
+- **ALPN identifiers:** `INBOX_ALPN` (signed ingress, actor→world), `AVATAR_ALPN` (avatar commands, actor→world), `PRESENCE_ALPN` (presence push, world→actor), `IPFS_ALPN`
 - **Relay defaults:** `DEFAULT_WORLD_RELAY_URL`
 - **Lane model:** `WorldLane` + `LaneCapability` for transport-capability negotiation
 - **Transport ack:** `TransportAck` + `TransportAckCode` for standardized lane-level accept/reject feedback

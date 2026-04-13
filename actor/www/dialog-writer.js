@@ -27,7 +27,7 @@ export function createDialogWriter({ byId, displayActor, formatDialogText }) {
 
   function writeWhisper(senderDid, senderHandle, text) {
     const actor = displayActor(senderDid, senderHandle);
-    appendMessage('world', `${actor} whispers ${text}.`);
+    appendMessage('world', `${actor} (private): ${text}`);
   }
 
   function writeSystem(text) {

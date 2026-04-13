@@ -48,6 +48,18 @@ Don't mutate data that's is badly formed. Raise an error instead.
 
 When validating input always check if input is valid and else fail. You should mot explicitly search for previously mention errors and just raise an error for arbitrary values, unless this is required. Don't create a set of error values, but of valid values and check for membership in that else fail.
 
+## CRITICAL: Aliases are ALWAYS local to the actor. All messages to world use full DIDs.
+
+This is an absolute, non-negotiable rule:
+
+- **Aliases (`@world`, `@here`, `@me`, `@avatar`, user-defined aliases) exist ONLY in the actor.**
+- **The world NEVER receives, parses, dispatches, or interprets alias names.**
+- **The actor MUST resolve every alias to a full `did:ma:...` DID before sending ANY message to the world.**
+- **No alias string (e.g. "here", "avatar", "world", "me") may ever appear as a target in a MessageEnvelope sent over the wire.**
+- **The world receives only full DIDs as targets. Period.**
+
+If you find yourself adding alias-name matching (`"here"`, `"avatar"`, `"room"`, etc.) to world code, you are doing it wrong. Stop and fix the actor instead.
+
 Actor runtime invariants (chat/input routing):
 
 - `@` in user input means target routing. Resolve aliases behind `@...` to DID before evaluation.

@@ -30,14 +30,14 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use ma_core::{
-    ActorCommand, AVATAR_ALPN, BROADCAST_ALPN,
-    CONTENT_TYPE_PRESENCE, CONTENT_TYPE_WORLD, CompiledCapabilityAcl,
-    CONTENT_TYPE_DOC, DEFAULT_WORLD_RELAY_URL,
+    ActorCommand, AVATAR_ALPN, PRESENCE_ALPN,
+    CONTENT_TYPE_BROADCAST, CONTENT_TYPE_PRESENCE, CONTENT_TYPE_WORLD, CompiledCapabilityAcl,
+    DEFAULT_WORLD_RELAY_URL,
     ExitData, LaneCapability, MessageEnvelope, ObjectDefinition, ObjectInboxMessage,
     MAILBOX_COMMANDS_INLINE,
-    IpfsPublishDidRequest, IpfsPublishDidResponse,
+    IpfsPublishDidResponse,
     ObjectMessageIntent, ObjectMessageKind, ObjectMessageRetention, ObjectMessageTarget,
-    ObjectRuntimeState, IPFS_ALPN, PRESENCE_ALPN, PresenceAvatar, RoomActorAction, RoomActorContext,
+    ObjectRuntimeState, IPFS_ALPN, PresenceAvatar, RoomActorAction, RoomActorContext,
     RoomEvent, TransportAck, TransportAckCode, INBOX_ALPN, WorldCommand, WorldLane, WorldRequest,
     WorldResponse, compile_acl, create_world_did, evaluate_compiled_acl_with_owner,
     execute_room_actor_command,
@@ -45,7 +45,6 @@ use ma_core::{
     parse_property_command, parse_property_command_for_keys,
     LegacyRequirement, RequirementChecker, RequirementSet, RequirementValue,
     pin_update_add_rm,
-    ROOM_METHOD_BROADCAST_SEND,
     TtlCache,
 };
 use moka::sync::Cache;
@@ -81,7 +80,7 @@ use lang::{
 };
 use kubo::{
     IpnsPublishOptions, dag_get_dag_cbor, dag_put_dag_cbor, generate_kubo_key, ipfs_add,
-    import_kubo_key, ipns_publish_with_retry, list_kubo_key_names, list_kubo_keys, name_resolve, pin_add_named,
+    ipns_publish_with_retry, list_kubo_key_names, list_kubo_keys, name_resolve, pin_add_named,
     pin_rm, wait_for_kubo_api,
 };
 use room::{Room, RoomAcl};
@@ -227,6 +226,34 @@ struct PresenceRefreshRequestEvent {
     ts: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct PresenceRoomStateEvent {
+    v: u8,
+    kind: String,
+    room: String,
+    room_did: String,
+    room_title: String,
+    room_description: String,
+    avatars: Vec<PresenceAvatar>,
+    latest_event_sequence: u64,
+    room_object_dids: HashMap<String, String>,
+    ts: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RoomBroadcastEvent {
+    v: u8,
+    kind: String,
+    room: String,
+    room_did: String,
+    room_title: String,
+    room_description: String,
+    avatars: Vec<PresenceAvatar>,
+    events: Vec<RoomEvent>,
+    latest_event_sequence: u64,
+    ts: String,
+}
+
 #[derive(Clone, Debug)]
 struct WorldProtocol {
     world: Arc<World>,
@@ -238,8 +265,50 @@ struct WorldProtocol {
 
 #[derive(Clone, Debug)]
 struct IpfsProtocol {
-    world: Arc<World>,
+    kubo_url: String,
     did_cache: Arc<RwLock<HashMap<String, CachedDidDocument>>>,
+}
+
+/// Placeholder protocol handler active while the world is locked.
+///
+/// Reads the first framed request and responds with a "world is locked" error
+/// in the same length-prefixed JSON format the real protocols use, then closes.
+#[derive(Clone, Debug)]
+struct LockedGateProtocol;
+
+impl ProtocolHandler for LockedGateProtocol {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let (mut send, mut recv) = connection.accept_bi().await?;
+
+        // Read first frame (we still need to consume it to follow the protocol).
+        let frame_len = match recv.read_u32().await {
+            Ok(n) => n as usize,
+            Err(_) => {
+                let _ = send.finish();
+                return Ok(());
+            }
+        };
+        if frame_len > 256 * 1024 {
+            let _ = send.finish();
+            return Ok(());
+        }
+        let mut buf = vec![0u8; frame_len];
+        if recv.read_exact(&mut buf).await.is_err() {
+            let _ = send.finish();
+            return Ok(());
+        }
+
+        let response = serde_json::json!({
+            "ok": false,
+            "message": "world is locked; waiting for unlock"
+        });
+        let payload = serde_json::to_vec(&response).unwrap_or_default();
+        let _ = send.write_u32(payload.len() as u32).await;
+        let _ = send.write_all(&payload).await;
+        let _ = send.flush().await;
+        let _ = send.finish();
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -912,14 +981,75 @@ impl World {
     /// Returns `None` if the owner has no avatar (i.e. has not entered).
     async fn resolve_avatar_did_for_owner(&self, owner_did: &str) -> Option<Did> {
         let rooms = self.rooms.read().await;
-        for room in rooms.values() {
-            for avatar in room.avatars.values() {
+        for (_room_name, room) in rooms.iter() {
+            for (_handle, avatar) in room.avatars.iter() {
                 if avatar.owner == owner_did {
                     return Some(avatar.agent_did.clone());
                 }
             }
         }
         None
+    }
+
+    /// Ensure sender has an avatar in the given room.
+    /// Creates the avatar on first contact; refreshes endpoint/presence for existing ones.
+    /// Returns (avatar_did, handle, newly_created).
+    async fn ensure_avatar(
+        &self,
+        sender_did: &Did,
+        sender_profile: &str,
+        agent_endpoint: &str,
+        room: &str,
+    ) -> Result<(Did, String, bool)> {
+        let is_new = self.resolve_avatar_did_for_owner(&sender_did.id()).await.is_none();
+
+        if is_new && !self.can_enter(sender_did).await {
+            return Err(anyhow!("entry denied by ACL for {}", sender_did.id()));
+        }
+
+        let language_order = collapse_world_language_order_strict(sender_profile)
+            .ok_or_else(|| anyhow!(
+                "no supported language found in ma.language='{}'. supported={}",
+                sender_profile,
+                supported_world_languages_text()
+            ))?;
+
+        let world_ipns = self
+            .local_world_ipns()
+            .await
+            .unwrap_or_else(|| "unconfigured".to_string());
+        let avatar_fragment = sender_did
+            .fragment
+            .clone()
+            .unwrap_or_else(|| "avatar".to_string())
+            .trim()
+            .trim_start_matches('@')
+            .to_string();
+        let avatar_did =
+            Did::try_from(create_world_did(&world_ipns, &avatar_fragment).as_str())
+                .map_err(|err| anyhow!("invalid derived avatar DID: {}", err))?;
+
+        let signing_key = SigningKey::generate(avatar_did.clone())
+            .map_err(|e| anyhow!("failed to generate avatar signing key: {}", e))?;
+
+        let avatar_req = AvatarRequest {
+            did: avatar_did.clone(),
+            owner_did: sender_did.id(),
+            agent_endpoint: agent_endpoint.to_string(),
+            language_order,
+            signing_secret: signing_key.private_key_bytes(),
+            encryption_pubkey_multibase: None,
+        };
+
+        let handle = self.join_room(room, avatar_req, None).await?;
+
+        if is_new {
+            let _ = self
+                .set_avatar_description_for_did(room, &avatar_did.id(), "skeleton avatar")
+                .await;
+        }
+
+        Ok((avatar_did, handle, is_new))
     }
 
     async fn upsert_avatar_location(&self, room_name: &str, did: &str, endpoint: &str) {
@@ -2966,20 +3096,17 @@ impl World {
             }
             MessageEnvelope::RoomCommand { command } => {
                 let caller_did = from_did.id();
+                let broadcasted = command.starts_with("say ") || command.starts_with("emote ");
                 let response = self
                     .room_command(room_name, &command, &sender_key, sender_profile, Some(caller_did.as_str()))
                     .await;
                 info!("[{}] {} -> @here: {} -> {}", room_name, sender_key, command, response);
                 self.record_event(format!("[{room_name}] {sender_key} -> @here: {command} => {}", response))
                     .await;
-                (response, false, room_name.to_string())
+                (response, broadcasted, room_name.to_string())
             }
             MessageEnvelope::ActorCommand { target, command } => {
-                let broadcasted = matches!(command, ActorCommand::Say { .. });
-                let speech_text = match &command {
-                    ActorCommand::Say { payload } => Some(normalize_spoken_text(payload)),
-                    ActorCommand::Raw { .. } => None,
-                };
+                let broadcasted = matches!(command, ActorCommand::Say { .. } | ActorCommand::Emote { .. });
                 let (response, effective_room) = self
                     .handle_actor_command(room_name, &sender_key, from_did, sender_profile, &target, command)
                     .await;
@@ -2990,17 +3117,6 @@ impl World {
                     response.replace('\n', " ")
                 ))
                 .await;
-                if broadcasted {
-                    self.record_room_event(
-                        room_name,
-                        "speech",
-                        Some(sender_key.clone()),
-                        Some(from_did.id()),
-                        None,
-                        speech_text.unwrap_or_else(|| response.clone()),
-                    )
-                        .await;
-                }
                 (response, broadcasted, effective_room)
             }
         };
@@ -3733,7 +3849,8 @@ impl World {
             if self.is_local_world_ipns(&target_did.ipns).await {
                 if target_did.fragment.is_none() {
                     let cmd = match &command {
-                        ActorCommand::Say { payload } => payload.trim().to_string(),
+                        ActorCommand::Say { payload } => format!("say {}", payload.trim()),
+                        ActorCommand::Emote { payload } => format!("emote {}", payload.trim()),
                         ActorCommand::Raw { command } => command.trim().to_string(),
                     };
                     let effective_cmd = if cmd.is_empty() { "_list".to_string() } else { cmd };
@@ -3752,7 +3869,8 @@ impl World {
                     };
                     if room_exists {
                         let room_cmd = match &command {
-                            ActorCommand::Say { payload } => payload.trim().to_string(),
+                            ActorCommand::Say { payload } => format!("say {}", payload.trim()),
+                            ActorCommand::Emote { payload } => format!("emote {}", payload.trim()),
                             ActorCommand::Raw { command } => command.trim().to_string(),
                         };
                         let effective_cmd = if room_cmd.is_empty() {
@@ -3931,6 +4049,10 @@ impl World {
                         let speech = normalize_spoken_text(&payload);
                         (format!("@{} says to @{}: {}", from, actor_target, speech), room_name.to_string())
                     }
+                    ActorCommand::Emote { payload } => {
+                        let action = normalize_spoken_text(&payload);
+                        (format!("* @{} {} at @{}", from, action, actor_target), room_name.to_string())
+                    }
                     ActorCommand::Raw { command } => {
                         (format!("@{} is here. Try '@{} say \"...\"'. (got: {})", actor_target, actor_target, command), room_name.to_string())
                     }
@@ -4065,6 +4187,7 @@ impl World {
 
         let raw = match command {
             ActorCommand::Say { payload } => payload,
+            ActorCommand::Emote { payload } => format!("emote {}", payload),
             ActorCommand::Raw { command } => command,
         };
         let trimmed = raw.trim();
@@ -4851,9 +4974,17 @@ impl World {
 
         match command {
             ActorCommand::Say { payload } => {
-                // ' / say: broadcast speech to the room, formatted identically to Chatter.
+                // say/emote are room methods — redirect to room_command.
                 let speech = normalize_spoken_text(&payload);
-                (format!("{}: {}", from, speech), room_name.to_string())
+                let room_cmd = format!("say {}", speech);
+                let response = self.room_command(room_name, &room_cmd, from, sender_profile, Some(&from_did.id())).await;
+                (response, room_name.to_string())
+            }
+            ActorCommand::Emote { payload } => {
+                let text = normalize_spoken_text(&payload);
+                let room_cmd = format!("emote {}", text);
+                let response = self.room_command(room_name, &room_cmd, from, sender_profile, Some(&from_did.id())).await;
+                (response, room_name.to_string())
             }
             ActorCommand::Raw { command } => {
                 let trimmed = command.trim();
@@ -6007,6 +6138,51 @@ impl World {
             let who = caller_did.unwrap_or(from);
             return format!("@here pong room={} by={}", room_name, who);
         }
+
+        // say: broadcast speech to everyone in the room.
+        if let Some(rest) = trimmed.strip_prefix("say") {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                let speech = normalize_spoken_text(rest.trim());
+                if speech.is_empty() {
+                    return "@here say what?".to_string();
+                }
+                info!("[{}] {}: {}", room_name, from, speech);
+                self.record_event(format!("[{room_name}] {from}: {speech}")).await;
+                self.record_room_event(
+                    room_name,
+                    "speech",
+                    Some(from.to_string()),
+                    caller_did.map(|d| d.to_string()),
+                    None,
+                    speech.clone(),
+                )
+                .await;
+                return format!("{}: {}", from, speech);
+            }
+        }
+
+        // emote: broadcast an emote action to everyone in the room.
+        if let Some(rest) = trimmed.strip_prefix("emote") {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                let action = normalize_spoken_text(rest.trim());
+                if action.is_empty() {
+                    return "@here emote what?".to_string();
+                }
+                info!("[{}] {} {}", room_name, from, action);
+                self.record_event(format!("[{room_name}] * {from} {action}")).await;
+                self.record_room_event(
+                    room_name,
+                    "emote",
+                    Some(from.to_string()),
+                    caller_did.map(|d| d.to_string()),
+                    None,
+                    action.clone(),
+                )
+                .await;
+                return format!("* {} {}", from, action);
+            }
+        }
+
         if let Some(rest) = trimmed.strip_prefix("l ") {
             let did_raw = rest.trim();
             if did_raw.is_empty() {
@@ -6485,84 +6661,6 @@ impl World {
     }
 }
 
-async fn best_effort_publish_did_document_to_kubo(
-    world: Arc<World>,
-    did_document_json: String,
-    ipns_private_key_base64: String,
-    desired_fragment: Option<String>,
-) -> Result<(Option<String>, Option<String>)> {
-    let document = Document::unmarshal(&did_document_json)
-        .map_err(|e| anyhow!("invalid DID document JSON: {}", e))?;
-    let document_did = Did::try_from(document.id.as_str())
-        .map_err(|e| anyhow!("invalid document DID '{}': {}", document.id, e))?;
-    let document_ipns_id = document_did.ipns.clone();
-
-    let kubo_url = world.kubo_url().await;
-    let keys = list_kubo_keys(&kubo_url).await?;
-
-    let desired = desired_fragment
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .or(document_did.fragment.clone());
-
-    let mut key_name: Option<String> = None;
-
-    if let Some(alias) = desired {
-        if let Some(existing) = keys.iter().find(|key| key.name == alias) {
-            if existing.id.trim() != document_ipns_id {
-                return Err(anyhow!(
-                    "fragment '{}' exists already with another key id",
-                    alias
-                ));
-            }
-            key_name = Some(alias);
-        } else if !ipns_private_key_base64.trim().is_empty() {
-            let key_bytes = B64
-                .decode(ipns_private_key_base64.trim())
-                .map_err(|e| anyhow!("invalid base64 key payload: {}", e))?;
-            let imported = import_kubo_key(&kubo_url, &alias, key_bytes).await?;
-            if imported.id.trim() != document_ipns_id {
-                return Err(anyhow!(
-                    "imported key id '{}' does not match document ipns '{}'",
-                    imported.id,
-                    document_ipns_id
-                ));
-            }
-            key_name = Some(alias);
-        }
-    }
-
-    if key_name.is_none() {
-        key_name = keys
-            .iter()
-            .find(|key| key.id.trim() == document_ipns_id)
-            .map(|key| key.name.clone());
-    }
-
-    let Some(key_name) = key_name else {
-        return Err(anyhow!(
-            "no matching Kubo key for DID ipns '{}' and no importable private key provided",
-            document_ipns_id
-        ));
-    };
-
-    let document_cid = ipfs_add(&kubo_url, did_document_json.into_bytes()).await?;
-    let ipns_options = IpnsPublishOptions::default();
-    ipns_publish_with_retry(
-        &kubo_url,
-        &key_name,
-        &document_cid,
-        &ipns_options,
-        3,
-        Duration::from_millis(1_000),
-    )
-    .await?;
-
-    Ok((Some(key_name), Some(document_cid)))
-}
-
 impl WorldProtocol {
     fn content_type_matches(actual: &str, canonical: &str, legacy: &str) -> bool {
         actual == canonical || actual == legacy
@@ -6768,6 +6866,155 @@ impl WorldProtocol {
 
         for endpoint in endpoints {
             self.push_presence_snapshot_to(room_name, &endpoint).await;
+        }
+    }
+
+    async fn push_presence_room_state_to(
+        &self,
+        room_name: &str,
+        target_endpoint_id: &str,
+    ) {
+        let context = self.room_presence_context(room_name).await;
+        let (room_did, room_title, room_description, avatars, _endpoints) = match context {
+            Ok(value) => value,
+            Err(err) => {
+                warn!("presence room-state context unavailable for room '{}': {}", room_name, err);
+                return;
+            }
+        };
+
+        let signing_key = match self.room_signing_key(&room_did).await {
+            Ok(key) => key,
+            Err(err) => {
+                warn!("presence room-state signing key unavailable for {}: {}", room_did, err);
+                return;
+            }
+        };
+
+        let latest_event_sequence = self
+            .world
+            .latest_room_event_sequence(room_name)
+            .await
+            .unwrap_or(0);
+        let room_object_dids = self.world.room_object_did_map(room_name).await;
+
+        let payload = PresenceRoomStateEvent {
+            v: 1,
+            kind: "presence.room_state".to_string(),
+            room: room_name.to_string(),
+            room_did: room_did.clone(),
+            room_title,
+            room_description,
+            avatars,
+            latest_event_sequence,
+            room_object_dids,
+            ts: Utc::now().to_rfc3339(),
+        };
+        let content = match serde_json::to_vec(&payload) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!("presence room-state encode failed for room '{}': {}", room_name, err);
+                return;
+            }
+        };
+        let message = match Message::new(
+            room_did.clone(),
+            room_did,
+            CONTENT_TYPE_PRESENCE,
+            content,
+            &signing_key,
+        ) {
+            Ok(msg) => msg,
+            Err(err) => {
+                warn!("presence room-state message build failed: {}", err);
+                return;
+            }
+        };
+        let cbor = match message.to_cbor() {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!("presence room-state cbor encode failed: {}", err);
+                return;
+            }
+        };
+
+        if let Err(err) = self.send_signed_push_to_endpoint(target_endpoint_id, cbor).await {
+            warn!("presence room-state push to {} failed: {}", target_endpoint_id, err);
+        }
+    }
+
+    async fn push_room_broadcast(&self, room_name: &str, since_sequence: u64) {
+        let context = self.room_presence_context(room_name).await;
+        let (room_did, room_title, room_description, avatars, endpoints) = match context {
+            Ok(value) => value,
+            Err(err) => {
+                warn!("room broadcast context unavailable for '{}': {}", room_name, err);
+                return;
+            }
+        };
+        let signing_key = match self.room_signing_key(&room_did).await {
+            Ok(key) => key,
+            Err(err) => {
+                warn!("room broadcast signing key unavailable for {}: {}", room_did, err);
+                return;
+            }
+        };
+        let (events, latest_event_sequence) = match self.world.room_events_since(room_name, since_sequence).await {
+            Ok(val) => val,
+            Err(err) => {
+                warn!("room broadcast events unavailable for '{}': {}", room_name, err);
+                return;
+            }
+        };
+        if events.is_empty() {
+            return;
+        }
+
+        let payload = RoomBroadcastEvent {
+            v: 1,
+            kind: "room.broadcast".to_string(),
+            room: room_name.to_string(),
+            room_did: room_did.clone(),
+            room_title,
+            room_description,
+            avatars,
+            events,
+            latest_event_sequence,
+            ts: Utc::now().to_rfc3339(),
+        };
+        let content = match serde_json::to_vec(&payload) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!("room broadcast encode failed for '{}': {}", room_name, err);
+                return;
+            }
+        };
+        let message = match Message::new(
+            room_did.clone(),
+            room_did,
+            CONTENT_TYPE_BROADCAST,
+            content,
+            &signing_key,
+        ) {
+            Ok(msg) => msg,
+            Err(err) => {
+                warn!("room broadcast message build failed: {}", err);
+                return;
+            }
+        };
+        let cbor = match message.to_cbor() {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!("room broadcast cbor encode failed: {}", err);
+                return;
+            }
+        };
+
+        for endpoint in endpoints {
+            let cbor_clone = cbor.clone();
+            if let Err(err) = self.send_signed_push_to_endpoint_on_lane(&endpoint, cbor_clone, PRESENCE_ALPN).await {
+                warn!("room broadcast push to {} failed: {}", endpoint, err);
+            }
         }
     }
 
@@ -7014,12 +7261,6 @@ impl WorldProtocol {
     }
 
     async fn handle_request(&self, request: WorldRequest, agent_endpoint: String) -> Result<WorldResponse> {
-        if !self.world.is_unlocked().await {
-            return Err(anyhow!(
-                "world is locked; unlock from the status page before sending commands"
-            ));
-        }
-
         if !self.lane.supports_request(&request) {
             return Err(anyhow!(
                 "lane '{}' does not support this request type",
@@ -7052,166 +7293,84 @@ impl WorldProtocol {
         let sender_profile = sender_profile_from_document(&sender_document);
 
         match command {
-            WorldCommand::Enter { .. } if self.lane == WorldLane::Avatar => {
-                return Err(anyhow!("Enter must be sent on ma/inbox/1, not ma/avatar/1"));
-            }
-            WorldCommand::Enter { room, preferred_handle, encryption_pubkey_multibase } => {
-                let room = room.unwrap_or_else(|| DEFAULT_ROOM.to_string());
-                if !self.world.can_enter(&sender_did).await {
-                    let (allow_all, allow_owner, allow_count, owner_did, acl_source) =
-                        self.world.entry_acl_debug().await;
-                    let (knock_id, duplicate) = self
-                        .world
-                        .enqueue_knock(
-                            &room,
-                            &sender_did.id(),
-                            &agent_endpoint,
-                            preferred_handle.clone(),
-                        )
-                        .await;
-                    let detail = if duplicate {
-                        format!(
-                            "entry deni ACL for {}; existing knock request id={} is pending (acl_source='{}' allow_all={} allow_owner={} allow_count={} owner_did={})",
-                            sender_did.id(),
-                            knock_id,
-                            acl_source,
-                            allow_all,
-                            allow_owner,
-                            allow_count,
-                            owner_did.unwrap_or_else(|| "(none)".to_string())
-                        )
-                    } else {
-                        format!(
-                            "entry deni ACL for {}; knock request queued with id={} (acl_source='{}' allow_all={} allow_owner={} allow_count={} owner_did={})",
-                            sender_did.id(),
-                            knock_id,
-                            acl_source,
-                            allow_all,
-                            allow_owner,
-                            allow_count,
-                            owner_did.unwrap_or_else(|| "(none)".to_string())
-                        )
-                    };
-                    return Ok(WorldResponse {
-                        ok: false,
-                        room,
-                        message: detail.clone(),
-                        endpoint_id: self.endpoint_id.clone(),
-                        latest_event_sequence: 0,
-                        broadcasted: false,
-                        events: Vec::new(),
-                        handle: String::new(),
-                        room_description: String::new(),
-                        room_title: String::new(),
-                        room_did: String::new(),
-                        world_did: String::new(),
-                        avatars: Vec::new(),
-                        room_object_dids: HashMap::new(),
-                        transport_ack: Some(TransportAck {
-                            lane: self.lane.label().to_string(),
-                            code: TransportAckCode::Rejected,
-                            detail,
-                        }),
-                    });
-                }
-                let selected_handle = preferred_handle;
-                let Some(collapsed_language_order) = collapse_world_language_order_strict(&sender_profile) else {
-                    return Ok(WorldResponse {
-                        ok: false,
-                        room,
-                        message: format!(
-                            "no supported language found in ma.language='{}'. supported={}",
-                            sender_profile,
-                            supported_world_languages_text()
-                        ),
-                        endpoint_id: self.endpoint_id.clone(),
-                        latest_event_sequence: 0,
-                        broadcasted: false,
-                        events: Vec::new(),
-                        handle: String::new(),
-                        room_description: String::new(),
-                        room_title: String::new(),
-                        room_did: String::new(),
-                        world_did: String::new(),
-                        avatars: Vec::new(),
-                        room_object_dids: HashMap::new(),
-                        transport_ack: Some(TransportAck {
-                            lane: self.lane.label().to_string(),
-                            code: TransportAckCode::Rejected,
-                            detail: "language selection required".to_string(),
-                        }),
-                    });
+            WorldCommand::Ping { room_did } => {
+                let pinged_room = if room_did.is_empty() {
+                    DEFAULT_ROOM.to_string()
+                } else if let Ok(did) = Did::try_from(room_did.as_str()) {
+                    did.fragment.clone().unwrap_or_else(|| DEFAULT_ROOM.to_string())
+                } else {
+                    room_did.clone() // Postel: accept plain room name
                 };
-                let world_ipns = self
-                    .world
+
+                // Derive the avatar DID so we can look up existing location.
+                let world_ipns = self.world
                     .local_world_ipns()
                     .await
                     .unwrap_or_else(|| "unconfigured".to_string());
-                let avatar_fragment = selected_handle
+                let avatar_fragment = sender_did
+                    .fragment
                     .clone()
-                    .or_else(|| sender_did.fragment.clone())
                     .unwrap_or_else(|| "avatar".to_string())
                     .trim()
                     .trim_start_matches('@')
                     .to_string();
-                let avatar_did = Did::try_from(create_world_did(&world_ipns, &avatar_fragment).as_str())
-                    .map_err(|err| anyhow!("invalid derived avatar DID: {}", err))?;
-                let avatar_did_id = avatar_did.id();
-                let is_first_enter = self
-                    .world
-                    .did_to_handle
-                    .read()
-                    .await
-                    .get(&avatar_did_id)
-                    .is_none();
+                let avatar_did_str = create_world_did(&world_ipns, &avatar_fragment);
 
-                // Generate a fresh Ed25519 signing key for this avatar.
-                // The world holds this key and signs outbound messages on behalf of the avatar.
-                let avatar_signing_key = SigningKey::generate(avatar_did.clone())
-                    .map_err(|e| anyhow!("failed to generate avatar signing key: {}", e))?;
-                let avatar_signing_secret = avatar_signing_key.private_key_bytes();
+                // Check if avatar already exists somewhere.
+                let existing_room = self.world.avatar_room_for_did(&avatar_did_str).await;
 
-                let avatar_req = AvatarRequest {
-                    did: avatar_did,
-                    owner_did: sender_did.id(),
-                    agent_endpoint: agent_endpoint.clone(),
-                    language_order: collapsed_language_order,
-                    signing_secret: avatar_signing_secret,
-                    encryption_pubkey_multibase,
-                };
-                let handle = self.world.join_room(&room, avatar_req, selected_handle).await?;
-                if is_first_enter {
-                    let _ = self
-                        .world
-                        .set_avatar_description_for_did(&room, &avatar_did_id, "skeleton avatar")
+                let (actual_room, handle, created) = if let Some(room) = existing_room {
+                    // Avatar exists — report actual location, touch presence, don't move.
+                    let _ = self.world
+                        .touch_avatar_presence_for_did(&room, &avatar_did_str)
                         .await;
+                    self.world
+                        .upsert_avatar_location(&room, &avatar_did_str, &agent_endpoint)
+                        .await;
+                    let h = self.world
+                        .avatar_handle_for_did(&room, &avatar_did_str)
+                        .await
+                        .unwrap_or_else(|| avatar_fragment.clone());
+                    (room, h, false)
+                } else {
+                    // First contact — ensure avatar in the pinged room.
+                    let (_, h, c) = self.world.ensure_avatar(
+                        sender_did, &sender_profile, &agent_endpoint, &pinged_room,
+                    ).await?;
+                    (pinged_room.clone(), h, c)
+                };
+
+                if created {
+                    self.push_presence_snapshot(&actual_room).await;
                 }
-                self.push_presence_snapshot(&room).await;
-                let latest_event_sequence = self.world.latest_room_event_sequence(&room).await?;
+
+                let actual_room_did = self.world.room_did(&actual_room).await;
                 Ok(WorldResponse {
                     ok: true,
-                    room: room.clone(),
-                    message: format!("entered {room}"),
+                    room: actual_room.clone(),
+                    message: format!("pong {}", actual_room_did),
                     endpoint_id: self.endpoint_id.clone(),
-                    latest_event_sequence,
+                    latest_event_sequence: self.world.latest_room_event_sequence(&actual_room).await.unwrap_or(0),
                     broadcasted: false,
                     events: Vec::new(),
                     handle,
-                    room_description: self.world.room_description(&room).await,
-                    room_title: self.world.room_title(&room).await,
-                    room_did: self.world.room_did(&room).await,
+                    room_description: self.world.room_description(&actual_room).await,
+                    room_title: self.world.room_title(&actual_room).await,
+                    room_did: actual_room_did,
                     world_did: self.world.world_did.read().await.clone().unwrap_or_default(),
-                    avatars: self.world.room_avatars(&room).await,
-                    room_object_dids: self.world.room_object_did_map(&room).await,
+                    avatars: self.world.room_avatars(&actual_room).await,
+                    room_object_dids: self.world.room_object_did_map(&actual_room).await,
                     transport_ack: None,
                 })
             }
-            WorldCommand::Message { .. } if self.lane == WorldLane::Inbox => {
-                return Err(anyhow!("Message must be sent on ma/avatar/1, not ma/inbox/1"));
-            }
             WorldCommand::Message { room, envelope } => {
-                let avatar_did = self.world.resolve_avatar_did_for_owner(&sender_did.id()).await
-                    .ok_or_else(|| anyhow!("no avatar found for sender {}", sender_did.id()))?;
+                let (avatar_did, handle, created) = self.world.ensure_avatar(
+                    sender_did, &sender_profile, &agent_endpoint, &room,
+                ).await?;
+                if created {
+                    self.push_presence_snapshot(&room).await;
+                }
+
                 let route_room = match &envelope {
                     MessageEnvelope::ActorCommand { target, .. }
                         if target.eq_ignore_ascii_case("avatar") =>
@@ -7232,7 +7391,6 @@ impl WorldProtocol {
                     .world
                     .upsert_avatar_location(&route_room, &avatar_did.id(), &agent_endpoint)
                     .await;
-                let method = ROOM_METHOD_BROADCAST_SEND;
                 let effective_sender_profile = self
                     .world
                     .avatar_language_order_for_did(&route_room, &avatar_did.id())
@@ -7248,9 +7406,6 @@ impl WorldProtocol {
                         message.to
                     ));
                 }
-                if !is_world_admin {
-                    debug!("processing non-admin {} on lane '{}'", method, self.lane.label());
-                }
 
                 // Route command envelopes using the active room handle bound to sender DID.
                 let actor_name = self
@@ -7263,10 +7418,19 @@ impl WorldProtocol {
                     .send_message(&route_room, &actor_name, &avatar_did, &effective_sender_profile, envelope)
                     .await?;
                 if effective_room != route_room {
+                    self.push_presence_room_state_to(&effective_room, &agent_endpoint).await;
                     self.push_presence_snapshot(&route_room).await;
                     self.push_presence_snapshot(&effective_room).await;
                 }
                 let latest_event_sequence = self.world.latest_room_event_sequence(&effective_room).await?;
+                if broadcasted {
+                    let proto = self.clone();
+                    let room_for_broadcast = effective_room.clone();
+                    let seq_before = if latest_event_sequence > 0 { latest_event_sequence - 1 } else { 0 };
+                    tokio::spawn(async move {
+                        proto.push_room_broadcast(&room_for_broadcast, seq_before).await;
+                    });
+                }
                 Ok(WorldResponse {
                     ok: true,
                     room_description: self.world.room_description(&effective_room).await,
@@ -7280,17 +7444,18 @@ impl WorldProtocol {
                     latest_event_sequence,
                     broadcasted,
                     events: Vec::new(),
-                    handle: String::new(),
+                    handle,
                     room_object_dids: self.world.room_object_did_map(&effective_room).await,
                     transport_ack: None,
                 })
             }
-            WorldCommand::RoomEvents { .. } if self.lane == WorldLane::Inbox => {
-                return Err(anyhow!("RoomEvents must be sent on ma/avatar/1, not ma/inbox/1"));
-            }
             WorldCommand::RoomEvents { room, since_sequence } => {
-                let avatar_did = self.world.resolve_avatar_did_for_owner(&sender_did.id()).await
-                    .ok_or_else(|| anyhow!("no avatar found for sender {}", sender_did.id()))?;
+                let (avatar_did, _handle, created) = self.world.ensure_avatar(
+                    sender_did, &sender_profile, &agent_endpoint, &room,
+                ).await?;
+                if created {
+                    self.push_presence_snapshot(&room).await;
+                }
                 let _ = self
                     .world
                     .touch_avatar_presence_for_did(&room, &avatar_did.id())
@@ -7401,76 +7566,33 @@ impl IpfsProtocol {
     }
 
     async fn handle_request(&self, request: WorldRequest) -> Result<IpfsPublishDidResponse> {
-        if !self.world.is_unlocked().await {
-            return Err(anyhow!(
-                "world is locked; unlock from the status page before sending IPFS publish"
-            ));
-        }
-
-        let message = Message::from_cbor(&request.message_cbor)
-            .map_err(|e| anyhow!("invalid signed message: {}", e))?;
-        if message.content_type != CONTENT_TYPE_DOC {
-            return Err(anyhow!(
-                "expected {} on ma/ipfs/1, got {}",
-                CONTENT_TYPE_DOC,
-                message.content_type
-            ));
-        }
-
-        let sender_did = Did::try_from(message.from.as_str())
-            .map_err(|e| anyhow!("invalid sender did '{}': {}", message.from, e))?;
-        let sender_ipns = sender_did.ipns.clone();
-
-        let request_payload: IpfsPublishDidRequest = serde_json::from_slice(&message.content)
-            .map_err(|e| anyhow!("invalid IPFS publish payload: {}", e))?;
-
-        let document = Document::unmarshal(&request_payload.did_document_json)
-            .map_err(|e| anyhow!("invalid DID document JSON: {}", e))?;
-        document
-            .validate()
-            .map_err(|e| anyhow!("invalid DID document: {}", e))?;
-        document
-            .verify()
-            .map_err(|e| anyhow!("DID document signature verification failed: {}", e))?;
-
-        let document_did = Did::try_from(document.id.as_str())
-            .map_err(|e| anyhow!("invalid document DID '{}': {}", document.id, e))?;
-        let document_ipns = document_did.ipns.clone();
-        if document_ipns != sender_ipns {
-            return Err(anyhow!(
-                "sender IPNS '{}' does not match document IPNS '{}'",
-                sender_ipns,
-                document_ipns
-            ));
-        }
-
-        message
-            .verify_with_document(&document)
-            .map_err(|e| anyhow!("request signature verification failed: {}", e))?;
+        let validated = ma_core::ipfs_publish::validate_ipfs_publish_request(
+            &request.message_cbor,
+        )?;
 
         {
             let mut cache = self.did_cache.write().await;
             cache.insert(
-                document_ipns.clone(),
+                validated.document_did.ipns.clone(),
                 CachedDidDocument {
-                    document: document.clone(),
+                    document: validated.document.clone(),
                     dirty: false,
                 },
             );
         }
 
-        let (key_name, cid) = best_effort_publish_did_document_to_kubo(
-            self.world.clone(),
-            request_payload.did_document_json.clone(),
-            request_payload.ipns_private_key_base64.clone(),
-            request_payload.desired_fragment.clone(),
+        let (key_name, cid) = ma_core::ipfs_publish::publish_did_document_to_kubo(
+            &self.kubo_url,
+            &validated.request.did_document_json,
+            &validated.request.ipns_private_key_base64,
+            validated.request.desired_fragment.as_deref(),
         )
         .await?;
 
         Ok(IpfsPublishDidResponse {
             ok: true,
             message: "did document published via ma/ipfs/1".to_string(),
-            did: Some(document_did.id()),
+            did: Some(validated.document_did.id()),
             key_name,
             cid,
         })
@@ -8750,6 +8872,48 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Passphrase-based auto-unlock from runtime config.
+    if !world.is_unlocked().await {
+        if let Some(passphrase) = runtime_cfg.unlock_passphrase.as_deref().filter(|s| !s.trim().is_empty()) {
+            let bundle_file = runtime_cfg
+                .unlock_bundle_file
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    runtime_config_path(&world_slug)
+                        .with_file_name(format!("{}.bundle.json", world_slug))
+                });
+            match fs::read_to_string(&bundle_file) {
+                Ok(bundle_json) => {
+                    match world.unlock_runtime(passphrase, &bundle_json).await {
+                        Ok(count) => {
+                            info!(
+                                "auto-unlock (passphrase): enabled with {} actor bundles from {}",
+                                count,
+                                bundle_file.display()
+                            );
+                        }
+                        Err(err) => {
+                            warn!(
+                                "auto-unlock (passphrase): unlock failed for bundle {}: {}",
+                                bundle_file.display(),
+                                err
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        "auto-unlock (passphrase): could not read bundle {}: {}",
+                        bundle_file.display(),
+                        err
+                    );
+                }
+            }
+        }
+    }
+
     // Bind status listener before iroh endpoint setup so listen failures abort early.
     let listener = bind_status_listener(&listen_addr).await?;
     let status_addr = listener.local_addr()?;
@@ -8976,29 +9140,10 @@ async fn main() -> Result<()> {
         }
 
         let did_cache = Arc::new(RwLock::new(HashMap::new()));
-        let inbox_protocol = WorldProtocol {
-            world: world.clone(),
-            endpoint: endpoint.clone(),
-            endpoint_id: endpoint_id.clone(),
-            did_cache: did_cache.clone(),
-            lane: WorldLane::Inbox,
-        };
-        let avatar_protocol = WorldProtocol {
-            world: world.clone(),
-            endpoint: endpoint.clone(),
-            endpoint_id: endpoint_id.clone(),
-            did_cache: did_cache.clone(),
-            lane: WorldLane::Avatar,
-        };
         let ipfs_protocol = IpfsProtocol {
-            world: world.clone(),
+            kubo_url: kubo_url.clone(),
             did_cache: did_cache.clone(),
         };
-        let router = Router::builder(endpoint.clone())
-            .accept(INBOX_ALPN, inbox_protocol.clone())
-            .accept(AVATAR_ALPN, avatar_protocol)
-            .accept(IPFS_ALPN, ipfs_protocol)
-            .spawn();
         let online_started = Instant::now();
         let online_status = match tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await {
             Ok(_) => format!("ok in {}ms", online_started.elapsed().as_millis()),
@@ -9072,7 +9217,7 @@ async fn main() -> Result<()> {
         info!("World status page: {}", world_info.status_url);
         info!("Inbox protocol ALPN: {}", String::from_utf8_lossy(INBOX_ALPN));
         info!("IPFS protocol ALPN (citizenship): {}", String::from_utf8_lossy(IPFS_ALPN));
-        info!("Broadcast protocol ALPN (outbound push to agents): {}", String::from_utf8_lossy(BROADCAST_ALPN));
+        info!("Presence protocol ALPN (outbound push to agents): {}", String::from_utf8_lossy(PRESENCE_ALPN));
         info!("World entry ACL: {}", world_info.entry_acl);
         info!("Optional DID field ma:presenceHint = {}", world_info.location_hint);
         info!("Iroh online readiness: {}", online_status);
@@ -9100,6 +9245,52 @@ async fn main() -> Result<()> {
         world
             .record_event(format!("world online at {}", world_info.status_url))
             .await;
+
+        // Wait for unlock before accepting protocol connections.
+        // While locked, a gate router responds with "world is locked" on all ALPNs.
+        if !world.is_unlocked().await {
+            let gate = LockedGateProtocol;
+            let gate_router = Router::builder(endpoint.clone())
+                .accept(INBOX_ALPN, gate.clone())
+                .accept(AVATAR_ALPN, gate.clone())
+                .accept(IPFS_ALPN, gate)
+                .spawn();
+            world
+                .record_event("world runtime locked; gate router active — waiting for unlock".to_string())
+                .await;
+            info!("World locked — gate router active, waiting for unlock via status page at {}", world_info.status_url);
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if world.is_unlocked().await {
+                    break;
+                }
+            }
+            gate_router.shutdown().await?;
+            world
+                .record_event("world unlocked — starting protocol lanes".to_string())
+                .await;
+            info!("World unlocked — starting protocol lanes");
+        }
+
+        let inbox_protocol = WorldProtocol {
+            world: world.clone(),
+            endpoint: endpoint.clone(),
+            endpoint_id: endpoint_id.clone(),
+            did_cache: did_cache.clone(),
+            lane: WorldLane::Inbox,
+        };
+        let avatar_protocol = WorldProtocol {
+            world: world.clone(),
+            endpoint: endpoint.clone(),
+            endpoint_id: endpoint_id.clone(),
+            did_cache: did_cache.clone(),
+            lane: WorldLane::Avatar,
+        };
+        let router = Router::builder(endpoint.clone())
+            .accept(INBOX_ALPN, inbox_protocol.clone())
+            .accept(AVATAR_ALPN, avatar_protocol)
+            .accept(IPFS_ALPN, ipfs_protocol)
+            .spawn();
 
         let presence_probe_secs = env::var("MA_PRESENCE_PROBE_SECS")
             .ok()
@@ -9149,11 +9340,6 @@ async fn main() -> Result<()> {
             presence_stale_secs
         );
 
-        if !world.is_unlocked().await {
-            world
-                .record_event("world runtime locked; unlock required before handling commands".to_string())
-                .await;
-        }
         world
             .record_event(format!("iroh online readiness: {}", online_status))
             .await;

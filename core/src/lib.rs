@@ -14,6 +14,8 @@ pub use ma_core::ttl_cache;
 // Realms-specific modules stay here.
 pub mod domain;
 pub mod identity;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod ipfs_publish;
 pub mod interfaces;
 pub mod object_runtime;
 pub mod parser;
@@ -63,8 +65,7 @@ pub use protocol::{
     IpfsPublishDidRequest, IpfsPublishDidResponse,
     LaneCapability, PresenceAvatar, RoomEvent, TransportAck, TransportAckCode, WorldCommand,
     WorldLane, WorldRequest, WorldResponse,
-    AVATAR_ALPN, BROADCAST_ALPN, DEFAULT_WORLD_RELAY_URL, INBOX_ALPN, IPFS_ALPN, PRESENCE_ALPN,
-    WHISPER_ALPN,
+    AVATAR_ALPN, PRESENCE_ALPN, DEFAULT_WORLD_RELAY_URL, INBOX_ALPN, IPFS_ALPN,
     DEFAULT_CONTENT_TYPE, CONTENT_TYPE_CHAT, CONTENT_TYPE_PRESENCE,
     CONTENT_TYPE_WORLD, CONTENT_TYPE_BROADCAST,
     CONTENT_TYPE_DOC, CONTENT_TYPE_WHISPER,
@@ -106,28 +107,22 @@ mod tests {
 
     #[test]
     fn parses_chat_with_quote_prefix() {
-        // ' is shorthand for @avatar say.
+        // ' is shorthand for room say.
         assert_eq!(
             parse_message("'Hello, world!"),
-            MessageEnvelope::ActorCommand {
-                target: "avatar".to_string(),
-                command: ActorCommand::Say {
-                    payload: "Hello, world!".to_string()
-                }
+            MessageEnvelope::RoomCommand {
+                command: "say Hello, world!".to_string()
             }
         );
     }
 
     #[test]
     fn parses_bare_say_verb() {
-        // `say foo` (bare) routes through the lexicon and becomes Say, not Raw.
+        // `say foo` (bare) is a room method.
         assert_eq!(
             parse_message("say hello"),
-            MessageEnvelope::ActorCommand {
-                target: "avatar".to_string(),
-                command: ActorCommand::Say {
-                    payload: "hello".to_string()
-                }
+            MessageEnvelope::RoomCommand {
+                command: "say hello".to_string()
             }
         );
     }
@@ -137,11 +132,48 @@ mod tests {
         // Text after ' is the raw payload — inner quotes are untouched.
         assert_eq!(
             parse_message("' abc blåbærsylttøy '''"),
-            MessageEnvelope::ActorCommand {
-                target: "avatar".to_string(),
-                command: ActorCommand::Say {
-                    payload: " abc blåbærsylttøy '''".to_string()
-                }
+            MessageEnvelope::RoomCommand {
+                command: "say  abc blåbærsylttøy '''".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_emote_with_colon_prefix() {
+        assert_eq!(
+            parse_message(":dances"),
+            MessageEnvelope::RoomCommand {
+                command: "emote dances".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_emote_with_space() {
+        assert_eq!(
+            parse_message(":tap dances for 10 seconds"),
+            MessageEnvelope::RoomCommand {
+                command: "emote tap dances for 10 seconds".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_bare_emote_verb() {
+        assert_eq!(
+            parse_message("emote smiles"),
+            MessageEnvelope::RoomCommand {
+                command: "emote smiles".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_here_emote_command() {
+        assert_eq!(
+            parse_message("@here emote bows"),
+            MessageEnvelope::RoomCommand {
+                command: "emote bows".to_string()
             }
         );
     }
@@ -172,11 +204,8 @@ mod tests {
     fn parses_room_command() {
         assert_eq!(
             parse_message("@here who"),
-            MessageEnvelope::ActorCommand {
-                target: "here".to_string(),
-                command: ActorCommand::Raw {
-                    command: "who".to_string()
-                }
+            MessageEnvelope::RoomCommand {
+                command: "who".to_string()
             }
         );
     }

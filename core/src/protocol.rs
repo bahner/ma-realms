@@ -6,11 +6,9 @@ use serde::{Deserialize, Serialize};
 
 // ─── ALPN Protocol Identifiers ──────────────────────────────────────────────
 
-pub const BROADCAST_ALPN: &[u8] = b"ma/broadcast/1";
 pub const PRESENCE_ALPN: &[u8] = b"ma/presence/1";
 pub const INBOX_ALPN: &[u8] = b"ma/inbox/1";
 pub const AVATAR_ALPN: &[u8] = b"ma/avatar/1";
-pub const WHISPER_ALPN: &[u8] = b"ma/whisper/1";
 pub const IPFS_ALPN: &[u8] = b"ma/ipfs/1";
 pub const DEFAULT_WORLD_RELAY_URL: &str = "https://euc1-1.relay.n0.iroh-canary.iroh.link/";
 
@@ -50,6 +48,7 @@ pub struct IpfsPublishDidResponse {
 pub const ROOM_METHOD_EVENTS_POLL: &str = "room.events.poll";
 pub const ROOM_METHOD_BROADCAST_SEND: &str = "room.broadcast.send";
 pub const ROOM_METHOD_PRESENCE_LIST: &str = "room.presence.list";
+pub const AVATAR_METHOD_PING: &str = "avatar.ping";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -182,12 +181,10 @@ pub struct WorldResponse {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorldCommand {
-    Enter {
-        room: Option<String>,
-        #[serde(default)]
-        preferred_handle: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        encryption_pubkey_multibase: Option<String>,
+    /// Ping with a room DID — ensures avatar exists in that room, returns pong with room state.
+    /// Also serves as keepalive and room-change (ping a different room = move).
+    Ping {
+        room_did: String,
     },
     Message {
         room: String,
@@ -202,9 +199,9 @@ pub enum WorldCommand {
 impl WorldCommand {
     pub fn internal_method(&self) -> Option<&'static str> {
         match self {
+            Self::Ping { .. } => Some(AVATAR_METHOD_PING),
             Self::Message { .. } => Some(ROOM_METHOD_BROADCAST_SEND),
             Self::RoomEvents { .. } => Some(ROOM_METHOD_EVENTS_POLL),
-            Self::Enter { .. } => None,
         }
     }
 }

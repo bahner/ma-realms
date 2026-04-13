@@ -9,6 +9,9 @@ export function contentTypeToRouteKey(contentType) {
   if (value === 'application/x-ma-presence' || value === 'application/x.ma.presence') {
     return 'application/x-ma-presence';
   }
+  if (value === 'application/x-ma-broadcast' || value === 'application/x.ma.broadcast') {
+    return 'application/x-ma-broadcast';
+  }
   return '';
 }
 
@@ -52,7 +55,7 @@ export function createInboundDispatcher(deps) {
     const currentRootDid = didRoot(currentDid);
     const senderRootDid = didRoot(evt.senderDid || '');
     return Boolean(
-      (evt.kind === 'speech' || evt.kind === 'chat') &&
+      (evt.kind === 'speech' || evt.kind === 'emote' || evt.kind === 'chat') &&
         senderRootDid &&
         currentRootDid &&
         senderRootDid === currentRootDid
@@ -66,7 +69,7 @@ export function createInboundDispatcher(deps) {
 
   function writeDialogWhisper(senderDid, senderHandle, text) {
     const actor = displayActor(senderDid, senderHandle);
-    appendMessage('world', `${actor} whispers ${text}.`);
+    appendMessage('world', `${actor} (private): ${text}`);
   }
 
   function writeDialogSystem(text) {
@@ -102,7 +105,7 @@ export function createInboundDispatcher(deps) {
     }
     const senderDid = evt.senderDid;
     if (!senderDid) {
-      throw new Error('missing sender DID for whisper');
+      throw new Error('missing sender DID for direct message');
     }
     const senderDoc = await fetchDidDocumentJsonByDid(senderDid);
     const text = decodeWhisperEventMessage(
@@ -124,17 +127,18 @@ export function createInboundDispatcher(deps) {
     writeDialogChat(evt.senderDid, evt.senderHandle, evt.text);
   }
 
+  async function handleInboundEmote(evt) {
+    if (!evt.text) return;
+    const actor = displayActor(evt.senderDid, evt.senderHandle);
+    appendMessage('world', `* ${actor} ${evt.text}`);
+  }
+
   async function handleInboundDefault(evt) {
     if (!evt.text) return;
     writeDialogWorld(evt.text);
   }
 
   async function handleInboundPresence(evt) {
-    const expectedRoomDid = state.currentHome?.roomDid;
-    if (!expectedRoomDid || evt.senderDid !== expectedRoomDid) {
-      logger.log('inbox.presence', `dropped presence from unexpected sender ${evt.senderDid || '(none)'} (expected room did ${expectedRoomDid || 'none'})`);
-      return;
-    }
     if (!evt.text) return;
     let payload;
     try {
@@ -143,21 +147,76 @@ export function createInboundDispatcher(deps) {
       logger.log('inbox.presence', `invalid presence payload json: ${error instanceof Error ? error.message : String(error)}`);
       return;
     }
+    const expectedRoomDid = state.currentHome?.roomDid;
+    const kind = String(payload?.kind || '').trim();
+    const allowCrossRoomSender = kind === 'presence.room_state';
+    if (!allowCrossRoomSender && (!expectedRoomDid || evt.senderDid !== expectedRoomDid)) {
+      logger.log('inbox.presence', `dropped presence from unexpected sender ${evt.senderDid || '(none)'} (expected room did ${expectedRoomDid || 'none'})`);
+      return;
+    }
     if (typeof onPresenceEvent === 'function') {
       await onPresenceEvent(payload, evt);
     }
-    const kind = String(payload?.kind || '').trim();
     if (kind === 'presence.refresh.request' && typeof onPresenceRefreshRequest === 'function') {
       await onPresenceRefreshRequest(payload, evt);
     }
+  }
+
+  async function handleInboundBroadcast(evt) {
+    if (!evt.text) return;
+    let payload;
+    try {
+      payload = JSON.parse(evt.text);
+    } catch (error) {
+      logger.log('inbox.broadcast', `invalid broadcast payload json: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    const broadcastRoom = String(payload?.room || '').trim();
+    const currentRoom = String(state.currentHome?.room || '').trim();
+    if (!currentRoom || broadcastRoom !== currentRoom) {
+      logger.log('inbox.broadcast', `dropped broadcast for room '${broadcastRoom}' (current='${currentRoom}')`);
+      return;
+    }
+
+    // Update room metadata from broadcast.
+    if (payload.room_title && state.currentHome) {
+      state.currentHome.roomTitle = payload.room_title;
+    }
+    if (typeof payload.room_description === 'string' && state.currentHome) {
+      state.currentHome.roomDescription = payload.room_description;
+    }
+    if (payload.room_did && state.currentHome) {
+      state.currentHome.roomDid = payload.room_did;
+    }
+
+    // Dispatch contained events.
+    const currentSeq = state.currentHome?.lastEventSequence || 0;
+    for (const event of payload.events || []) {
+      const seq = typeof event.sequence === 'number' ? event.sequence : 0;
+      if (seq <= currentSeq) continue;
+      await dispatchInboundEvent(event);
+      if (state.currentHome && seq > (state.currentHome.lastEventSequence || 0)) {
+        state.currentHome.lastEventSequence = seq;
+      }
+    }
+    if (typeof payload.latest_event_sequence === 'number' && state.currentHome) {
+      state.currentHome.lastEventSequence = Math.max(
+        state.currentHome.lastEventSequence || 0,
+        payload.latest_event_sequence
+      );
+    }
+
+    logger.log('inbox.broadcast', `processed broadcast for room '${broadcastRoom}' events=${(payload.events || []).length} latest_seq=${payload.latest_event_sequence || 0}`);
   }
 
   const inboundRoutes = {
     'application/x-ma-chat': { name: 'chat', handler: handleInboundChat },
     'application/x-ma-whisper': { name: 'whisper', handler: handleInboundWhisper },
     'application/x-ma-presence': { name: 'presence', handler: handleInboundPresence },
+    'application/x-ma-broadcast': { name: 'broadcast', handler: handleInboundBroadcast },
     'event/system': { name: 'system', handler: handleInboundSystem },
     'event/speech': { name: 'speech', handler: handleInboundSpeech },
+    'event/emote': { name: 'emote', handler: handleInboundEmote },
     'event/default': { name: 'default', handler: handleInboundDefault }
   };
 

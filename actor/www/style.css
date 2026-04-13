@@ -42,14 +42,14 @@ body {
 
 .shell {
   flex: 1;
-  width: min(960px, calc(100% - 2rem));
+  width: calc(100% - 2rem);
   margin: 2.25rem auto;
   position: relative;
   z-index: 1;
 }
 
 .app-footer {
-  width: min(960px, calc(100% - 2rem));
+  width: calc(100% - 2rem);
   margin: 0 auto 1.2rem;
   color: var(--muted);
   font-size: 0.8rem;
@@ -547,7 +547,7 @@ button.primary {
 
 .chat-body {
   display: grid;
-  grid-template-columns: 1fr 190px;
+  grid-template-columns: 1fr minmax(240px, 25%);
   gap: 0.75rem;
   align-items: start;
   margin-top: 1rem;
@@ -600,9 +600,7 @@ button.primary {
 .avatar-item {
   font-size: 0.82rem;
   color: var(--text);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  word-break: break-all;
   padding: 0.18rem 0.1rem;
 }
 

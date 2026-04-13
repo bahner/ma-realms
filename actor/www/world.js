@@ -810,26 +810,27 @@ export function createWorldDispatchFlow({
       }
 
       if (trimmedText.startsWith("'")) {
-        const payload = trimmedText.substring(1);
+        const payload = trimmedText.substring(1).trim();
+        if (!payload) return;
         const sendStart = Date.now();
-        logger.log('send.chat', `room=${state.currentHome.room} actor=${activeActorName()} msg_len=${payload.length}`);
+        logger.log('send.say', `room=${state.currentHome.room} actor=${activeActorName()} msg_len=${payload.length}`);
 
         const result = JSON.parse(
-          await sendWorldChatWithTtl(
+          await sendWorldCmdWithTtl(
             state.currentHome.endpointId,
             state.passphrase,
             state.encryptedBundle,
             activeActorName(),
             state.currentHome.room,
-            payload,
-            BigInt(resolveTtlSeconds('chat'))
+            `say ${payload}`,
+            BigInt(resolveTtlSeconds('cmd'))
           )
         );
         const elapsed = Date.now() - sendStart;
-        logger.log('send.chat', `response ok=${result.ok} broadcasted=${result.broadcasted} latest_seq=${result.latest_event_sequence || 0} in ${elapsed}ms`);
+        logger.log('send.say', `response ok=${result.ok} broadcasted=${result.broadcasted} latest_seq=${result.latest_event_sequence || 0} in ${elapsed}ms`);
 
         if (!result.ok) {
-          throw new Error(result.message || 'chat failed');
+          throw new Error(result.message || 'say failed');
         }
 
         await pollCurrentHomeEvents();
@@ -839,22 +840,59 @@ export function createWorldDispatchFlow({
         return;
       }
 
+      if (trimmedText.startsWith(':')) {
+        const payload = trimmedText.substring(1).trim();
+        if (!payload) return;
+        const sendStart = Date.now();
+        logger.log('send.emote', `room=${state.currentHome.room} actor=${activeActorName()} msg_len=${payload.length}`);
+
+        const result = JSON.parse(
+          await sendWorldCmdWithTtl(
+            state.currentHome.endpointId,
+            state.passphrase,
+            state.encryptedBundle,
+            activeActorName(),
+            state.currentHome.room,
+            `emote ${payload}`,
+            BigInt(resolveTtlSeconds('cmd'))
+          )
+        );
+        const elapsed = Date.now() - sendStart;
+        logger.log('send.emote', `response ok=${result.ok} broadcasted=${result.broadcasted} latest_seq=${result.latest_event_sequence || 0} in ${elapsed}ms`);
+
+        if (!result.ok) {
+          throw new Error(result.message || 'emote failed');
+        }
+
+        await pollCurrentHomeEvents();
+        return;
+      }
+
       if (trimmedText.startsWith('@')) {
         const trimmed = trimmedText.replace(/^@+/, '@');
         const whisperSep = trimmed.indexOf(" '");
         if (whisperSep > 1) {
           const target = trimmed.substring(1, whisperSep).trim();
           const payload = trimmed.substring(whisperSep + 2);
+          const dotIdx = target.indexOf('.');
+          const baseRaw = String(dotIdx === -1 ? target : target.slice(0, dotIdx)).trim();
+          const pathRaw = String(dotIdx === -1 ? '' : target.slice(dotIdx + 1)).trim();
+
           try {
-            const targetDid = await resolveCommandTargetDidOrToken(target);
-            if (!isMaDid(String(targetDid))) {
-              throw new Error(`Whisper target must resolve to did:ma, got: ${targetDid}`);
+            const resolvedBase = isMaDid(baseRaw)
+              ? baseRaw
+              : await resolveCommandTargetDidOrToken(baseRaw);
+            const normalizedDid = String(resolvedBase || '').trim().replace(/^@+/, '');
+            const { targetDid, targetPath, routeWorld } = normalizeDidTargetPath(normalizedDid, pathRaw);
+            const isDirectDidTarget = isMaDid(String(targetDid)) && String(targetDid).includes('#') && !routeWorld && !targetPath;
+
+            if (isDirectDidTarget) {
+              await sendWhisperToDid(targetDid, payload, { ttlSeconds: resolveTtlSeconds('whisper') });
+              appendMessage('system', `Message sent to ${targetDid}.`);
+              return;
             }
-            await sendWhisperToDid(targetDid, payload, { ttlSeconds: resolveTtlSeconds('whisper') });
-            appendMessage('system', `Chat sent to ${targetDid}.`);
-            return;
           } catch (err) {
-            appendMessage('system', `Error sending chat to ${target}: ${err.message}`);
+            appendMessage('system', `Error sending message to ${target}: ${err.message}`);
             return;
           }
         }

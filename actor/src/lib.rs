@@ -42,7 +42,7 @@ fn recipient_inbox_endpoint_id(document: &Document) -> Result<String, JsValue> {
 }
 
 async fn send_whisper_signed_message(target_endpoint_id: &str, message_cbor: Vec<u8>) -> Result<InboxResponse, JsValue> {
-    let requested_alpn = String::from_utf8_lossy(WHISPER_ALPN).to_string();
+    let requested_alpn = String::from_utf8_lossy(INBOX_ALPN).to_string();
     let target: EndpointId = target_endpoint_id
         .trim()
         .parse()
@@ -61,7 +61,7 @@ async fn send_whisper_signed_message(target_endpoint_id: &str, message_cbor: Vec
 
     let endpoint_addr = EndpointAddr::new(target).with_relay_url(relay_url);
     let connection = endpoint
-        .connect(endpoint_addr, WHISPER_ALPN)
+        .connect(endpoint_addr, INBOX_ALPN)
         .await
         .map_err(|e| js_err(format!(
             "whisper endpoint.connect() failed: {} (requested_alpn={})",
@@ -105,24 +105,8 @@ struct WorldConnCache {
     target_id: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WorldTransportKind {
-    Inbox,
-    Avatar,
-}
-
-impl WorldTransportKind {
-    fn alpn(self) -> &'static [u8] {
-        match self {
-            WorldTransportKind::Inbox => INBOX_ALPN,
-            WorldTransportKind::Avatar => AVATAR_ALPN,
-        }
-    }
-}
-
 thread_local! {
     static WORLD_CONN_CACHE: RefCell<Option<WorldConnCache>> = RefCell::new(None);
-    static AVATAR_CONN_CACHE: RefCell<Option<WorldConnCache>> = RefCell::new(None);
     static ACL_COMPILED_CACHE: RefCell<HashMap<String, CompiledCapabilityAcl>> = RefCell::new(HashMap::new());
     static ROOM_DID_CACHE: RefCell<HashMap<String, CachedDidEntry>> = RefCell::new(HashMap::new());
     static ROOM_OBJECT_DID_CACHE: RefCell<HashMap<String, CachedDidEntry>> = RefCell::new(HashMap::new());
@@ -137,25 +121,16 @@ struct CachedDidEntry {
 
 const ROOM_DID_CACHE_TTL_MS: f64 = 5.0 * 60.0 * 1000.0;
 
-fn take_conn_cache(kind: WorldTransportKind) -> Option<WorldConnCache> {
-    match kind {
-        WorldTransportKind::Inbox => WORLD_CONN_CACHE.with(|c| c.borrow_mut().take()),
-        WorldTransportKind::Avatar => AVATAR_CONN_CACHE.with(|c| c.borrow_mut().take()),
-    }
+fn take_conn_cache() -> Option<WorldConnCache> {
+    WORLD_CONN_CACHE.with(|c| c.borrow_mut().take())
 }
 
-fn store_conn_cache(kind: WorldTransportKind, cache: WorldConnCache) {
-    match kind {
-        WorldTransportKind::Inbox => WORLD_CONN_CACHE.with(|c| *c.borrow_mut() = Some(cache)),
-        WorldTransportKind::Avatar => AVATAR_CONN_CACHE.with(|c| *c.borrow_mut() = Some(cache)),
-    }
+fn store_conn_cache(cache: WorldConnCache) {
+    WORLD_CONN_CACHE.with(|c| *c.borrow_mut() = Some(cache))
 }
 
-fn clear_conn_cache(kind: WorldTransportKind) {
-    match kind {
-        WorldTransportKind::Inbox => WORLD_CONN_CACHE.with(|c| *c.borrow_mut() = None),
-        WorldTransportKind::Avatar => AVATAR_CONN_CACHE.with(|c| *c.borrow_mut() = None),
-    }
+fn clear_conn_cache() {
+    WORLD_CONN_CACHE.with(|c| *c.borrow_mut() = None)
 }
 
 fn with_inbox_state<T>(f: impl FnOnce(&Option<InboxListenerState>) -> T) -> T {
@@ -284,26 +259,14 @@ async fn ensure_inbox_listener_with_secret(secret_key: SecretKey) -> Result<Stri
         expected_content_type: None,
         lane_label: INBOX_ALPN,
     };
-    let whisper_protocol = InboxProtocol {
-        queue: queue.clone(),
-        expected_content_type: Some(CONTENT_TYPE_WHISPER),
-        lane_label: WHISPER_ALPN,
-    };
-    let broadcast_protocol = InboxProtocol {
-        queue: queue.clone(),
-        expected_content_type: Some(CONTENT_TYPE_BROADCAST),
-        lane_label: BROADCAST_ALPN,
-    };
     let presence_protocol = InboxProtocol {
         queue: queue.clone(),
-        expected_content_type: Some(CONTENT_TYPE_PRESENCE),
+        expected_content_type: None,
         lane_label: PRESENCE_ALPN,
     };
 
     let router = Router::builder(endpoint.clone())
         .accept(INBOX_ALPN, inbox_protocol)
-        .accept(WHISPER_ALPN, whisper_protocol)
-        .accept(BROADCAST_ALPN, broadcast_protocol)
         .accept(PRESENCE_ALPN, presence_protocol)
         .spawn();
 
@@ -320,9 +283,8 @@ async fn ensure_inbox_listener_with_secret(secret_key: SecretKey) -> Result<Stri
 async fn create_stream_cache(
     target_id_str: &str,
     relay_hint: Option<&str>,
-    kind: WorldTransportKind,
 ) -> Result<WorldConnCache, JsValue> {
-    let requested_alpn = String::from_utf8_lossy(kind.alpn()).to_string();
+    let requested_alpn = String::from_utf8_lossy(INBOX_ALPN).to_string();
     let target: EndpointId = target_id_str
         .trim()
         .parse()
@@ -348,7 +310,7 @@ async fn create_stream_cache(
         }
     }
 
-    let connection = endpoint.connect(endpoint_addr, kind.alpn())
+    let connection = endpoint.connect(endpoint_addr, INBOX_ALPN)
         .await
         .map_err(|e| js_err(format!(
             "endpoint.connect() failed: {} (requested_alpn={} target={})",
@@ -373,9 +335,8 @@ async fn create_stream_cache(
 
 async fn get_or_create_stream_cache(
     target_id_str: &str,
-    kind: WorldTransportKind,
 ) -> Result<WorldConnCache, JsValue> {
-    if let Some(cached) = take_conn_cache(kind) {
+    if let Some(cached) = take_conn_cache() {
         if cached.target_id == target_id_str {
             return Ok(cached);
         }
@@ -383,7 +344,7 @@ async fn get_or_create_stream_cache(
         cached.endpoint.close().await;
     }
 
-    create_stream_cache(target_id_str, None, kind).await
+    create_stream_cache(target_id_str, None).await
 }
 
 async fn exchange_on_stream(cache: &mut WorldConnCache, request: &WorldRequest) -> Result<WorldResponse, JsValue> {
@@ -429,7 +390,7 @@ async fn exchange_on_stream(cache: &mut WorldConnCache, request: &WorldRequest) 
 use ma_core::{
     CompiledCapabilityAcl,
     compile_acl,
-    CONTENT_TYPE_BROADCAST, CONTENT_TYPE_CHAT, CONTENT_TYPE_PRESENCE,
+    CONTENT_TYPE_CHAT,
     CONTENT_TYPE_DOC, CONTENT_TYPE_WORLD, CONTENT_TYPE_WHISPER,
     DEFAULT_WORLD_RELAY_URL,
     evaluate_compiled_acl_with_owner,
@@ -449,7 +410,7 @@ use ma_core::{
     resolve_inbox_endpoint_id as core_resolve_inbox_endpoint_id,
     resolve_alias_input as core_resolve_alias_input,
     RoomEvent, WorldCommand, WorldRequest, WorldResponse,
-    AVATAR_ALPN, BROADCAST_ALPN, INBOX_ALPN, IPFS_ALPN, PRESENCE_ALPN, WHISPER_ALPN,
+    PRESENCE_ALPN, INBOX_ALPN, IPFS_ALPN,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -921,27 +882,19 @@ fn decrypt_bundle(passphrase: &str, bundle: &EncryptedIdentityBundle) -> Result<
 }
 
 async fn send_world_request(endpoint_id: &str, request: WorldRequest) -> Result<WorldResponse, JsValue> {
-    send_world_request_on_lane(endpoint_id, request, WorldTransportKind::Inbox).await
-}
-
-async fn send_world_request_on_avatar(endpoint_id: &str, request: WorldRequest) -> Result<WorldResponse, JsValue> {
-    send_world_request_on_lane(endpoint_id, request, WorldTransportKind::Avatar).await
-}
-
-async fn send_world_request_on_lane(endpoint_id: &str, request: WorldRequest, lane: WorldTransportKind) -> Result<WorldResponse, JsValue> {
     let mut last_error: Option<JsValue> = None;
     for _ in 0..2 {
-        let mut cache = get_or_create_stream_cache(endpoint_id, lane).await?;
+        let mut cache = get_or_create_stream_cache(endpoint_id).await?;
         match exchange_on_stream(&mut cache, &request).await {
             Ok(response) => {
-                store_conn_cache(lane, cache);
+                store_conn_cache(cache);
                 return Ok(response);
             }
             Err(err) => {
                 last_error = Some(err);
                 cache.connection.close(0u32.into(), b"stream error");
                 cache.endpoint.close().await;
-                clear_conn_cache(lane);
+                clear_conn_cache();
             }
         }
     }
@@ -952,11 +905,7 @@ async fn send_world_request_on_lane(endpoint_id: &str, request: WorldRequest, la
 /// Close and drop the cached world connection (call on lock/logout).
 #[wasm_bindgen]
 pub async fn disconnect_world() {
-    if let Some(cached) = take_conn_cache(WorldTransportKind::Inbox) {
-        cached.connection.close(0u32.into(), b"bye");
-        cached.endpoint.close().await;
-    }
-    if let Some(cached) = take_conn_cache(WorldTransportKind::Avatar) {
+    if let Some(cached) = take_conn_cache() {
         cached.connection.close(0u32.into(), b"bye");
         cached.endpoint.close().await;
     }
@@ -1897,13 +1846,12 @@ pub fn set_bundle_transports(
     endpoint_id: &str,
 ) -> Result<String, JsValue> {
     let inbox_hint = format!("/ma-iroh/{}/ma/inbox/1", endpoint_id);
-    let whisper_hint = format!("/ma-iroh/{}/ma/whisper/1", endpoint_id);
-    let broadcast_hint = format!("/ma-iroh/{}/ma/broadcast/1", endpoint_id);
-    let transports = serde_json::json!([inbox_hint.clone(), whisper_hint, broadcast_hint]);
+    let presence_hint = format!("/ma-iroh/{}/ma/presence/1", endpoint_id);
+    let transports = serde_json::json!([inbox_hint.clone(), presence_hint.clone()]);
     update_bundle_document(passphrase, encrypted_bundle_json, move |document| {
         document.set_ma_transports(transports);
         document.set_ma_current_inbox(&inbox_hint);
-        document.set_presence_hint(&inbox_hint).map_err(js_err)?;
+        document.set_presence_hint(&presence_hint).map_err(js_err)?;
         Ok(())
     }, false)
 }
@@ -1937,15 +1885,15 @@ pub fn set_bundle_updated_for_send(
 /// Enter a world over iroh using the world protocol.
 #[wasm_bindgen]
 pub async fn connect_world(endpoint_id: &str) -> Result<(), JsValue> {
-    let cache = get_or_create_stream_cache(endpoint_id, WorldTransportKind::Inbox).await?;
-    store_conn_cache(WorldTransportKind::Inbox, cache);
+    let cache = get_or_create_stream_cache(endpoint_id).await?;
+    store_conn_cache(cache);
     Ok(())
 }
 
 #[wasm_bindgen]
 pub async fn connect_world_with_relay(endpoint_id: &str, relay_url: &str) -> Result<(), JsValue> {
-    let cache = create_stream_cache(endpoint_id, Some(relay_url), WorldTransportKind::Inbox).await?;
-    store_conn_cache(WorldTransportKind::Inbox, cache);
+    let cache = create_stream_cache(endpoint_id, Some(relay_url)).await?;
+    store_conn_cache(cache);
     Ok(())
 }
 
@@ -2069,29 +2017,24 @@ pub async fn publish_did_document_via_world_ipfs(
     serde_json::to_string(&response).map_err(js_err)
 }
 
-/// Enter a world over iroh using the world protocol.
+/// Ping the world with a room DID (or name). Serves as keepalive and initial enter.
+/// The world responds with the actual room the avatar is in (pong).
+/// If the pong room differs from the pinged room, the actor should adjust @here.
 #[wasm_bindgen]
-pub async fn enter_world(
+pub async fn ping_world(
     endpoint_id: &str,
     passphrase: &str,
     encrypted_bundle_json: &str,
     actor_name: &str,
-    room: &str,
+    room_did: &str,
 ) -> Result<String, JsValue> {
-    let room = room.trim();
     let timestamp_ms = js_sys::Date::now() as u64;
     let request = build_signed_world_request(
         passphrase,
         encrypted_bundle_json,
         actor_name,
-        WorldCommand::Enter {
-            room: if room.is_empty() {
-                None
-            } else {
-                Some(room.to_string())
-            },
-            preferred_handle: Some(actor_name.trim().to_string()),
-            encryption_pubkey_multibase: None,
+        WorldCommand::Ping {
+            room_did: room_did.trim().to_string(),
         },
         CONTENT_TYPE_WORLD,
         timestamp_ms,
@@ -2105,6 +2048,18 @@ pub async fn enter_world(
         pending_whispers: vec![],
     })
     .map_err(js_err)
+}
+
+/// Compatibility wrapper: enter_world now sends a Ping.
+#[wasm_bindgen]
+pub async fn enter_world(
+    endpoint_id: &str,
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+    actor_name: &str,
+    room: &str,
+) -> Result<String, JsValue> {
+    ping_world(endpoint_id, passphrase, encrypted_bundle_json, actor_name, room).await
 }
 
 /// Send a signed `application/x-ma-chat` message to a room.
@@ -2156,7 +2111,7 @@ pub async fn send_world_chat_with_ttl(
         timestamp_ms,
         ttl_seconds,
     )?;
-    let response = send_world_request_on_avatar(endpoint_id, request).await?;
+    let response = send_world_request(endpoint_id, request).await?;
     update_room_did_cache_from_response(&response);
 
     serde_json::to_string(&WorldActionResult {
@@ -2404,7 +2359,7 @@ pub async fn send_world_cmd_with_ttl(
         timestamp_ms,
         ttl_seconds,
     )?;
-    let response = send_world_request_on_avatar(endpoint_id, request).await?;
+    let response = send_world_request(endpoint_id, request).await?;
     update_room_did_cache_from_response(&response);
 
     serde_json::to_string(&WorldActionResult {
@@ -2437,7 +2392,7 @@ pub async fn poll_world_events(
         timestamp_ms,
         DEFAULT_MESSAGE_TTL_SECS,
     )?;
-    let response = send_world_request_on_avatar(endpoint_id, request).await?;
+    let response = send_world_request(endpoint_id, request).await?;
     update_room_did_cache_from_response(&response);
 
     serde_json::to_string(&WorldActionResult {

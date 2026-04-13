@@ -9,7 +9,7 @@ import init, {
   normalize_bip39_phrase,
   connect_world,
   connect_world_with_relay,
-  enter_world,
+  ping_world,
   poll_world_events,
   send_world_chat,
   send_world_chat_with_ttl,
@@ -137,8 +137,10 @@ const IPFS_GATEWAY_FALLBACKS = [
 const LOCAL_EDIT_SCRIPT_KEY = `${STORAGE_PREFIX}.localEditScript`;
 const LEGACY_LOCAL_EDIT_SCRIPT_CID_KEY = `${STORAGE_PREFIX}.localEditScriptCid`;
 
-const ROOM_POLL_INTERVAL_MS = 1500;
+const ROOM_POLL_INTERVAL_MS = 30_000;
 const AVATAR_PING_INTERVAL_MS = 25_000;
+const PING_FIB_START = 3000;
+const PING_WORLD_GONE_THRESHOLD = 60_000;
 const DID_DOC_CACHE_TTL_MS = 60_000;
 const DEFAULT_CHAT_TTL_SECONDS = 60;
 const DEFAULT_CMD_TTL_SECONDS = 60;
@@ -199,6 +201,7 @@ const state = {
   avatarPingTimer: null,
   roomPollInFlight: false,
   inboxPollInFlight: false,
+  consecutivePollFailures: 0,
   pollErrorShown: false,
   passphrase: '',
   handleDidMap: {},
@@ -224,6 +227,9 @@ const state = {
   reentryInProgress: null,
   reentryFibPrev: 3000,
   reentryFibCurr: 3000,
+  pingFibPrev: PING_FIB_START,
+  pingFibCurr: PING_FIB_START,
+  pingRetryTimer: null,
   editSession: null,
   editBusy: false,
   lockOverlayAnimationId: 0,
@@ -1333,25 +1339,101 @@ async function sendCurrentHomePresencePing() {
   if (!state.currentHome || !worldDispatchFlow) {
     return;
   }
-  const worldDid = currentWorldDid();
-  if (!worldDid) {
+  try {
+    const localRoomDid = String(state.currentHome?.roomDid || '').trim();
+    const pingTarget = localRoomDid || String(state.currentHome?.room || '').trim() || 'lobby';
+    const pingRaw = await ping_world(
+      state.currentHome.endpointId,
+      state.passphrase,
+      state.encryptedBundle,
+      currentActorFragment(),
+      pingTarget
+    );
+    const pingResult = JSON.parse(String(pingRaw || '{}'));
+    const response = pingResult?.response || {};
+
+    const serverRoomDid = String(response.room_did || '').trim();
+    const serverRoom = String(response.room || '').trim();
+
+    if (state.currentHome && (serverRoomDid || serverRoom)) {
+      const beforeDid = String(state.currentHome.roomDid || '').trim();
+      const beforeRoom = String(state.currentHome.room || '').trim();
+      const didChanged = Boolean(serverRoomDid && beforeDid && serverRoomDid !== beforeDid);
+      const roomChanged = Boolean(serverRoom && beforeRoom && serverRoom !== beforeRoom);
+
+      if (didChanged || roomChanged) {
+        logger.log('presence.ping', `room truth update: local=${beforeDid || beforeRoom} server=${serverRoomDid || serverRoom}`);
+      }
+
+      if (serverRoom) {
+        state.currentHome.room = serverRoom;
+      }
+      if (serverRoomDid) {
+        state.currentHome.roomDid = serverRoomDid;
+      }
+      if (typeof response.room_title === 'string' && response.room_title) {
+        state.currentHome.roomTitle = response.room_title;
+      }
+      if (typeof response.room_description === 'string') {
+        state.currentHome.roomDescription = response.room_description;
+      }
+      if (typeof response.handle === 'string' && response.handle) {
+        state.currentHome.handle = response.handle;
+      }
+
+      updateRoomHeading(state.currentHome.roomTitle || '', state.currentHome.roomDescription || '');
+      syncSpecialAliasesFromCurrentHome();
+      saveActiveHomeSnapshot();
+
+      if (didChanged || roomChanged) {
+        try {
+          await pollCurrentHomeEvents();
+        } catch (error) {
+          logger.log('presence.ping', `manual room poll after drift failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    }
+
+    // Ping success — reset fibonacci and clear any retry timer.
+    state.pingFibPrev = PING_FIB_START;
+    state.pingFibCurr = PING_FIB_START;
+    if (state.pingRetryTimer) {
+      clearTimeout(state.pingRetryTimer);
+      state.pingRetryTimer = null;
+    }
+  } catch (error) {
+    logger.log('presence.ping', `failed: ${error instanceof Error ? error.message : String(error)}`);
+    schedulePingRetry();
+  }
+}
+
+function schedulePingRetry() {
+  if (state.pingRetryTimer) return; // Already scheduled.
+  if (state.pingFibCurr >= PING_WORLD_GONE_THRESHOLD) {
+    logger.log('presence.ping', `world unresponsive after ${state.pingFibCurr}ms fibonacci — declaring world gone`);
+    if (!state.pollErrorShown) {
+      appendSystemUi(
+        'World appears unreachable. Attempting re-entry...',
+        'Verden er utilgjengelig. Forsøker re-entry...'
+      );
+      state.pollErrorShown = true;
+    }
+    state.pingFibPrev = PING_FIB_START;
+    state.pingFibCurr = PING_FIB_START;
+    requestReentry('world gone');
     return;
   }
-  const roomDid = String(state.currentHome?.roomDid || '').trim();
-  const command = roomDid
-    ? `@${worldDid}.ping ${roomDid}`
-    : `@${worldDid}.ping`;
-  const response = await sendWorldCommandQuery(command);
 
-  const match = String(response || '').match(/room_did=(\S+)/);
-  if (match) {
-    const serverRoomDid = match[1];
-    const localRoomDid = String(state.currentHome?.roomDid || '').trim();
-    if (localRoomDid && serverRoomDid && serverRoomDid !== localRoomDid) {
-      logger.log('presence.ping', `room drift detected: local=${localRoomDid} server=${serverRoomDid}`);
-      requestReentry('room drift');
-    }
-  }
+  const delayMs = state.pingFibCurr;
+  const next = Math.min(state.pingFibPrev + state.pingFibCurr, PING_WORLD_GONE_THRESHOLD);
+  state.pingFibPrev = state.pingFibCurr;
+  state.pingFibCurr = next;
+
+  logger.log('presence.ping', `scheduling retry in ${delayMs}ms (next=${next}ms)`);
+  state.pingRetryTimer = setTimeout(() => {
+    state.pingRetryTimer = null;
+    sendCurrentHomePresencePing().catch(() => {});
+  }, delayMs);
 }
 
 async function loadLocalScriptEditor() {
@@ -2267,6 +2349,10 @@ function stopHomeEventPolling() {
     clearInterval(state.avatarPingTimer);
     state.avatarPingTimer = null;
   }
+  if (state.pingRetryTimer) {
+    clearTimeout(state.pingRetryTimer);
+    state.pingRetryTimer = null;
+  }
   state.roomPollInFlight = false;
   state.inboxPollInFlight = false;
   state.pollErrorShown = false;
@@ -2280,7 +2366,57 @@ const inboundDispatcher = createInboundDispatcher({
   fetchDidDocumentJsonByDid,
   decodeChatEventMessage: decode_chat_event_message,
   decodeWhisperEventMessage: decode_whisper_event_message,
-  onPresenceEvent: applyPresencePayload,
+  onPresenceEvent: async (payload) => {
+    const kind = String(payload?.kind || '').trim();
+    if (kind === 'presence.room_state' && state.currentHome) {
+      const room = String(payload?.room || '').trim();
+      const roomDid = String(payload?.room_did || '').trim();
+
+      if (room) {
+        state.currentHome.room = room;
+      }
+      if (roomDid) {
+        state.currentHome.roomDid = roomDid;
+      }
+      if (typeof payload?.room_title === 'string' && payload.room_title) {
+        state.currentHome.roomTitle = payload.room_title;
+      }
+      if (typeof payload?.room_description === 'string') {
+        state.currentHome.roomDescription = payload.room_description;
+      }
+      if (typeof payload?.latest_event_sequence === 'number') {
+        state.currentHome.lastEventSequence = Math.max(
+          toSequenceNumber(state.currentHome.lastEventSequence || 0),
+          toSequenceNumber(payload.latest_event_sequence)
+        );
+      }
+
+      clearRoomPresence();
+      if (Array.isArray(payload?.avatars)) {
+        for (const avatar of payload.avatars) {
+          const handle = String(avatar?.handle || '').trim();
+          const did = String(avatar?.did || '').trim();
+          if (handle) {
+            trackRoomPresence(handle, did);
+          }
+        }
+      }
+
+      if (payload?.room_object_dids && typeof payload.room_object_dids === 'object') {
+        primeDidLookupCacheFromRoomObjectDids(payload.room_object_dids);
+      }
+
+      updateRoomHeading(state.currentHome.roomTitle || '', state.currentHome.roomDescription || '');
+      syncSpecialAliasesFromCurrentHome();
+      saveLastRoom(state.currentHome.endpointId, state.currentHome.room || 'lobby');
+      saveActiveHomeSnapshot();
+      updateIdentityLine();
+      logger.log('presence.room_state', `applied forced room-state for room=${state.currentHome.room} did=${state.currentHome.roomDid}`);
+      return;
+    }
+
+    applyPresencePayload(payload);
+  },
   onPresenceRefreshRequest: async () => {
     try {
       await sendCurrentHomePresencePing();
@@ -2395,6 +2531,7 @@ async function pollCurrentHomeEvents() {
       nextSequence,
       toSequenceNumber(result.latest_event_sequence || home.lastEventSequence || 0)
     );
+    state.consecutivePollFailures = 0;
     state.pollErrorShown = false;
   } catch (error) {
     const elapsed = Date.now() - pollStart;
@@ -2435,6 +2572,9 @@ function requestReentry(reason) {
     .then(() => {
       state.reentryFibPrev = 3000;
       state.reentryFibCurr = 3000;
+      state.pingFibPrev = PING_FIB_START;
+      state.pingFibCurr = PING_FIB_START;
+      state.consecutivePollFailures = 0;
       state.pollErrorShown = false;
       logger.log('reconnect', 're-entry complete');
       appendSystemUi('Re-entry complete.', 'Re-entry fullført.');
@@ -2466,24 +2606,9 @@ function startHomeEventPolling() {
   }, state.worldPingIntervalMs ?? AVATAR_PING_INTERVAL_MS);
 
   state.roomPollTimer = setInterval(() => {
-    Promise.resolve()
-      .then(() =>
-        pollDirectInbox().catch((error) => {
-          logger.log('inbox.poll', `non-fatal inbox poll failure: ${error instanceof Error ? error.message : String(error)}`);
-        })
-      )
-      .then(() => pollCurrentHomeEvents())
-      .catch((error) => {
-      if (state.debug) {
-        logger.log('poll.error', `room event poll failed: ${error instanceof Error ? error.message : String(error)}`);
-      }
-      if (state.currentHome) {
-        requestReentry('poll failure');
-      } else {
-        appendMessage('system', `Room sync failed: ${error instanceof Error ? error.message : String(error)}`);
-        state.pollErrorShown = true;
-      }
-      });
+    pollDirectInbox().catch((error) => {
+      logger.log('inbox.poll', `non-fatal inbox poll failure: ${error instanceof Error ? error.message : String(error)}`);
+    });
   }, ROOM_POLL_INTERVAL_MS);
 }
 
@@ -2986,7 +3111,7 @@ function syncBundleTransportsFromEndpoint(endpointId) {
 }
 
 function refillCommandInputWithActiveTarget() {
-  const alias = String(state.activeObjectTargetAlias || '').trim();
+  const alias = String(state.activeObjectTargetAlias || '').trim().replace(/^@+/, '');
   const inputEl = byId('command-input');
   if (!inputEl) {
     return;
@@ -2995,7 +3120,7 @@ function refillCommandInputWithActiveTarget() {
     inputEl.value = '';
     return;
   }
-  inputEl.value = `${alias} `;
+  inputEl.value = `@${alias} `;
   inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
 }
 
@@ -3191,16 +3316,16 @@ async function enterWorldWithRetry(endpointId, actorName, room) {
         announcedConnectivity = true;
       }
 
-      // Phase 2: World enter request
-      logger.log(`connect.attempt.${attempt}`, `phase 2/2: sending enter request`);
+      // Phase 2: World ping (initial avatar/session sync)
+      logger.log(`connect.attempt.${attempt}`, `phase 2/2: sending ping request`);
       const requestStart = Date.now();
       const response = await withTimeout(
-        enter_world(endpointId, state.passphrase, state.encryptedBundle, actorName, room),
+        ping_world(endpointId, state.passphrase, state.encryptedBundle, actorName, room),
         12000,
-        'enter request timed out'
+        'ping request timed out'
       );
       const requestElapsed = Date.now() - requestStart;
-      logger.log(`connect.attempt.${attempt}`, `enter request succeeded in ${requestElapsed}ms`);
+      logger.log(`connect.attempt.${attempt}`, `ping request succeeded in ${requestElapsed}ms`);
       
       const result = JSON.parse(response);
       logger.log(`connect.attempt.${attempt}`, `response: ok=${result.ok} room=${result.room} latest_seq=${result.latest_event_sequence || 0} endpoint=${result.endpoint_id?.slice(0, 8)}...`);
@@ -3425,7 +3550,6 @@ async function enterHome(target, preferredRoom = null) {
   syncBundleTransportsFromEndpoint(inboxEndpointId);
   updateIdentityLine();
 
-  await pollCurrentHomeEvents();
   startHomeEventPolling();
 
   if (!silent) {

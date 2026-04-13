@@ -58,6 +58,7 @@ pub enum MessageEnvelope {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ActorCommand {
     Say { payload: String },
+    Emote { payload: String },
     Raw { command: String },
 }
 
@@ -90,6 +91,12 @@ pub fn parse_message(input: &str) -> MessageEnvelope {
             } else {
                 format!("{} {}", path, command)
             };
+            // @here.method → room command (no alias sent over wire).
+            if target == "here" {
+                return MessageEnvelope::RoomCommand {
+                    command: method_cmd,
+                };
+            }
             return MessageEnvelope::ActorCommand {
                 target,
                 command: ActorCommand::Raw {
@@ -99,11 +106,8 @@ pub fn parse_message(input: &str) -> MessageEnvelope {
         }
 
         if target == "here" {
-            return MessageEnvelope::ActorCommand {
-                target,
-                command: ActorCommand::Raw {
-                    command: canonical_room_command(&command),
-                },
+            return MessageEnvelope::RoomCommand {
+                command: canonical_room_command(&command),
             };
         }
 
@@ -122,14 +126,34 @@ pub fn parse_message(input: &str) -> MessageEnvelope {
         };
     }
 
-    // A leading single-quote is shorthand for `say`.
+    // A leading single-quote is shorthand for room say.
     if let Some(speech) = trimmed.strip_prefix('\'') {
-        return MessageEnvelope::ActorCommand {
-            target: "avatar".to_string(),
-            command: ActorCommand::Say {
-                payload: speech.to_string(),
-            },
+        return MessageEnvelope::RoomCommand {
+            command: format!("say {}", speech),
         };
+    }
+
+    // A leading colon is shorthand for room emote.
+    if let Some(emote) = trimmed.strip_prefix(':') {
+        return MessageEnvelope::RoomCommand {
+            command: format!("emote {}", emote),
+        };
+    }
+
+    // Bare `say` and `emote` are room methods.
+    if let Some(rest) = trimmed.strip_prefix("say") {
+        if rest.starts_with(char::is_whitespace) {
+            return MessageEnvelope::RoomCommand {
+                command: format!("say {}", rest.trim()),
+            };
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("emote") {
+        if rest.starts_with(char::is_whitespace) {
+            return MessageEnvelope::RoomCommand {
+                command: format!("emote {}", rest.trim()),
+            };
+        }
     }
 
     // Bare input is interpreted as command to caller avatar.
@@ -144,6 +168,14 @@ pub fn parse_actor_command(command: &str) -> ActorCommand {
     if let Some(rest) = trimmed.strip_prefix("say") {
         if rest.starts_with(char::is_whitespace) {
             return ActorCommand::Say {
+                payload: rest.trim().to_string(),
+            };
+        }
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("emote") {
+        if rest.starts_with(char::is_whitespace) {
+            return ActorCommand::Emote {
                 payload: rest.trim().to_string(),
             };
         }
