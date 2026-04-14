@@ -89,16 +89,21 @@ For a full Rust clean as well, run `cargo clean` manually.
 
 ## Command Surface
 
-All client commands use dot prefix (`.`). Bare text is gameplay sent to the world.
+Self/config commands use the `my.*` namespace. Operational local commands still use dot prefix (`.`). Bare text is gameplay sent to the world.
 
 ### Dot Commands (local/client)
 
 - `.help`
-- `.identity`
-- `.alias <name> <address>`
-- `.set home [did:ma:<world>#<room>]` (without arg: use current position)
-- `.unalias <name>`
-- `.aliases`
+- `my.did`
+- `my.identity`
+- `my.identity.publish <did:ma:<world>>`
+- `my.home <did:ma:<world>#<room>>`
+- `my.aliases`
+- `my.aliases add <name> <address>`
+- `my.aliases del <name>`
+- `my.aliases.<name>`
+- `my.aliases.rewrite [on|off]`
+- `my.mail [list|pick|reply|delete|clear]`
 - `.inspect @here` (inspect room DID/content CID and exit CID references)
 - `.inspect @exit <name|alias>` (inspect one exit document by name)
 - `.edit [@here|@me|did:ma:<world>#<room>]`
@@ -140,13 +145,12 @@ Unqualified `.edit` is intentionally local-only. Network-backed editing requires
 
 Alias example:
 
-- `.alias oppsett bafyabcdefoppsettcid`
+- `my.aliases add oppsett bafyabcdefoppsettcid`
 - `.eval oppsett`
 
 Home target example:
 
-- `.set home did:ma:<world>#lobby`
-- `.set home` (sets `home` to your current room DID)
+- `my.home did:ma:<world>#lobby`
 - `go home`
 
 ## World Connection Over Iroh

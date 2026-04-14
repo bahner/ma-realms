@@ -57,6 +57,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::{net::TcpListener, sync::{Mutex, RwLock}};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::prelude::*;
+#[cfg(unix)]
+use tokio::signal::unix::{SignalKind, signal};
 
 mod actor;
 mod avatar_commands;
@@ -9711,7 +9713,8 @@ async fn main() -> Result<()> {
             .await;
 
         info!("World initialized. Waiting for connections...");
-        tokio::signal::ctrl_c().await?;
+        let signal_name = wait_for_shutdown_signal().await?;
+        info!("Received {} shutting down", signal_name);
         info!("Shutting down ma-world — saving state...");
 
         match world.save_encrypted_state().await {
@@ -9730,6 +9733,21 @@ async fn main() -> Result<()> {
 
     endpoint.close().await;
     run_result
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> Result<&'static str> {
+    let mut sigterm = signal(SignalKind::terminate())?;
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => Ok("SIGINT"),
+        _ = sigterm.recv() => Ok("SIGTERM"),
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> Result<&'static str> {
+    tokio::signal::ctrl_c().await?;
+    Ok("SIGINT")
 }
 
 async fn bind_status_listener(listen_addr: &str) -> Result<TcpListener> {

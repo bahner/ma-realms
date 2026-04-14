@@ -245,6 +245,7 @@ export function createWorldDispatchFlow({
   isLikelyIrohAddress,
   normalizeIrohAddress,
   parseDot,
+  parseLocalCommand,
   resolveCommandTargetDidOrToken,
   logger,
   sendWorldChat,
@@ -615,29 +616,6 @@ export function createWorldDispatchFlow({
       return `${prefix}${normalized}${String(suffix || '')}`;
     });
 
-    out = out.replace(/^(\s*@\S+)(\s+.+)$/u, (all, head, tail) => {
-      const parts = String(tail || '').trim().split(/\s+/u);
-      const rewritten = parts.map((token) => {
-        const raw = String(token || '').trim();
-        if (!raw) {
-          return raw;
-        }
-        if (raw.includes('"') || raw.includes("'")) {
-          return raw;
-        }
-
-        const direct = resolveAliasTarget(raw, aliases);
-        const stripped = resolveAliasTarget(raw.replace(/^@+/, ''), aliases);
-        const resolved = String(direct || stripped || '').trim();
-        if (!resolved || !isMaDid(resolved)) {
-          return raw;
-        }
-        return resolved;
-      });
-
-      return `${head} ${rewritten.join(' ')}`;
-    });
-
     return out;
   }
 
@@ -657,6 +635,18 @@ export function createWorldDispatchFlow({
 
     if (!rawTarget) {
       return trimmed;
+    }
+
+    const loweredRawTarget = rawTarget.toLowerCase();
+    if (loweredRawTarget.startsWith('my.')) {
+      const resolvedMyTarget = await resolveCommandTargetDidOrToken(rawTarget);
+      const normalizedMyDid = String(resolvedMyTarget || '').trim().replace(/^@+/, '');
+      if (!isMaDid(normalizedMyDid)) {
+        throw new Error('Target after @my. must resolve to did:ma.');
+      }
+      return remainder
+        ? `@${normalizedMyDid} ${remainder}`
+        : `@${normalizedMyDid}`;
     }
 
     const dotIdx = rawTarget.indexOf('.');
@@ -742,6 +732,10 @@ export function createWorldDispatchFlow({
       const rewrittenInput = rewriteAliasesToDid(text);
       const trimmedText = rewrittenInput.trim();
 
+      if (typeof parseLocalCommand === 'function' && parseLocalCommand(trimmedText)) {
+        return;
+      }
+
       if (!state.identity) {
         appendMessage('system', 'Create or unlock an identity first.');
         return;
@@ -804,7 +798,7 @@ export function createWorldDispatchFlow({
           }
         }
 
-        appendMessage('system', 'Not connected. Use go did:ma:<world>#<room> or go home (after .set home).');
+        appendMessage('system', 'Not connected. Use go did:ma:<world>#<room> or go home (after my.home did:ma:<world>#<room>).');
         return;
       }
 

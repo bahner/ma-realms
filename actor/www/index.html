@@ -186,21 +186,21 @@
             <li><code>'hei alle</code> — si noe i rommet (legg til <code>'</code> foran)</li>
             <li><code>@alice 'hei</code> — hvisker til en spesifikk person</li>
             <li><code>.help</code> — vis alle lokale dot-kommandoer</li>
-            <li><code>.aliases</code> — vis aliaslisten din</li>
+            <li><code>my.aliases</code> — vis aliaslisten din</li>
           </ul>
         </section>
 
         <section>
           <h3>4. Publiser identiteten din</h3>
           <p>For at andre skal finne deg, publiser DID-dokumentet ditt til verden:</p>
-          <pre>.identity.publish did:ma:&lt;world&gt;</pre>
+          <pre>my.identity.publish did:ma:&lt;world&gt;</pre>
           <p>Dette ber verdens IPFS-node om å pinne dokumentet ditt og gjøre det
           tilgjengelig via IPNS.</p>
         </section>
 
         <section class="trust-section">
           <h3>Hvem stoler du på?</h3>
-          <p>Når du kjører <code>.identity.publish</code>, sender du DID-dokumentet ditt
+          <p>Når du kjører <code>my.identity.publish</code>, sender du DID-dokumentet ditt
           til verdens IPFS-node. Det betyr:</p>
           <ul>
             <li><strong>Verden ser dokumentet ditt</strong> — den pinnes på verdens node

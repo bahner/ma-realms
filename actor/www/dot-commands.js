@@ -8,7 +8,6 @@ export function createDotCommands({
   humanizeIdentifier,
   isPrintableAliasLabel,
   saveAliasBook,
-  resolveCurrentPositionTarget,
   setDebugMode,
   setLogEnabled,
   setLogLevel,
@@ -27,6 +26,7 @@ export function createDotCommands({
   onDotEdit,
   onDotEval,
   onDotInspect,
+  resolveCommandTargetDidOrToken,
   lookupDidInCurrentRoom,
   sendWorldCommandQuery,
   cacheRoomDidLookup,
@@ -71,177 +71,155 @@ export function createDotCommands({
     return raw;
   }
 
-  function parseDot(input) {
-    const trimmed = String(input || '').trim();
-    if (!trimmed.startsWith('.')) {
-      return false;
-    }
-
-    const rest = trimmed.slice(1).trim();
-    if (!rest) {
-      appendSystemUi('Usage: .<command> (try .help)', 'Bruk: .<kommando> (prøv .help)');
+  function showIdentityDocument() {
+    if (!state.identity) {
+      appendSystemUi('No identity loaded. Create or unlock an identity first.', 'Ingen identitet lastet. Opprett eller lås opp en identitet først.');
       return true;
     }
 
-    const [verbRaw, ...args] = rest.split(/\s+/);
-    const verbToken = String(verbRaw || '').trim();
-    const dotCommand = verbToken.toLowerCase();
-    const tail = args.join(' ').trim();
+    Promise.resolve()
+      .then(async () => {
+        if (typeof prepareIdentityDocumentForSend === 'function') {
+          await prepareIdentityDocumentForSend();
+        }
 
-    if (dotCommand === 'help') {
-      appendSystemUi('Dot commands:', 'Punktkommandoer:');
-      appendSystemUi('  .help                      - this message', '  .help                      - denne meldingen');
-      appendSystemUi('  .identity                  - show local pre-publish DID document as raw JSON', '  .identity                  - vis lokalt DID-dokument (før publisering) som rå JSON');
-      appendSystemUi('  .identity.publish <did:ma:world> - publish DID document to world via ma/ipfs/1', '  .identity.publish <did:ma:world> - publiser DID-dokument til verden via ma/ipfs/1');
-      appendSystemUi('  .aliases add <name> <target> - add/update alias (no spaces in target)', '  .aliases add <navn> <mål> - legg til/oppdater alias (ingen mellomrom i mål)');
-      appendSystemUi('    note: @here/@me/@world/@avatar are updated automatically', '    merk: @here/@me/@world/@avatar oppdateres automatisk');
-      appendSystemUi('  .set home [did:ma:...#room]- set home target (or current position)', '  .set home [did:ma:...#room]- sett home-mål (eller nåværende posisjon)');
-      appendSystemUi('  .aliases del <name>        - remove alias', '  .aliases del <navn>        - fjern alias');
-      appendSystemUi('  .aliases                   - list aliases', '  .aliases                   - list alias');
-      appendSystemUi('  .aliases.<name>            - show address for one alias', '  .aliases.<navn>            - vis adresse for ett alias');
-      appendSystemUi('  .aliases.rewrite [on|off]  - rewrite aliases to DID before parsing', '  .aliases.rewrite [on|off]  - skriv alias om til DID før parsing');
-      appendSystemUi('  .inspect @here|@me|@exit <name>|<object>- inspect room/me/exit/object and discover DID/CIDs', '  .inspect @here|@me|@exit <navn>|<objekt>- inspiser rom/meg/utgang/objekt og finn DID/CID');
-      appendSystemUi('  .use <object|did> [as alias] - set local default target', '  .use <objekt|did> [as alias] - sett lokal standardtarget');
-      appendSystemUi('  .unuse @alias              - clear local default target', '  .unuse @alias              - fjern lokal standardtarget');
-      appendSystemUi('  .edit [@here|@me|@exit <name>|did:ma:<world>#<room>] - open editor', '  .edit [@here|@me|@exit <navn>|did:ma:<world>#<room>] - åpne editor');
-      appendSystemUi('  .eval <cid|alias>          - run script from IPFS CID or alias', '  .eval <cid|alias>          - kjør script fra IPFS CID eller alias');
-      appendSystemUi('  .refresh                   - fetch latest room state and events now', '  .refresh                   - hent siste romtilstand og hendelser nå');
-      appendSystemUi('  .ping [@world|@here|@avatar]- local RTT ping via command path', '  .ping [@world|@here|@avatar]- lokal RTT-ping via kommandoløypa');
-      appendSystemUi('  .mail [list|pick|reply|delete|clear] - inspect mailbox queue', '  .mail [list|pick|reply|delete|clear] - inspiser mailbox-kø');
-      appendSystemUi('  .smoke [alias]             - run connectivity smoke test', '  .smoke [alias]             - kjør enkel tilkoblingstest');
-      appendSystemUi('  .debug [on|off]            - toggle debug logs', '  .debug [on|off]            - slå debuglogger av/på');
-      appendSystemUi('  .log                       - show log settings', '  .log                       - vis logginnstillinger');
-      appendSystemUi('  .log.enabled [true|false]  - get/set console logging enabled', '  .log.enabled [true|false]  - hent/sett om konsoll-logging er aktiv');
-      appendSystemUi('  .log.level [warn|info|debug|error] - get/set console log level', '  .log.level [warn|info|debug|error] - hent/sett loggnivå i konsoll');
-      appendSystemUi('  .dialog.id [alias|fragment|did] - get/set DID rendering in dialog', '  .dialog.id [alias|fragment|did] - hent/sett DID-visning i dialog');
-      appendSystemUi('  .msg.ttl                    - show actor message TTL defaults', '  .msg.ttl                    - vis standard TTL for actor-meldinger');
-      appendSystemUi('  .msg.ttl <chat|cmd|whisper> <seconds> - set default TTL per message type', '  .msg.ttl <chat|cmd|whisper> <sekunder> - sett standard TTL per meldingstype');
-      appendSystemUi('  .ttl [seconds]              - show/set temporary TTL override for outgoing messages', '  .ttl [sekunder]             - vis/sett midlertidig TTL-override for utgående meldinger');
-      appendSystemUi('  .ttl.unset                  - clear temporary TTL override and use defaults', '  .ttl.unset                  - fjern midlertidig TTL-override og bruk standardverdier');
-      appendSystemUi('  .batch.start <seconds>      - start collecting a local batch with per-command timeout', '  .batch.start <sekunder>     - start innsamling av lokal batch med timeout per kommando');
-      appendSystemUi('  .batch.retry <count>        - set retries per batch command', '  .batch.retry <antall>       - sett retry per batch-kommando');
-      appendSystemUi('  .batch                      - run collected batch (fail-fast)', '  .batch                      - kjør innsamlet batch (stopp ved feil)');
-      appendSystemUi('Gameplay (bare, no prefix):', 'Gameplay (bart, uten prefiks):');
-      appendSystemUi('  go did:ma:<world>#<room>   - connect when currently disconnected', '  go did:ma:<world>#<room>   - koble til når du er frakoblet');
-      appendMessage('system', '  pick up <object>           - pick up object before open/list/accept actions');
-      appendSystemUi('  go north                   - navigate (server resolves exit)', '  go north                   - naviger (server løser utgang)');
-      appendSystemUi('  look                       - describe current room', '  look                       - beskriv naverende rom');
-      appendSystemUi('  attack goblin              - gameplay command sent to world', '  attack goblin              - gameplay-kommando sendt til world');
-      appendSystemUi('  @did:ma:<world>#<room> poll - refresh room metadata on demand', '  @did:ma:<world>#<room> poll - oppdater rommetadata ved behov');
-      appendMessage('system', "  'Hello world               - shorthand for @me say Hello world");
-      appendSystemUi('  @target command args       - send command to actor', '  @target command args       - send kommando til actor');
-      appendMessage('system', "  @target 'message           - whisper to actor (E2E)");
-      appendSystemUi('  @world.<command>           - world-admin command', '  @world.<kommando>          - world-admin-kommando');
+        const documentJson = String(state.identity?.document_json || '').trim();
+        if (!documentJson) {
+          appendMessage('system', 'No local DID document available in identity bundle yet.');
+          return;
+        }
+
+        try {
+          const parsed = JSON.parse(documentJson);
+          appendMessage('system', JSON.stringify(parsed, null, 2));
+        } catch {
+          appendMessage('system', documentJson);
+        }
+      })
+      .catch((error) => {
+        appendMessage('system', `Identity prepare failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    return true;
+  }
+
+  function publishIdentity(args) {
+    if (!state.identity) {
+      appendSystemUi('No identity loaded. Create or unlock an identity first.', 'Ingen identitet lastet. Opprett eller lås opp en identitet først.');
+      return true;
+    }
+    if (args.length !== 1 || !isMaDid(String(args[0] || ''))) {
+      appendMessage('system', 'Usage: my.identity.publish <did:ma:world>');
+      return true;
+    }
+    const worldDid = String(args[0]).trim();
+    appendMessage('system', `Publishing identity to ${worldDid} via ma/ipfs/1...`);
+    Promise.resolve()
+      .then(async () => {
+        const result = await publishIdentityToWorldDid(worldDid);
+        if (result?.ok) {
+          appendMessage('system', result.message || 'DID document published successfully.');
+        } else {
+          appendMessage('system', result?.message || 'Publish failed (world returned ok=false).');
+        }
+      })
+      .catch((error) => {
+        appendMessage('system', `Identity publish failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    return true;
+  }
+
+  function setHome(args) {
+    if (args.length !== 1) {
+      appendMessage('system', 'Usage: my.home <did:ma:<world>#<room>>');
       return true;
     }
 
-    if (dotCommand === 'identity') {
-      if (!state.identity) {
-        appendSystemUi('No identity loaded. Create or unlock an identity first.', 'Ingen identitet lastet. Opprett eller lås opp en identitet først.');
-        return true;
-      }
-
-      Promise.resolve()
-        .then(async () => {
-          if (typeof prepareIdentityDocumentForSend === 'function') {
-            await prepareIdentityDocumentForSend();
-          }
-
-          const documentJson = String(state.identity?.document_json || '').trim();
-          if (!documentJson) {
-            appendMessage('system', 'No local DID document available in identity bundle yet.');
-            return;
-          }
-
-          try {
-            const parsed = JSON.parse(documentJson);
-            appendMessage('system', JSON.stringify(parsed, null, 2));
-          } catch {
-            appendMessage('system', documentJson);
-          }
-        })
-        .catch((error) => {
-          appendMessage('system', `Identity prepare failed: ${error instanceof Error ? error.message : String(error)}`);
-        });
+    const target = String(args[0] || '').trim();
+    if (!isMaDid(target) || !target.includes('#')) {
+      appendMessage('system', 'Usage: my.home <did:ma:<world>#<room>>');
       return true;
     }
 
-    if (dotCommand === 'identity.publish') {
-      if (!state.identity) {
-        appendSystemUi('No identity loaded. Create or unlock an identity first.', 'Ingen identitet lastet. Opprett eller lås opp en identitet først.');
+    state.aliasBook.home = target;
+    saveAliasBook();
+    if (typeof onAliasBookChanged === 'function') {
+      onAliasBookChanged();
+    }
+    appendMessage('system', `Home set: home => ${target}`);
+    return true;
+  }
+
+  function handleAliasRewrite(args) {
+    if (args.length === 0) {
+      appendMessage('system', `${state.aliasRewriteEnabled ? 'on' : 'off'}`);
+      return true;
+    }
+    if (args.length !== 1) {
+      appendMessage('system', 'Usage: my.aliases.rewrite [on|off]');
+      return true;
+    }
+    const mode = String(args[0] || '').trim().toLowerCase();
+    if (mode !== 'on' && mode !== 'off') {
+      appendMessage('system', 'Usage: my.aliases.rewrite [on|off]');
+      return true;
+    }
+    if (typeof setAliasRewriteEnabled === 'function') {
+      setAliasRewriteEnabled(mode === 'on');
+    }
+    appendMessage('system', `Alias rewrite is now ${mode}.`);
+    return true;
+  }
+
+  function handleAliases(subcommand, args, pathSuffix = '') {
+    if (!subcommand && !pathSuffix && args.length === 0) {
+      const entries = Object.entries(state.aliasBook);
+      if (entries.length === 0) {
+        appendMessage('system', 'No aliases saved yet.');
         return true;
       }
-      if (args.length !== 1 || !isMaDid(String(args[0] || ''))) {
-        appendMessage('system', 'Usage: .identity.publish <did:ma:world>');
-        return true;
+      for (const [name, address] of entries) {
+        appendMessage('system', `my.aliases.${name} ${address}`);
       }
-      const worldDid = String(args[0]).trim();
-      appendMessage('system', `Publishing identity to ${worldDid} via ma/ipfs/1...`);
-      Promise.resolve()
-        .then(async () => {
-          const result = await publishIdentityToWorldDid(worldDid);
-          if (result?.ok) {
-            appendMessage('system', result.message || 'DID document published successfully.');
-          } else {
-            appendMessage('system', result?.message || 'Publish failed (world returned ok=false).');
-          }
-        })
-        .catch((error) => {
-          appendMessage('system', `Identity publish failed: ${error instanceof Error ? error.message : String(error)}`);
-        });
       return true;
     }
 
-    if (dotCommand === 'aliases') {
-      if (args.length === 0) {
-        const entries = Object.entries(state.aliasBook);
-        if (entries.length === 0) {
-          appendMessage('system', 'No aliases saved yet.');
-          return true;
-        }
-        for (const [name, address] of entries) {
-          appendMessage('system', `.aliases.${name} ${address}`);
-        }
+    if (pathSuffix) {
+      if (pathSuffix === 'rewrite') {
+        return handleAliasRewrite(args);
+      }
+
+      if (pathSuffix === 'add' || pathSuffix === 'del') {
+        return handleAliases(pathSuffix, args);
+      }
+
+      const inputAliasName = normalizeAliasNameToken(pathSuffix);
+      const aliasName = resolveAliasBookKey(inputAliasName);
+      if (!aliasName) {
+        appendMessage('system', 'Usage: my.aliases.<name>');
+        return true;
+      }
+      if (!Object.prototype.hasOwnProperty.call(state.aliasBook, aliasName)) {
+        appendMessage('system', `Alias not found: ${inputAliasName}`);
+        return true;
+      }
+      appendMessage('system', `my.aliases.${aliasName} ${state.aliasBook[aliasName]}`);
+      return true;
+    }
+
+    const action = String(subcommand || '').trim().toLowerCase();
+    if (!action) {
+      appendMessage('system', 'Usage: my.aliases | my.aliases add <name> <target> | my.aliases del <name> | my.aliases.<name> | my.aliases.rewrite [on|off]');
+      return true;
+    }
+
+    if (action === 'add') {
+      if (args.length !== 2) {
+        appendMessage('system', 'Usage: my.aliases add <name> <target>');
         return true;
       }
 
-      const sub = String(args[0] || '').trim().toLowerCase();
-      if (sub !== 'add' && sub !== 'del') {
-        appendMessage('system', 'Usage: .aliases | .aliases add <name> <target> | .aliases del <name> | .aliases.<name> | .aliases.rewrite [on|off]');
-        return true;
-      }
-
-      if (sub === 'del') {
-        if (args.length !== 2) {
-          appendMessage('system', 'Usage: .aliases del <name>');
-          return true;
-        }
-        const inputName = normalizeAliasNameToken(args[1]);
-        const name = resolveAliasBookKey(inputName);
-        if (DYNAMIC_SPECIAL_ALIASES.has(name)) {
-          appendMessage('system', `Alias ${name} is managed automatically.`);
-          return true;
-        }
-        if (!name || !Object.prototype.hasOwnProperty.call(state.aliasBook, name)) {
-          appendMessage('system', `Alias not found: ${inputName || String(args[1] || '').trim()}`);
-          return true;
-        }
-        delete state.aliasBook[name];
-        saveAliasBook();
-        if (typeof onAliasBookChanged === 'function') {
-          onAliasBookChanged();
-        }
-        appendMessage('system', `Alias removed: ${name}`);
-        return true;
-      }
-
-      if (args.length !== 3) {
-        appendMessage('system', 'Usage: .aliases add <name> <target>');
-        return true;
-      }
-
-      let name = normalizeAliasNameToken(args[1]);
-      const address = normalizeAliasTargetToken(args[2]);
+      const name = normalizeAliasNameToken(args[0]);
+      const address = normalizeAliasTargetToken(args[1]);
 
       if (DYNAMIC_SPECIAL_ALIASES.has(name)) {
         appendMessage('system', `Alias ${name} is managed automatically.`);
@@ -267,66 +245,260 @@ export function createDotCommands({
       return true;
     }
 
-    if (dotCommand === 'aliases.rewrite') {
-      if (args.length === 0) {
-        appendMessage('system', `${state.aliasRewriteEnabled ? 'on' : 'off'}`);
-        return true;
-      }
+    if (action === 'del') {
       if (args.length !== 1) {
-        appendMessage('system', 'Usage: .aliases.rewrite [on|off]');
+        appendMessage('system', 'Usage: my.aliases del <name>');
         return true;
       }
-      const mode = String(args[0] || '').trim().toLowerCase();
-      if (mode !== 'on' && mode !== 'off') {
-        appendMessage('system', 'Usage: .aliases.rewrite [on|off]');
+      const inputName = normalizeAliasNameToken(args[0]);
+      const name = resolveAliasBookKey(inputName);
+      if (DYNAMIC_SPECIAL_ALIASES.has(name)) {
+        appendMessage('system', `Alias ${name} is managed automatically.`);
         return true;
       }
-      if (typeof setAliasRewriteEnabled === 'function') {
-        setAliasRewriteEnabled(mode === 'on');
-      }
-      appendMessage('system', `Alias rewrite is now ${mode}.`);
-      return true;
-    }
-
-    if (dotCommand.startsWith('aliases.')) {
-      const inputAliasName = normalizeAliasNameToken(verbToken.slice('aliases.'.length).trim());
-      const aliasName = resolveAliasBookKey(inputAliasName);
-      if (!aliasName) {
-        appendMessage('system', 'Usage: .aliases.<name>');
+      if (!name || !Object.prototype.hasOwnProperty.call(state.aliasBook, name)) {
+        appendMessage('system', `Alias not found: ${inputName || String(args[0] || '').trim()}`);
         return true;
       }
-      if (!Object.prototype.hasOwnProperty.call(state.aliasBook, aliasName)) {
-        appendMessage('system', `Alias not found: ${inputAliasName}`);
-        return true;
-      }
-      appendMessage('system', `.aliases.${aliasName} ${state.aliasBook[aliasName]}`);
-      return true;
-    }
-
-    if (dotCommand === 'set') {
-      const key = String(args[0] || '').toLowerCase();
-      if (key !== 'home') {
-        appendMessage('system', 'Usage: .set home [did:ma:<world>#<room>]');
-        return true;
-      }
-
-      let target = args.slice(1).join(' ').trim();
-      if (!target) {
-        target = resolveCurrentPositionTarget();
-        if (!target) {
-          appendMessage('system', 'Could not resolve current position as did:ma target. Use .set home did:ma:<world>#<room>.');
-          return true;
-        }
-      }
-
-      if (!isMaDid(target)) {
-        appendMessage('system', 'Usage: .set home [did:ma:<world>#<room>]');
-        return true;
-      }
-
-      state.aliasBook.home = target;
+      delete state.aliasBook[name];
       saveAliasBook();
-      appendMessage('system', `Home set: home => ${target}`);
+      if (typeof onAliasBookChanged === 'function') {
+        onAliasBookChanged();
+      }
+      appendMessage('system', `Alias removed: ${name}`);
+      return true;
+    }
+
+    if (action === 'rewrite') {
+      return handleAliasRewrite(args);
+    }
+
+    appendMessage('system', 'Usage: my.aliases | my.aliases add <name> <target> | my.aliases del <name> | my.aliases.<name> | my.aliases.rewrite [on|off]');
+    return true;
+  }
+
+  function handleMail(subcommand, args) {
+    const action = String(subcommand || 'list').toLowerCase();
+    const list = Array.isArray(state.mailbox) ? state.mailbox : [];
+
+    if (action === 'list') {
+      if (!list.length) {
+        appendSystemUi('Mailbox is empty.', 'Mailbox er tom.');
+        return true;
+      }
+      appendMessage('system', `Mailbox (${list.length}):`);
+      for (const entry of list) {
+        const preview = String(entry.content_text || '').replace(/\s+/g, ' ').slice(0, 80) || '(binary)';
+        appendMessage(
+          'system',
+          `  #${entry.id} from=${humanizeIdentifier(entry.from_did || '(unknown)')} type=${entry.content_type || '(unknown)'} text=${preview}`
+        );
+      }
+      appendSystemUi('Use my.mail pick <id>, my.mail reply <id> <text>, or my.mail delete <id>.', 'Bruk my.mail pick <id>, my.mail reply <id> <tekst>, eller my.mail delete <id>.');
+      return true;
+    }
+
+    if (action === 'pick' || action === 'show') {
+      const idRaw = String(args[0] || '').trim();
+      const id = Number(idRaw);
+      if (!Number.isFinite(id) || id <= 0) {
+        appendMessage('system', 'Usage: my.mail pick <id>');
+        return true;
+      }
+      const entry = list.find((item) => Number(item.id) === id);
+      if (!entry) {
+        appendMessage('system', `Mailbox entry not found: ${id}`);
+        return true;
+      }
+      appendMessage('system', `my.mail pick ${id}`);
+      appendMessage('system', `  from: ${humanizeIdentifier(entry.from_did || '(unknown)')}`);
+      appendMessage('system', `  endpoint: ${humanizeIdentifier(entry.from_endpoint || '(unknown)')}`);
+      appendMessage('system', `  type: ${entry.content_type || '(unknown)'}`);
+      appendMessage('system', `  text: ${entry.content_text || '(binary)'}`);
+      appendMessage('system', `  cbor: ${entry.message_cbor_b64 || '(missing)'}`);
+      return true;
+    }
+
+    if (action === 'delete' || action === 'del' || action === 'rm') {
+      const idRaw = String(args[0] || '').trim();
+      const id = Number(idRaw);
+      if (!Number.isFinite(id) || id <= 0) {
+        appendMessage('system', 'Usage: my.mail delete <id>');
+        return true;
+      }
+      const before = list.length;
+      state.mailbox = list.filter((item) => Number(item.id) !== id);
+      if (state.mailbox.length === before) {
+        appendMessage('system', `Mailbox entry not found: ${id}`);
+        return true;
+      }
+      appendMessage('system', `Deleted mailbox entry #${id}.`);
+      return true;
+    }
+
+    if (action === 'reply') {
+      const idRaw = String(args[0] || '').trim();
+      const id = Number(idRaw);
+      const replyText = args.slice(1).join(' ').trim();
+      if (!Number.isFinite(id) || id <= 0 || !replyText) {
+        appendMessage('system', 'Usage: my.mail reply <id> <text>');
+        return true;
+      }
+      const entry = list.find((item) => Number(item.id) === id);
+      if (!entry) {
+        appendMessage('system', `Mailbox entry not found: ${id}`);
+        return true;
+      }
+      const targetDid = String(entry.from_did || '').trim();
+      if (!isMaDid(targetDid)) {
+        appendMessage('system', `Mailbox entry #${id} has no valid sender DID.`);
+        return true;
+      }
+      sendWhisperToDid(targetDid, replyText)
+        .then(() => {
+          appendMessage('system', `Reply sent to ${humanizeIdentifier(targetDid)} from mailbox #${id}.`);
+        })
+        .catch((error) => {
+          appendMessage('system', `Reply failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
+      return true;
+    }
+
+    if (action === 'clear') {
+      const cleared = list.length;
+      state.mailbox = [];
+      appendMessage('system', `Mailbox cleared (${cleared} entries).`);
+      return true;
+    }
+
+    appendMessage('system', 'Usage: my.mail [list|pick <id>|reply <id> <text>|delete <id>|clear]');
+    return true;
+  }
+
+  function parseLocalCommand(input) {
+    const trimmed = String(input || '').trim();
+    if (!trimmed) {
+      return false;
+    }
+    if (trimmed.startsWith('.')) {
+      return parseDot(trimmed);
+    }
+
+    const [verbRaw, ...args] = trimmed.split(/\s+/);
+    const verbToken = String(verbRaw || '').trim();
+    const command = verbToken.toLowerCase();
+    if (!command.startsWith('my.')) {
+      return false;
+    }
+
+    if (command === 'my.did') {
+      if (!state.identity) {
+        appendSystemUi('No identity loaded. Create or unlock an identity first.', 'Ingen identitet lastet. Opprett eller lås opp en identitet først.');
+        return true;
+      }
+      appendMessage('system', String(state.identity?.did || '').trim() || '(missing did)');
+      return true;
+    }
+
+    if (command === 'my.identity') {
+      return showIdentityDocument();
+    }
+
+    if (command === 'my.identity.publish') {
+      return publishIdentity(args);
+    }
+
+    if (command === 'my.home') {
+      return setHome(args);
+    }
+
+    if (command === 'my.aliases') {
+      return handleAliases(args[0] || '', args.slice(1));
+    }
+
+    if (command.startsWith('my.aliases.')) {
+      return handleAliases('', args, command.slice('my.aliases.'.length));
+    }
+
+    if (command === 'my.mail') {
+      return handleMail(args[0] || 'list', args.slice(1));
+    }
+
+    if (command.startsWith('my.mail.')) {
+      return handleMail(command.slice('my.mail.'.length), args);
+    }
+
+    appendMessage('system', uiText(
+      `Unknown command: ${verbToken}. Try .help.`,
+      `Ukjent kommando: ${verbToken}. Prøv .help.`
+    ));
+    return true;
+  }
+
+  function parseDot(input) {
+    const trimmed = String(input || '').trim();
+    if (!trimmed.startsWith('.')) {
+      return false;
+    }
+
+    const rest = trimmed.slice(1).trim();
+    if (!rest) {
+      appendSystemUi('Usage: .<command> (try .help)', 'Bruk: .<kommando> (prøv .help)');
+      return true;
+    }
+
+    const [verbRaw, ...args] = rest.split(/\s+/);
+    const verbToken = String(verbRaw || '').trim();
+    const dotCommand = verbToken.toLowerCase();
+    const tail = args.join(' ').trim();
+
+    if (dotCommand === 'help') {
+      appendSystemUi('Local commands:', 'Lokale kommandoer:');
+      appendSystemUi('  .help                      - this message', '  .help                      - denne meldingen');
+      appendSystemUi('My namespace (self/config):', 'My-navnerom (selv/konfig):');
+      appendSystemUi('  my.did                    - show your identity DID', '  my.did                    - vis identitets-DID-en din');
+      appendSystemUi('  my.identity               - show local pre-publish DID document as raw JSON', '  my.identity               - vis lokalt DID-dokument (før publisering) som rå JSON');
+      appendSystemUi('  my.identity.publish <did:ma:world> - publish DID document to world via ma/ipfs/1', '  my.identity.publish <did:ma:world> - publiser DID-dokument til verden via ma/ipfs/1');
+      appendSystemUi('  my.home <did:ma:...#room> - set home target', '  my.home <did:ma:...#room> - sett home-mål');
+      appendSystemUi('  my.aliases add <name> <target> - add/update alias (no spaces in target)', '  my.aliases add <navn> <mål> - legg til/oppdater alias (ingen mellomrom i mål)');
+      appendSystemUi('    note: @here/@me/@world/@avatar are updated automatically', '    merk: @here/@me/@world/@avatar oppdateres automatisk');
+      appendSystemUi('  my.aliases del <name>      - remove alias', '  my.aliases del <navn>      - fjern alias');
+      appendSystemUi('  my.aliases                 - list aliases', '  my.aliases                 - list alias');
+      appendSystemUi('  my.aliases.<name>          - show address for one alias', '  my.aliases.<navn>          - vis adresse for ett alias');
+      appendSystemUi('  my.aliases.rewrite [on|off]- rewrite aliases to DID before parsing', '  my.aliases.rewrite [on|off]- skriv alias om til DID før parsing');
+      appendSystemUi('  my.mail [list|pick|reply|delete|clear] - inspect mailbox queue', '  my.mail [list|pick|reply|delete|clear] - inspiser mailbox-kø');
+      appendSystemUi('Dot commands (local tools):', 'Punktkommandoer (lokale verktøy):');
+      appendSystemUi('  .inspect @here|@me|@exit <name>|<object>- inspect room/me/exit/object and discover DID/CIDs', '  .inspect @here|@me|@exit <navn>|<objekt>- inspiser rom/meg/utgang/objekt og finn DID/CID');
+      appendSystemUi('  .use <object|did> [as alias] - set local default target', '  .use <objekt|did> [as alias] - sett lokal standardtarget');
+      appendSystemUi('  .unuse @alias              - clear local default target', '  .unuse @alias              - fjern lokal standardtarget');
+      appendSystemUi('  .edit [@here|@me|@exit <name>|did:ma:<world>#<room>] - open editor', '  .edit [@here|@me|@exit <navn>|did:ma:<world>#<room>] - åpne editor');
+      appendSystemUi('  .eval <cid|alias>          - run script from IPFS CID or alias', '  .eval <cid|alias>          - kjør script fra IPFS CID eller alias');
+      appendSystemUi('  .refresh                   - fetch latest room state and events now', '  .refresh                   - hent siste romtilstand og hendelser nå');
+      appendSystemUi('  .ping [@world|@here|@avatar]- local RTT ping via command path', '  .ping [@world|@here|@avatar]- lokal RTT-ping via kommandoløypa');
+      appendSystemUi('  .smoke [alias]             - run connectivity smoke test', '  .smoke [alias]             - kjør enkel tilkoblingstest');
+      appendSystemUi('  .debug [on|off]            - toggle debug logs', '  .debug [on|off]            - slå debuglogger av/på');
+      appendSystemUi('  .log                       - show log settings', '  .log                       - vis logginnstillinger');
+      appendSystemUi('  .log.enabled [true|false]  - get/set console logging enabled', '  .log.enabled [true|false]  - hent/sett om konsoll-logging er aktiv');
+      appendSystemUi('  .log.level [warn|info|debug|error] - get/set console log level', '  .log.level [warn|info|debug|error] - hent/sett loggnivå i konsoll');
+      appendSystemUi('  .dialog.id [alias|fragment|did] - get/set DID rendering in dialog', '  .dialog.id [alias|fragment|did] - hent/sett DID-visning i dialog');
+      appendSystemUi('  .msg.ttl                    - show actor message TTL defaults', '  .msg.ttl                    - vis standard TTL for actor-meldinger');
+      appendSystemUi('  .msg.ttl <chat|cmd|whisper> <seconds> - set default TTL per message type', '  .msg.ttl <chat|cmd|whisper> <sekunder> - sett standard TTL per meldingstype');
+      appendSystemUi('  .ttl [seconds]              - show/set temporary TTL override for outgoing messages', '  .ttl [sekunder]             - vis/sett midlertidig TTL-override for utgående meldinger');
+      appendSystemUi('  .ttl.unset                  - clear temporary TTL override and use defaults', '  .ttl.unset                  - fjern midlertidig TTL-override og bruk standardverdier');
+      appendSystemUi('  .batch.start <seconds>      - start collecting a local batch with per-command timeout', '  .batch.start <sekunder>     - start innsamling av lokal batch med timeout per kommando');
+      appendSystemUi('  .batch.retry <count>        - set retries per batch command', '  .batch.retry <antall>       - sett retry per batch-kommando');
+      appendSystemUi('  .batch                      - run collected batch (fail-fast)', '  .batch                      - kjør innsamlet batch (stopp ved feil)');
+      appendSystemUi('Gameplay (bare, no prefix):', 'Gameplay (bart, uten prefiks):');
+      appendSystemUi('  go did:ma:<world>#<room>   - connect when currently disconnected', '  go did:ma:<world>#<room>   - koble til når du er frakoblet');
+      appendMessage('system', '  pick up <object>           - pick up object before open/list/accept actions');
+      appendSystemUi('  go north                   - navigate (server resolves exit)', '  go north                   - naviger (server løser utgang)');
+      appendSystemUi('  look                       - describe current room', '  look                       - beskriv naverende rom');
+      appendSystemUi('  attack goblin              - gameplay command sent to world', '  attack goblin              - gameplay-kommando sendt til world');
+      appendSystemUi('  @did:ma:<world>#<room> poll - refresh room metadata on demand', '  @did:ma:<world>#<room> poll - oppdater rommetadata ved behov');
+      appendMessage('system', "  'Hello world               - shorthand for @me say Hello world");
+      appendSystemUi('  @target command args       - send command to actor', '  @target command args       - send kommando til actor');
+      appendMessage('system', "  @target 'message           - whisper to actor (E2E)");
+      appendSystemUi('  @world.<command>           - world-admin command', '  @world.<kommando>          - world-admin-kommando');
       return true;
     }
 
@@ -545,7 +717,9 @@ export function createDotCommands({
         .then(async () => {
           const objectDid = isMaDid(rawTarget)
             ? rawTarget
-            : await lookupDidInCurrentRoom(rawTarget);
+            : (rawTarget.toLowerCase().startsWith('@my.')
+              ? await resolveCommandTargetDidOrToken(rawTarget)
+              : await lookupDidInCurrentRoom(rawTarget));
           const fragment = objectDid.includes('#') ? objectDid.split('#')[1] : '';
           const autoAlias = fragment ? `@${fragment.replace(/[^A-Za-z0-9_-]/g, '').toLowerCase()}` : '@obj';
           const alias = requestedAlias || autoAlias;
@@ -622,104 +796,6 @@ export function createDotCommands({
       return true;
     }
 
-    if (dotCommand === 'mail' || dotCommand === 'mailbox') {
-      const sub = String(args[0] || 'list').toLowerCase();
-      const list = Array.isArray(state.mailbox) ? state.mailbox : [];
-
-      if (sub === 'list') {
-        if (!list.length) {
-          appendSystemUi('Mailbox is empty.', 'Mailbox er tom.');
-          return true;
-        }
-        appendMessage('system', `Mailbox (${list.length}):`);
-        for (const entry of list) {
-          const preview = String(entry.content_text || '').replace(/\s+/g, ' ').slice(0, 80) || '(binary)';
-          appendMessage(
-            'system',
-            `  #${entry.id} from=${humanizeIdentifier(entry.from_did || '(unknown)')} type=${entry.content_type || '(unknown)'} text=${preview}`
-          );
-        }
-        appendSystemUi('Use .mail pick <id>, .mail reply <id> <text>, or .mail delete <id>.', 'Bruk .mail pick <id>, .mail reply <id> <tekst>, eller .mail delete <id>.');
-        return true;
-      }
-
-      if (sub === 'pick' || sub === 'show') {
-        const idRaw = String(args[1] || '').trim();
-        const id = Number(idRaw);
-        if (!Number.isFinite(id) || id <= 0) {
-          appendMessage('system', 'Usage: .mail pick <id>');
-          return true;
-        }
-        const entry = list.find((item) => Number(item.id) === id);
-        if (!entry) {
-          appendMessage('system', `Mailbox entry not found: ${id}`);
-          return true;
-        }
-        appendMessage('system', `.mail pick ${id}`);
-        appendMessage('system', `  from: ${humanizeIdentifier(entry.from_did || '(unknown)')}`);
-        appendMessage('system', `  endpoint: ${humanizeIdentifier(entry.from_endpoint || '(unknown)')}`);
-        appendMessage('system', `  type: ${entry.content_type || '(unknown)'}`);
-        appendMessage('system', `  text: ${entry.content_text || '(binary)'}`);
-        appendMessage('system', `  cbor: ${entry.message_cbor_b64 || '(missing)'}`);
-        return true;
-      }
-
-      if (sub === 'delete' || sub === 'del' || sub === 'rm') {
-        const idRaw = String(args[1] || '').trim();
-        const id = Number(idRaw);
-        if (!Number.isFinite(id) || id <= 0) {
-          appendMessage('system', 'Usage: .mail delete <id>');
-          return true;
-        }
-        const before = list.length;
-        state.mailbox = list.filter((item) => Number(item.id) !== id);
-        if (state.mailbox.length === before) {
-          appendMessage('system', `Mailbox entry not found: ${id}`);
-          return true;
-        }
-        appendMessage('system', `Deleted mailbox entry #${id}.`);
-        return true;
-      }
-
-      if (sub === 'reply') {
-        const idRaw = String(args[1] || '').trim();
-        const id = Number(idRaw);
-        const replyText = args.slice(2).join(' ').trim();
-        if (!Number.isFinite(id) || id <= 0 || !replyText) {
-          appendMessage('system', 'Usage: .mail reply <id> <text>');
-          return true;
-        }
-        const entry = list.find((item) => Number(item.id) === id);
-        if (!entry) {
-          appendMessage('system', `Mailbox entry not found: ${id}`);
-          return true;
-        }
-        const targetDid = String(entry.from_did || '').trim();
-        if (!isMaDid(targetDid)) {
-          appendMessage('system', `Mailbox entry #${id} has no valid sender DID.`);
-          return true;
-        }
-        sendWhisperToDid(targetDid, replyText)
-          .then(() => {
-            appendMessage('system', `Reply sent to ${humanizeIdentifier(targetDid)} from mailbox #${id}.`);
-          })
-          .catch((error) => {
-            appendMessage('system', `Reply failed: ${error instanceof Error ? error.message : String(error)}`);
-          });
-        return true;
-      }
-
-      if (sub === 'clear') {
-        const cleared = list.length;
-        state.mailbox = [];
-        appendMessage('system', `Mailbox cleared (${cleared} entries).`);
-        return true;
-      }
-
-      appendMessage('system', 'Usage: .mail [list|pick <id>|reply <id> <text>|delete <id>|clear]');
-      return true;
-    }
-
     if (dotCommand === 'smoke') {
       if (args.length > 1) {
         appendMessage('system', 'Usage: .smoke [alias]');
@@ -740,5 +816,6 @@ export function createDotCommands({
 
   return {
     parseDot,
+    parseLocalCommand,
   };
 }

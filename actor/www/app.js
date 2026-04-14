@@ -1145,6 +1145,46 @@ async function resolveCommandTargetDidOrToken(targetToken) {
   if (!raw) {
     throw new Error('Usage: @target <command>');
   }
+  const rawLower = raw.toLowerCase();
+  if (rawLower.startsWith('my.')) {
+    const aliasName = String(raw.slice(3) || '').trim();
+    if (!aliasName) {
+      throw new Error('Usage: @my.<alias> <command>');
+    }
+
+    const aliasDirect = String(state.aliasBook?.[aliasName] || '').trim();
+    const aliasWithAt = String(state.aliasBook?.[`@${aliasName}`] || '').trim();
+    const resolvedAlias = String(aliasDirect || aliasWithAt || resolveAliasInput(aliasName) || '').trim();
+    if (!resolvedAlias) {
+      throw new Error(`@my.${aliasName} is not defined in my.aliases.`);
+    }
+
+    if (isMaDid(resolvedAlias)) {
+      return resolvedAlias;
+    }
+
+    if (resolvedAlias.startsWith('@')) {
+      const aliasTarget = String(resolvedAlias || '').trim().replace(/^@+/, '');
+      const nestedAliasDirect = String(state.aliasBook?.[aliasTarget] || '').trim();
+      const nestedAliasWithAt = String(state.aliasBook?.[`@${aliasTarget}`] || '').trim();
+      const nestedResolved = String(
+        nestedAliasDirect
+        || nestedAliasWithAt
+        || resolveAliasInput(aliasTarget)
+        || ''
+      ).trim();
+
+      if (isMaDid(aliasTarget)) {
+        return aliasTarget;
+      }
+      if (isMaDid(nestedResolved)) {
+        return nestedResolved;
+      }
+    }
+
+    throw new Error(`@my.${aliasName} must resolve to did:ma.`);
+  }
+
   if (raw.toLowerCase() === 'world') {
     const worldDid = currentWorldDid();
     if (isMaDidTarget(worldDid) && worldDid.includes('#') && !isUnconfiguredDidTarget(worldDid)) {
@@ -1179,52 +1219,10 @@ async function resolveCommandTargetDidOrToken(targetToken) {
     }
   }
 
-  const aliasDirect = String(state.aliasBook?.[raw] || '').trim();
-  const aliasWithAt = String(state.aliasBook?.[`@${raw}`] || '').trim();
-  const resolvedAlias = String(aliasDirect || aliasWithAt || resolveAliasInput(raw) || '').trim();
-
-  if (resolvedAlias.startsWith('@')) {
-    const aliasTarget = String(resolvedAlias || '').trim().replace(/^@+/, '');
-    if (!aliasTarget) {
-      throw new Error(`Alias target for '${raw}' is empty.`);
-    }
-
-    const nestedAliasDirect = String(state.aliasBook?.[aliasTarget] || '').trim();
-    const nestedAliasWithAt = String(state.aliasBook?.[`@${aliasTarget}`] || '').trim();
-    const nestedResolved = String(
-      nestedAliasDirect
-      || nestedAliasWithAt
-      || resolveAliasInput(aliasTarget)
-      || ''
-    ).trim();
-
-    if (isMaDid(aliasTarget)) {
-      cacheRoomDidLookup(raw, aliasTarget);
-      return aliasTarget;
-    }
-    if (isMaDid(nestedResolved)) {
-      cacheRoomDidLookup(raw, nestedResolved);
-      return nestedResolved;
-    }
-
-    // Keep @handle aliases as @handle (for remote actor names), do not force DID lookup.
-    return aliasTarget;
-  }
-
-  if (isMaDid(resolvedAlias)) {
-    return resolvedAlias;
-  }
-
-  const mappedDid = lookupHandleDid(raw) || lookupHandleDid(resolvedAlias) || '';
+  const mappedDid = lookupHandleDid(raw) || '';
   if (isMaDid(String(mappedDid))) {
     cacheRoomDidLookup(raw, mappedDid);
     return mappedDid;
-  }
-
-  const didByEndpoint = String(findDidByEndpoint(resolvedAlias) || '').trim();
-  if (isMaDid(didByEndpoint)) {
-    cacheRoomDidLookup(raw, didByEndpoint);
-    return didByEndpoint;
   }
 
   if (isBuiltinTargetToken(raw)) {
@@ -2051,11 +2049,11 @@ function dialogText(text) {
     return source;
   }
 
-  if (lowered.startsWith('.aliases')
+  if (lowered.startsWith('my.aliases')
     || lowered.startsWith('alias saved:')
     || lowered.startsWith('alias removed:')
     || lowered.startsWith('alias not found:')
-    || lowered.startsWith('usage: .aliases')
+    || lowered.startsWith('usage: my.aliases')
     || lowered.startsWith('resolving did target ')
     || lowered.startsWith('connecting to ')
     || lowered.startsWith('send failed:')
@@ -2732,25 +2730,6 @@ function showSetup() {
   updateLocationContext();
 }
 
-function resolveCurrentPositionTarget() {
-  if (!state.currentHome) {
-    return '';
-  }
-
-  const roomDid = String(state.currentHome.roomDid || '').trim();
-  if (isMaDidTarget(roomDid) && !isUnconfiguredDidTarget(roomDid)) {
-    return roomDid;
-  }
-
-  const worldDid = currentWorldDid();
-  if (worldDid) {
-    const room = String(state.currentHome.room || 'lobby').trim() || 'lobby';
-    return didWithFragment(worldDid, room);
-  }
-
-  return '';
-}
-
 function setUiLanguage(value) {
   const normalized = normalizeUiLang(value) || uiLangFromLanguage('en', DEFAULT_UI_LANG);
   state.uiLang = normalized;
@@ -2834,7 +2813,7 @@ const {
   clearActiveObjectTarget,
 });
 
-const { parseDot } = createDotCommands({
+const { parseDot, parseLocalCommand } = createDotCommands({
   state,
   appendSystemUi,
   appendMessage,
@@ -2842,7 +2821,6 @@ const { parseDot } = createDotCommands({
   humanizeIdentifier,
   isPrintableAliasLabel,
   saveAliasBook,
-  resolveCurrentPositionTarget,
   setDebugMode,
   setLogEnabled,
   setLogLevel,
@@ -2862,6 +2840,7 @@ const { parseDot } = createDotCommands({
   onDotEdit,
   onDotEval,
   onDotInspect,
+  resolveCommandTargetDidOrToken,
   lookupDidInCurrentRoom,
   sendWorldCommandQuery,
   cacheRoomDidLookup,
@@ -3629,6 +3608,7 @@ worldDispatchFlow = createWorldDispatchFlow({
   isLikelyIrohAddress,
   normalizeIrohAddress,
   parseDot,
+  parseLocalCommand,
   resolveCommandTargetDidOrToken,
   logger,
   sendWorldChat: send_world_chat,
@@ -3681,6 +3661,10 @@ function enqueueCommandText(text) {
     .then(async () => {
       if (queuedText.startsWith('.')) {
         parseDot(queuedText);
+        return;
+      }
+
+      if (parseLocalCommand(queuedText)) {
         return;
       }
 
