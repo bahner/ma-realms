@@ -2621,9 +2621,8 @@ mod tests {
         let ipns = generate_ipns_id().expect("ipns id");
         let encrypted_bundle_json = build_valid_bundle(passphrase, &ipns);
 
-        let result = validate_identity_bundle_keys(passphrase, &encrypted_bundle_json)
-            .expect("valid bundle should pass");
-        assert_eq!(result, "ok");
+        let result = validate_identity_bundle_keys_internal(passphrase, &encrypted_bundle_json);
+        assert!(result.is_ok(), "valid bundle should pass: {:?}", result.err());
     }
 
     #[test]

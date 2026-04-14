@@ -331,7 +331,11 @@ fn cmd_property(command: &str, ctx: &RoomActorContext<'_>) -> Option<RoomActorRe
 pub fn execute_room_actor_command(command: &str, ctx: &RoomActorContext<'_>) -> RoomActorResult {
     let normalized = command.trim();
 
-    if normalized.is_empty() || normalized.eq_ignore_ascii_case("help") {
+    if normalized.is_empty() {
+        return cmd_show(ctx);
+    }
+
+    if normalized.eq_ignore_ascii_case("help") {
         return cmd_help(ctx);
     }
 
@@ -373,7 +377,7 @@ pub fn execute_room_actor_command(command: &str, ctx: &RoomActorContext<'_>) -> 
     //       return result;
     //   }
 
-    none_result(format!("@here unknown command: {}", normalized))
+    cmd_help(ctx)
 }
 
 #[cfg(test)]
@@ -420,5 +424,28 @@ mod tests {
             result.action,
             RoomActorAction::Bury { ref exit_name } if exit_name == "north"
         ));
+    }
+
+    #[test]
+    fn empty_command_defaults_to_show() {
+        let result = execute_room_actor_command("", &sample_ctx());
+        assert!(result.response.contains("@here 'lobby': did=did:ma:world#lobby owner=did:ma:owner"));
+        assert!(matches!(result.action, RoomActorAction::None));
+    }
+
+    #[test]
+    fn unknown_command_falls_back_to_help() {
+        let result = execute_room_actor_command("foobardoesntexist", &sample_ctx());
+        assert!(result.response.starts_with("@here commands:"));
+        assert!(result.response.contains("show"));
+        assert!(matches!(result.action, RoomActorAction::None));
+    }
+
+    #[test]
+    fn explicit_help_still_returns_help() {
+        let result = execute_room_actor_command("help", &sample_ctx());
+        assert!(result.response.starts_with("@here commands:"));
+        assert!(result.response.contains("owner [did]"));
+        assert!(matches!(result.action, RoomActorAction::None));
     }
 }

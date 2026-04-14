@@ -16,10 +16,10 @@ We never care about backward compatibility, since I am the only user and I can a
 
 Terminology for command scripting:
 
-- method = action written in dot notation on scope/target (for example avatar.peek, avatar.apply, actor.apply)
+- method = action written in dot notation on scope/target (for example @avatar, avatar.apply, actor.apply)
 - attribute = named field on target (for example avatar.name, avatar.description)
-- path = composed dotted selector for nested fields (for example actor.ma.transports.peek)
-- scoped commands must be expressed as dot-notated methods, not space form (for example avatar.peek, not "avatar peek")
+- path = composed dotted selector for nested fields (for example actor.ma.transports, actor.apply)
+- scoped commands must be expressed as dot-notated methods, not space form (for example avatar.apply, not "avatar apply")
 - verb is only used for natural-language interpretation, not as the primary term in scripted paths
 
 WE NEVER EVER GENERATE SHORTENED DIDs THEY MUST BE FULL INCLUDING FRAGMENTS

@@ -525,6 +525,62 @@ export function createWorldDispatchFlow({
     return resolveAliasTargetToken(token, aliases);
   }
 
+  function normalizeInputAliases(rawText) {
+    const text = String(rawText || '');
+    if (!text.trim()) {
+      return text;
+    }
+    return text.replace(/\\?@(avatar|me|here|world|my\.[a-z0-9_-]{1,32})\b/gi, (match, token, offset, input) => {
+      if (match.startsWith('\\')) {
+        return `@${token}`;
+      }
+      const lower = token.toLowerCase();
+      // @here and @world followed by '.' are command targets handled by rewriteAliasesToDid —
+      // leave them unexpanded so their specific rewrites still trigger.
+      if ((lower === 'here' || lower === 'world') && input[offset + match.length] === '.') {
+        return match;
+      }
+      if (lower === 'me' || lower === 'avatar') {
+        const did = String(state.identity?.did || '').trim();
+        if (!isMaDid(did)) {
+          throw new Error(`@${lower} requires an active identity.`);
+        }
+        return `@${did}`;
+      }
+      if (lower === 'here') {
+        const roomDid = String(state.currentHome?.roomDid || '').trim();
+        if (!isMaDid(roomDid)) {
+          throw new Error('@here requires an active room connection.');
+        }
+        return `@${roomDid}`;
+      }
+      if (lower === 'world') {
+        const worldDid = String(
+          state.aliasBook?.['@world']
+          || state.currentHome?.worldDid
+          || ''
+        ).trim();
+        if (!isMaDid(worldDid)) {
+          throw new Error('@world requires a valid world connection.');
+        }
+        return `@${worldDid}`;
+      }
+      if (lower.startsWith('my.')) {
+        const key = token.slice(3);
+        const resolved = String(
+          state.aliasBook?.[key]
+          || state.aliasBook?.[`@${key}`]
+          || ''
+        ).trim();
+        if (!isMaDid(resolved)) {
+          throw new Error(`@my.${key} is not defined or does not resolve to a did:ma.`);
+        }
+        return `@${resolved}`;
+      }
+      return match;
+    });
+  }
+
   function rewriteAliasesToDid(input) {
     const text = String(input || '');
     if (!text.trim() || text.trim().startsWith("'")) {
@@ -551,8 +607,13 @@ export function createWorldDispatchFlow({
       }
 
       let resolvedValue = rawValue;
-      // Keep value syntax strict: resolve bare alias tokens only.
-      if (!rawValue.startsWith('@')) {
+      if (rawValue.startsWith('@')) {
+        const stripped = rawValue.slice(1);
+        if (isMaDid(stripped)) {
+          resolvedValue = stripped;
+        }
+        // else: non-DID @token, leave rawValue as-is
+      } else if (!isMaDid(rawValue)) {
         const resolved = resolveAliasTarget(rawValue, aliases);
         const normalized = String(resolved || '').trim();
         if (normalized) {
@@ -597,17 +658,47 @@ export function createWorldDispatchFlow({
       return all;
     });
 
-    out = out.replace(/^(\s*@(?:here|world)\.owner\s+)(\S+)(.*)$/i, (all, prefix, value, suffix) => {
+    out = out.replace(/^(\s*)@here\.owner(\s+\S+)?(.*)$/i, (all, prefix, value, suffix) => {
+      const roomDid = String(state.currentHome?.roomDid || '').trim();
+      if (!isMaDid(roomDid)) {
+        return all;
+      }
+      // If no argument, treat as property-get, do not rewrite
+      if (!value || !value.trim()) {
+        return all;
+      }
+      const rawValue = String(value || '').trim();
+      let resolvedValue = rawValue;
+      if (rawValue.startsWith('@')) {
+        const stripped = rawValue.slice(1);
+        if (isMaDid(stripped)) {
+          resolvedValue = stripped;
+        }
+      } else if (!isMaDid(rawValue)) {
+        const resolved = resolveAliasTarget(rawValue, aliases);
+        const normalized = String(resolved || '').trim();
+        if (normalized) {
+          resolvedValue = normalized;
+        }
+      }
+      return `${prefix}@${roomDid}.owner ${resolvedValue}${String(suffix || '')}`;
+    });
+
+    out = out.replace(/^(\s*@world\.owner\s+)(\S+)(.*)$/i, (all, prefix, value, suffix) => {
       const rawValue = String(value || '').trim();
       if (!rawValue) {
         return all;
       }
-
-      // Keep value syntax strict: resolve bare alias tokens only.
       if (rawValue.startsWith('@')) {
+        const stripped = rawValue.slice(1);
+        if (isMaDid(stripped)) {
+          return `${prefix}${stripped}${String(suffix || '')}`;
+        }
         return all;
       }
-
+      if (isMaDid(rawValue)) {
+        return `${prefix}${rawValue}${String(suffix || '')}`;
+      }
       const resolved = resolveAliasTarget(rawValue, aliases);
       const normalized = String(resolved || '').trim();
       if (!normalized) {
@@ -656,9 +747,24 @@ export function createWorldDispatchFlow({
       return trimmed;
     }
 
-    const resolvedBase = isMaDid(baseRaw)
-      ? baseRaw
-      : await resolveCommandTargetDidOrToken(baseRaw);
+    // Resolve built-in aliases to their DID before further processing
+    let resolvedBase;
+    const lowerBase = baseRaw.toLowerCase();
+    if (lowerBase === 'here') {
+      resolvedBase = String(state.currentHome?.roomDid || '').trim();
+    } else if (lowerBase === 'world') {
+      resolvedBase = String(
+        state.aliasBook?.['@world']
+        || state.currentHome?.worldDid
+        || ''
+      ).trim();
+    } else if (lowerBase === 'me' || lowerBase === 'avatar') {
+      resolvedBase = String(state.identity?.did || '').trim();
+    } else {
+      resolvedBase = isMaDid(baseRaw)
+        ? baseRaw
+        : await resolveCommandTargetDidOrToken(baseRaw);
+    }
     const normalizedDid = String(resolvedBase || '').trim().replace(/^@+/, '');
     if (!isMaDid(normalizedDid)) {
       throw new Error('Target after @ must resolve to did:ma.');
@@ -691,11 +797,17 @@ export function createWorldDispatchFlow({
       throw new Error('Join a home before sending commands.');
     }
 
-    const rewritten = rewriteAliasesToDid(commandText);
+    const preNormalized = normalizeInputAliases(commandText);
+    const rewritten = rewriteAliasesToDid(preNormalized);
     const routed = routeBareCommandToSelfDid(rewritten);
+
     const normalizedCommand = routed.startsWith('@')
       ? await normalizeOutgoingAtTarget(routed)
       : routed;
+
+    // DEBUG: Logg faktisk kommando som sendes til world
+    // eslint-disable-next-line no-console
+    console.log('[ma-debug] sendWorldCommandQuery normalizedCommand:', normalizedCommand);
 
     const result = JSON.parse(
       await sendWorldCmdWithTtl(
@@ -729,7 +841,8 @@ export function createWorldDispatchFlow({
       : 0;
 
     try {
-      const rewrittenInput = rewriteAliasesToDid(text);
+      const preNormalizedInput = normalizeInputAliases(text);
+      const rewrittenInput = rewriteAliasesToDid(preNormalizedInput);
       const trimmedText = rewrittenInput.trim();
 
       if (typeof parseLocalCommand === 'function' && parseLocalCommand(trimmedText)) {
@@ -916,9 +1029,24 @@ export function createWorldDispatchFlow({
           const pathRaw = String(dotIdx === -1 ? '' : target.slice(dotIdx + 1)).trim();
 
           try {
-            const resolvedBase = isMaDid(baseRaw)
-              ? baseRaw
-              : await resolveCommandTargetDidOrToken(baseRaw);
+            // Resolve built-in aliases to their DID
+            let resolvedBase;
+            const lowerBase = baseRaw.toLowerCase();
+            if (lowerBase === 'here') {
+              resolvedBase = String(state.currentHome?.roomDid || '').trim();
+            } else if (lowerBase === 'world') {
+              resolvedBase = String(
+                state.aliasBook?.['@world']
+                || state.currentHome?.worldDid
+                || ''
+              ).trim();
+            } else if (lowerBase === 'me' || lowerBase === 'avatar') {
+              resolvedBase = String(state.identity?.did || '').trim();
+            } else {
+              resolvedBase = isMaDid(baseRaw)
+                ? baseRaw
+                : await resolveCommandTargetDidOrToken(baseRaw);
+            }
             const normalizedDid = String(resolvedBase || '').trim().replace(/^@+/, '');
             const { targetDid, targetPath, routeWorld } = normalizeDidTargetPath(normalizedDid, pathRaw);
             const isDirectDidTarget = isMaDid(String(targetDid)) && String(targetDid).includes('#') && !routeWorld && !targetPath;
@@ -955,9 +1083,24 @@ export function createWorldDispatchFlow({
           return;
         }
 
-        const resolvedBase = isMaDid(baseRaw)
-          ? baseRaw
-          : await resolveCommandTargetDidOrToken(baseRaw);
+        // Resolve built-in aliases to their DID
+        let resolvedBase;
+        const lowerBase = baseRaw.toLowerCase();
+        if (lowerBase === 'here') {
+          resolvedBase = String(state.currentHome?.roomDid || '').trim();
+        } else if (lowerBase === 'world') {
+          resolvedBase = String(
+            state.aliasBook?.['@world']
+            || state.currentHome?.worldDid
+            || ''
+          ).trim();
+        } else if (lowerBase === 'me' || lowerBase === 'avatar') {
+          resolvedBase = String(state.identity?.did || '').trim();
+        } else {
+          resolvedBase = isMaDid(baseRaw)
+            ? baseRaw
+            : await resolveCommandTargetDidOrToken(baseRaw);
+        }
         const normalizedDid = String(resolvedBase || '').trim().replace(/^@+/, '');
         if (!isMaDid(normalizedDid)) {
           throw new Error('Target after @ must resolve to did:ma.');
@@ -1050,6 +1193,8 @@ export function createWorldDispatchFlow({
   return {
     sendWorldCommandQuery,
     sendCurrentWorldMessage,
+    normalizeInputAliases,
+    rewriteAliasesToDid,
   };
 }
 

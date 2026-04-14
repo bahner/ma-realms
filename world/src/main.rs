@@ -698,13 +698,19 @@ struct WorldRootRoomEntry {
     #[serde(rename = "/")]
     cid: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     did: Option<String>,
-    owner_cid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
     acl_cid: String,
+    /// Legacy field — ignored on read, never written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_cid: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -778,15 +784,7 @@ struct RoomAclDoc {
     acl: RoomAcl,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct RoomOwnerDoc {
-    kind: String,
-    version: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    owner_did: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    owner_assertion_key: Option<String>,
-}
+
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct AvatarStateDoc {
@@ -997,8 +995,6 @@ struct RoomYamlDocV2 {
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 struct LegacyRoomAclYaml {
     owner: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    owner_assertion_key: Option<String>,
     #[serde(default)]
     allow_all: bool,
     #[serde(default)]
@@ -2746,40 +2742,11 @@ impl World {
                                 );
                             }
                         }
-                        if room_entry.owner_cid.trim().is_empty() {
-                            return Err(anyhow!(
-                                "missing owner_cid metadata for room '{}' in world index {}",
-                                room_name,
-                                root_cid
-                            ));
-                        }
                         if room_entry.acl_cid.trim().is_empty() {
                             return Err(anyhow!(
                                 "missing acl_cid metadata for room '{}' in world index {}",
                                 room_name,
                                 root_cid
-                            ));
-                        }
-
-                        let owner_yaml = kubo::cat_cid(&kubo_url, &room_entry.owner_cid).await
-                            .map_err(|e| anyhow!(
-                                "failed loading owner metadata {} for room '{}': {}",
-                                room_entry.owner_cid,
-                                room_name,
-                                e
-                            ))?;
-                        let owner_doc: RoomOwnerDoc = serde_yaml::from_str(&owner_yaml)
-                            .map_err(|e| anyhow!(
-                                "invalid owner doc at {} for room '{}': {}",
-                                room_entry.owner_cid,
-                                room_name,
-                                e
-                            ))?;
-                        if owner_doc.kind != "ma_room_owner" || owner_doc.version != 1 {
-                            return Err(anyhow!(
-                                "unsupported owner doc kind/version at {} for room '{}'",
-                                room_entry.owner_cid,
-                                room_name
                             ));
                         }
 
@@ -2806,8 +2773,7 @@ impl World {
                         }
 
                         let mut loaded_acl = acl_doc.acl;
-                        loaded_acl.owner = owner_doc.owner_did;
-                        loaded_acl.owner_assertion_key = owner_doc.owner_assertion_key;
+                        loaded_acl.owner = room_entry.owner.clone();
                         if let Some(owner) = loaded_acl.owner.clone() {
                             loaded_acl.allow.insert(owner.clone());
                             loaded_acl.deny.remove(&owner);
@@ -2908,7 +2874,7 @@ impl World {
         }
 
         let room_cids = self.room_cids.read().await.clone();
-        let room_meta: HashMap<String, (String, String, String, Option<String>, Option<String>, RoomAcl)> = self
+        let room_meta: HashMap<String, (String, String, String, Option<String>, RoomAcl)> = self
             .rooms
             .read()
             .await
@@ -2921,7 +2887,6 @@ impl World {
                         room.title_or_default(),
                         room.description_or_default(),
                         room.acl.owner.clone(),
-                        room.acl.owner_assertion_key.clone(),
                         room.acl.clone(),
                     ),
                 )
@@ -2934,24 +2899,13 @@ impl World {
                 continue;
             }
 
-            let (did, title, description, owner_did, owner_assertion_key, mut acl) = room_meta
+            let (did, title, description, owner_did, mut acl) = room_meta
                 .get(&name)
                 .cloned()
-                .unwrap_or_else(|| (String::new(), String::new(), String::new(), None, None, RoomAcl::open()));
+                .unwrap_or_else(|| (String::new(), String::new(), String::new(), None, RoomAcl::open()));
 
-            let owner_doc = RoomOwnerDoc {
-                kind: "ma_room_owner".to_string(),
-                version: 1,
-                owner_did,
-                owner_assertion_key,
-            };
-            let owner_yaml = serde_yaml::to_string(&owner_doc)
-                .map_err(|e| anyhow!("failed to serialize owner metadata for room '{}': {}", name, e))?;
-            let owner_cid = kubo::ipfs_add(&kubo_url, owner_yaml.into_bytes()).await?;
-
-            // Owner metadata is persisted separately from ACL metadata.
+            // Owner is persisted inline in room entry, not in ACL doc.
             acl.owner = None;
-            acl.owner_assertion_key = None;
 
             let acl_doc = RoomAclDoc {
                 kind: "ma_room_acl".to_string(),
@@ -2963,14 +2917,16 @@ impl World {
             let acl_cid = kubo::ipfs_add(&kubo_url, acl_yaml.into_bytes()).await?;
 
             rooms_index.insert(
-                name,
+                name.clone(),
                 WorldRootRoomDagValue::Entry(WorldRootRoomEntry {
                     cid,
+                    name: Some(name.clone()),
                     title: if title.trim().is_empty() { None } else { Some(title) },
                     description: if description.trim().is_empty() { None } else { Some(description) },
                     did: if did.trim().is_empty() { None } else { Some(did) },
-                    owner_cid,
+                    owner: owner_did,
                     acl_cid,
+                    owner_cid: None,
                 }),
             );
         }

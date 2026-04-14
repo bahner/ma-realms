@@ -9,9 +9,6 @@ use std::collections::{HashMap, HashSet};
 pub struct RoomAcl {
     /// Root DID of the room owner.
     pub owner: Option<String>,
-    /// Public assertion key (multibase) of current owner at time of assignment.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner_assertion_key: Option<String>,
     /// Allow list of root DIDs, supports '*' wildcard for open access.
     pub allow: HashSet<String>,
     /// Explicit deny list of root DIDs. Takes priority over allow list.
@@ -25,7 +22,6 @@ impl RoomAcl {
         allow.insert("*".to_string());
         Self {
             owner: None,
-            owner_assertion_key: None,
             allow,
             deny: HashSet::new(),
         }
