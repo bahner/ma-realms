@@ -22,6 +22,7 @@ pub const CONTENT_TYPE_EVENT: &str = "application/x-ma-event";
 pub const CONTENT_TYPE_BROADCAST: &str = "application/x-ma-broadcast";
 pub const CONTENT_TYPE_DOC: &str = "application/x-ma-doc";
 pub const CONTENT_TYPE_WHISPER: &str = "application/x-ma-whisper";
+pub const CONTENT_TYPE_MESSAGE: &str = "application/x-ma-message";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IpfsPublishDidRequest {

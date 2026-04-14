@@ -455,6 +455,32 @@ struct AvatarLocationEntry {
     seen_at: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AvatarRegistryEntry {
+    did: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    owner: String,
+    #[serde(default)]
+    fragment: String,
+    #[serde(default)]
+    lang: String,
+    #[serde(default)]
+    endpoint: String,
+    #[serde(default)]
+    room: String,
+    #[serde(default)]
+    key_agreement: String,
+    #[serde(default)]
+    acl: String,
+    #[serde(default)]
+    shortcuts: HashMap<String, String>,
+    doc: IpldLink,
+}
+
 #[derive(Debug)]
 pub struct World {
     rooms: Arc<RwLock<HashMap<String, Room>>>,
@@ -518,6 +544,8 @@ pub struct World {
     next_knock_id: Arc<RwLock<u64>>,
     /// TTL-backed avatar location table keyed by root DID.
     avatar_locations: Arc<RwLock<TtlCache<String, AvatarLocationEntry>>>,
+    /// Global avatar DID-doc registry keyed by avatar fragment.
+    avatar_registry: Arc<RwLock<HashMap<String, AvatarRegistryEntry>>>,
     /// Fast lookup from object DID to room/object inbox route.
     object_inbox_index: Cache<String, InboxRoute>,
 }
@@ -689,6 +717,8 @@ enum WorldRootRoomDagValue {
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 struct WorldRootIndexDag {
     rooms: HashMap<String, WorldRootRoomDagValue>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    avatars: HashMap<String, AvatarRegistryEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     state_cid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -768,6 +798,8 @@ struct RuntimeStateDoc {
     room_cids: HashMap<String, String>,
     #[serde(default)]
     room_objects: HashMap<String, Vec<ObjectRuntimeState>>,
+    #[serde(default)]
+    avatar_registry: HashMap<String, AvatarRegistryEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lang_cid: Option<String>,
 }
@@ -809,6 +841,17 @@ fn sender_push_endpoint_from_document(document: &Document) -> Option<String> {
     }
 }
 
+fn sender_encryption_pubkey_multibase_from_document(document: &Document) -> Result<String> {
+    let vm = document
+        .get_verification_method_by_id(&document.key_agreement)
+        .map_err(|e| anyhow!("sender DID document missing keyAgreement verification method: {}", e))?;
+    let key = vm.public_key_multibase.trim();
+    if key.is_empty() {
+        return Err(anyhow!("sender DID document keyAgreement publicKeyMultibase is empty"));
+    }
+    Ok(key.to_string())
+}
+
 fn extract_did_description_from_json(document_json: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(document_json).ok()?;
 
@@ -840,6 +883,42 @@ fn extract_did_description_from_json(document_json: &str) -> Option<String> {
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(str::to_string)
+}
+
+fn format_public_inspect_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "(null)".to_string(),
+        serde_json::Value::Bool(flag) => flag.to_string(),
+        serde_json::Value::Number(number) => number.to_string(),
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+        }
+    }
+}
+
+fn resolve_public_inspect_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let trimmed = path.trim().trim_matches('.');
+    if trimmed.is_empty() || trimmed == "_list" {
+        return Some(value);
+    }
+
+    let mut current = value;
+    for segment in trimmed.split('.') {
+        let key = segment.trim();
+        if key.is_empty() {
+            return None;
+        }
+        match current {
+            serde_json::Value::Object(map) => current = map.get(key)?,
+            serde_json::Value::Array(items) => {
+                let index: usize = key.parse().ok()?;
+                current = items.get(index)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(current)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -937,6 +1016,7 @@ impl World {
                 Duration::from_secs(PRESENCE_STALE_AFTER_SECS_DEFAULT),
                 MAX_AVATAR_LOCATION_CACHE,
             ))),
+            avatar_registry: Arc::new(RwLock::new(HashMap::new())),
             object_inbox_index: Cache::new(OBJECT_INBOX_INDEX_CAPACITY),
         }
     }
@@ -1002,6 +1082,230 @@ impl World {
             .map(|(handle, _)| handle.clone())
     }
 
+    async fn public_inspect_tree(&self) -> serde_json::Value {
+        let world_did = self
+            .world_did
+            .read()
+            .await
+            .clone()
+            .unwrap_or_else(|| format!("{DID_PREFIX}unconfigured"));
+        let owner = self
+            .owner_did
+            .read()
+            .await
+            .clone()
+            .unwrap_or_else(|| "(none)".to_string());
+        let lang_cid = self
+            .lang_cid
+            .read()
+            .await
+            .clone()
+            .unwrap_or_else(|| "(none)".to_string());
+        let avatar_registry = self.avatar_registry.read().await.clone();
+        let rooms = self.rooms.read().await;
+
+        let mut rooms_json = serde_json::Map::new();
+        for (room_name, room) in rooms.iter() {
+            let mut avatars_json = serde_json::Map::new();
+            for (handle, avatar) in room.avatars.iter() {
+                avatars_json.insert(
+                    handle.clone(),
+                    serde_json::json!({
+                        "did": avatar.agent_did.id(),
+                        "owner": avatar.owner,
+                        "description": avatar.description_or_default(),
+                        "fragment": avatar.agent_did.fragment.clone().unwrap_or_default(),
+                        "lang": avatar.language_order,
+                        "endpoint": avatar.agent_endpoint,
+                        "acl": avatar.acl.summary(),
+                        "shortcuts": avatar.object_shortcuts,
+                    }),
+                );
+            }
+
+            rooms_json.insert(
+                room_name.clone(),
+                serde_json::json!({
+                    "did": room.did,
+                    "title": room.title_or_default(),
+                    "description": room.description_or_default(),
+                    "avatars": avatars_json,
+                    "avatar_count": room.avatars.len(),
+                }),
+            );
+        }
+        drop(rooms);
+
+        serde_json::json!({
+            "did": world_did,
+            "owner": owner,
+            "rooms": rooms_json,
+            "avatars": avatar_registry,
+            "lang_cid": lang_cid,
+        })
+    }
+
+    async fn refresh_avatar_registry_entry_for_did(&self, did_id: &str) -> Result<()> {
+        let (room_name, avatar) = {
+            let rooms = self.rooms.read().await;
+            let mut found: Option<(String, Avatar)> = None;
+            for (room_name, room) in rooms.iter() {
+                if let Some(entry) = room
+                    .avatars
+                    .values()
+                    .find(|avatar| avatar.agent_did.id() == did_id)
+                {
+                    found = Some((room_name.clone(), entry.clone()));
+                    break;
+                }
+            }
+            found.ok_or_else(|| anyhow!("avatar '{}' not found in world rooms", did_id))?
+        };
+
+        let avatar_did = avatar.agent_did.clone();
+        let fragment = avatar_did
+            .fragment
+            .clone()
+            .ok_or_else(|| anyhow!("avatar DID '{}' missing fragment", avatar_did.id()))?;
+        let encryption_pubkey = avatar
+            .encryption_pubkey_multibase
+            .clone()
+            .ok_or_else(|| anyhow!("avatar '{}' missing keyAgreement public key", avatar_did.id()))?;
+        let description = avatar.description_or_default();
+        let avatar_name = avatar.inbox.clone();
+        let owner = avatar.owner.clone();
+        let language_order = avatar.language_order.clone();
+        let endpoint = avatar.agent_endpoint.clone();
+        let acl_summary = avatar.acl.summary();
+        let shortcuts = avatar.object_shortcuts.clone();
+
+        let world_did_raw = self
+            .world_did
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("world DID is not configured"))?;
+        let world_did = Did::try_from(world_did_raw.as_str())
+            .map_err(|e| anyhow!("invalid configured world DID '{}': {}", world_did_raw, e))?;
+
+        let world_signing_key_bytes = self
+            .unlocked_world_signing_key
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("world signing key is not unlocked"))?;
+        let signer_did = Did::new_root(&world_did.ipns)
+            .map_err(|e| anyhow!("failed building world signer DID: {}", e))?;
+        let signing_key = SigningKey::from_private_key_bytes(signer_did, world_signing_key_bytes)
+            .map_err(|e| anyhow!("failed restoring world signing key: {}", e))?;
+
+        let mut document = Document::new(&avatar_did, &avatar_did);
+
+        let assertion_vm = VerificationMethod::new(
+            avatar_did.base_id(),
+            avatar_did.base_id(),
+            signing_key.key_type.clone(),
+            "assertion",
+            signing_key.public_key_multibase.clone(),
+        )
+        .map_err(|e| anyhow!("failed building avatar assertion method: {}", e))?;
+        let key_agreement_vm = VerificationMethod::new(
+            avatar_did.base_id(),
+            avatar_did.base_id(),
+            "Multikey",
+            "key-agreement",
+            encryption_pubkey.clone(),
+        )
+        .map_err(|e| anyhow!("failed building avatar keyAgreement method: {}", e))?;
+
+        let assertion_vm_id = assertion_vm.id.clone();
+        let key_agreement_vm_id = key_agreement_vm.id.clone();
+        document
+            .add_verification_method(assertion_vm.clone())
+            .map_err(|e| anyhow!("failed adding avatar assertion method: {}", e))?;
+        document
+            .add_verification_method(key_agreement_vm)
+            .map_err(|e| anyhow!("failed adding avatar keyAgreement method: {}", e))?;
+        document.assertion_method = assertion_vm_id;
+        document.key_agreement = key_agreement_vm_id;
+        document.set_ma_type("avatar")?;
+        if !language_order.trim().is_empty() {
+            document
+                .set_language(language_order.clone())
+                .map_err(|e| anyhow!("failed setting avatar language on DID document: {}", e))?;
+        }
+        document.set_ma_transports(serde_json::Value::Array(
+            vec![
+                format!(
+                    "/ma-iroh/{}/{}",
+                    avatar.agent_endpoint,
+                    String::from_utf8_lossy(PRESENCE_ALPN)
+                ),
+                format!(
+                    "/ma-iroh/{}/{}",
+                    avatar.agent_endpoint,
+                    String::from_utf8_lossy(INBOX_ALPN)
+                ),
+            ]
+            .into_iter()
+            .map(serde_json::Value::String)
+            .collect(),
+        ));
+        document.set_ma_ping_interval_secs(WORLD_PING_INTERVAL_SECS);
+        document
+            .sign(&signing_key, &assertion_vm)
+            .map_err(|e| anyhow!("failed signing avatar DID document: {}", e))?;
+
+        let kubo_url = self.kubo_url().await;
+        let document_json = document
+            .marshal()
+            .map_err(|e| anyhow!("failed marshaling avatar DID document: {}", e))?;
+        let document_value: serde_json::Value = serde_json::from_str(&document_json)
+            .map_err(|e| anyhow!("failed converting avatar DID document to JSON value: {}", e))?;
+        let doc_cid = dag_put_dag_cbor(&kubo_url, &document_value).await?;
+
+        let next_entry = AvatarRegistryEntry {
+            did: avatar_did.id(),
+            name: avatar_name,
+            description,
+            owner,
+            fragment: fragment.clone(),
+            lang: language_order,
+            endpoint,
+            room: room_name,
+            key_agreement: encryption_pubkey,
+            acl: acl_summary,
+            shortcuts,
+            doc: IpldLink { cid: doc_cid },
+        };
+
+        let changed = {
+            let mut registry = self.avatar_registry.write().await;
+            let changed = registry.get(&fragment).map(|entry| {
+                entry.did != next_entry.did
+                    || entry.name != next_entry.name
+                    || entry.description != next_entry.description
+                    || entry.owner != next_entry.owner
+                    || entry.fragment != next_entry.fragment
+                    || entry.lang != next_entry.lang
+                    || entry.endpoint != next_entry.endpoint
+                    || entry.room != next_entry.room
+                    || entry.key_agreement != next_entry.key_agreement
+                    || entry.acl != next_entry.acl
+                    || entry.shortcuts != next_entry.shortcuts
+                    || entry.doc.cid != next_entry.doc.cid
+            }).unwrap_or(true);
+            registry.insert(fragment, next_entry);
+            changed
+        };
+
+        if changed {
+            let _ = self.save_world_index().await;
+        }
+
+        Ok(())
+    }
+
     /// Find the avatar DID owned by `owner_did` anywhere in this world.
     /// Returns `None` if the owner has no avatar (i.e. has not entered).
     async fn resolve_avatar_did_for_owner(&self, owner_did: &str) -> Option<Did> {
@@ -1024,6 +1328,7 @@ impl World {
         sender_did: &Did,
         sender_profile: &str,
         agent_endpoint: &str,
+        sender_encryption_pubkey_multibase: &str,
         room: &str,
     ) -> Result<(Did, String, bool)> {
         let is_new = self.resolve_avatar_did_for_owner(&sender_did.id()).await.is_none();
@@ -1063,7 +1368,7 @@ impl World {
             agent_endpoint: agent_endpoint.to_string(),
             language_order,
             signing_secret: signing_key.private_key_bytes(),
-            encryption_pubkey_multibase: None,
+            encryption_pubkey_multibase: Some(sender_encryption_pubkey_multibase.to_string()),
         };
 
         let handle = self.join_room(room, avatar_req, None).await?;
@@ -2290,6 +2595,7 @@ impl World {
         let (index_rooms, loaded_legacy_yaml, had_embedded_room_metadata): (HashMap<String, WorldRootRoomEntry>, bool, bool) =
             match dag_get_dag_cbor::<WorldRootIndexDag>(&kubo_url, root_cid).await {
                 Ok(dag) => {
+                    *self.avatar_registry.write().await = dag.avatars.clone();
                     *self.state_cid.write().await = dag.state_cid.clone();
                     *self.lang_cid.write().await = dag.lang_cid.clone();
                     let mut had_embedded = false;
@@ -2313,6 +2619,7 @@ impl World {
                     (rooms, false, had_embedded)
                 }
                 Err(_) => {
+                    self.avatar_registry.write().await.clear();
                     let yaml = kubo::cat_cid(&kubo_url, root_cid).await?;
                     let legacy: WorldRootIndex = serde_yaml::from_str(&yaml)
                         .map_err(|e| anyhow!("invalid world root index at {}: {}", root_cid, e))?;
@@ -2507,7 +2814,7 @@ impl World {
         let previous_world_cid = self.world_cid.read().await.clone();
         let pin_name = self.world_root_pin_name.read().await.clone();
         let room_cids = self.room_cids.read().await.clone();
-        let room_meta: HashMap<String, (String, Option<String>, Option<String>, RoomAcl)> = self
+        let room_meta: HashMap<String, (String, String, String, Option<String>, Option<String>, RoomAcl)> = self
             .rooms
             .read()
             .await
@@ -2517,6 +2824,8 @@ impl World {
                     name.clone(),
                     (
                         room.did.clone(),
+                        room.title_or_default(),
+                        room.description_or_default(),
                         room.acl.owner.clone(),
                         room.acl.owner_assertion_key.clone(),
                         room.acl.clone(),
@@ -2531,10 +2840,10 @@ impl World {
                 continue;
             }
 
-            let (did, owner_did, owner_assertion_key, mut acl) = room_meta
+            let (did, title, description, owner_did, owner_assertion_key, mut acl) = room_meta
                 .get(&name)
                 .cloned()
-                .unwrap_or_else(|| (String::new(), None, None, RoomAcl::open()));
+                .unwrap_or_else(|| (String::new(), String::new(), String::new(), None, None, RoomAcl::open()));
 
             let owner_doc = RoomOwnerDoc {
                 kind: "ma_room_owner".to_string(),
@@ -2563,8 +2872,8 @@ impl World {
                 name,
                 WorldRootRoomDagValue::Entry(WorldRootRoomEntry {
                     cid,
-                    title: None,
-                    description: None,
+                    title: if title.trim().is_empty() { None } else { Some(title) },
+                    description: if description.trim().is_empty() { None } else { Some(description) },
                     did: if did.trim().is_empty() { None } else { Some(did) },
                     owner_cid,
                     acl_cid,
@@ -2574,6 +2883,7 @@ impl World {
 
         let index = WorldRootIndexDag {
             rooms: rooms_index,
+            avatars: self.avatar_registry.read().await.clone(),
             state_cid: self.state_cid.read().await.clone(),
             lang_cid: self.lang_cid.read().await.clone(),
         };
@@ -2751,10 +3061,17 @@ impl World {
             };
 
             if let Some(mut avatar) = moved {
+                let endpoint_changed = avatar.agent_endpoint != req.agent_endpoint;
+                let language_changed = avatar.language_order != req.language_order;
+                let owner_changed = avatar.owner != req.owner_did;
+                let encryption_changed = avatar.encryption_pubkey_multibase != req.encryption_pubkey_multibase;
                 avatar.agent_endpoint = req.agent_endpoint.clone();
                 avatar.language_order = req.language_order.clone();
+                avatar.owner = req.owner_did.clone();
+                avatar.encryption_pubkey_multibase = req.encryption_pubkey_multibase.clone();
                 avatar.touch_presence();
                 let moved_handle = avatar.inbox.clone();
+                let refresh_registry = endpoint_changed || language_changed || owner_changed || encryption_changed;
 
                 if let Some(room) = rooms.get_mut(room_name) {
                     room.add_avatar(avatar);
@@ -2764,6 +3081,11 @@ impl World {
                 self
                     .upsert_avatar_location(room_name, &did_id, &req.agent_endpoint)
                     .await;
+                if refresh_registry {
+                    if let Err(err) = self.refresh_avatar_registry_entry_for_did(&did_id).await {
+                        warn!("failed refreshing avatar registry for {}: {}", did_id, err);
+                    }
+                }
 
                 info!(
                     "[{}] {} moved from {} ({:?})",
@@ -2802,16 +3124,28 @@ impl World {
             .iter_mut()
             .find(|(_, avatar)| avatar.agent_did.id() == did_id)
         {
+            let endpoint_changed = existing.agent_endpoint != req.agent_endpoint;
+            let language_changed = existing.language_order != req.language_order;
+            let owner_changed = existing.owner != req.owner_did;
+            let encryption_changed = existing.encryption_pubkey_multibase != req.encryption_pubkey_multibase;
             existing.agent_endpoint = req.agent_endpoint.clone();
             existing.language_order = req.language_order.clone();
+            existing.owner = req.owner_did.clone();
+            existing.encryption_pubkey_multibase = req.encryption_pubkey_multibase.clone();
             existing.touch_presence();
             info!("[{}] {} already present ({:?})", room_name, existing_handle, req.did);
             let existing_handle_value = existing_handle.clone();
+            let refresh_registry = endpoint_changed || language_changed || owner_changed || encryption_changed;
             drop(rooms);
             self.rebuild_avatar_room_index().await;
             self
                 .upsert_avatar_location(room_name, &did_id, &req.agent_endpoint)
                 .await;
+            if refresh_registry {
+                if let Err(err) = self.refresh_avatar_registry_entry_for_did(&did_id).await {
+                    warn!("failed refreshing avatar registry for {}: {}", did_id, err);
+                }
+            }
             return Ok(existing_handle_value);
         }
 
@@ -2842,6 +3176,9 @@ impl World {
         self
             .upsert_avatar_location(room_name, &did_id, &req.agent_endpoint)
             .await;
+        if let Err(err) = self.refresh_avatar_registry_entry_for_did(&did_id).await {
+            warn!("failed refreshing avatar registry for {}: {}", did_id, err);
+        }
 
         info!("[{}] {} joined ({:?}) from {}", room_name, handle, req.did, req.agent_endpoint);
         self.record_event(format!(
@@ -3369,6 +3706,7 @@ impl World {
                 )
             })
             .collect::<HashMap<_, _>>();
+        let avatar_registry = self.avatar_registry.read().await.clone();
 
         let state = RuntimeStateDoc {
             kind: "ma_world_runtime_state".to_string(),
@@ -3382,6 +3720,7 @@ impl World {
             owner_did,
             room_cids,
             room_objects,
+            avatar_registry,
             lang_cid: self.lang_cid.read().await.clone(),
         };
 
@@ -3797,6 +4136,7 @@ impl World {
         *self.next_room_event_sequence.write().await = state.next_room_event_sequence;
         *self.handle_to_did.write().await = state.handle_to_did;
         *self.did_to_handle.write().await = state.did_to_handle;
+        *self.avatar_registry.write().await = state.avatar_registry;
         let loaded_owner_did = state.owner_did;
         *self.owner_did.write().await = loaded_owner_did.clone();
         if let Some(owner) = loaded_owner_did {
@@ -5683,6 +6023,90 @@ impl World {
             }
         }
 
+        if !normalized.contains(char::is_whitespace) {
+            let tree = self.public_inspect_tree().await;
+            if let Some(value) = resolve_public_inspect_path(&tree, normalized) {
+                return format_public_inspect_value(value);
+            }
+        }
+
+        if let Some(property) = parse_property_command(normalized) {
+            let path = property.key;
+            let value = property.value.unwrap_or_default();
+            if value.is_empty() && (path == "avatars" || path == "avatars._list" || path.starts_with("avatars.")) {
+                let registry = self.avatar_registry.read().await;
+
+                if path == "avatars" || path == "avatars._list" {
+                    if registry.is_empty() {
+                        return "@world avatars: (none)".to_string();
+                    }
+                    let mut fragments = registry.keys().cloned().collect::<Vec<_>>();
+                    fragments.sort();
+                    return format!("@world avatars:\n{}", fragments.join("\n"));
+                }
+
+                let mut parts = path.split('.');
+                let root = parts.next().unwrap_or_default();
+                let fragment = parts.next().unwrap_or_default().trim();
+                let key = parts.collect::<Vec<_>>().join(".");
+                if root != "avatars" || fragment.is_empty() {
+                    return "@world avatar path usage: @world.avatars.<fragment>.<field>".to_string();
+                }
+                let Some(entry) = registry.get(fragment) else {
+                    return format!("@world avatar '{}' not found", fragment);
+                };
+
+                if key.is_empty() || key == "_list" {
+                    return format!(
+                        "@ .world.avatars.{0}.did {1}\n@ .world.avatars.{0}.name {2}\n@ .world.avatars.{0}.description {3}\n@ .world.avatars.{0}.owner {4}\n@ .world.avatars.{0}.fragment {5}\n@ .world.avatars.{0}.lang {6}\n@ .world.avatars.{0}.endpoint {7}\n@ .world.avatars.{0}.room {8}\n@ .world.avatars.{0}.key_agreement {9}\n@ .world.avatars.{0}.acl {10}\n@ .world.avatars.{0}.doc {11}",
+                        fragment,
+                        entry.did,
+                        entry.name,
+                        entry.description,
+                        entry.owner,
+                        entry.fragment,
+                        entry.lang,
+                        entry.endpoint,
+                        entry.room,
+                        entry.key_agreement,
+                        entry.acl,
+                        entry.doc.cid,
+                    );
+                }
+
+                return match key.as_str() {
+                    "did" => entry.did.clone(),
+                    "name" => entry.name.clone(),
+                    "description" => entry.description.clone(),
+                    "owner" => entry.owner.clone(),
+                    "fragment" => entry.fragment.clone(),
+                    "lang" | "language" => entry.lang.clone(),
+                    "endpoint" => entry.endpoint.clone(),
+                    "room" => entry.room.clone(),
+                    "key_agreement" => entry.key_agreement.clone(),
+                    "acl" => entry.acl.clone(),
+                    "doc" => entry.doc.cid.clone(),
+                    "shortcuts" => {
+                        if entry.shortcuts.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            let mut rows = entry
+                                .shortcuts
+                                .iter()
+                                .map(|(alias, object_id)| format!("{} -> {}", alias, object_id))
+                                .collect::<Vec<_>>();
+                            rows.sort();
+                            rows.join("\n")
+                        }
+                    }
+                    _ => format!(
+                        "@world unknown avatar attribute '{}'. Allowed: did, name, description, owner, fragment, lang, endpoint, room, key_agreement, acl, shortcuts, doc",
+                        key
+                    ),
+                };
+            }
+        }
+
         // Command tokens are world/realm-defined and intentionally invariant.
         // Localized input aliases (e.g. "grave" -> "dig") belong in actor/client.
 
@@ -7563,6 +7987,8 @@ impl WorldProtocol {
         let sender_profile = sender_profile_from_document(&sender_document);
         let sender_push_endpoint = sender_push_endpoint_from_document(&sender_document)
             .unwrap_or_else(|| agent_endpoint.clone());
+        let sender_encryption_pubkey_multibase =
+            sender_encryption_pubkey_multibase_from_document(&sender_document)?;
         if sender_push_endpoint != agent_endpoint {
             debug!(
                 "sender endpoint drift: request_remote={} did_push_endpoint={} did={}",
@@ -7615,7 +8041,11 @@ impl WorldProtocol {
                 } else {
                     // First contact — ensure avatar in the pinged room.
                     let (_, h, c) = self.world.ensure_avatar(
-                        sender_did, &sender_profile, &sender_push_endpoint, &pinged_room,
+                        sender_did,
+                        &sender_profile,
+                        &sender_push_endpoint,
+                        &sender_encryption_pubkey_multibase,
+                        &pinged_room,
                     ).await?;
                     (pinged_room.clone(), h, c)
                 };
@@ -7645,7 +8075,11 @@ impl WorldProtocol {
             }
             WorldCommand::Message { room, envelope } => {
                 let (avatar_did, handle, created) = self.world.ensure_avatar(
-                    sender_did, &sender_profile, &sender_push_endpoint, &room,
+                    sender_did,
+                    &sender_profile,
+                    &sender_push_endpoint,
+                    &sender_encryption_pubkey_multibase,
+                    &room,
                 ).await?;
                 if created {
                     self.push_presence_snapshot(&room).await;
@@ -7756,7 +8190,11 @@ impl WorldProtocol {
             }
             WorldCommand::RoomEvents { room, since_sequence } => {
                 let (avatar_did, _handle, created) = self.world.ensure_avatar(
-                    sender_did, &sender_profile, &sender_push_endpoint, &room,
+                    sender_did,
+                    &sender_profile,
+                    &sender_push_endpoint,
+                    &sender_encryption_pubkey_multibase,
+                    &room,
                 ).await?;
                 if created {
                     self.push_presence_snapshot(&room).await;

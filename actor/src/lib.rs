@@ -37,12 +37,34 @@ fn recipient_inbox_endpoint_id(document: &Document) -> Result<String, JsValue> {
             return Ok(endpoint);
         }
     }
-
     Err(js_err("recipient DID document has no usable inbox transport endpoint"))
 }
 
-async fn send_whisper_signed_message(target_endpoint_id: &str, message_cbor: Vec<u8>) -> Result<InboxResponse, JsValue> {
-    let requested_alpn = String::from_utf8_lossy(INBOX_ALPN).to_string();
+/// Resolve the presence endpoint from a DID document, preferring `presence_hint`.
+/// Falls back to `current_inbox` since both share the same iroh endpoint ID.
+fn recipient_presence_endpoint_id(document: &Document) -> Result<String, JsValue> {
+    if let Some(ma) = document.ma.as_ref() {
+        // Prefer presence_hint — confirms the actor is listening on the presence lane.
+        if let Some(hint) = ma.presence_hint.as_deref() {
+            if let Some(endpoint) = core_resolve_inbox_endpoint_id(None, Some(hint), None) {
+                return Ok(endpoint);
+            }
+        }
+        // Fall back to inbox endpoint — same iroh node, but receiver may not accept PRESENCE_ALPN.
+        if let Some(endpoint) = core_resolve_inbox_endpoint_id(
+            ma.current_inbox.as_deref(),
+            None,
+            ma.transports.as_ref(),
+        ) {
+            return Ok(endpoint);
+        }
+    }
+    Err(js_err("recipient DID document has no usable presence transport endpoint"))
+}
+
+/// Generic framed send over an arbitrary ALPN lane using the InboxRequest protocol.
+async fn send_to_lane(alpn: &'static [u8], target_endpoint_id: &str, message_cbor: Vec<u8>) -> Result<InboxResponse, JsValue> {
+    let alpn_label = String::from_utf8_lossy(alpn);
     let target: EndpointId = target_endpoint_id
         .trim()
         .parse()
@@ -61,19 +83,19 @@ async fn send_whisper_signed_message(target_endpoint_id: &str, message_cbor: Vec
 
     let endpoint_addr = EndpointAddr::new(target).with_relay_url(relay_url);
     let connection = endpoint
-        .connect(endpoint_addr, INBOX_ALPN)
+        .connect(endpoint_addr, alpn)
         .await
         .map_err(|e| js_err(format!(
-            "whisper endpoint.connect() failed: {} (requested_alpn={})",
-            e, requested_alpn
+            "send_to_lane connect failed: {} (alpn={})",
+            e, alpn_label
         )))?;
 
     let (mut send, mut recv) = connection
         .open_bi()
         .await
         .map_err(|e| js_err(format!(
-            "whisper connection.open_bi() failed: {} (requested_alpn={})",
-            e, requested_alpn
+            "send_to_lane open_bi failed: {} (alpn={})",
+            e, alpn_label
         )))?;
 
     let request = InboxRequest::Signed { message_cbor };
@@ -85,7 +107,7 @@ async fn send_whisper_signed_message(target_endpoint_id: &str, message_cbor: Vec
 
     let frame_len = recv.read_u32().await.map_err(js_err)? as usize;
     if frame_len > 256 * 1024 {
-        return Err(js_err(format!("whisper response frame too large: {}", frame_len)));
+        return Err(js_err(format!("send_to_lane response frame too large: {}", frame_len)));
     }
     let mut bytes = vec![0u8; frame_len];
     recv.read_exact(&mut bytes).await.map_err(js_err)?;
@@ -391,7 +413,7 @@ use ma_core::{
     CompiledCapabilityAcl,
     compile_acl,
     CONTENT_TYPE_CHAT,
-    CONTENT_TYPE_DOC, CONTENT_TYPE_WORLD, CONTENT_TYPE_WHISPER,
+    CONTENT_TYPE_DOC, CONTENT_TYPE_WORLD, CONTENT_TYPE_WHISPER, CONTENT_TYPE_MESSAGE,
     DEFAULT_WORLD_RELAY_URL,
     evaluate_compiled_acl_with_owner,
     did_root as core_did_root,
@@ -2121,7 +2143,7 @@ pub async fn send_world_chat_with_ttl(
     .map_err(js_err)
 }
 
-/// Send an E2E-encrypted `application/x-ma-whisper` to recipient DID.
+/// Send an E2E-encrypted `application/x-ma-whisper` over the presence lane (instant, peer must be online).
 #[wasm_bindgen]
 pub async fn send_world_whisper(
     _endpoint_id: &str,
@@ -2143,11 +2165,96 @@ pub async fn send_world_whisper(
     .await
 }
 
-/// Send an E2E-encrypted `application/x-ma-whisper` to recipient DID with explicit TTL (seconds).
-/// `ttl_seconds = 0` means no TTL expiration.
+/// Send an E2E-encrypted `application/x-ma-whisper` over the presence lane with explicit TTL.
+/// Requires the recipient to be online (`ma/presence/1`). `ttl_seconds = 0` means no TTL.
 #[wasm_bindgen]
 pub async fn send_world_whisper_with_ttl(
     _endpoint_id: &str,
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+    actor_name: &str,
+    recipient_document_json: &str,
+    text: &str,
+    ttl_seconds: u64,
+) -> Result<String, JsValue> {
+    let encrypted: EncryptedIdentityBundle = serde_json::from_str(encrypted_bundle_json)
+        .map_err(|e| js_err(format!("invalid bundle JSON: {e}")))?;
+    let plain_bytes = decrypt_bundle(passphrase, &encrypted).map_err(js_err)?;
+    let plain: IdentityBundlePlain = serde_json::from_slice(&plain_bytes)
+        .map_err(|e| js_err(format!("bundle corrupted: {e}")))?;
+
+    let recipient_document = Document::unmarshal(recipient_document_json).map_err(js_err)?;
+    let recipient_endpoint_id = recipient_presence_endpoint_id(&recipient_document)?;
+    let actor_name = actor_name.trim();
+    let from_did = Did::try_from(plain.document.id.as_str())
+        .and_then(|did| did.with_fragment(actor_name))
+        .map_err(js_err)?;
+
+    let signing_key = restore_signing_key(&plain.ipns, &plain.signing_private_key_hex)?;
+    let encryption_key = restore_encryption_key(&plain.ipns, &plain.encryption_private_key_hex)?;
+    let cipher_payload = encrypt_whisper_content(text.as_bytes(), &encryption_key, &recipient_document)?;
+
+    let timestamp_ms = js_sys::Date::now() as u64;
+    let message = build_signed_message_with_js_time(
+        from_did.id(),
+        recipient_document.id.clone(),
+        CONTENT_TYPE_WHISPER.to_string(),
+        cipher_payload,
+        &signing_key,
+        timestamp_ms,
+        ttl_seconds,
+    )?;
+
+    let response = send_to_lane(PRESENCE_ALPN, &recipient_endpoint_id, message.to_cbor().map_err(js_err)?).await?;
+
+    serde_json::to_string(&WorldActionResult {
+        response: WorldResponse {
+            ok: response.ok,
+            room: String::new(),
+            message: response.message,
+            endpoint_id: recipient_endpoint_id,
+            latest_event_sequence: 0,
+            broadcasted: false,
+            events: Vec::new(),
+            handle: String::new(),
+            room_description: String::new(),
+            room_title: String::new(),
+            room_did: String::new(),
+            world_did: String::new(),
+            avatars: Vec::new(),
+            room_object_dids: HashMap::new(),
+            transport_ack: None,
+        },
+        pending_whispers: Vec::new(),
+    })
+    .map_err(js_err)
+}
+
+/// Send an E2E-encrypted `application/x-ma-message` over the inbox lane (persistent, queued).
+/// Use this for mail-like messages where the recipient need not be online (`ma/inbox/1`).
+#[wasm_bindgen]
+pub async fn send_direct_message(
+    passphrase: &str,
+    encrypted_bundle_json: &str,
+    actor_name: &str,
+    recipient_document_json: &str,
+    text: &str,
+) -> Result<String, JsValue> {
+    send_direct_message_with_ttl(
+        passphrase,
+        encrypted_bundle_json,
+        actor_name,
+        recipient_document_json,
+        text,
+        0u64,
+    )
+    .await
+}
+
+/// Send an E2E-encrypted `application/x-ma-message` over the inbox lane with explicit TTL.
+/// `ttl_seconds = 0` means no TTL expiration (message persists until actor drains inbox).
+#[wasm_bindgen]
+pub async fn send_direct_message_with_ttl(
     passphrase: &str,
     encrypted_bundle_json: &str,
     actor_name: &str,
@@ -2176,14 +2283,14 @@ pub async fn send_world_whisper_with_ttl(
     let message = build_signed_message_with_js_time(
         from_did.id(),
         recipient_document.id.clone(),
-        CONTENT_TYPE_WHISPER.to_string(),
+        CONTENT_TYPE_MESSAGE.to_string(),
         cipher_payload,
         &signing_key,
         timestamp_ms,
         ttl_seconds,
     )?;
 
-    let response = send_whisper_signed_message(&recipient_endpoint_id, message.to_cbor().map_err(js_err)?).await?;
+    let response = send_to_lane(INBOX_ALPN, &recipient_endpoint_id, message.to_cbor().map_err(js_err)?).await?;
 
     serde_json::to_string(&WorldActionResult {
         response: WorldResponse {

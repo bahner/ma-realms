@@ -291,22 +291,10 @@ export function createInboxTransport({
 }) {
   function messageRequiresResponse(meta) {
     const contentType = String(meta?.content_type || '').trim().toLowerCase();
-    const contentText = String(meta?.content_text || '').trim().toLowerCase();
-    if (!contentType && !contentText) {
-      return false;
-    }
-
-    if (
-      contentType === 'application/x-ma-whisper' ||
-      contentType === 'application/x.ma.whisper' ||
-      contentType === 'application/x-ma-cmd' ||
-      contentType === 'application/x-ma-command' ||
-      contentType === 'application/x-ma-world'
-    ) {
-      return true;
-    }
-
-    return /\bknock\b/.test(contentText);
+    return (
+      contentType === 'application/x-ma-message' ||
+      contentType === 'application/x.ma.message'
+    );
   }
 
   function queueMailboxItem(item, meta) {

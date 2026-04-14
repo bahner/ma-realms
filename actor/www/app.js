@@ -15,6 +15,8 @@ import init, {
   send_world_chat_with_ttl,
   send_world_whisper,
   send_world_whisper_with_ttl,
+  send_direct_message,
+  send_direct_message_with_ttl,
   send_world_cmd,
   send_world_cmd_with_ttl,
   publish_did_document_via_world_ipfs,
@@ -2375,10 +2377,12 @@ const whisperFlow = createWhisperFlow({
   fetchDidDocumentJsonByDid,
   sendWorldWhisper: send_world_whisper,
   sendWorldWhisperWithTtl: send_world_whisper_with_ttl,
+  sendDirectMessage: send_direct_message,
+  sendDirectMessageWithTtl: send_direct_message_with_ttl,
   getMessageTtl,
 });
 
-const { sendWhisperToDid } = whisperFlow;
+const { sendWhisperToDid, sendMessageToDid } = whisperFlow;
 
 function stopHomeEventPolling() {
   if (state.roomPollTimer) {
@@ -2853,6 +2857,7 @@ const { parseDot, parseLocalCommand } = createDotCommands({
   prepareIdentityDocumentForSend,
   publishIdentityToWorldDid,
   sendWhisperToDid,
+  sendMessageToDid,
   runSmokeTest,
 });
 
@@ -3622,6 +3627,7 @@ worldDispatchFlow = createWorldDispatchFlow({
   applyWorldResponse,
   tryHandleDidTargetMetaPoll,
   sendWhisperToDid,
+  sendMessageToDid,
   isNotRegisteredInRoomMessage,
   performTransparentReentry,
 });

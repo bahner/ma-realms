@@ -39,6 +39,7 @@ export function createDotCommands({
   prepareIdentityDocumentForSend,
   publishIdentityToWorldDid,
   sendWhisperToDid,
+  sendMessageToDid,
   runSmokeTest,
 }) {
   const DYNAMIC_SPECIAL_ALIASES = new Set(['@here', '@me', '@world', '@avatar']);
@@ -354,7 +355,7 @@ export function createDotCommands({
         appendMessage('system', `Mailbox entry #${id} has no valid sender DID.`);
         return true;
       }
-      sendWhisperToDid(targetDid, replyText)
+      sendMessageToDid(targetDid, replyText)
         .then(() => {
           appendMessage('system', `Reply sent to ${humanizeIdentifier(targetDid)} from mailbox #${id}.`);
         })

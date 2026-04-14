@@ -7,18 +7,13 @@ export function createWhisperFlow({
   fetchDidDocumentJsonByDid,
   sendWorldWhisper,
   sendWorldWhisperWithTtl,
+  sendDirectMessage,
+  sendDirectMessageWithTtl,
   getMessageTtl,
 }) {
-  async function sendWhisperToDid(targetDidOrAlias, text, options = {}) {
-    if (!state.identity || !state.currentHome) {
-      throw new Error('Join a home before sending chat.');
-    }
-
+  function resolveTargetDid(targetDidOrAlias) {
     const key = String(targetDidOrAlias || '').trim().replace(/^@+/, '');
-    if (!key) {
-      throw new Error("Usage: @target '<message>");
-    }
-
+    if (!key) return null;
     const resolved = resolveAliasInput(key);
     const mappedDid = state.handleDidMap[key]
       || state.handleDidMap[String(key).toLowerCase()]
@@ -28,8 +23,17 @@ export function createWhisperFlow({
     const targetDid = isMaDid(key)
       ? key
       : (isMaDid(resolved) ? resolved : (mappedDid || findDidByEndpoint(resolved) || resolved));
-    if (!isMaDid(String(targetDid))) {
-      throw new Error(`Message target must be a did:ma DID, alias, or known handle mapped to a DID. Got: ${targetDid}`);
+    return isMaDid(String(targetDid)) ? targetDid : null;
+  }
+
+  async function sendWhisperToDid(targetDidOrAlias, text, options = {}) {
+    if (!state.identity || !state.currentHome) {
+      throw new Error('Join a home before sending chat.');
+    }
+
+    const targetDid = resolveTargetDid(targetDidOrAlias);
+    if (!targetDid) {
+      throw new Error(`Message target must be a did:ma DID, alias, or known handle mapped to a DID. Got: ${targetDidOrAlias}`);
     }
 
     const recipientDocumentJson = await fetchDidDocumentJsonByDid(targetDid);
@@ -55,11 +59,40 @@ export function createWhisperFlow({
     );
 
     if (!result.ok) {
-      throw new Error(result.message || 'direct message failed');
+      throw new Error(result.message || 'whisper failed');
+    }
+  }
+
+  /// Send a persistent encrypted message (application/x-ma-message) over the inbox lane.
+  /// The recipient need not be online — the message is queued in their ma/inbox/1.
+  async function sendMessageToDid(targetDidOrAlias, text) {
+    if (!state.identity) {
+      throw new Error('Load an identity before sending a message.');
+    }
+
+    const targetDid = resolveTargetDid(targetDidOrAlias);
+    if (!targetDid) {
+      throw new Error(`Message target must be a did:ma DID, alias, or known handle mapped to a DID. Got: ${targetDidOrAlias}`);
+    }
+
+    const recipientDocumentJson = await fetchDidDocumentJsonByDid(targetDid);
+    const result = JSON.parse(
+      await sendDirectMessage(
+        state.passphrase,
+        state.encryptedBundle,
+        state.aliasName,
+        recipientDocumentJson,
+        text,
+      )
+    );
+
+    if (!result.ok) {
+      throw new Error(result.message || 'message send failed');
     }
   }
 
   return {
     sendWhisperToDid,
+    sendMessageToDid,
   };
 }

@@ -177,10 +177,13 @@ Browser calls require IPFS API CORS headers allowing your app origin (for exampl
 ## Protocol & Transport
 
 The WASM client uses ALPN constants and content types from `ma-did` directly
-(e.g. `CONTENT_TYPE_CHAT`, `CONTENT_TYPE_PRESENCE`, `CONTENT_TYPE_WHISPER`, `CONTENT_TYPE_BROADCAST`).
+(e.g. `CONTENT_TYPE_CHAT`, `CONTENT_TYPE_PRESENCE`, `CONTENT_TYPE_WHISPER`, `CONTENT_TYPE_BROADCAST`, `CONTENT_TYPE_MESSAGE`).
 Connection caches are maintained inbox-first (signed world traffic over
 `ma/inbox/1`) so repeated interactions with the same world reuse the iroh
 connection.
+
+`my.mail` is backed by inbound `application/x-ma-message` traffic, which keeps
+mail-like messages easy to filter from other inbox traffic.
 
 An inbox listener registers protocol handlers for the `ma/inbox/1`,
 `ma/whisper/1`, `ma/broadcast/1`, and `ma/presence/1` ALPN lanes so the
