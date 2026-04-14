@@ -716,6 +716,13 @@ enum WorldRootRoomDagValue {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 struct WorldRootIndexDag {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    config: Option<WorldRootConfigDag>,
+    #[serde(default)]
+    public: WorldRootPublicDag,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    private: Option<WorldRootPrivateDag>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     rooms: HashMap<String, WorldRootRoomDagValue>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     avatars: HashMap<String, AvatarRegistryEntry>,
@@ -723,6 +730,34 @@ struct WorldRootIndexDag {
     state_cid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lang_cid: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct WorldRootConfigDag {
+    #[serde(default)]
+    schema: String,
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    world_did: String,
+    #[serde(default)]
+    generated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct WorldRootPublicDag {
+    #[serde(default)]
+    rooms: HashMap<String, WorldRootRoomDagValue>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    avatars: HashMap<String, AvatarRegistryEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lang_cid: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct WorldRootPrivateDag {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state_cid: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -824,6 +859,20 @@ fn sender_profile_from_document(document: &Document) -> String {
         }
     }
     "und".to_string()
+}
+
+fn normalize_language_for_did_document(language_order: &str) -> Option<String> {
+    let tokens = language_order
+        .split(|ch: char| ch == ':' || ch == ';' || ch == ',' || ch.is_ascii_whitespace())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens.join(":"))
+    }
 }
 
 fn sender_push_endpoint_from_document(document: &Document) -> Option<String> {
@@ -1229,10 +1278,15 @@ impl World {
         document.assertion_method = assertion_vm_id;
         document.key_agreement = key_agreement_vm_id;
         document.set_ma_type("avatar")?;
-        if !language_order.trim().is_empty() {
-            document
-                .set_language(language_order.clone())
-                .map_err(|e| anyhow!("failed setting avatar language on DID document: {}", e))?;
+        if let Some(did_language_order) = normalize_language_for_did_document(&language_order) {
+            if let Err(err) = document.set_language(did_language_order.clone()) {
+                warn!(
+                    "ignoring invalid avatar language '{}' for {}: {}",
+                    did_language_order,
+                    avatar_did.id(),
+                    err
+                );
+            }
         }
         document.set_ma_transports(serde_json::Value::Array(
             vec![
@@ -2595,12 +2649,28 @@ impl World {
         let (index_rooms, loaded_legacy_yaml, had_embedded_room_metadata): (HashMap<String, WorldRootRoomEntry>, bool, bool) =
             match dag_get_dag_cbor::<WorldRootIndexDag>(&kubo_url, root_cid).await {
                 Ok(dag) => {
-                    *self.avatar_registry.write().await = dag.avatars.clone();
-                    *self.state_cid.write().await = dag.state_cid.clone();
-                    *self.lang_cid.write().await = dag.lang_cid.clone();
+                    let avatars = if !dag.public.avatars.is_empty() {
+                        dag.public.avatars.clone()
+                    } else {
+                        dag.avatars.clone()
+                    };
+                    let state_cid = dag
+                        .private
+                        .as_ref()
+                        .and_then(|private| private.state_cid.clone())
+                        .or(dag.state_cid.clone());
+                    let lang_cid = dag.public.lang_cid.clone().or(dag.lang_cid.clone());
+
+                    *self.avatar_registry.write().await = avatars;
+                    *self.state_cid.write().await = state_cid;
+                    *self.lang_cid.write().await = lang_cid;
                     let mut had_embedded = false;
-                    let rooms = dag
-                        .rooms
+                    let room_entries = if !dag.public.rooms.is_empty() {
+                        dag.public.rooms
+                    } else {
+                        dag.rooms
+                    };
+                    let rooms = room_entries
                         .into_iter()
                         .map(|(name, value)| {
                             let entry = match value {
@@ -2813,6 +2883,30 @@ impl World {
         let kubo_url = self.kubo_url().await;
         let previous_world_cid = self.world_cid.read().await.clone();
         let pin_name = self.world_root_pin_name.read().await.clone();
+        // Backfill static snapshots for runtime rooms that don't yet have a room CID,
+        // so the world root DAG remains browseable via ipfs dag get.
+        let runtime_room_names = {
+            let rooms = self.rooms.read().await;
+            let mut names = rooms.keys().cloned().collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        let missing_room_cids = {
+            let room_cids = self.room_cids.read().await;
+            runtime_room_names
+                .into_iter()
+                .filter(|name| !room_cids.contains_key(name))
+                .collect::<Vec<_>>()
+        };
+        for room_name in missing_room_cids {
+            let cid = self.save_room_static(&room_name).await?;
+            info!(
+                "Room '{}' static snapshot backfilled as {} before world index save",
+                room_name,
+                cid
+            );
+        }
+
         let room_cids = self.room_cids.read().await.clone();
         let room_meta: HashMap<String, (String, String, String, Option<String>, Option<String>, RoomAcl)> = self
             .rooms
@@ -2882,10 +2976,19 @@ impl World {
         }
 
         let index = WorldRootIndexDag {
-            rooms: rooms_index,
-            avatars: self.avatar_registry.read().await.clone(),
-            state_cid: self.state_cid.read().await.clone(),
-            lang_cid: self.lang_cid.read().await.clone(),
+            config: None,
+            public: WorldRootPublicDag {
+                rooms: rooms_index,
+                avatars: self.avatar_registry.read().await.clone(),
+                lang_cid: self.lang_cid.read().await.clone(),
+            },
+            private: Some(WorldRootPrivateDag {
+                state_cid: self.state_cid.read().await.clone(),
+            }),
+            rooms: HashMap::new(),
+            avatars: HashMap::new(),
+            state_cid: None,
+            lang_cid: None,
         };
         let new_cid = kubo::dag_put_dag_cbor(&kubo_url, &index).await?;
 
@@ -3779,7 +3882,11 @@ impl World {
             *self.last_pointer_publish_ok.write().await = Some(false);
             *self.last_pointer_publish_root_cid.write().await = Some(root_cid.clone());
             *self.last_pointer_publish_error.write().await = Some(message.clone());
-            return Err(anyhow!(message));
+            warn!(
+                "runtime DID/IPNS publish failed; keeping saved state/root locally: {}",
+                message
+            );
+            return Ok((state_cid, root_cid));
         }
 
         *self.last_pointer_publish_ok.write().await = Some(true);
@@ -5941,7 +6048,16 @@ impl World {
                             .await
                             .clone()
                             .unwrap_or_else(|| format!("{DID_PREFIX}unconfigured"));
-                        let rooms = self.rooms.read().await.len();
+                        let rooms = {
+                            let rooms = self.rooms.read().await;
+                            let mut names = rooms.keys().cloned().collect::<Vec<_>>();
+                            names.sort();
+                            if names.is_empty() {
+                                "(none)".to_string()
+                            } else {
+                                names.join(",")
+                            }
+                        };
                         let lang_cid = self
                             .lang_cid
                             .read()
@@ -5949,7 +6065,7 @@ impl World {
                             .clone()
                             .unwrap_or_else(|| "(none)".to_string());
                         return format!(
-                            "@ .world.owner {}\n@ .world.did {}\n@ .world.rooms {}\n@ .world.lang_cid {}",
+                            "@world.owner {}\n@world.did {}\n@world.rooms {}\n@world.lang_cid {}",
                             owner, did, rooms, lang_cid
                         );
                     }
@@ -5969,7 +6085,15 @@ impl World {
                             .clone()
                             .unwrap_or_else(|| format!("{DID_PREFIX}unconfigured"))
                     }
-                    "rooms" => return self.rooms.read().await.len().to_string(),
+                    "rooms" => {
+                        let rooms = self.rooms.read().await;
+                        let mut names = rooms.keys().cloned().collect::<Vec<_>>();
+                        names.sort();
+                        if names.is_empty() {
+                            return "(none)".to_string();
+                        }
+                        return names.join("\n");
+                    }
                     "lang_cid" => {
                         return self
                             .lang_cid
@@ -8529,6 +8653,10 @@ async fn publish_world_did_runtime_ma(
     root_cid: &str,
     pointer_mode: bool,
 ) -> Result<()> {
+    const RUNTIME_IPNS_ATTEMPTS: u32 = 3;
+    const RUNTIME_IPNS_TIMEOUT_SECS: u64 = 12;
+    const RUNTIME_IPNS_BACKOFF_MS: u64 = 500;
+
     let world_key_name = normalize_world_key_name(world_slug);
     let did_identifier = ensure_kubo_key_id(kubo_url, &world_key_name).await?;
     let world_did = Did::new(&did_identifier, world_slug)
@@ -8549,7 +8677,7 @@ async fn publish_world_did_runtime_ma(
         let state_key_name = runtime_state_key_name(world_slug);
         let state_ipns_id = ensure_kubo_key_id(kubo_url, &state_key_name).await?;
         let ipns_options = IpnsPublishOptions {
-            timeout: Duration::from_secs(45),
+            timeout: Duration::from_secs(RUNTIME_IPNS_TIMEOUT_SECS),
             ..IpnsPublishOptions::default()
         };
         ipns_publish_with_retry(
@@ -8557,8 +8685,8 @@ async fn publish_world_did_runtime_ma(
             &state_key_name,
             root_cid,
             &ipns_options,
-            8,
-            Duration::from_millis(1500),
+            RUNTIME_IPNS_ATTEMPTS,
+            Duration::from_millis(RUNTIME_IPNS_BACKOFF_MS),
         )
         .await?;
 
@@ -8583,7 +8711,7 @@ async fn publish_world_did_runtime_ma(
     let document_cid = ipfs_add(kubo_url, document_json.into_bytes()).await?;
 
     let ipns_options = IpnsPublishOptions {
-        timeout: Duration::from_secs(45),
+        timeout: Duration::from_secs(RUNTIME_IPNS_TIMEOUT_SECS),
         ..IpnsPublishOptions::default()
     };
     ipns_publish_with_retry(
@@ -8591,8 +8719,8 @@ async fn publish_world_did_runtime_ma(
         &world_key_name,
         &document_cid,
         &ipns_options,
-        8,
-        Duration::from_millis(1500),
+        RUNTIME_IPNS_ATTEMPTS,
+        Duration::from_millis(RUNTIME_IPNS_BACKOFF_MS),
     )
     .await?;
 
@@ -9640,6 +9768,191 @@ async fn main() -> Result<()> {
         println!("  config: {}", report.config_path);
         println!("  authoring: {}", report.authoring_dir);
         println!("  actors: {}", report.actor_count);
+        return Ok(());
+    }
+
+    if args.len() >= 2 && args[1] == "verify-root" {
+        let mut world_slug = default_world_slug.clone();
+        let mut root_cid: Option<String> = None;
+
+        let mut idx = 2usize;
+        while idx < args.len() {
+            match args[idx].as_str() {
+                "--slug" => {
+                    idx += 1;
+                    if idx >= args.len() {
+                        return Err(anyhow!("missing value for --slug"));
+                    }
+                    world_slug = args[idx].clone();
+                }
+                "--root-cid" => {
+                    idx += 1;
+                    if idx >= args.len() {
+                        return Err(anyhow!("missing value for --root-cid"));
+                    }
+                    root_cid = Some(args[idx].clone());
+                }
+                other => {
+                    return Err(anyhow!(
+                        "unknown argument '{}' for verify-root (supported: --slug, --root-cid)",
+                        other
+                    ));
+                }
+            }
+            idx += 1;
+        }
+
+        let root_cid = root_cid.ok_or_else(|| anyhow!("--root-cid is required for verify-root"))?;
+        let normalized_slug = normalize_world_key_name(&world_slug);
+        let runtime_cfg_path = runtime_config_path(&normalized_slug);
+        let runtime_cfg = load_runtime_file_config(&runtime_cfg_path)?;
+        let kubo_url = runtime_cfg
+            .kubo_api_url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_KUBO_API_URL.to_string());
+        let iroh_path = runtime_cfg
+            .iroh_secret
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| runtime_iroh_secret_default_path(&normalized_slug));
+        let secret_key = load_persisted_iroh_secret_key(&iroh_path)?
+            .ok_or_else(|| anyhow!(
+                "missing iroh secret at {}. Create it with: ma-world --gen-iroh-secret --slug {}",
+                iroh_path.display(),
+                normalized_slug
+            ))?;
+        let world_master_key = derive_world_master_key(&secret_key, &normalized_slug);
+        let world_key_name = normalize_world_key_name(&normalized_slug);
+        let did_identifier = ensure_kubo_key_id(&kubo_url, &world_key_name).await?;
+        let world_did = Did::new(&did_identifier, &normalized_slug)
+            .map_err(|e| anyhow!("failed to build world DID from key id '{}': {}", did_identifier, e))?;
+
+        let world = World::new(
+            EntryAcl {
+                allow_all: true,
+                allow_owner: true,
+                allowed_dids: HashSet::new(),
+                source: "*".to_string(),
+            },
+            kubo_url.clone(),
+            normalized_slug.clone(),
+        );
+        world.set_world_master_key(world_master_key).await;
+        world.set_world_did(&world_did.id()).await?;
+
+        let rooms_loaded = world.load_from_world_cid(&root_cid).await?;
+        let mut verified_state_cid = String::new();
+        if let Some(state_cid) = world.state_cid().await {
+            let _ = world.load_encrypted_state(&state_cid).await?;
+            verified_state_cid = state_cid;
+        }
+
+        println!("verify-root OK");
+        println!("  slug: {}", normalized_slug);
+        println!("  root_cid: {}", root_cid);
+        println!("  rooms_loaded: {}", rooms_loaded);
+        if verified_state_cid.is_empty() {
+            println!("  state_cid: (none)");
+        } else {
+            println!("  state_cid: {}", verified_state_cid);
+        }
+        return Ok(());
+    }
+
+    if args.len() >= 2 && args[1] == "restore-root" {
+        let mut world_slug = default_world_slug.clone();
+        let mut root_cid: Option<String> = None;
+        let mut dry_run = false;
+
+        let mut idx = 2usize;
+        while idx < args.len() {
+            match args[idx].as_str() {
+                "--slug" => {
+                    idx += 1;
+                    if idx >= args.len() {
+                        return Err(anyhow!("missing value for --slug"));
+                    }
+                    world_slug = args[idx].clone();
+                }
+                "--root-cid" => {
+                    idx += 1;
+                    if idx >= args.len() {
+                        return Err(anyhow!("missing value for --root-cid"));
+                    }
+                    root_cid = Some(args[idx].clone());
+                }
+                "--dry-run" => {
+                    dry_run = true;
+                }
+                other => {
+                    return Err(anyhow!(
+                        "unknown argument '{}' for restore-root (supported: --slug, --root-cid, --dry-run)",
+                        other
+                    ));
+                }
+            }
+            idx += 1;
+        }
+
+        let root_cid = root_cid.ok_or_else(|| anyhow!("--root-cid is required for restore-root"))?;
+        let normalized_slug = normalize_world_key_name(&world_slug);
+        let runtime_cfg_path = runtime_config_path(&normalized_slug);
+        let runtime_cfg = load_runtime_file_config(&runtime_cfg_path)?;
+        let kubo_url = runtime_cfg
+            .kubo_api_url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_KUBO_API_URL.to_string());
+        let iroh_path = runtime_cfg
+            .iroh_secret
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| runtime_iroh_secret_default_path(&normalized_slug));
+        let secret_key = load_persisted_iroh_secret_key(&iroh_path)?
+            .ok_or_else(|| anyhow!(
+                "missing iroh secret at {}. Create it with: ma-world --gen-iroh-secret --slug {}",
+                iroh_path.display(),
+                normalized_slug
+            ))?;
+        let world_master_key = derive_world_master_key(&secret_key, &normalized_slug);
+        let world_key_name = normalize_world_key_name(&normalized_slug);
+        let did_identifier = ensure_kubo_key_id(&kubo_url, &world_key_name).await?;
+        let world_did = Did::new(&did_identifier, &normalized_slug)
+            .map_err(|e| anyhow!("failed to build world DID from key id '{}': {}", did_identifier, e))?;
+
+        let world = World::new(
+            EntryAcl {
+                allow_all: true,
+                allow_owner: true,
+                allowed_dids: HashSet::new(),
+                source: "*".to_string(),
+            },
+            kubo_url.clone(),
+            normalized_slug.clone(),
+        );
+        world.set_world_master_key(world_master_key).await;
+        world.set_world_did(&world_did.id()).await?;
+
+        let rooms_loaded = world.load_from_world_cid(&root_cid).await?;
+        if let Some(state_cid) = world.state_cid().await {
+            let _ = world.load_encrypted_state(&state_cid).await?;
+        }
+
+        if dry_run {
+            println!("restore-root DRY-RUN OK");
+            println!("  slug: {}", normalized_slug);
+            println!("  input_root_cid: {}", root_cid);
+            println!("  rooms_loaded: {}", rooms_loaded);
+            return Ok(());
+        }
+
+        let (new_state_cid, new_root_cid) = world.save_encrypted_state().await?;
+
+        println!("restore-root OK");
+        println!("  slug: {}", normalized_slug);
+        println!("  input_root_cid: {}", root_cid);
+        println!("  rooms_loaded: {}", rooms_loaded);
+        println!("  output_state_cid: {}", new_state_cid);
+        println!("  output_root_cid: {}", new_root_cid);
         return Ok(());
     }
 

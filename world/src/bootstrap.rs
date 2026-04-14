@@ -14,6 +14,8 @@ pub fn print_cli_help() {
     println!("  ma-world --gen-iroh-secret [--slug <slug>] [<path>]");
     println!("  ma-world create-unlock-bundle --slug <slug> --passphrase <passphrase> [--out <path>]");
     println!("  ma-world --gen-headless-config --slug <slug> [--passphrase <passphrase>]");
+    println!("  ma-world verify-root --slug <slug> --root-cid <cid>");
+    println!("  ma-world restore-root --slug <slug> --root-cid <cid> [--dry-run]");
     println!();
     println!("publish-world options:");
     println!("  --slug <slug>");
