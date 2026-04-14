@@ -9,6 +9,9 @@ export function contentTypeToRouteKey(contentType) {
   if (value === 'application/x-ma-presence' || value === 'application/x.ma.presence') {
     return 'application/x-ma-presence';
   }
+  if (value === 'application/x-ma-event' || value === 'application/x.ma.event') {
+    return 'application/x-ma-event';
+  }
   if (value === 'application/x-ma-broadcast' || value === 'application/x.ma.broadcast') {
     return 'application/x-ma-broadcast';
   }
@@ -162,23 +165,23 @@ export function createInboundDispatcher(deps) {
     }
   }
 
-  async function handleInboundBroadcast(evt) {
+  async function handleInboundRoomEvent(evt) {
     if (!evt.text) return;
     let payload;
     try {
       payload = JSON.parse(evt.text);
     } catch (error) {
-      logger.log('inbox.broadcast', `invalid broadcast payload json: ${error instanceof Error ? error.message : String(error)}`);
+      logger.log('inbox.event', `invalid room event payload json: ${error instanceof Error ? error.message : String(error)}`);
       return;
     }
-    const broadcastRoom = String(payload?.room || '').trim();
+    const eventRoom = String(payload?.room || '').trim();
     const currentRoom = String(state.currentHome?.room || '').trim();
-    if (!currentRoom || broadcastRoom !== currentRoom) {
-      logger.log('inbox.broadcast', `dropped broadcast for room '${broadcastRoom}' (current='${currentRoom}')`);
+    if (!currentRoom || eventRoom !== currentRoom) {
+      logger.log('inbox.event', `dropped room event for room '${eventRoom}' (current='${currentRoom}')`);
       return;
     }
 
-    // Update room metadata from broadcast.
+    // Update room metadata from event envelope.
     if (payload.room_title && state.currentHome) {
       state.currentHome.roomTitle = payload.room_title;
     }
@@ -189,11 +192,11 @@ export function createInboundDispatcher(deps) {
       state.currentHome.roomDid = payload.room_did;
     }
 
-    // Dispatch contained events.
+    // Dispatch one contained event.
     const currentSeq = state.currentHome?.lastEventSequence || 0;
-    for (const event of payload.events || []) {
-      const seq = typeof event.sequence === 'number' ? event.sequence : 0;
-      if (seq <= currentSeq) continue;
+    const event = payload?.event;
+    const seq = typeof event?.sequence === 'number' ? event.sequence : 0;
+    if (seq > currentSeq && event) {
       await dispatchInboundEvent(event);
       if (state.currentHome && seq > (state.currentHome.lastEventSequence || 0)) {
         state.currentHome.lastEventSequence = seq;
@@ -206,13 +209,30 @@ export function createInboundDispatcher(deps) {
       );
     }
 
-    logger.log('inbox.broadcast', `processed broadcast for room '${broadcastRoom}' events=${(payload.events || []).length} latest_seq=${payload.latest_event_sequence || 0}`);
+    logger.log('inbox.event', `processed room event for room '${eventRoom}' seq=${seq} latest_seq=${payload.latest_event_sequence || 0}`);
+  }
+
+  async function handleInboundBroadcast(evt) {
+    if (!evt.text) return;
+
+    let text = '';
+    try {
+      const payload = JSON.parse(evt.text);
+      text = String(payload?.message || payload?.text || payload?.body || '').trim();
+    } catch (_error) {
+      text = String(evt.text || '').trim();
+    }
+
+    if (!text) return;
+    appendMessage('world', `[Broadcast] ${text}`);
+    logger.log('inbox.broadcast', `processed broadcast announcement len=${text.length}`);
   }
 
   const inboundRoutes = {
     'application/x-ma-chat': { name: 'chat', handler: handleInboundChat },
     'application/x-ma-whisper': { name: 'whisper', handler: handleInboundWhisper },
     'application/x-ma-presence': { name: 'presence', handler: handleInboundPresence },
+    'application/x-ma-event': { name: 'event', handler: handleInboundRoomEvent },
     'application/x-ma-broadcast': { name: 'broadcast', handler: handleInboundBroadcast },
     'event/system': { name: 'system', handler: handleInboundSystem },
     'event/speech': { name: 'speech', handler: handleInboundSpeech },
@@ -357,6 +377,10 @@ export function createInboxTransport({
           ? 'whisper'
           : routeKey === 'application/x-ma-presence'
             ? 'presence'
+            : routeKey === 'application/x-ma-event'
+              ? 'event'
+              : routeKey === 'application/x-ma-broadcast'
+                ? 'broadcast'
             : 'chat';
 
         await dispatchInboundEvent({
@@ -365,7 +389,7 @@ export function createInboxTransport({
           sender: '',
           sender_did: meta.from,
           sender_endpoint: item.from_endpoint || '',
-          message: kind === 'presence' ? (meta.content_text || '') : '',
+          message: (kind === 'presence' || kind === 'event' || kind === 'broadcast') ? (meta.content_text || '') : '',
           message_cbor_b64: item.message_cbor_b64,
           sequence: 0,
           occurred_at: ''

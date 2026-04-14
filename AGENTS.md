@@ -22,6 +22,8 @@ Terminology for command scripting:
 - scoped commands must be expressed as dot-notated methods, not space form (for example avatar.peek, not "avatar peek")
 - verb is only used for natural-language interpretation, not as the primary term in scripted paths
 
+WE NEVER EVER GENERATE SHORTENED DIDs THEY MUST BE FULL INCLUDING FRAGMENTS
+
 We use classic dot notation for objects and methods, so @did:ma:someipns#fragment.name shows the name, while @did:ma:someipns#fragment.whisper Hello sends a whisper with the content "Hello" to @did:ma:someipns#fragment.name. This is fairly standard object notation. In practice, that means scripts can be stored in YAML format.
 
 Inbox-first transport model:

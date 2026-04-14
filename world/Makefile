@@ -4,6 +4,7 @@ BINARY := target/debug/ma-world
 RELEASE_BINARY := target/release/ma-world
 STAMP := target/.build_stamp
 MA_WORLD_VERSION ?=
+RELEASE_OPTS ?= --release --target x86_64-unknown-linux-musl
 
 help:
 	@echo "Available targets:"
@@ -16,12 +17,12 @@ help:
 build: $(STAMP)
 
 $(STAMP): Cargo.toml src/*.rs ../../did/src/*.rs ../core/src/*.rs
-	MA_WORLD_VERSION="$(MA_WORLD_VERSION)" cargo build
+	MA_WORLD_VERSION="$(MA_WORLD_VERSION)" cargo build $(BUILD_OPTS)
 	@mkdir -p $(dir $(STAMP))
 	@touch $(STAMP)
 
 release: Cargo.toml src/*.rs ../../did/src/*.rs ../core/src/*.rs
-	MA_WORLD_VERSION="$(MA_WORLD_VERSION)" cargo build --release
+	MA_WORLD_VERSION="$(MA_WORLD_VERSION)" cargo build $(RELEASE_OPTS)
 	@echo "🏗️  Release binary at $(RELEASE_BINARY)"
 
 run: build

@@ -18,6 +18,7 @@ pub const DEFAULT_CONTENT_TYPE: &str = "application/x-ma";
 pub const CONTENT_TYPE_CHAT: &str = "application/x-ma-chat";
 pub const CONTENT_TYPE_PRESENCE: &str = "application/x-ma-presence";
 pub const CONTENT_TYPE_WORLD: &str = "application/x-ma-world";
+pub const CONTENT_TYPE_EVENT: &str = "application/x-ma-event";
 pub const CONTENT_TYPE_BROADCAST: &str = "application/x-ma-broadcast";
 pub const CONTENT_TYPE_DOC: &str = "application/x-ma-doc";
 pub const CONTENT_TYPE_WHISPER: &str = "application/x-ma-whisper";

@@ -536,6 +536,43 @@ export function createWorldDispatchFlow({
     }
 
     let out = text;
+    let ownerOverrideRewriteInfo = null;
+
+    out = out.replace(/^(\s*)@@here\.owner\s+(\S+)(.*)$/i, (all, prefix, value, suffix) => {
+      const room = String(state.currentHome?.room || '').trim();
+      if (!room) {
+        return all;
+      }
+
+      const rawValue = String(value || '').trim();
+      if (!rawValue) {
+        return all;
+      }
+
+      let resolvedValue = rawValue;
+      // Keep value syntax strict: resolve bare alias tokens only.
+      if (!rawValue.startsWith('@')) {
+        const resolved = resolveAliasTarget(rawValue, aliases);
+        const normalized = String(resolved || '').trim();
+        if (normalized) {
+          resolvedValue = normalized;
+        }
+      }
+
+      ownerOverrideRewriteInfo = {
+        room,
+        resolvedValue,
+      };
+
+      return `${prefix}@world.room ${room} owner ${resolvedValue}${String(suffix || '')}`;
+    });
+
+    if (ownerOverrideRewriteInfo) {
+      appendMessage(
+        'system',
+        `admin override: @@here.owner -> @world.room ${ownerOverrideRewriteInfo.room} owner ${ownerOverrideRewriteInfo.resolvedValue}`
+      );
+    }
 
     out = out.replace(/^(\s*go\s+)(\S+)(.*)$/i, (all, prefix, target, suffix) => {
       const rawTarget = String(target || '').trim();
@@ -686,7 +723,9 @@ export function createWorldDispatchFlow({
       throw new Error(result.message || 'command failed');
     }
     if (result.broadcasted) {
-      await pollCurrentHomeEvents();
+      pollCurrentHomeEvents().catch((error) => {
+        logger.log('poll.events', `non-fatal fallback poll after broadcast failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
     }
     return String(result.message || '');
   }
@@ -833,7 +872,9 @@ export function createWorldDispatchFlow({
           throw new Error(result.message || 'say failed');
         }
 
-        await pollCurrentHomeEvents();
+        pollCurrentHomeEvents().catch((error) => {
+          logger.log('poll.events', `non-fatal fallback poll after broadcast failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
         appendAmbientProseAfterSpeech().catch((err) => {
           logger.log('ambient.prose', `failed: ${err instanceof Error ? err.message : String(err)}`);
         });
@@ -864,7 +905,9 @@ export function createWorldDispatchFlow({
           throw new Error(result.message || 'emote failed');
         }
 
-        await pollCurrentHomeEvents();
+        pollCurrentHomeEvents().catch((error) => {
+          logger.log('poll.events', `non-fatal fallback poll after broadcast failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
         return;
       }
 
@@ -964,7 +1007,9 @@ export function createWorldDispatchFlow({
           return;
         }
 
-        await pollCurrentHomeEvents();
+        pollCurrentHomeEvents().catch((error) => {
+          logger.log('poll.events', `non-fatal fallback poll after broadcast failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
         return;
       }
 
@@ -995,7 +1040,9 @@ export function createWorldDispatchFlow({
         return;
       }
 
-      await pollCurrentHomeEvents();
+      pollCurrentHomeEvents().catch((error) => {
+        logger.log('poll.events', `non-fatal fallback poll after broadcast failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (attempt >= 1 || !isNotRegisteredInRoomMessage(message)) {

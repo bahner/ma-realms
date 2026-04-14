@@ -25,13 +25,13 @@ use chrono::Utc;
 use did_ma::{DID_PREFIX, Did, Document, EncryptionKey, Message, SigningKey, VerificationMethod};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey,
-    endpoint::Connection,
+    endpoint::{Connection, RecvStream, SendStream},
     endpoint::presets,
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use ma_core::{
     ActorCommand, AVATAR_ALPN, PRESENCE_ALPN,
-    CONTENT_TYPE_BROADCAST, CONTENT_TYPE_PRESENCE, CONTENT_TYPE_WORLD, CompiledCapabilityAcl,
+    CONTENT_TYPE_BROADCAST, CONTENT_TYPE_EVENT, CONTENT_TYPE_PRESENCE, CONTENT_TYPE_WORLD, CompiledCapabilityAcl,
     DEFAULT_WORLD_RELAY_URL,
     ExitData, LaneCapability, MessageEnvelope, ObjectDefinition, ObjectInboxMessage,
     MAILBOX_COMMANDS_INLINE,
@@ -45,6 +45,7 @@ use ma_core::{
     parse_property_command, parse_property_command_for_keys,
     LegacyRequirement, RequirementChecker, RequirementSet, RequirementValue,
     pin_update_add_rm,
+    resolve_inbox_endpoint_id as core_resolve_inbox_endpoint_id,
     TtlCache,
 };
 use moka::sync::Cache;
@@ -53,7 +54,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::{net::TcpListener, sync::RwLock};
+use tokio::{net::TcpListener, sync::{Mutex, RwLock}};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::prelude::*;
 
@@ -99,9 +100,9 @@ const MAX_OBJECT_INBOX: usize = 512;
 const OBJECT_INBOX_INDEX_CAPACITY: u64 = 4096;
 const MAILBOX_LOCK_SECS: u64 = 600;
 const OBJECT_WASHER_INTERVAL_SECS: u64 = 20;
-const PRESENCE_PROBE_INTERVAL_SECS_DEFAULT: u64 = 10;
-const PRESENCE_STALE_AFTER_SECS_DEFAULT: u64 = 25;
-const WORLD_PING_INTERVAL_SECS: u32 = 30;
+const PRESENCE_PROBE_INTERVAL_SECS_DEFAULT: u64 = 5;
+const PRESENCE_STALE_AFTER_SECS_DEFAULT: u64 = 30;
+const WORLD_PING_INTERVAL_SECS: u32 = 5;
 const RELAY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_WORLD_SLUG: &str = "ma";
 const DEFAULT_KUBO_API_URL: &str = "http://127.0.0.1:5001";
@@ -140,6 +141,15 @@ pub(crate) struct AvatarRequest {
     pub encryption_pubkey_multibase: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct WorldBroadcastEnvelope {
+    v: u8,
+    kind: String,
+    room: String,
+    room_did: String,
+    message: String,
+    ts: String,
+}
 #[derive(Clone, Debug, Serialize)]
 pub struct AvatarSnapshot {
     pub inbox: String,
@@ -228,7 +238,7 @@ struct PresenceRoomStateEvent {
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct RoomBroadcastEvent {
+struct RoomEventEnvelope {
     v: u8,
     kind: String,
     room: String,
@@ -236,7 +246,7 @@ struct RoomBroadcastEvent {
     room_title: String,
     room_description: String,
     avatars: Vec<PresenceAvatar>,
-    events: Vec<RoomEvent>,
+    event: RoomEvent,
     latest_event_sequence: u64,
     ts: String,
 }
@@ -247,8 +257,19 @@ struct WorldProtocol {
     endpoint: Endpoint,
     endpoint_id: String,
     did_cache: Arc<RwLock<HashMap<String, CachedDidDocument>>>,
+    push_stream_cache: Arc<Mutex<HashMap<String, PushStreamCache>>>,
+    push_timeout_cooldown: Arc<Mutex<HashMap<String, Instant>>>,
     lane: WorldLane,
 }
+
+#[derive(Debug)]
+struct PushStreamCache {
+    connection: Connection,
+    send: SendStream,
+    recv: RecvStream,
+}
+
+const PUSH_TIMEOUT_COOLDOWN_SECS: u64 = 8;
 
 #[derive(Clone, Debug)]
 struct IpfsProtocol {
@@ -769,6 +790,21 @@ fn sender_profile_from_document(document: &Document) -> String {
         }
     }
     "und".to_string()
+}
+
+fn sender_push_endpoint_from_document(document: &Document) -> Option<String> {
+    let ma = document.ma.as_ref()?;
+    let endpoint = core_resolve_inbox_endpoint_id(
+        ma.current_inbox.as_deref(),
+        ma.presence_hint.as_deref(),
+        ma.transports.as_ref(),
+    )?;
+    let trimmed = endpoint.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn extract_did_description_from_json(document_json: &str) -> Option<String> {
@@ -3834,7 +3870,7 @@ impl World {
         if let Ok(target_did) = Did::try_from(target) {
 
             if self.is_local_world_ipns(&target_did.ipns).await {
-                if target_did.fragment.is_none() {
+                if target_did.fragment.is_none() || self.is_world_target_did(target).await {
                     let cmd = match &command {
                         ActorCommand::Say { payload } => format!("say {}", payload.trim()),
                         ActorCommand::Emote { payload } => format!("emote {}", payload.trim()),
@@ -5524,13 +5560,20 @@ impl World {
             return tr_world(
                 active_lang,
                 "world.help.commands",
-                "@world commands: help | ping [room] | list | claim | knock list [all] | knock accept <id> | knock reject <id> [note] | knock delete <id> | invite <did> [note] | room <name> acl show|open|close|allow <did>|deny <did> | flush [knock|all] | migrate-index | save | load <cid> | dig <direction> [to|til <#dest|did>] | bury <direction>",
+                "@world commands: help | ping [room] | list | claim | broadcast <message> | knock list [all] | knock accept <id> | knock reject <id> [note] | knock delete <id> | invite <did> [note] | room <name> acl show|open|close|allow <did>|deny <did> | room <name> owner <did> | flush [knock|all] | migrate-index | save | load <cid> | dig <direction> [to|til <#dest|did>] | bury <direction>",
             );
         }
 
         let mut parts = normalized.splitn(2, char::is_whitespace);
         let method = parts.next().unwrap_or_default().to_ascii_lowercase();
         let arg = parts.next().unwrap_or_default().trim().to_string();
+
+        if method == "broadcast" {
+            if arg.is_empty() {
+                return "@world usage: @world.broadcast <message>".to_string();
+            }
+            return format!("@world broadcast sent to room '{}'", room_name);
+        }
 
         if let Some(property) = parse_property_command_for_keys(
             normalized,
@@ -5981,6 +6024,7 @@ impl World {
 
         if method == "room" {
             // @world.room <name> acl show|open|close|allow <did>|deny <did>
+            // @world.room <name> owner <did:ma:...#fragment>
             // World-owner admin override for room-level ACLs.
             // Does NOT automatically bypass the ACL — caller must change it explicitly.
             let mut room_parts = arg.splitn(3, char::is_whitespace);
@@ -5988,8 +6032,50 @@ impl World {
             let sub = room_parts.next().unwrap_or_default().trim().to_ascii_lowercase();
             let sub_arg = room_parts.next().unwrap_or_default().trim().to_string();
 
-            if room_name_arg.is_empty() || sub != "acl" {
-                return "@world usage: @world.room <name> acl show|open|close|allow <did>|deny <did>".to_string();
+            if room_name_arg.is_empty() || sub.is_empty() {
+                return "@world usage: @world.room <name> acl show|open|close|allow <did>|deny <did> | @world.room <name> owner <did:ma:...#fragment>".to_string();
+            }
+
+            if sub == "owner" {
+                if sub_arg.is_empty() {
+                    return format!(
+                        "@world usage: @world.room {} owner <did:ma:...#fragment>",
+                        room_name_arg
+                    );
+                }
+                if !sub_arg.contains('#') {
+                    return format!(
+                        "@world invalid owner DID '{}': missing #fragment",
+                        sub_arg
+                    );
+                }
+                let target_did = match Did::try_from(sub_arg.as_str()) {
+                    Ok(d) => {
+                        if d.fragment.is_none() {
+                            return format!(
+                                "@world invalid owner DID '{}': missing #fragment",
+                                sub_arg
+                            );
+                        }
+                        d.id()
+                    }
+                    Err(e) => return format!("@world invalid owner DID '{}': {}", sub_arg, e),
+                };
+
+                let mut rooms = self.rooms.write().await;
+                let Some(room) = rooms.get_mut(&room_name_arg) else {
+                    return format!("@world room '{}' not found", room_name_arg);
+                };
+                room.acl.owner = Some(target_did.clone());
+                room.acl.allow.insert(target_did.clone());
+                room.acl.deny.remove(&target_did);
+                drop(rooms);
+                let _ = self.save_rooms_and_world_index(&[room_name_arg.clone()]).await;
+                return format!("@world room '{}' owner set to {}", room_name_arg, target_did);
+            }
+
+            if sub != "acl" {
+                return "@world usage: @world.room <name> acl show|open|close|allow <did>|deny <did> | @world.room <name> owner <did:ma:...#fragment>".to_string();
             }
 
             let mut acl_parts = sub_arg.splitn(2, char::is_whitespace);
@@ -6669,17 +6755,35 @@ impl WorldProtocol {
     }
 
     async fn room_signing_key(&self, room_did: &str) -> Result<SigningKey> {
-        let slots = self.world.actor_secrets.read().await;
-        let Some(secret) = slots.get(room_did) else {
-            return Err(anyhow!("missing room actor secret for {}", room_did));
-        };
-
         let room_did_parsed = Did::try_from(room_did)
             .map_err(|e| anyhow!("invalid room did '{}': {}", room_did, e))?;
+        let room_did_canonical = room_did_parsed.id();
         let signing_did = Did::new_root(&room_did_parsed.ipns)
             .map_err(|e| anyhow!("invalid signing did for room {}: {}", room_did, e))?;
-        SigningKey::from_private_key_bytes(signing_did, secret.signing_key)
-            .map_err(|e| anyhow!("failed to restore signing key for {}: {}", room_did, e))
+
+        if let Some(room_key) = {
+            let slots = self.world.actor_secrets.read().await;
+            slots
+                .get(room_did)
+                .or_else(|| slots.get(room_did_canonical.as_str()))
+                .map(|secret| secret.signing_key)
+        } {
+            return SigningKey::from_private_key_bytes(signing_did.clone(), room_key)
+                .map_err(|e| anyhow!("failed to restore signing key for room {}: {}", room_did, e));
+        }
+
+        if let Some(world_key) = {
+            let world_key_guard = self.world.unlocked_world_signing_key.read().await;
+            *world_key_guard
+        } {
+            return SigningKey::from_private_key_bytes(signing_did, world_key)
+                .map_err(|e| anyhow!("failed to restore fallback signing key for room {}: {}", room_did, e));
+        }
+
+        Err(anyhow!(
+            "missing signing key for room {}: missing room actor secret and missing unlocked world signing key",
+            room_did
+        ))
     }
 
     async fn room_presence_context(
@@ -6713,12 +6817,15 @@ impl WorldProtocol {
         ))
     }
 
-    async fn send_signed_push_to_endpoint_on_lane(
+    fn push_cache_key(target_endpoint_id: &str, lane_alpn: &'static [u8]) -> String {
+        format!("{}|{}", String::from_utf8_lossy(lane_alpn), target_endpoint_id.trim())
+    }
+
+    async fn create_push_stream_cache(
         &self,
         target_endpoint_id: &str,
-        message_cbor: Vec<u8>,
         lane_alpn: &'static [u8],
-    ) -> Result<()> {
+    ) -> Result<PushStreamCache> {
         let target: EndpointId = target_endpoint_id
             .trim()
             .parse()
@@ -6735,26 +6842,45 @@ impl WorldProtocol {
             .await
             .map_err(|e| anyhow!("push endpoint.connect failed: {}", e))?;
 
-        let (mut send, mut recv) = connection
+        let (send, recv) = connection
             .open_bi()
             .await
             .map_err(|e| anyhow!("push connection.open_bi failed: {}", e))?;
 
+        Ok(PushStreamCache {
+            connection,
+            send,
+            recv,
+        })
+    }
+
+    async fn exchange_push_on_stream(
+        &self,
+        cache: &mut PushStreamCache,
+        message_cbor: Vec<u8>,
+    ) -> Result<()> {
         let request = OutboxRequest::Signed { message_cbor };
         let payload = serde_json::to_vec(&request)
             .map_err(|e| anyhow!("failed to serialize outbox request: {}", e))?;
 
-        send.write_u32(payload.len() as u32)
+        cache
+            .send
+            .write_u32(payload.len() as u32)
             .await
             .map_err(|e| anyhow!("push write_u32 failed: {}", e))?;
-        send.write_all(&payload)
+        cache
+            .send
+            .write_all(&payload)
             .await
             .map_err(|e| anyhow!("push write_all failed: {}", e))?;
-        send.flush()
+        cache
+            .send
+            .flush()
             .await
             .map_err(|e| anyhow!("push flush failed: {}", e))?;
 
-        let frame_len = recv
+        let frame_len = cache
+            .recv
             .read_u32()
             .await
             .map_err(|e| anyhow!("push read_u32 failed: {}", e))? as usize;
@@ -6763,7 +6889,9 @@ impl WorldProtocol {
         }
 
         let mut bytes = vec![0u8; frame_len];
-        recv.read_exact(&mut bytes)
+        cache
+            .recv
+            .read_exact(&mut bytes)
             .await
             .map_err(|e| anyhow!("push read_exact failed: {}", e))?;
         let response: OutboxResponse = serde_json::from_slice(&bytes)
@@ -6772,9 +6900,69 @@ impl WorldProtocol {
             return Err(anyhow!("push rejected: {}", response.message));
         }
 
-        let _ = send.finish();
-        connection.close(0u32.into(), b"ok");
         Ok(())
+    }
+
+    async fn send_signed_push_to_endpoint_on_lane(
+        &self,
+        target_endpoint_id: &str,
+        message_cbor: Vec<u8>,
+        lane_alpn: &'static [u8],
+    ) -> Result<()> {
+        let cache_key = Self::push_cache_key(target_endpoint_id, lane_alpn);
+        let now = Instant::now();
+        {
+            let mut cooldowns = self.push_timeout_cooldown.lock().await;
+            cooldowns.retain(|_, until| *until > now);
+            if let Some(until) = cooldowns.get(&cache_key) {
+                debug!(
+                    "push endpoint {} on lane {} is in cooldown for {:?}",
+                    target_endpoint_id,
+                    String::from_utf8_lossy(lane_alpn),
+                    until.saturating_duration_since(now)
+                );
+                return Ok(());
+            }
+        }
+        let mut last_error: Option<anyhow::Error> = None;
+
+        for _ in 0..2 {
+            let mut stream_cache = {
+                let mut slots = self.push_stream_cache.lock().await;
+                slots.remove(&cache_key)
+            }
+            .unwrap_or(self.create_push_stream_cache(target_endpoint_id, lane_alpn).await?);
+
+            match self
+                .exchange_push_on_stream(&mut stream_cache, message_cbor.clone())
+                .await
+            {
+                Ok(()) => {
+                    let mut slots = self.push_stream_cache.lock().await;
+                    slots.insert(cache_key.clone(), stream_cache);
+                    return Ok(());
+                }
+                Err(err) => {
+                    if err.to_string().contains("timed out") {
+                        let until = Instant::now() + Duration::from_secs(PUSH_TIMEOUT_COOLDOWN_SECS);
+                        let mut cooldowns = self.push_timeout_cooldown.lock().await;
+                        cooldowns.insert(cache_key.clone(), until);
+                        warn!(
+                            "push timeout for endpoint {} on lane {}; cooling down for {}s",
+                            target_endpoint_id,
+                            String::from_utf8_lossy(lane_alpn),
+                            PUSH_TIMEOUT_COOLDOWN_SECS
+                        );
+                        stream_cache.connection.close(0u32.into(), b"push timeout");
+                        return Ok(());
+                    }
+                    last_error = Some(err);
+                    stream_cache.connection.close(0u32.into(), b"stream error");
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("push failed")))
     }
 
     async fn send_signed_push_to_endpoint(
@@ -6945,26 +7133,26 @@ impl WorldProtocol {
         }
     }
 
-    async fn push_room_broadcast(&self, room_name: &str, since_sequence: u64) {
+    async fn push_room_events(&self, room_name: &str, since_sequence: u64) {
         let context = self.room_presence_context(room_name).await;
         let (room_did, room_title, room_description, avatars, endpoints) = match context {
             Ok(value) => value,
             Err(err) => {
-                warn!("room broadcast context unavailable for '{}': {}", room_name, err);
+                warn!("room events context unavailable for '{}': {}", room_name, err);
                 return;
             }
         };
         let signing_key = match self.room_signing_key(&room_did).await {
             Ok(key) => key,
             Err(err) => {
-                warn!("room broadcast signing key unavailable for {}: {}", room_did, err);
+                warn!("room event signing key unavailable for {}: {}", room_did, err);
                 return;
             }
         };
         let (events, latest_event_sequence) = match self.world.room_events_since(room_name, since_sequence).await {
             Ok(val) => val,
             Err(err) => {
-                warn!("room broadcast events unavailable for '{}': {}", room_name, err);
+                warn!("room events unavailable for '{}': {}", room_name, err);
                 return;
             }
         };
@@ -6972,22 +7160,97 @@ impl WorldProtocol {
             return;
         }
 
-        let payload = RoomBroadcastEvent {
+        for event in events {
+            let payload = RoomEventEnvelope {
+                v: 1,
+                kind: "room.event".to_string(),
+                room: room_name.to_string(),
+                room_did: room_did.clone(),
+                room_title: room_title.clone(),
+                room_description: room_description.clone(),
+                avatars: avatars.clone(),
+                event,
+                latest_event_sequence,
+                ts: Utc::now().to_rfc3339(),
+            };
+            let content = match serde_json::to_vec(&payload) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    warn!("room event encode failed for '{}': {}", room_name, err);
+                    continue;
+                }
+            };
+            let message = match Message::new(
+                room_did.clone(),
+                room_did.clone(),
+                CONTENT_TYPE_EVENT,
+                content,
+                &signing_key,
+            ) {
+                Ok(msg) => msg,
+                Err(err) => {
+                    warn!("room event message build failed: {}", err);
+                    continue;
+                }
+            };
+            let cbor = match message.to_cbor() {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    warn!("room event cbor encode failed: {}", err);
+                    continue;
+                }
+            };
+
+            for endpoint in &endpoints {
+                let cbor_clone = cbor.clone();
+                if let Err(err) = self
+                    .send_signed_push_to_endpoint_on_lane(endpoint, cbor_clone, PRESENCE_ALPN)
+                    .await
+                {
+                    warn!("room event push to {} failed: {}", endpoint, err);
+                }
+            }
+        }
+    }
+
+    async fn push_world_broadcast(&self, room_name: &str, message_text: &str) {
+        let text = message_text.trim();
+        if text.is_empty() {
+            return;
+        }
+
+        let context = self.room_presence_context(room_name).await;
+        let (room_did, _room_title, _room_description, _avatars, endpoints) = match context {
+            Ok(value) => value,
+            Err(err) => {
+                warn!("world broadcast context unavailable for '{}': {}", room_name, err);
+                return;
+            }
+        };
+        if endpoints.is_empty() {
+            return;
+        }
+
+        let signing_key = match self.room_signing_key(&room_did).await {
+            Ok(key) => key,
+            Err(err) => {
+                warn!("world broadcast signing key unavailable for {}: {}", room_did, err);
+                return;
+            }
+        };
+
+        let payload = WorldBroadcastEnvelope {
             v: 1,
-            kind: "room.broadcast".to_string(),
+            kind: "world.broadcast".to_string(),
             room: room_name.to_string(),
             room_did: room_did.clone(),
-            room_title,
-            room_description,
-            avatars,
-            events,
-            latest_event_sequence,
+            message: text.to_string(),
             ts: Utc::now().to_rfc3339(),
         };
         let content = match serde_json::to_vec(&payload) {
             Ok(bytes) => bytes,
             Err(err) => {
-                warn!("room broadcast encode failed for '{}': {}", room_name, err);
+                warn!("world broadcast encode failed for '{}': {}", room_name, err);
                 return;
             }
         };
@@ -7000,22 +7263,25 @@ impl WorldProtocol {
         ) {
             Ok(msg) => msg,
             Err(err) => {
-                warn!("room broadcast message build failed: {}", err);
+                warn!("world broadcast message build failed: {}", err);
                 return;
             }
         };
         let cbor = match message.to_cbor() {
             Ok(bytes) => bytes,
             Err(err) => {
-                warn!("room broadcast cbor encode failed: {}", err);
+                warn!("world broadcast cbor encode failed: {}", err);
                 return;
             }
         };
 
         for endpoint in endpoints {
             let cbor_clone = cbor.clone();
-            if let Err(err) = self.send_signed_push_to_endpoint_on_lane(&endpoint, cbor_clone, PRESENCE_ALPN).await {
-                warn!("room broadcast push to {} failed: {}", endpoint, err);
+            if let Err(err) = self
+                .send_signed_push_to_endpoint_on_lane(&endpoint, cbor_clone, INBOX_ALPN)
+                .await
+            {
+                warn!("world broadcast push to {} failed: {}", endpoint, err);
             }
         }
     }
@@ -7293,6 +7559,16 @@ impl WorldProtocol {
         agent_endpoint: String,
     ) -> Result<WorldResponse> {
         let sender_profile = sender_profile_from_document(&sender_document);
+        let sender_push_endpoint = sender_push_endpoint_from_document(&sender_document)
+            .unwrap_or_else(|| agent_endpoint.clone());
+        if sender_push_endpoint != agent_endpoint {
+            debug!(
+                "sender endpoint drift: request_remote={} did_push_endpoint={} did={}",
+                agent_endpoint,
+                sender_push_endpoint,
+                sender_did.id()
+            );
+        }
 
         match command {
             WorldCommand::Ping { room_did } => {
@@ -7327,7 +7603,7 @@ impl WorldProtocol {
                         .touch_avatar_presence_for_did(&room, &avatar_did_str)
                         .await;
                     self.world
-                        .upsert_avatar_location(&room, &avatar_did_str, &agent_endpoint)
+                        .upsert_avatar_location(&room, &avatar_did_str, &sender_push_endpoint)
                         .await;
                     let h = self.world
                         .avatar_handle_for_did(&room, &avatar_did_str)
@@ -7337,7 +7613,7 @@ impl WorldProtocol {
                 } else {
                     // First contact — ensure avatar in the pinged room.
                     let (_, h, c) = self.world.ensure_avatar(
-                        sender_did, &sender_profile, &agent_endpoint, &pinged_room,
+                        sender_did, &sender_profile, &sender_push_endpoint, &pinged_room,
                     ).await?;
                     (pinged_room.clone(), h, c)
                 };
@@ -7367,7 +7643,7 @@ impl WorldProtocol {
             }
             WorldCommand::Message { room, envelope } => {
                 let (avatar_did, handle, created) = self.world.ensure_avatar(
-                    sender_did, &sender_profile, &agent_endpoint, &room,
+                    sender_did, &sender_profile, &sender_push_endpoint, &room,
                 ).await?;
                 if created {
                     self.push_presence_snapshot(&room).await;
@@ -7391,7 +7667,7 @@ impl WorldProtocol {
                     .await;
                 self
                     .world
-                    .upsert_avatar_location(&route_room, &avatar_did.id(), &agent_endpoint)
+                    .upsert_avatar_location(&route_room, &avatar_did.id(), &sender_push_endpoint)
                     .await;
                 let effective_sender_profile = self
                     .world
@@ -7409,6 +7685,26 @@ impl WorldProtocol {
                     ));
                 }
 
+                let requested_world_broadcast = match &envelope {
+                    MessageEnvelope::ActorCommand {
+                        target,
+                        command: ActorCommand::Raw { command },
+                    } if target.eq_ignore_ascii_case("world") => {
+                        let raw = command.trim();
+                        if let Some(rest) = raw.strip_prefix("broadcast") {
+                            let text = rest.trim();
+                            if text.is_empty() {
+                                None
+                            } else {
+                                Some(text.to_string())
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+
                 // Route command envelopes using the active room handle bound to sender DID.
                 let actor_name = self
                     .world
@@ -7420,9 +7716,14 @@ impl WorldProtocol {
                     .send_message(&route_room, &actor_name, &avatar_did, &effective_sender_profile, envelope)
                     .await?;
                 if effective_room != route_room {
-                    self.push_presence_room_state_to(&effective_room, &agent_endpoint).await;
+                    self.push_presence_room_state_to(&effective_room, &sender_push_endpoint).await;
                     self.push_presence_snapshot(&route_room).await;
                     self.push_presence_snapshot(&effective_room).await;
+                }
+                if let Some(text) = requested_world_broadcast {
+                    if message.starts_with("@world broadcast sent") {
+                        self.push_world_broadcast(&effective_room, &text).await;
+                    }
                 }
                 let latest_event_sequence = self.world.latest_room_event_sequence(&effective_room).await?;
                 if broadcasted {
@@ -7430,7 +7731,7 @@ impl WorldProtocol {
                     let room_for_broadcast = effective_room.clone();
                     let seq_before = if latest_event_sequence > 0 { latest_event_sequence - 1 } else { 0 };
                     tokio::spawn(async move {
-                        proto.push_room_broadcast(&room_for_broadcast, seq_before).await;
+                        proto.push_room_events(&room_for_broadcast, seq_before).await;
                     });
                 }
                 Ok(WorldResponse {
@@ -7453,7 +7754,7 @@ impl WorldProtocol {
             }
             WorldCommand::RoomEvents { room, since_sequence } => {
                 let (avatar_did, _handle, created) = self.world.ensure_avatar(
-                    sender_did, &sender_profile, &agent_endpoint, &room,
+                    sender_did, &sender_profile, &sender_push_endpoint, &room,
                 ).await?;
                 if created {
                     self.push_presence_snapshot(&room).await;
@@ -7464,7 +7765,7 @@ impl WorldProtocol {
                     .await;
                 self
                     .world
-                    .upsert_avatar_location(&room, &avatar_did.id(), &agent_endpoint)
+                    .upsert_avatar_location(&room, &avatar_did.id(), &sender_push_endpoint)
                     .await;
                 let (events, latest_event_sequence) = self.world.room_events_since(&room, since_sequence).await?;
                 Ok(WorldResponse {
@@ -9317,6 +9618,8 @@ async fn main() -> Result<()> {
             endpoint: endpoint.clone(),
             endpoint_id: endpoint_id.clone(),
             did_cache: did_cache.clone(),
+            push_stream_cache: Arc::new(Mutex::new(HashMap::new())),
+            push_timeout_cooldown: Arc::new(Mutex::new(HashMap::new())),
             lane: WorldLane::Inbox,
         };
         let avatar_protocol = WorldProtocol {
@@ -9324,6 +9627,8 @@ async fn main() -> Result<()> {
             endpoint: endpoint.clone(),
             endpoint_id: endpoint_id.clone(),
             did_cache: did_cache.clone(),
+            push_stream_cache: inbox_protocol.push_stream_cache.clone(),
+            push_timeout_cooldown: inbox_protocol.push_timeout_cooldown.clone(),
             lane: WorldLane::Avatar,
         };
         let router = Router::builder(endpoint.clone())
@@ -9623,6 +9928,62 @@ mod tests {
         let changed = world.prune_stale_avatars(Duration::from_secs(25)).await;
         assert!(changed.iter().any(|room| room == "lobby"));
         assert_eq!(world.avatar_room_for_did("did:ma:k51stale#agent").await, None);
+    }
+
+    #[tokio::test]
+    async fn world_room_owner_admin_override_sets_owner() {
+        let world = test_world();
+        world.create_room("lobby".to_string()).await.unwrap();
+        world
+            .set_owner_did("did:ma:k51admin#owner")
+            .await
+            .unwrap();
+
+        let caller = Did::try_from("did:ma:k51admin#owner").unwrap();
+        let response = world
+            .handle_world_command(
+                "lobby",
+                "owner",
+                &caller,
+                "nb_NO:en_UK",
+                "room lobby owner did:ma:k51recovered#hero",
+            )
+            .await;
+
+        assert!(response.contains("owner set to did:ma:k51recovered#hero"));
+
+        let rooms = world.rooms.read().await;
+        let lobby = rooms.get("lobby").unwrap();
+        assert_eq!(lobby.acl.owner.as_deref(), Some("did:ma:k51recovered#hero"));
+        assert!(lobby.acl.allow.contains("did:ma:k51recovered#hero"));
+        assert!(!lobby.acl.deny.contains("did:ma:k51recovered#hero"));
+    }
+
+    #[tokio::test]
+    async fn world_room_owner_admin_override_rejects_fragmentless_did() {
+        let world = test_world();
+        world.create_room("lobby".to_string()).await.unwrap();
+        world
+            .set_owner_did("did:ma:k51admin#owner")
+            .await
+            .unwrap();
+
+        let caller = Did::try_from("did:ma:k51admin#owner").unwrap();
+        let response = world
+            .handle_world_command(
+                "lobby",
+                "owner",
+                &caller,
+                "nb_NO:en_UK",
+                "room lobby owner did:ma:k51recovered",
+            )
+            .await;
+
+        assert!(response.contains("missing #fragment"));
+
+        let rooms = world.rooms.read().await;
+        let lobby = rooms.get("lobby").unwrap();
+        assert_ne!(lobby.acl.owner.as_deref(), Some("did:ma:k51recovered"));
     }
 }
 

@@ -1,4 +1,4 @@
-.PHONY: help core-build actor-build world-build actor-cid write-agent-version write-actor-version run-world dev dev-agent dev-agent-mcp smoke-alpha check clean distclean
+.PHONY: help core-build actor-build agent-build world-build actor-cid write-agent-version write-actor-version run-world dev dev-agent dev-agent-mcp smoke-alpha check clean distclean
 
 WORLD_SLUG ?= ma
 WORLD_LISTEN ?=
@@ -33,6 +33,7 @@ help:
 	@echo "ma-realms targets:"
 	@echo "  make core-build                              Build ma-core"
 	@echo "  make actor-build                             Build ma-actor web bundle and write actor/.cid"
+	@echo "  make agent-build                             Build ma-agent"
 	@echo "  make world-build                             Build ma-world"
 	@echo "  make actor-cid                               Print actor/.cid"
 	@echo "  make run-world WORLD_SLUG=<slug> [WORLD_LISTEN=ip:port] [WORLD_KUBO_URL=url]"
@@ -52,6 +53,9 @@ core-build:
 actor-build:
 	$(MAKE) -C actor build MA_ACTOR_VERSION="$(MA_ACTOR_VERSION)"
 	$(MAKE) --no-print-directory write-actor-version
+
+agent-build:
+	cargo build --manifest-path agent/Cargo.toml --bin ma-agent
 
 world-build:
 	$(MAKE) -C world build MA_WORLD_VERSION="$(MA_WORLD_VERSION)"
@@ -110,7 +114,7 @@ dev-agent-mcp:
 	echo "Command: cargo run --manifest-path agent/Cargo.toml --bin ma-agent -- --mcp --agentd-url $(MA_AGENTD_URL)"; \
 	cargo run --manifest-path agent/Cargo.toml --bin ma-agent -- --mcp --agentd-url "$(MA_AGENTD_URL)"
 
-smoke-alpha: actor-build world-build
+smoke-alpha: actor-build agent-build world-build
 	@set -euo pipefail; \
 	mkdir -p tmp; \
 	AGENT_LOG="tmp/smoke-agent.log"; \
@@ -168,6 +172,12 @@ smoke-alpha: actor-build world-build
 
 check:
 	cargo check -q
+
+release:
+	$(MAKE) -C world release
+	scp target/x86_64-unknown-linux-musl/release/ma-world panteia:bin
+	$(MAKE) -C actor atlas
+
 
 clean:
 	$(MAKE) -C core clean

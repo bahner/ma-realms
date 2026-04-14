@@ -126,7 +126,7 @@ publish:
 test-web:
 	@$(MAKE) --no-print-directory $(TEST_WEB_STAMP)
 
-web: build-release
+atlas: build-release
 	scp -r www atlas:/home/ma/
 
 clean:

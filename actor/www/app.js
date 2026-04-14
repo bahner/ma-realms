@@ -137,8 +137,10 @@ const IPFS_GATEWAY_FALLBACKS = [
 const LOCAL_EDIT_SCRIPT_KEY = `${STORAGE_PREFIX}.localEditScript`;
 const LEGACY_LOCAL_EDIT_SCRIPT_CID_KEY = `${STORAGE_PREFIX}.localEditScriptCid`;
 
-const ROOM_POLL_INTERVAL_MS = 30_000;
-const AVATAR_PING_INTERVAL_MS = 25_000;
+const ROOM_POLL_INTERVAL_MS = 5_000;
+const AVATAR_PING_INTERVAL_MS = 5_000;
+const MIN_WORLD_PING_INTERVAL_MS = 3_000;
+const MAX_WORLD_PING_INTERVAL_MS = 30_000;
 const PING_FIB_START = 3000;
 const PING_WORLD_GONE_THRESHOLD = 60_000;
 const DID_DOC_CACHE_TTL_MS = 60_000;
@@ -230,6 +232,7 @@ const state = {
   pingFibPrev: PING_FIB_START,
   pingFibCurr: PING_FIB_START,
   pingRetryTimer: null,
+  pingInFlight: false,
   editSession: null,
   editBusy: false,
   lockOverlayAnimationId: 0,
@@ -404,10 +407,9 @@ function syncSpecialAliasesFromCurrentHome() {
 
   const roomDid = String(state.currentHome?.roomDid || '').trim();
   const room = String(state.currentHome?.room || '').trim();
-  const worldDidRaw = String(state.currentHome?.worldDid || '').trim();
-  const worldDid = didRoot(worldDidRaw);
+  const worldDid = String(state.currentHome?.worldDid || '').trim();
 
-  if (isMaDid(worldDid)) {
+  if (isMaDidTarget(worldDid) && worldDid.includes('#') && !isUnconfiguredDidTarget(worldDid)) {
     next['@world'] = worldDid;
   }
 
@@ -1144,12 +1146,11 @@ async function resolveCommandTargetDidOrToken(targetToken) {
     throw new Error('Usage: @target <command>');
   }
   if (raw.toLowerCase() === 'world') {
-    const worldDidRaw = String(state.currentHome?.worldDid || state.aliasBook?.['@world'] || '').trim();
-    const worldDid = didRoot(worldDidRaw);
-    if (isMaDid(worldDid) && !isUnconfiguredDidTarget(worldDid)) {
+    const worldDid = currentWorldDid();
+    if (isMaDidTarget(worldDid) && worldDid.includes('#') && !isUnconfiguredDidTarget(worldDid)) {
       return worldDid;
     }
-    throw new Error('@world requires a valid world did:ma root. Reconnect to refresh world DID.');
+    throw new Error('@world requires a valid world did:ma target with #fragment. Reconnect to refresh world DID.');
   }
   const activeAliasRaw = String(state.activeObjectTargetAlias || '').trim().replace(/^@+/, '');
   const activeDid = String(state.activeObjectTargetDid || '').trim();
@@ -1323,16 +1324,12 @@ async function sendWorldCommandQuery(commandText) {
 
 function currentWorldDid() {
   const worldAlias = String(state.aliasBook?.['@world'] || '').trim();
-  if (isMaDidTarget(worldAlias)) {
+  if (isMaDidTarget(worldAlias) && worldAlias.includes('#') && !isUnconfiguredDidTarget(worldAlias)) {
     return worldAlias;
   }
   const worldDid = String(state.currentHome?.worldDid || '').trim();
-  if (isMaDidTarget(worldDid)) {
+  if (isMaDidTarget(worldDid) && worldDid.includes('#') && !isUnconfiguredDidTarget(worldDid)) {
     return worldDid;
-  }
-  const roomDid = String(state.currentHome?.roomDid || '').trim();
-  if (isMaDidTarget(roomDid)) {
-    return roomDid;
   }
   return '';
 }
@@ -1341,6 +1338,10 @@ async function sendCurrentHomePresencePing() {
   if (!state.currentHome || !worldDispatchFlow) {
     return;
   }
+  if (state.pingInFlight) {
+    return;
+  }
+  state.pingInFlight = true;
   try {
     const localRoomDid = String(state.currentHome?.roomDid || '').trim();
     const pingTarget = localRoomDid || String(state.currentHome?.room || '').trim() || 'lobby';
@@ -1406,6 +1407,8 @@ async function sendCurrentHomePresencePing() {
   } catch (error) {
     logger.log('presence.ping', `failed: ${error instanceof Error ? error.message : String(error)}`);
     schedulePingRetry();
+  } finally {
+    state.pingInFlight = false;
   }
 }
 
@@ -1953,13 +1956,50 @@ function didParts(value) {
 }
 
 function aliasForDid(did) {
-  const entries = Object.entries(state.aliasBook || {});
-  for (const [alias, address] of entries) {
-    if (address === did) {
-      return alias;
-    }
+  const target = String(did || '').trim();
+  if (!target) {
+    return '';
   }
-  return '';
+
+  const entries = Object.entries(state.aliasBook || {});
+  const candidates = entries
+    .filter(([, address]) => String(address || '').trim() === target)
+    .map(([alias]) => String(alias || '').trim())
+    .filter(Boolean);
+
+  if (!candidates.length) {
+    return '';
+  }
+
+  const hashIdx = target.indexOf('#');
+  const fragment = hashIdx === -1 ? '' : target.slice(hashIdx + 1).trim().toLowerCase();
+  const reserved = new Set(['world', '@world', 'here', '@here', 'me', '@me', 'avatar', '@avatar']);
+
+  const score = (alias) => {
+    const lowered = alias.toLowerCase();
+    const stripped = lowered.replace(/^@+/, '');
+    if (fragment && stripped === fragment) {
+      return lowered.startsWith('@') ? 90 : 100;
+    }
+    if (!reserved.has(lowered)) {
+      return lowered.startsWith('@') ? 60 : 70;
+    }
+    return 10;
+  };
+
+  candidates.sort((a, b) => {
+    const sa = score(a);
+    const sb = score(b);
+    if (sa !== sb) {
+      return sb - sa;
+    }
+    if (a.length !== b.length) {
+      return a.length - b.length;
+    }
+    return a.localeCompare(b);
+  });
+
+  return candidates[0] || '';
 }
 
 function formatDidForDialog(value) {
@@ -2357,6 +2397,7 @@ function stopHomeEventPolling() {
   }
   state.roomPollInFlight = false;
   state.inboxPollInFlight = false;
+  state.pingInFlight = false;
   state.pollErrorShown = false;
 }
 
@@ -2608,9 +2649,6 @@ function startHomeEventPolling() {
   }, state.worldPingIntervalMs ?? AVATAR_PING_INTERVAL_MS);
 
   state.roomPollTimer = setInterval(() => {
-    pollCurrentHomeEvents().catch((error) => {
-      logger.log('poll.events', `non-fatal room poll failure: ${error instanceof Error ? error.message : String(error)}`);
-    });
     pollDirectInbox().catch((error) => {
       logger.log('inbox.poll', `non-fatal inbox poll failure: ${error instanceof Error ? error.message : String(error)}`);
     });
@@ -3450,7 +3488,11 @@ async function enterHome(target, preferredRoom = null) {
 
     const rawPingInterval = targetDoc?.ma?.pingIntervalSecs;
     if (typeof rawPingInterval === 'number' && rawPingInterval > 0) {
-      state.worldPingIntervalMs = rawPingInterval * 1000;
+      const rawPingIntervalMs = rawPingInterval * 1000;
+      state.worldPingIntervalMs = Math.min(
+        MAX_WORLD_PING_INTERVAL_MS,
+        Math.max(MIN_WORLD_PING_INTERVAL_MS, rawPingIntervalMs)
+      );
     } else {
       state.worldPingIntervalMs = null;
     }
