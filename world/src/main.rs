@@ -10103,12 +10103,21 @@ async fn main() -> Result<()> {
             locations.set_default_max_cache(Duration::from_secs(presence_stale_secs));
         }
 
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
         let inbox_presence = inbox_protocol.clone();
+        let mut probe_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(presence_probe_secs));
             let stale_after = Duration::from_secs(presence_stale_secs);
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = probe_shutdown.changed() => { break; }
+                }
+                if *probe_shutdown.borrow() {
+                    break;
+                }
                 let changed_rooms = inbox_presence.world.prune_stale_avatars(stale_after).await;
                 for room_name in changed_rooms {
                     inbox_presence.push_presence_snapshot(&room_name).await;
@@ -10162,8 +10171,13 @@ async fn main() -> Result<()> {
         info!("World initialized. Waiting for connections...");
         let signal_name = wait_for_shutdown_signal().await?;
         info!("Received {} shutting down", signal_name);
-        info!("Shutting down ma-world — saving state...");
+        info!("Shutting down ma-world — stopping background tasks...");
 
+        // Cancel the presence probe loop immediately so it stops trying to
+        // reach stale/dead actor endpoints before we close the iroh router.
+        let _ = shutdown_tx.send(true);
+
+        info!("Shutting down ma-world — saving state...");
         match world.save_encrypted_state().await {
             Ok((state_cid, root_cid)) => {
                 info!("State saved: state_cid={} root_cid={}", state_cid, root_cid);
@@ -10173,7 +10187,16 @@ async fn main() -> Result<()> {
             }
         }
 
-        router.shutdown().await?;
+        // Give the iroh router a bounded window to drain open connections.
+        // If it takes longer than 5 s we exit anyway — connections will time out
+        // on the actor side.
+        let shutdown_timeout = Duration::from_secs(5);
+        match tokio::time::timeout(shutdown_timeout, router.shutdown()).await {
+            Ok(Ok(())) => info!("Router shut down cleanly."),
+            Ok(Err(e)) => warn!("Router shutdown error: {}", e),
+            Err(_) => warn!("Router shutdown timed out after {}s; forcing exit.", shutdown_timeout.as_secs()),
+        }
+
         Ok(())
     }
     .await;
