@@ -6176,11 +6176,20 @@ impl World {
         }
 
         // All remaining commands require world-owner privilege.
+        // Escalate: accept the caller if they are the world owner directly, or
+        // if they are an avatar whose registered owner DID is the world owner.
         let owner_did = self.owner_did.read().await.clone();
-        let is_owner = owner_did
-            .as_ref()
-            .map(|owner| owner == &caller_did)
-            .unwrap_or(false);
+        let is_owner = if let Some(ref owner) = owner_did {
+            owner == &caller_did
+                || self
+                    .avatar_registry
+                    .read()
+                    .await
+                    .values()
+                    .any(|entry| entry.did == caller_did && entry.owner == *owner)
+        } else {
+            false
+        };
 
         if !is_owner {
             return tr_world(
