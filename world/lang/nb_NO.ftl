@@ -1,4 +1,4 @@
-world.help.commands = kommandoer: help | list | show [did] | describe [did] | lang [show|set <cid>|clear]
+world.help.commands = kommandoer: help | list | show [did] | describe [did] | lang [show|set <cid>|clear] | save | publish
 world.list.empty = @world objekter: (ingen)
 world.private.status.on = @world private=on (nye brukere må banke på)
 world.private.status.off = @world private=off (åpen inngang)

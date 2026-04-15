@@ -1206,8 +1206,10 @@ fn build_signed_world_request(
         .document
         .ma
         .as_ref()
-        .and_then(|ma| ma.world.clone())
+        .and_then(|ma| ma.world.as_ref())
+        .and_then(|w| w.as_str())
         .filter(|did| Did::validate(did).is_ok())
+        .map(|s| s.to_string())
         .or_else(cached_world_target_did);
 
     let command_world_did = match &command {

@@ -79,7 +79,7 @@ use lang::{
 };
 use kubo::{
     IpnsPublishOptions, dag_get_dag_cbor, dag_put_dag_cbor, generate_kubo_key, ipfs_add,
-    ipns_publish_with_retry, list_kubo_key_names, list_kubo_keys, name_resolve, pin_add_named,
+    ipns_publish_with_retry, list_kubo_key_names, list_kubo_keys, pin_add_named,
     pin_rm, wait_for_kubo_api,
 };
 use room::{Room, RoomAcl};
@@ -102,6 +102,7 @@ const MAX_OBJECT_INBOX: usize = 512;
 const OBJECT_INBOX_INDEX_CAPACITY: u64 = 4096;
 const MAILBOX_LOCK_SECS: u64 = 600;
 const OBJECT_WASHER_INTERVAL_SECS: u64 = 20;
+const IPNS_PUBLISH_INTERVAL_SECS_DEFAULT: u64 = 600;
 const PRESENCE_PROBE_INTERVAL_SECS_DEFAULT: u64 = 5;
 const PRESENCE_STALE_AFTER_SECS_DEFAULT: u64 = 30;
 const WORLD_PING_INTERVAL_SECS: u32 = 5;
@@ -532,10 +533,12 @@ pub struct World {
     lang_cid: Arc<RwLock<Option<String>>>,
     /// Stable Kubo pin name for world root index snapshots.
     world_root_pin_name: Arc<RwLock<String>>,
-    /// Last result of publishing world root CID to the runtime state pointer IPNS key.
-    last_pointer_publish_ok: Arc<RwLock<Option<bool>>>,
-    last_pointer_publish_root_cid: Arc<RwLock<Option<String>>>,
-    last_pointer_publish_error: Arc<RwLock<Option<String>>>,
+    /// IPNS publish tracking.
+    last_publish_ok: Arc<RwLock<Option<bool>>>,
+    last_publish_root_cid: Arc<RwLock<Option<String>>>,
+    last_publish_error: Arc<RwLock<Option<String>>>,
+    /// True when IPFS root has changed since last IPNS publish.
+    ipns_dirty: Arc<RwLock<bool>>,
     /// Room-local interactable objects keyed by room then object id.
     room_objects: Arc<RwLock<HashMap<String, HashMap<String, ObjectRuntimeState>>>>,
     /// Inbox of async knock requests for private worlds.
@@ -1048,9 +1051,10 @@ impl World {
             state_cid: Arc::new(RwLock::new(None)),
             lang_cid: Arc::new(RwLock::new(None)),
             world_root_pin_name: Arc::new(RwLock::new(world_root_pin_name)),
-            last_pointer_publish_ok: Arc::new(RwLock::new(None)),
-            last_pointer_publish_root_cid: Arc::new(RwLock::new(None)),
-            last_pointer_publish_error: Arc::new(RwLock::new(None)),
+            last_publish_ok: Arc::new(RwLock::new(None)),
+            last_publish_root_cid: Arc::new(RwLock::new(None)),
+            last_publish_error: Arc::new(RwLock::new(None)),
+            ipns_dirty: Arc::new(RwLock::new(false)),
             room_objects: Arc::new(RwLock::new(HashMap::new())),
             knock_inbox: Arc::new(RwLock::new(TtlCache::with_capacity(
                 Duration::from_secs(KNOCK_PENDING_TTL_SECS as u64),
@@ -3655,31 +3659,12 @@ impl World {
         self.room_cids.read().await.len()
     }
 
-    pub async fn did_ma_pointer_info(&self) -> (Option<String>, Option<String>, Option<String>) {
-        let Some(world_did) = self.world_did.read().await.clone() else {
-            return (None, None, Some("world DID is not configured".to_string()));
-        };
-        let kubo_url = self.kubo_url().await;
-        match resolve_world_pointer_from_did(&kubo_url, &world_did).await {
-            Ok((link, resolved)) => (link, resolved, None),
-            Err(err) => (None, None, Some(err.to_string())),
-        }
-    }
-
-    pub async fn last_pointer_publish_status(&self) -> (Option<bool>, Option<String>, Option<String>) {
+    pub async fn last_publish_status(&self) -> (Option<bool>, Option<String>, Option<String>) {
         (
-            self.last_pointer_publish_ok.read().await.clone(),
-            self.last_pointer_publish_root_cid.read().await.clone(),
-            self.last_pointer_publish_error.read().await.clone(),
+            self.last_publish_ok.read().await.clone(),
+            self.last_publish_root_cid.read().await.clone(),
+            self.last_publish_error.read().await.clone(),
         )
-    }
-
-    pub async fn ma_runtime_mode(&self) -> String {
-        if ma_pointer_mode_enabled() {
-            "pointer".to_string()
-        } else {
-            "inline".to_string()
-        }
     }
 
     pub async fn save_encrypted_state(&self) -> Result<(String, String)> {
@@ -3823,33 +3808,57 @@ impl World {
             self.save_rooms_and_world_index(&room_names).await?
         };
 
-        let pointer_mode = ma_pointer_mode_enabled();
+        *self.ipns_dirty.write().await = true;
+
+        Ok((state_cid, root_cid))
+    }
+
+    /// Publish the current world state to IPNS. Updates the DID document with the
+    /// latest world root CID as an IPLD link and publishes to the world IPNS key.
+    pub async fn publish_to_ipns(&self) -> Result<()> {
+        let kubo_url = self.kubo_url().await;
+        let secrets = self.read_world_runtime_secrets().await?;
+        let state_cid = self.state_cid.read().await.clone()
+            .ok_or_else(|| anyhow!("no state CID available for IPNS publish"))?;
+        let root_cid = self.world_cid.read().await.clone()
+            .ok_or_else(|| anyhow!("no world root CID available for IPNS publish"))?;
+
         if let Err(err) = publish_world_did_runtime_ma(
             &kubo_url,
             &self.world_root_pin_name().await,
             secrets.world_master_key,
             &state_cid,
             &root_cid,
-            pointer_mode,
         )
         .await
         {
             let message = err.to_string();
-            *self.last_pointer_publish_ok.write().await = Some(false);
-            *self.last_pointer_publish_root_cid.write().await = Some(root_cid.clone());
-            *self.last_pointer_publish_error.write().await = Some(message.clone());
-            warn!(
-                "runtime DID/IPNS publish failed; keeping saved state/root locally: {}",
-                message
-            );
-            return Ok((state_cid, root_cid));
+            *self.last_publish_ok.write().await = Some(false);
+            *self.last_publish_root_cid.write().await = Some(root_cid.clone());
+            *self.last_publish_error.write().await = Some(message.clone());
+            return Err(anyhow!("IPNS publish failed: {}", message));
         }
 
-        *self.last_pointer_publish_ok.write().await = Some(true);
-        *self.last_pointer_publish_root_cid.write().await = Some(root_cid.clone());
-        *self.last_pointer_publish_error.write().await = None;
+        *self.last_publish_ok.write().await = Some(true);
+        *self.last_publish_root_cid.write().await = Some(root_cid);
+        *self.last_publish_error.write().await = None;
+        *self.ipns_dirty.write().await = false;
 
-        Ok((state_cid, root_cid))
+        Ok(())
+    }
+
+    /// Save state to IPFS and immediately publish to IPNS.
+    pub async fn save_and_publish(&self) -> Result<(String, String)> {
+        let result = self.save_encrypted_state().await?;
+        if let Err(err) = self.publish_to_ipns().await {
+            warn!("IPNS publish after save failed: {}", err);
+        }
+        Ok(result)
+    }
+
+    /// Returns true if IPFS state has changed since last IPNS publish.
+    pub async fn is_ipns_dirty(&self) -> bool {
+        *self.ipns_dirty.read().await
     }
 
     async fn flush_dirty_object_blobs(&self) -> Result<usize> {
@@ -6429,11 +6438,22 @@ impl World {
             }
         }
 
+        if method == "publish" {
+            match self.publish_to_ipns().await {
+                Ok(()) => {
+                    return "@world published to IPNS".to_string();
+                }
+                Err(e) => {
+                    return format!("@world publish failed: {}", e);
+                }
+            }
+        }
+
         if method == "save" {
-            match self.save_encrypted_state().await {
+            match self.save_and_publish().await {
                 Ok((state_cid, root_cid)) => {
                     return format!(
-                        "@world saved encrypted runtime state: state_cid={} root_cid={}",
+                        "@world saved and published: state_cid={} root_cid={}",
                         state_cid, root_cid
                     );
                 }
@@ -8509,20 +8529,6 @@ fn derive_world_encryption_private_key(world_master_key: &[u8; 32]) -> [u8; 32] 
     out
 }
 
-fn runtime_state_key_name(world_slug: &str) -> String {
-    format!("{}-state", normalize_world_key_name(world_slug))
-}
-
-fn ma_pointer_mode_enabled() -> bool {
-    match std::env::var("MA_WORLD_MA_POINTER") {
-        Ok(value) => {
-            let normalized = value.trim().to_ascii_lowercase();
-            normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on"
-        }
-        Err(_) => false,
-    }
-}
-
 async fn ensure_kubo_key_id(kubo_url: &str, key_name: &str) -> Result<String> {
     let mut keys = list_kubo_keys(kubo_url).await?;
     if !keys.iter().any(|key| key.name == key_name) {
@@ -8538,67 +8544,29 @@ async fn ensure_kubo_key_id(kubo_url: &str, key_name: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("kubo key '{}' exists but has no usable id", key_name))
 }
 
-async fn resolve_world_pointer_from_did(kubo_url: &str, world_did: &str) -> Result<(Option<String>, Option<String>)> {
-    let world = Did::try_from(world_did)
-        .map_err(|e| anyhow!("invalid world DID '{}': {}", world_did, e))?;
-    let document = kubo::fetch_did_document(kubo_url, &world).await?;
-    let Some(ma) = document.ma.as_ref() else {
-        return Ok((None, None));
-    };
-    let Some(link) = ma.link.as_ref() else {
-        return Ok((None, None));
-    };
-
-    let target = link.trim();
-    if target.is_empty() {
-        return Ok((None, None));
-    }
-
-    if let Some(cid) = target.strip_prefix("/ipfs/") {
-        let value = cid.trim();
-        return if value.is_empty() {
-            Ok((Some(target.to_string()), None))
-        } else {
-            Ok((Some(target.to_string()), Some(value.to_string())))
-        };
-    }
-
-    if target.starts_with("/ipns/") {
-        let resolved = name_resolve(kubo_url, target, true).await?;
-        let Some(cid) = resolved.strip_prefix("/ipfs/") else {
-            return Err(anyhow!("ma link '{}' resolved to non-/ipfs path '{}'", target, resolved));
-        };
-        let value = cid.trim();
-        return if value.is_empty() {
-            Ok((Some(target.to_string()), None))
-        } else {
-            Ok((Some(target.to_string()), Some(value.to_string())))
-        };
-    }
-
-    Ok((Some(target.to_string()), Some(target.to_string())))
-}
-
-async fn resolve_world_root_cid_from_did_pointer(kubo_url: &str, world_did: &str) -> Result<Option<String>> {
-    let (_, root_cid) = resolve_world_pointer_from_did(kubo_url, world_did).await?;
-    Ok(root_cid)
-}
-
-async fn resolve_world_root_cid_from_did_inline(kubo_url: &str, world_did: &str) -> Result<Option<String>> {
+/// Resolve the world root CID from the ma.world IPLD link in the DID document.
+async fn resolve_world_root_cid_from_did(kubo_url: &str, world_did: &str) -> Result<Option<String>> {
     let world = Did::try_from(world_did)
         .map_err(|e| anyhow!("invalid world DID '{}': {}", world_did, e))?;
     let document = kubo::fetch_did_document(kubo_url, &world).await?;
     let Some(ma) = document.ma.as_ref() else {
         return Ok(None);
     };
-    let Some(root_cid) = ma.world_root_cid.as_ref() else {
+    // ma.world is an IPLD link { "/": "<cid>" }
+    let Some(world_val) = ma.world.as_ref() else {
         return Ok(None);
     };
-    let value = root_cid.trim();
-    if value.is_empty() {
+    let Some(obj) = world_val.as_object() else {
+        return Ok(None);
+    };
+    let Some(cid_str) = obj.get("/").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    let trimmed = cid_str.trim();
+    if trimmed.is_empty() {
         return Ok(None);
     }
-    Ok(Some(value.to_string()))
+    Ok(Some(trimmed.to_string()))
 }
 
 async fn publish_world_did_runtime_ma(
@@ -8607,7 +8575,6 @@ async fn publish_world_did_runtime_ma(
     world_master_key: [u8; 32],
     state_cid: &str,
     root_cid: &str,
-    pointer_mode: bool,
 ) -> Result<()> {
     const RUNTIME_IPNS_ATTEMPTS: u32 = 3;
     const RUNTIME_IPNS_TIMEOUT_SECS: u64 = 12;
@@ -8629,31 +8596,9 @@ async fn publish_world_did_runtime_ma(
     let mut document = kubo::fetch_did_document(kubo_url, &world_did).await?;
     document.set_ma_type("world")?;
 
-    if pointer_mode {
-        let state_key_name = runtime_state_key_name(world_slug);
-        let state_ipns_id = ensure_kubo_key_id(kubo_url, &state_key_name).await?;
-        let ipns_options = IpnsPublishOptions {
-            timeout: Duration::from_secs(RUNTIME_IPNS_TIMEOUT_SECS),
-            ..IpnsPublishOptions::default()
-        };
-        ipns_publish_with_retry(
-            kubo_url,
-            &state_key_name,
-            root_cid,
-            &ipns_options,
-            RUNTIME_IPNS_ATTEMPTS,
-            Duration::from_millis(RUNTIME_IPNS_BACKOFF_MS),
-        )
-        .await?;
-
-        document.set_ma_link(format!("/ipns/{}", state_ipns_id));
-        document.clear_ma_state_cid();
-        document.clear_ma_world_root_cid();
-    } else {
-        document.clear_ma_link();
-        document.set_ma_state_cid(state_cid);
-        document.set_ma_world_root_cid(root_cid);
-    }
+    // Set ma.world as an IPLD link to the world root CID for DAG traversal.
+    document.set_ma_world(serde_json::json!({ "/": root_cid }));
+    document.set_ma_state_cid(state_cid);
 
     let assertion_vm = document
         .get_verification_method_by_id(&document.assertion_method)
@@ -8661,13 +8606,14 @@ async fn publish_world_did_runtime_ma(
         .clone();
     document.sign(&signing_key, &assertion_vm)?;
 
-    let document_json = document
-        .marshal()
-        .map_err(|e| anyhow!("failed to marshal world DID document: {}", e))?;
-    let document_cid = ipfs_add(kubo_url, document_json.into_bytes()).await?;
+    let document_cid = dag_put_dag_cbor(kubo_url, &document).await?;
 
+    let ipns_ttl_secs = std::env::var("MA_WORLD_IPNS_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
     let ipns_options = IpnsPublishOptions {
         timeout: Duration::from_secs(RUNTIME_IPNS_TIMEOUT_SECS),
+        ttl: ipns_ttl_secs.map(|s| format!("{}s", s)),
         ..IpnsPublishOptions::default()
     };
     ipns_publish_with_retry(
@@ -8688,7 +8634,6 @@ async fn ensure_world_did_document(
     world_slug: &str,
     endpoint_id: &str,
     world_master_key: [u8; 32],
-    pointer_mode: bool,
 ) -> Result<String> {
     let key_name = normalize_world_key_name(world_slug);
     let mut keys = list_kubo_keys(kubo_url).await?;
@@ -8709,13 +8654,6 @@ async fn ensure_world_did_document(
 
     let world_did = Did::new(&did_identifier, world_slug)
         .map_err(|e| anyhow!("failed to build world DID from IPNS key '{}' slug '{}': {}", did_identifier, world_slug, e))?;
-
-    let state_ipns_id = if pointer_mode {
-        let state_key_name = runtime_state_key_name(world_slug);
-        Some(ensure_kubo_key_id(kubo_url, &state_key_name).await?)
-    } else {
-        None
-    };
 
     let signing_did = Did::new_root(&did_identifier)
         .map_err(|e| anyhow!("failed to build signing DID: {}", e))?;
@@ -8760,11 +8698,6 @@ async fn ensure_world_did_document(
     document.assertion_method = assertion_vm_id;
     document.key_agreement = key_agreement_vm_id;
     document.set_ma_type("world")?;
-    if let Some(state_ipns_id) = state_ipns_id {
-        document.set_ma_link(format!("/ipns/{}", state_ipns_id));
-    } else {
-        document.clear_ma_link();
-    }
     let transport_paths = vec![
         format!("/ma-iroh/{endpoint_id}/{}", String::from_utf8_lossy(INBOX_ALPN)),
         format!("/ma-iroh/{endpoint_id}/{}", String::from_utf8_lossy(AVATAR_ALPN)),
@@ -8779,10 +8712,7 @@ async fn ensure_world_did_document(
     document.set_ma_ping_interval_secs(WORLD_PING_INTERVAL_SECS);
     document.sign(&signing_key, &assertion_vm)?;
 
-    let document_json = document
-        .marshal()
-        .map_err(|e| anyhow!("failed to marshal world DID document: {}", e))?;
-    let document_cid = ipfs_add(kubo_url, document_json.into_bytes()).await?;
+    let document_cid = dag_put_dag_cbor(kubo_url, &document).await?;
 
     let ipns_options = IpnsPublishOptions {
         timeout: Duration::from_secs(45),
@@ -9901,7 +9831,7 @@ async fn main() -> Result<()> {
             return Ok(());
         }
 
-        let (new_state_cid, new_root_cid) = world.save_encrypted_state().await?;
+        let (new_state_cid, new_root_cid) = world.save_and_publish().await?;
 
         println!("restore-root OK");
         println!("  slug: {}", normalized_slug);
@@ -10154,7 +10084,6 @@ async fn main() -> Result<()> {
         let world_master_key = derive_world_master_key(endpoint.secret_key(), &world_slug);
         world.set_world_master_key(world_master_key).await;
         info!("World master key source: derived from iroh identity and world slug");
-        let pointer_mode = ma_pointer_mode_enabled();
 
         let endpoint_id = endpoint.id().to_string();
         let world_did = ensure_world_did_document(
@@ -10162,17 +10091,12 @@ async fn main() -> Result<()> {
             &world_slug,
             &endpoint_id,
             world_master_key,
-            pointer_mode,
         )
         .await?;
         world.set_world_did(&world_did).await?;
         info!("Runtime world DID: {}", world_did);
 
-        let restore_root = if pointer_mode {
-            resolve_world_root_cid_from_did_pointer(&kubo_url, &world_did).await?
-        } else {
-            resolve_world_root_cid_from_did_inline(&kubo_url, &world_did).await?
-        };
+        let restore_root = resolve_world_root_cid_from_did(&kubo_url, &world_did).await?;
         if let Some(root_cid) = restore_root {
             match world.load_from_world_cid(&root_cid).await {
                 Ok(rooms_loaded) => info!(
@@ -10200,7 +10124,7 @@ async fn main() -> Result<()> {
         }
 
         if world.world_cid().await.is_none() {
-            let (state_cid, root_cid) = world.save_encrypted_state().await?;
+            let (state_cid, root_cid) = world.save_and_publish().await?;
             info!(
                 "Bootstrapped world state with lobby snapshot: state_cid={} root_cid={}",
                 state_cid,
@@ -10222,6 +10146,30 @@ async fn main() -> Result<()> {
                         Err(err) => {
                             warn!("object washer flush failed: {}", err);
                         }
+                    }
+                }
+            });
+        }
+
+        // Background IPNS publisher: periodically publishes to IPNS if dirty.
+        {
+            let ipns_interval = std::env::var("MA_WORLD_IPNS_PUBLISH_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(IPNS_PUBLISH_INTERVAL_SECS_DEFAULT);
+            let world_for_ipns = world.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(ipns_interval));
+                ticker.tick().await; // skip immediate first tick
+                loop {
+                    ticker.tick().await;
+                    if !world_for_ipns.is_ipns_dirty().await {
+                        continue;
+                    }
+                    info!("IPNS publish timer: dirty state detected, publishing...");
+                    match world_for_ipns.publish_to_ipns().await {
+                        Ok(()) => info!("IPNS publish timer: published successfully"),
+                        Err(err) => warn!("IPNS publish timer: failed: {}", err),
                     }
                 }
             });
@@ -10447,9 +10395,9 @@ async fn main() -> Result<()> {
         let _ = shutdown_tx.send(true);
 
         info!("Shutting down ma-world — saving state...");
-        match world.save_encrypted_state().await {
+        match world.save_and_publish().await {
             Ok((state_cid, root_cid)) => {
-                info!("State saved: state_cid={} root_cid={}", state_cid, root_cid);
+                info!("State saved and published: state_cid={} root_cid={}", state_cid, root_cid);
             }
             Err(e) => {
                 warn!("Failed to save state on shutdown: {}", e);

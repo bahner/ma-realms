@@ -1,4 +1,4 @@
-world.help.commands = commands: help | list | show [did] | describe [did] | lang [show|set <cid>|clear]
+world.help.commands = commands: help | list | show [did] | describe [did] | lang [show|set <cid>|clear] | save | publish
 world.list.empty = @world objects: (none)
 world.private.status.on = @world private=on (new entrants must knock)
 world.private.status.off = @world private=off (open entry)

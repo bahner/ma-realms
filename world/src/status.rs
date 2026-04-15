@@ -66,10 +66,8 @@ async fn status_json(State(state): State<StatusState>) -> Json<StatusDocument> {
         .map(|room| room.avatars.len())
         .sum::<usize>();
     let recent_event_count = snapshot.recent_events.len();
-    let (ma_link, ma_link_resolved_root_cid, ma_link_error) = state.world.did_ma_pointer_info().await;
-    let (last_save_pointer_publish_ok, last_save_pointer_publish_root_cid, last_save_pointer_publish_error) =
-        state.world.last_pointer_publish_status().await;
-    let ma_runtime_mode = state.world.ma_runtime_mode().await;
+    let (last_publish_ok, last_publish_root_cid, last_publish_error) =
+        state.world.last_publish_status().await;
     let runtime = RuntimeStatus {
         unlocked: state.world.is_unlocked().await,
         kubo_url: state.world.kubo_url().await,
@@ -79,13 +77,9 @@ async fn status_json(State(state): State<StatusState>) -> Json<StatusDocument> {
         lang_cid: state.world.lang_cid().await,
         persisted_room_count: state.world.persisted_room_count().await,
         world_root_pin_name: state.world.world_root_pin_name().await,
-        ma_runtime_mode,
-        ma_link,
-        ma_link_resolved_root_cid,
-        ma_link_error,
-        last_save_pointer_publish_ok,
-        last_save_pointer_publish_root_cid,
-        last_save_pointer_publish_error,
+        last_publish_ok,
+        last_publish_root_cid,
+        last_publish_error,
     };
     Json(StatusDocument {
         world: state.world_info,
@@ -334,7 +328,7 @@ async fn update_world_owner(
     Form(form): Form<WorldOwnerForm>,
 ) -> Json<WorldOwnerResponse> {
     match state.world.set_owner_did(&form.owner).await {
-        Ok(owner) => match state.world.save_encrypted_state().await {
+        Ok(owner) => match state.world.save_and_publish().await {
             Ok((state_cid, root_cid)) => Json(WorldOwnerResponse {
                 ok: true,
                 message: format!(
@@ -361,7 +355,7 @@ async fn update_world_owner(
 }
 
 async fn save_world_state(State(state): State<StatusState>) -> Json<WorldStateSaveResponse> {
-    match state.world.save_encrypted_state().await {
+    match state.world.save_and_publish().await {
         Ok((state_cid, root_cid)) => Json(WorldStateSaveResponse {
             ok: true,
             message: "world state saved".to_string(),
@@ -441,13 +435,9 @@ struct RuntimeStatus {
     lang_cid: Option<String>,
     persisted_room_count: usize,
     world_root_pin_name: String,
-    ma_runtime_mode: String,
-    ma_link: Option<String>,
-    ma_link_resolved_root_cid: Option<String>,
-    ma_link_error: Option<String>,
-    last_save_pointer_publish_ok: Option<bool>,
-    last_save_pointer_publish_root_cid: Option<String>,
-    last_save_pointer_publish_error: Option<String>,
+    last_publish_ok: Option<bool>,
+    last_publish_root_cid: Option<String>,
+    last_publish_error: Option<String>,
 }
 
 #[derive(serde::Serialize)]
