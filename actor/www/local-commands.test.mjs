@@ -96,14 +96,12 @@ test('@my.home stores explicit room DID as home alias', () => {
   assert.equal(harness.messages[2], 'Publishing identity to did:ma:testworld#lobby via ma/ipfs/1...');
 });
 
-test('@actor.home aliases @my.home for local self command', () => {
+test('@actor.home is read-only and does not mutate home alias', () => {
   const harness = createHarness();
 
   assert.equal(harness.parseLocalCommand('@actor.home did:ma:testworld#atrium'), true);
-  assert.equal(harness.state.aliasBook.home, 'did:ma:testworld#atrium');
-  assert.equal(harness.messages[0], 'Home set: home => did:ma:testworld#atrium');
-  assert.equal(harness.messages[1], 'Birth: publishing identity to your home world now (first time can take a little while).');
-  assert.equal(harness.messages[2], 'Publishing identity to did:ma:testworld#atrium via ma/ipfs/1...');
+  assert.equal(harness.state.aliasBook.home, undefined);
+  assert.equal(harness.messages[0], '@actor.* is read-only for now. Use @my.* for mutating commands.');
 });
 
 test('@my aliases @actor for actor namespace commands', () => {

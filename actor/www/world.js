@@ -262,6 +262,21 @@ export function createWorldDispatchFlow({
   isNotRegisteredInRoomMessage,
   performTransparentReentry,
 }) {
+  function aliasValue(key) {
+    const raw = String(key || '').trim();
+    if (!raw) {
+      return '';
+    }
+    return String(state.systemAliases?.[raw] || state.aliasBook?.[raw] || '').trim();
+  }
+
+  function mergedAliasEntries() {
+    return {
+      ...(state.aliasBook || {}),
+      ...(state.systemAliases || {}),
+    };
+  }
+
   function resolveTtlSeconds(kind) {
     const temporary = Number(state.temporaryMessageTtlOverride);
     if (Number.isFinite(temporary) && temporary >= 0) {
@@ -378,9 +393,7 @@ export function createWorldDispatchFlow({
       throw new Error(`DID ${targetDid} did not resolve to a valid iroh endpoint.`);
     }
 
-    const normalizedTarget = routeWorld
-      ? `world.${targetPath}`
-      : (targetPath ? `${targetDid}.${targetPath}` : targetDid);
+    const normalizedTarget = targetPath ? `${targetDid}.${targetPath}` : targetDid;
     const normalizedInput = remainder
       ? `@${normalizedTarget} ${remainder}`
       : `@${normalizedTarget}`;
@@ -430,7 +443,7 @@ export function createWorldDispatchFlow({
     const plain = target.startsWith('@') ? target.slice(1) : target;
     const keys = [target, plain, `@${plain}`];
     for (const key of keys) {
-      const resolved = String(state.aliasBook?.[key] || '').trim();
+      const resolved = aliasValue(key);
       if (!resolved) {
         continue;
       }
@@ -481,15 +494,15 @@ export function createWorldDispatchFlow({
   }
 
   function activeAvatarDid() {
-    const aliasAvatar = String(state.aliasBook?.['@avatar'] || state.aliasBook?.avatar || '').trim();
+    const aliasAvatar = aliasValue('@avatar') || aliasValue('avatar');
     if (isMaDid(aliasAvatar) && aliasAvatar.includes('#')) {
       return aliasAvatar;
     }
 
     const worldRoot = String(
       state.currentHome?.roomDid
-      || state.aliasBook?.['@world']
-      || state.aliasBook?.world
+      || aliasValue('@world')
+      || aliasValue('world')
       || ''
     ).trim().split('#')[0];
     const handle = String(state.currentHome?.handle || '').trim().replace(/^@+/, '');
@@ -501,7 +514,7 @@ export function createWorldDispatchFlow({
 
   function aliasTargetMap() {
     const result = new Map();
-    for (const [alias, value] of Object.entries(state.aliasBook || {})) {
+    for (const [alias, value] of Object.entries(mergedAliasEntries())) {
       const rawKey = String(alias || '').trim();
       if (!rawKey) {
         continue;
@@ -541,7 +554,7 @@ export function createWorldDispatchFlow({
         return match;
       }
       if (lower === 'i' || lower === 'avatar') {
-        const did = String(state.aliasBook?.['@avatar'] || '').trim();
+        const did = aliasValue('@avatar');
         if (!isMaDid(did)) {
           throw new Error(`@${lower} requires an active avatar (enter a world first).`);
         }
@@ -563,7 +576,7 @@ export function createWorldDispatchFlow({
       }
       if (lower === 'world') {
         const worldDid = String(
-          state.aliasBook?.['@world']
+          aliasValue('@world')
           || state.currentHome?.worldDid
           || ''
         ).trim();
@@ -761,7 +774,7 @@ export function createWorldDispatchFlow({
       resolvedBase = String(state.currentHome?.roomDid || '').trim();
     } else if (lowerBase === 'world') {
       resolvedBase = String(
-        state.aliasBook?.['@world']
+        aliasValue('@world')
         || state.currentHome?.worldDid
         || ''
       ).trim();
@@ -777,10 +790,8 @@ export function createWorldDispatchFlow({
       throw new Error('Target after @ must resolve to did:ma.');
     }
 
-    const { targetDid, targetPath, routeWorld } = normalizeDidTargetPath(normalizedDid, pathRaw);
-    const normalizedTarget = routeWorld
-      ? `world.${targetPath}`
-      : (targetPath ? `${targetDid}.${targetPath}` : targetDid);
+    const { targetDid, targetPath } = normalizeDidTargetPath(normalizedDid, pathRaw);
+    const normalizedTarget = targetPath ? `${targetDid}.${targetPath}` : targetDid;
 
     return remainder
       ? `@${normalizedTarget} ${remainder}`
@@ -943,12 +954,12 @@ export function createWorldDispatchFlow({
           resolvedBase = String(state.currentHome?.roomDid || '').trim();
         } else if (lowerBase === 'world') {
           resolvedBase = String(
-            state.aliasBook?.['@world']
+            aliasValue('@world')
             || state.currentHome?.worldDid
             || ''
           ).trim();
         } else if (lowerBase === 'i' || lowerBase === 'avatar') {
-          resolvedBase = String(state.aliasBook?.['@avatar'] || '').trim();
+          resolvedBase = aliasValue('@avatar');
           if (!isMaDid(resolvedBase)) throw new Error('@I/@avatar requires an active avatar (enter a world first).');
         } else if (lowerBase === 'me') {
           resolvedBase = String(state.identity?.did || '').trim();
@@ -1000,13 +1011,13 @@ export function createWorldDispatchFlow({
       resolvedBase = String(state.currentHome?.roomDid || '').trim();
     } else if (lowerBase === 'world') {
       resolvedBase = String(
-        state.aliasBook?.['@world']
+        aliasValue('@world')
         || state.currentHome?.worldDid
         || ''
       ).trim();
     } else if (lowerBase === 'i') {
       // @I <verb> → @avatar.<verb>  (I is the subject acting in the world)
-      resolvedBase = String(state.aliasBook?.['@avatar'] || '').trim();
+      resolvedBase = aliasValue('@avatar');
       if (!isMaDid(resolvedBase)) throw new Error('@I requires an active avatar (enter a world first).');
       if (!pathRaw && remainder) {
         const verbEnd = remainder.indexOf(' ');
@@ -1015,7 +1026,7 @@ export function createWorldDispatchFlow({
         return sendAtTargetCommand(`@${resolvedBase}.${verb}${rest ? ' ' + rest : ''}`);
       }
     } else if (lowerBase === 'avatar') {
-      resolvedBase = String(state.aliasBook?.['@avatar'] || '').trim();
+      resolvedBase = aliasValue('@avatar');
       if (!isMaDid(resolvedBase)) throw new Error('@avatar requires an active avatar (enter a world first).');
     } else if (lowerBase === 'me') {
       resolvedBase = String(state.identity?.did || '').trim();
@@ -1029,10 +1040,8 @@ export function createWorldDispatchFlow({
       throw new Error('Target after @ must resolve to did:ma.');
     }
 
-    const { targetDid, targetPath, routeWorld } = normalizeDidTargetPath(normalizedDid, pathRaw);
-    const normalizedTarget = routeWorld
-      ? `world.${targetPath}`
-      : (targetPath ? `${targetDid}.${targetPath}` : targetDid);
+    const { targetDid, targetPath } = normalizeDidTargetPath(normalizedDid, pathRaw);
+    const normalizedTarget = targetPath ? `${targetDid}.${targetPath}` : targetDid;
 
     if (remainder && await tryHandleDidTargetMetaPoll(normalizedTarget, remainder)) {
       return true;

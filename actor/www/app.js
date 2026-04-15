@@ -200,6 +200,7 @@ const state = {
     commands: [],
   },
   aliasBook: {},
+  systemAliases: {},
   currentHome: null,
   roomPollTimer: null,
   avatarPingTimer: null,
@@ -400,6 +401,9 @@ function clearActiveHomeSnapshot(identityDid) {
 
 function syncSpecialAliasesFromCurrentHome() {
   const SPECIAL_KEYS = ['@world', '@here', '@me', '@avatar'];
+  const systemAliases = (state.systemAliases && typeof state.systemAliases === 'object')
+    ? state.systemAliases
+    : (state.systemAliases = {});
   const next = {};
 
   const identityDid = String(state.identity?.did || '').trim();
@@ -433,20 +437,19 @@ function syncSpecialAliasesFromCurrentHome() {
   let changed = false;
   for (const key of SPECIAL_KEYS) {
     const expected = String(next[key] || '').trim();
-    const current = String(state.aliasBook?.[key] || '').trim();
+    const current = String(systemAliases[key] || '').trim();
     if (expected) {
       if (current !== expected) {
-        state.aliasBook[key] = expected;
+        systemAliases[key] = expected;
         changed = true;
       }
     } else if (current) {
-      delete state.aliasBook[key];
+      delete systemAliases[key];
       changed = true;
     }
   }
 
   if (changed) {
-    saveAliasBook();
     refreshDialogAndPresenceFormatting();
   }
 }
@@ -1149,7 +1152,7 @@ async function resolveCommandTargetDidOrToken(targetToken) {
   }
   const rawLower = raw.toLowerCase();
   if (rawLower === 'i' || rawLower === 'avatar') {
-    const avatarDid = String(state.aliasBook?.['@avatar'] || '').trim();
+    const avatarDid = String(state.systemAliases?.['@avatar'] || state.aliasBook?.['@avatar'] || '').trim();
     if (!isMaDid(avatarDid)) {
       throw new Error(`@${raw} requires an active avatar (enter a world first).`);
     }
@@ -1338,7 +1341,7 @@ async function sendWorldCommandQuery(commandText) {
 }
 
 function currentWorldDid() {
-  const worldAlias = String(state.aliasBook?.['@world'] || '').trim();
+  const worldAlias = String(state.systemAliases?.['@world'] || state.aliasBook?.['@world'] || '').trim();
   if (isMaDidTarget(worldAlias) && worldAlias.includes('#') && !isUnconfiguredDidTarget(worldAlias)) {
     return worldAlias;
   }
@@ -2145,7 +2148,7 @@ function currentActorFragment() {
 }
 
 function currentAvatarDid() {
-  const aliasAvatar = String(state.aliasBook?.['@avatar'] || state.aliasBook?.avatar || '').trim();
+  const aliasAvatar = String(state.systemAliases?.['@avatar'] || state.aliasBook?.['@avatar'] || state.aliasBook?.avatar || '').trim();
   if (isMaDidTarget(aliasAvatar)) {
     return aliasAvatar;
   }

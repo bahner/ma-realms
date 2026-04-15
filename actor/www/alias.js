@@ -1,5 +1,30 @@
 import { isMaDid } from './did.js';
 
+const DYNAMIC_SPECIAL_ALIASES = new Set(['@here', '@me', '@world', '@avatar']);
+
+function normalizeAliasKeyForDynamicCheck(key) {
+  const raw = String(key || '').trim().toLowerCase();
+  if (!raw) return '';
+  return raw.startsWith('@') ? raw : `@${raw}`;
+}
+
+function isDynamicAliasKey(key) {
+  const normalized = normalizeAliasKeyForDynamicCheck(key);
+  return DYNAMIC_SPECIAL_ALIASES.has(normalized);
+}
+
+function sanitizeUserAliasBook(input) {
+  const source = input && typeof input === 'object' ? input : {};
+  const out = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (isDynamicAliasKey(key)) {
+      continue;
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
 export function isValidAliasName(aliasName) {
   return /^[a-z0-9_-]{2,32}$/i.test(String(aliasName || '').trim());
 }
@@ -26,12 +51,19 @@ export function createAliasFlow({
   aliasHumanizeText,
   roomDidCacheTtlMs,
 }) {
+  function mergedAliasBook() {
+    return {
+      ...(state.aliasBook || {}),
+      ...(state.systemAliases || {}),
+    };
+  }
+
   function saveAliasBook() {
-    identityStore.saveAliasBook(aliasBookKey, state.aliasBook);
+    identityStore.saveAliasBook(aliasBookKey, sanitizeUserAliasBook(state.aliasBook));
   }
 
   function loadAliasBook() {
-    return identityStore.loadAliasBook(aliasBookKey);
+    return sanitizeUserAliasBook(identityStore.loadAliasBook(aliasBookKey));
   }
 
   function setActiveAlias(aliasName) {
@@ -154,7 +186,7 @@ export function createAliasFlow({
     try {
       return aliasFindAliasForAddress(
         String(address || ''),
-        JSON.stringify(state.aliasBook || {})
+        JSON.stringify(mergedAliasBook())
       );
     } catch {
       return '';
@@ -168,7 +200,7 @@ export function createAliasFlow({
     }
 
     try {
-      return aliasResolveInput(raw, JSON.stringify(state.aliasBook || {}));
+      return aliasResolveInput(raw, JSON.stringify(mergedAliasBook()));
     } catch {
       return raw;
     }
@@ -178,7 +210,7 @@ export function createAliasFlow({
     try {
       return aliasHumanizeIdentifier(
         String(value || ''),
-        JSON.stringify(state.aliasBook || {})
+        JSON.stringify(mergedAliasBook())
       );
     } catch {
       return String(value || '').trim();
@@ -189,7 +221,7 @@ export function createAliasFlow({
     try {
       return aliasHumanizeText(
         String(text || ''),
-        JSON.stringify(state.aliasBook || {})
+        JSON.stringify(mergedAliasBook())
       );
     } catch {
       return String(text || '');

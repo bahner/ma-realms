@@ -308,6 +308,43 @@ export function createDotCommands({
     return true;
   }
 
+  function handleActorStateAliases(subcommand, args, pathSuffix = '') {
+    const runtime = (state.systemAliases && typeof state.systemAliases === 'object')
+      ? state.systemAliases
+      : {};
+
+    if (!subcommand && !pathSuffix && args.length === 0) {
+      const entries = Object.entries(runtime);
+      if (entries.length === 0) {
+        appendMessage('system', 'No actor runtime aliases set.');
+        return true;
+      }
+      for (const [name, address] of entries) {
+        appendMessage('system', `@actor.state.aliases.${name} ${address}`);
+      }
+      return true;
+    }
+
+    if (pathSuffix) {
+      const raw = normalizeAliasNameToken(pathSuffix);
+      const key = raw.startsWith('@') ? raw : `@${raw}`;
+      if (!Object.prototype.hasOwnProperty.call(runtime, key)) {
+        appendMessage('system', `Runtime alias not found: ${raw}`);
+        return true;
+      }
+      appendMessage('system', `@actor.state.aliases.${key} ${runtime[key]}`);
+      return true;
+    }
+
+    const action = String(subcommand || '').trim().toLowerCase();
+    if (!action || action === 'list' || action === 'show') {
+      return handleActorStateAliases('', [], '');
+    }
+
+    appendMessage('system', 'Usage: @actor.state.aliases | @actor.state.aliases.<name> (read-only runtime aliases)');
+    return true;
+  }
+
   function handleMail(subcommand, args) {
     const action = String(subcommand || 'list').toLowerCase();
     const list = Array.isArray(state.mailbox) ? state.mailbox : [];
@@ -418,6 +455,7 @@ export function createDotCommands({
     const [verbRaw, ...args] = trimmed.split(/\s+/);
     const verbToken = String(verbRaw || '').trim();
     const rawCommand = verbToken.toLowerCase();
+    const actorCommandMode = rawCommand.startsWith('@actor.');
     let command = rawCommand;
     if (rawCommand.startsWith('@actor.')) {
       command = `my.${rawCommand.slice('@actor.'.length)}`;
@@ -426,6 +464,23 @@ export function createDotCommands({
     }
     if (!command.startsWith('my.')) {
       return false;
+    }
+
+    if (actorCommandMode) {
+      const firstArg = String(args[0] || '').trim().toLowerCase();
+      const isAliasMutation = command === 'my.aliases'
+        && (firstArg === 'add' || firstArg === 'del' || firstArg === 'rewrite');
+      const isIdentityMutation = command === 'my.identity.publish' || command === 'my.home';
+      const isMailMutation = (command === 'my.mail' || command.startsWith('my.mail.'))
+        && (firstArg === 'reply' || firstArg === 'delete' || firstArg === 'del' || firstArg === 'rm' || firstArg === 'clear'
+          || command === 'my.mail.reply' || command === 'my.mail.delete' || command === 'my.mail.del' || command === 'my.mail.rm' || command === 'my.mail.clear');
+      const aliasPath = command.startsWith('my.aliases.') ? command.slice('my.aliases.'.length) : '';
+      const isAliasPathMutation = aliasPath === 'add' || aliasPath === 'del' || aliasPath === 'rewrite';
+
+      if (isAliasMutation || isIdentityMutation || isMailMutation || isAliasPathMutation) {
+        appendMessage('system', '@actor.* is read-only for now. Use @my.* for mutating commands.');
+        return true;
+      }
     }
 
     if (command === 'my.did') {
@@ -455,6 +510,14 @@ export function createDotCommands({
 
     if (command.startsWith('my.aliases.')) {
       return handleAliases('', args, command.slice('my.aliases.'.length));
+    }
+
+    if (command === 'my.state.aliases') {
+      return handleActorStateAliases(args[0] || '', args.slice(1));
+    }
+
+    if (command.startsWith('my.state.aliases.')) {
+      return handleActorStateAliases('', args, command.slice('my.state.aliases.'.length));
     }
 
     if (command === 'my.mail') {
@@ -504,8 +567,10 @@ export function createDotCommands({
       appendSystemUi('  @my.aliases                 - list aliases', '  @my.aliases                 - list alias');
       appendSystemUi('  @my.aliases.<name>          - show address for one alias', '  @my.aliases.<navn>          - vis adresse for ett alias');
       appendSystemUi('  @my.aliases.rewrite [on|off]- rewrite aliases to DID before parsing', '  @my.aliases.rewrite [on|off]- skriv alias om til DID før parsing');
+      appendSystemUi('  @actor.state.aliases        - list runtime symbolic aliases (read-only)', '  @actor.state.aliases        - vis symbolske runtime-alias (kun lesing)');
+      appendSystemUi('  @actor.state.aliases.<name> - show one runtime alias value', '  @actor.state.aliases.<navn> - vis verdi for ett runtime-alias');
       appendSystemUi('  @my.mail [list|pick|reply|delete|clear] - inspect mailbox queue', '  @my.mail [list|pick|reply|delete|clear] - inspiser mailbox-kø');
-      appendSystemUi('  @actor.<command>          - alias for @my.<command>', '  @actor.<kommando>          - alias for @my.<kommando>');
+      appendSystemUi('  @actor.<command>          - read-only actor namespace (use @my.* to mutate)', '  @actor.<kommando>          - skrivebeskyttet actor-navnerom (bruk @my.* for endringer)');
       appendSystemUi('Dot commands (local tools):', 'Punktkommandoer (lokale verktøy):');
       appendSystemUi('  .inspect @here|@me|@exit <name>|<object>- inspect room/me/exit/object and discover DID/CIDs', '  .inspect @here|@me|@exit <navn>|<objekt>- inspiser rom/meg/utgang/objekt og finn DID/CID');
       appendSystemUi('  .use <object|did> [as alias] - set local default target', '  .use <objekt|did> [as alias] - sett lokal standardtarget');

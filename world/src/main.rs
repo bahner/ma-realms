@@ -3252,6 +3252,36 @@ impl World {
         self.owner_did.read().await.clone()
     }
 
+    async fn owner_identity_link(&self) -> Option<String> {
+        let owner_root = self.owner_did.read().await.clone()?;
+
+        {
+            let registry = self.avatar_registry.read().await;
+            let mut links = registry
+                .values()
+                .filter_map(|entry| {
+                    let did = Did::try_from(entry.did.as_str()).ok()?;
+                    if did.base_id() != owner_root {
+                        return None;
+                    }
+                    let link = entry.identity.cid.trim();
+                    if link.is_empty() {
+                        None
+                    } else {
+                        Some(link.to_string())
+                    }
+                })
+                .collect::<Vec<_>>();
+            links.sort();
+            if let Some(link) = links.into_iter().next() {
+                return Some(link);
+            }
+        }
+
+        let owner_did = Did::try_from(owner_root.as_str()).ok()?;
+        Some(format!("/ipns/{}", owner_did.ipns))
+    }
+
     pub async fn set_owner_did(&self, did_raw: &str) -> Result<String> {
         let parsed = Did::try_from(did_raw.trim())
             .map_err(|e| anyhow!("invalid owner DID '{}': {}", did_raw, e))?;
@@ -5593,12 +5623,49 @@ impl World {
         let normalized = command.trim();
         let active_lang = world_lang_from_profile(sender_profile);
 
-        if normalized.is_empty() || normalized.eq_ignore_ascii_case("help") {
+        if normalized.eq_ignore_ascii_case("help") {
             return tr_world(
                 active_lang,
                 "world.help.commands",
                 "@world commands: help | ping [room] | list | claim | broadcast <message> | knock list [all] | knock accept <id> | knock reject <id> [note] | knock delete <id> | invite <did> [note] | room <name> acl show|open|close|allow <did>|deny <did> | room <name> owner <did> | flush [knock|all] | migrate-index | save | load <cid> | dig <direction> [to|til <#dest|did>] | bury <direction>",
             );
+        }
+
+        if normalized.is_empty() {
+            let owner = self
+                .owner_did
+                .read()
+                .await
+                .clone()
+                .unwrap_or_else(|| "(none)".to_string());
+            let did = self
+                .world_did
+                .read()
+                .await
+                .clone()
+                .unwrap_or_else(|| format!("{DID_PREFIX}unconfigured"));
+            let rooms = {
+                let rooms = self.rooms.read().await;
+                let mut names = rooms.keys().cloned().collect::<Vec<_>>();
+                names.sort();
+                if names.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    names.join(",")
+                }
+            };
+            let lang_cid = self
+                .lang_cid
+                .read()
+                .await
+                .clone()
+                .unwrap_or_else(|| "(none)".to_string());
+            return Reply::attr_list(Scope::World, &[
+                ("owner", &owner),
+                ("did", &did),
+                ("rooms", &rooms),
+                ("lang_cid", &lang_cid),
+            ]);
         }
 
         let mut parts = normalized.splitn(2, char::is_whitespace);
@@ -5623,6 +5690,10 @@ impl World {
                 match path.as_str() {
                     "_list" => {
                         let owner = self
+                            .owner_identity_link()
+                            .await
+                            .unwrap_or_else(|| "(none)".to_string());
+                        let owner_did = self
                             .owner_did
                             .read()
                             .await
@@ -5652,12 +5723,19 @@ impl World {
                             .unwrap_or_else(|| "(none)".to_string());
                         return Reply::attr_list(Scope::World, &[
                             ("owner", &owner),
+                            ("owner_did", &owner_did),
                             ("did", &did),
                             ("rooms", &rooms),
                             ("lang_cid", &lang_cid),
                         ]);
                     }
                     "owner" => {
+                        return self
+                            .owner_identity_link()
+                            .await
+                            .unwrap_or_else(|| "(none)".to_string())
+                    }
+                    "owner_did" => {
                         return self
                             .owner_did
                             .read()
@@ -5692,7 +5770,7 @@ impl World {
                     }
                     _ => {
                         return Reply::world(format!(
-                            "unknown attribute '{}'. Allowed: owner, did, rooms, lang_cid",
+                            "unknown attribute '{}'. Allowed: owner, owner_did, did, rooms, lang_cid",
                             path
                         )).to_string()
                     }
@@ -5711,7 +5789,33 @@ impl World {
                         return "You don't have access to this.".to_string();
                     }
                     let normalized = value.trim();
-                    return match self.set_owner_did(normalized).await {
+                    let resolved_owner = if Did::try_from(normalized).is_ok() {
+                        normalized.to_string()
+                    } else {
+                        let token = normalized.trim_start_matches('@');
+                        let from_room = {
+                            let rooms = self.rooms.read().await;
+                            rooms
+                                .get(room_name)
+                                .and_then(|room| room.avatars.get(token))
+                                .map(|avatar| avatar.agent_did.id())
+                        };
+                        if let Some(did) = from_room {
+                            did
+                        } else {
+                            let registry = self.avatar_registry.read().await;
+                            if let Some(entry) = registry.get(token) {
+                                entry.did.clone()
+                            } else {
+                                return Reply::world(format!(
+                                    "invalid owner '{}': expected did:ma:... or avatar handle/fragment",
+                                    value
+                                ))
+                                .to_string();
+                            }
+                        }
+                    };
+                    return match self.set_owner_did(&resolved_owner).await {
                         Ok(root) => root,
                         Err(err) => Reply::world(format!("invalid owner DID '{}': {}", value, err)).to_string(),
                     };
@@ -5728,7 +5832,7 @@ impl World {
                 }
                 _ => {
                     return Reply::world(format!(
-                        "unknown attribute '{}'. Allowed: owner, did, rooms, lang_cid",
+                        "unknown attribute '{}'. Allowed: owner, owner_did, did, rooms, lang_cid",
                         path
                     )).to_string()
                 }
@@ -5745,6 +5849,52 @@ impl World {
         if let Some(property) = parse_property_command(normalized) {
             let path = property.key;
             let value = property.value.unwrap_or_default();
+
+            if value.is_empty()
+                && (path == "owner.identity" || path.starts_with("owner.identity."))
+            {
+                let owner_did = match self.owner_did.read().await.clone() {
+                    Some(value) => value,
+                    None => return "(none)".to_string(),
+                };
+
+                let owner = match Did::try_from(owner_did.as_str()) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        return Reply::world(format!("invalid stored owner DID '{}': {}", owner_did, err)).to_string();
+                    }
+                };
+
+                if path == "owner.identity" {
+                    return format!("/ipns/{}", owner.ipns);
+                }
+
+                let subpath = path.trim_start_matches("owner.identity.");
+                let kubo_url = self.kubo_url().await;
+                let document = match kubo::fetch_did_document(&kubo_url, &owner).await {
+                    Ok(document) => document,
+                    Err(err) => {
+                        return Reply::world(format!("failed loading owner DID document: {}", err)).to_string();
+                    }
+                };
+                let raw = match document.marshal() {
+                    Ok(raw) => raw,
+                    Err(err) => {
+                        return Reply::world(format!("failed serializing owner DID document: {}", err)).to_string();
+                    }
+                };
+                let json: serde_json::Value = match serde_json::from_str(&raw) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return Reply::world(format!("invalid owner DID document JSON: {}", err)).to_string();
+                    }
+                };
+                if let Some(value) = resolve_public_inspect_path(&json, subpath) {
+                    return format_public_inspect_value(value);
+                }
+                return Reply::world(format!("owner identity path '{}' not found", subpath)).to_string();
+            }
+
             if value.is_empty() && (path == "avatars" || path == "avatars._list" || path.starts_with("avatars.")) {
                 let registry = self.avatar_registry.read().await;
 
