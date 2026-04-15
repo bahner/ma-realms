@@ -1,0 +1,27 @@
+kind: world_manifest
+version: 1
+world_id: "did:ma:k51exampleworld#ma-world"
+world_root_cid: "bafybeihworldrootexample"
+entry_room_id: "did:ma:k51exampleworld#ma-world-lobby"
+supported_evaluators:
+  - id: "lua"
+    version: "5.4"
+services:
+  builtin_verbs:
+    - "chat"
+    - "@here look"
+    - "@here describe"
+    - "move"
+  transport:
+    messaging: "iroh"
+    content: "ipfs"
+refs:
+  actor_registry_cid: "bafybeihactorregistryexample"
+  room_index_cid: "bafybeihroomindexexample"
+  acl_index_cid: null
+  capabilities_index_cid: null
+meta:
+  name: "Example World"
+  description: "An experimental MA world."
+  created_at: "2026-03-23T12:00:00Z"
+  updated_at: "2026-03-23T12:00:00Z"

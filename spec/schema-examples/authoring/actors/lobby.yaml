@@ -1,0 +1,27 @@
+kind: actor
+version: 1
+id: "did:ma:k51exampleworld#ma-world-lobby"
+type: "room"
+builtin:
+  owner: "did:ma:k51exampleworld#wizard"
+  location: "did:ma:k51exampleworld#ma-world"
+  controller: null
+  acl: null
+  program:
+    evaluator: "lua"
+    cid: "bafybeihlobbyscriptexample"
+  payload_cid: null
+  payload_encrypted: false
+meta:
+  name: "Lobby"
+  description: "A plain chat room."
+  created_at: "2026-03-23T12:00:00Z"
+  updated_at: "2026-03-23T12:00:00Z"
+  tags:
+    - "room"
+    - "public"
+properties:
+  enter_acl: null
+  supports_chat: true
+indexes:
+  contents: []

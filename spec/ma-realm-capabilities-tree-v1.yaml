@@ -1,0 +1,197 @@
+kind: ma_realm_capability_spec
+version: 1
+title: MA Realm Capability Model And Dot-Tree
+status: draft
+
+scope:
+  description: >-
+    Consolidated spec for capability checks and dot-notation object/method tree
+    for world-local avatar principals.
+  depends_on:
+    - ma-avatar-state-draft.txt
+
+identity_model:
+  actor:
+    definition: Signed sender DID in ma envelope from-field.
+    examples:
+      - did:ma:lars#bahner
+  world:
+    definition: Authoritative world DID root.
+    examples:
+      - did:ma:worldipns
+  avatar:
+    definition: World-local principal DID with flat fragment namespace.
+    format: did:ma:<world>#<avatar-id>
+    examples:
+      - did:ma:worldipns#bahner
+    rules:
+      - Flat fragment namespace only (no path semantics).
+      - Exactly one owner actor DID.
+      - avatar.owner MUST equal message.from for execution.
+
+message_rules:
+  envelope:
+    invariant:
+      - Actor identity is derived from signed from-field only.
+      - Actor identity is not duplicated as content authority.
+  content:
+    avatar_field:
+      required_for:
+        - world.message
+        - world.room_events
+      semantics: Execution context principal in world.
+      validation:
+        - avatar DID must be valid did:ma with fragment.
+        - avatar.owner == message.from.
+
+capabilities:
+  model:
+    principal: avatar DID
+    owner: actor DID
+    note: >-
+      owner links avatar to controlling actor. All in-world ACL/object ownership
+      checks are performed as avatar principal, not actor principal.
+  baseline:
+    act_as_avatar:
+      check: avatar.owner == message.from
+      grants:
+        - invoke methods as avatar context
+        - pass room/object/avatar ACL checks as avatar
+    world_admin:
+      check: avatar principal has world-admin authorization in world policy
+      grants:
+        - world mutating methods (acl, invite, dig, save/load, migrate)
+    room_owner:
+      check: room.owner == avatar DID
+      grants:
+        - room policy mutations
+        - room structural mutations where configured
+    object_owner:
+      check: object.owner == avatar DID
+      grants:
+        - object metadata/content mutations
+
+acl_resolution_order:
+  - transport and signature validity
+  - actor ownership of avatar (avatar.owner == from)
+  - object/room/world capability checks using avatar principal
+  - method-specific argument validation
+
+object_model:
+  world_object:
+    id: did:ma:<world>
+  room_object:
+    id: did:ma:<world>#<room-id>
+  avatar_object:
+    id: did:ma:<world>#<avatar-id>
+  generic_object:
+    id: did:ma:<world>#<object-id>
+
+methods:
+  notation:
+    examples:
+      - "@did:ma:<world>.ping"
+      - "@did:ma:<world>#<room>.show"
+      - "@did:ma:<world>#<avatar>.describe Hei"
+      - "@did:ma:<world>#<object>.peek"
+  tree:
+    world:
+      target: did:ma:<world>
+      methods:
+        - _list
+        - help
+        - ping [room]
+        - list
+        - claim
+        - knock.list [all]
+        - knock.accept <id>
+        - knock.reject <id> [note]
+        - knock.delete <id>
+        - invite <did> [note]
+        - room <name> acl show|open|close|allow <did>|deny <did>
+        - flush [knock|all]
+        - migrate-index
+        - save
+        - load <cid>
+        - dig <direction> [to|til <#dest|did>]
+      properties:
+        - owner
+        - did
+        - rooms
+        - lang_cid
+
+    room:
+      target: did:ma:<world>#<room-id>
+      methods:
+        - show
+        - who
+        - id [<selector>]
+        - content-b64 <payload>
+        - exit-content-b64 <exit-id> <payload>
+      notes:
+        - Room methods are executed with avatar context from content.avatar.
+
+    avatar:
+      target: did:ma:<world>#<avatar-id>
+      methods:
+        - show
+        - describe <text>
+        - language <ordered-list>
+        - lang <ordered-list>
+        - ping
+      properties:
+        - name (read-only runtime)
+        - description
+        - owner (actor DID)
+        - fragment
+        - lang
+
+    object:
+      target: did:ma:<world>#<object-id>
+      methods:
+        - id
+        - peek
+        - take
+        - drop
+        - apply <method> [args]
+        - inbox.list
+        - inbox.read <id>
+        - inbox.delete <id>
+      notes:
+        - Objects may have independent parsers/runtimes in future.
+        - World parser is delivery and baseline router, not sole interpreter.
+
+routing:
+  direct_targeting:
+    rule: All commands are sent directly to DID targets.
+    examples:
+      - "@did:ma:<world>.method"
+      - "@did:ma:<world>#<fragment>.method"
+  aliasing:
+    rule: Actor-local aliases must resolve to full DIDs before send.
+    disallowed_on_wire:
+      - @world
+      - @here
+      - @me
+      - @avatar
+
+state_and_restore:
+  checkpoint_overview:
+    - World issues signed avatar state.
+    - Actor stores immutable signed state.
+    - World validates and restores highest valid version.
+  versioning:
+    updated: unix nanoseconds informational
+    version: strict monotonic ordering key
+
+invariants:
+  - Actor signs all requests.
+  - Avatar is execution context principal.
+  - World is authoritative state signer.
+  - Highest valid version wins in restore.
+  - Fragment namespace remains flat.
+
+non_goals:
+  - Defining DID document schema in this file.
+  - Defining transport internals.
+  - Multi-writer merge semantics.

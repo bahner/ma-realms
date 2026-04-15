@@ -1,0 +1,29 @@
+kind: actor_registry
+version: 1
+world_id: "did:ma:k51exampleworld#ma-world"
+actors:
+  "did:ma:k51exampleworld#ma-world":
+    cid: "bafybeihworldactorexample"
+    type: "world"
+    owner: "did:ma:k51exampleworld#wizard"
+    location: null
+    updated_at: "2026-03-23T12:00:00Z"
+  "did:ma:k51exampleworld#ma-world-lobby":
+    cid: "bafybeihlobbyactorexample"
+    type: "room"
+    owner: "did:ma:k51exampleworld#wizard"
+    location: "did:ma:k51exampleworld#ma-world"
+    updated_at: "2026-03-23T12:00:00Z"
+indexes:
+  by_type:
+    world:
+      - "did:ma:k51exampleworld#ma-world"
+    room:
+      - "did:ma:k51exampleworld#ma-world-lobby"
+  by_location:
+    "did:ma:k51exampleworld#ma-world":
+      - "did:ma:k51exampleworld#ma-world-lobby"
+  by_owner:
+    "did:ma:k51exampleworld#wizard":
+      - "did:ma:k51exampleworld#ma-world"
+      - "did:ma:k51exampleworld#ma-world-lobby"

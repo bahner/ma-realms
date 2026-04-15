@@ -1,0 +1,25 @@
+kind: local_world_config
+version: 1
+world_slug: example-world
+world_id: "did:ma:k51exampleworld#ma-world"
+kubo:
+  api_url: "http://127.0.0.1:5001"
+  gateway_url: "http://127.0.0.1:8080"
+  world_ipns_key_name: "ma-world"
+  required_keys: []
+paths:
+  authoring_dir: "authoring"
+  secrets_dir: "secrets"
+  state_dir: "state"
+  cache_dir: "cache"
+crypto:
+  world_master_key_file: "secrets/world_master_key.bin"
+  object_keys_file: "secrets/object_keys.yaml"
+publish:
+  publish_world_ipns: true
+  auto_pin: true
+  room_ipns_enabled: false
+runtime:
+  supported_evaluators:
+    - id: "lua"
+      version: "5.4"

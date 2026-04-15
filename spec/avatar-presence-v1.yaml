@@ -1,0 +1,59 @@
+kind: ma_avatar_presence_protocol
+version: 1
+
+summary:
+  goal: Keep room presence fresh via avatar-origin heartbeat with TTL.
+  principle: Presence is derived from avatar.ping updates, not from static room membership alone.
+
+messages:
+  avatar_ping:
+    direction: actor_to_world
+    route: "@did:ma:<world>.ping [room_did_or_room_id]"
+    description: Avatar heartbeat carrying current location context.
+    fields:
+      sender: did:ma actor DID (signed message sender)
+      room_hint: optional did:ma:<world>#<room> or <room>
+
+  presence_refresh_request:
+    direction: world_to_actor
+    channel: application/x-ma-presence
+    kind: presence.refresh.request
+    description: Ask avatars in a room to immediately send avatar.ping.
+    fields:
+      room: room id
+      room_did: did:ma:<world>#<room>
+      ts: rfc3339 timestamp
+
+world_runtime:
+  cache:
+    name: avatar_locations
+    key: actor_root_did
+    value:
+      did_root: actor root DID
+      room: room id
+      endpoint: iroh endpoint id
+      seen_at: rfc3339 timestamp
+    ttl_seconds_default: 25
+
+  update_rules:
+    - on enter, set avatar_locations[did_root] with room+endpoint
+    - on message and room poll, refresh avatar_locations[did_root]
+    - on ping, refresh avatar_locations[did_root]
+    - on leave/stale prune, remove avatar_locations[did_root]
+
+  roster_rules:
+    - room roster includes only avatars with fresh avatar_locations entry for that room
+
+timers:
+  actor_ping_interval_seconds: 25
+  world_prune_probe_seconds: 10
+  world_presence_stale_seconds: 25
+
+startup:
+  world_restart_behavior:
+    - after startup, world sends presence.refresh.request per room
+    - actors receiving request should immediately send avatar.ping
+
+notes:
+  - actor-local aliases are never sent over wire; targets must be full did:ma values
+  - this protocol keeps complexity low by using a single heartbeat primitive
