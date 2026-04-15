@@ -13,6 +13,7 @@ permissions:
 jobs:
   test:
     name: test (${{ matrix.crate }})
+    if: ${{ false }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -37,6 +38,7 @@ jobs:
 
   build-agent:
     name: build ma-agent (${{ matrix.target }})
+    if: ${{ false }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

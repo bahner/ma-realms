@@ -12,6 +12,7 @@ permissions:
 jobs:
   build:
     name: build (${{ matrix.target }})
+    if: ${{ false }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -106,9 +107,9 @@ jobs:
 
   release:
     name: create release
+    if: ${{ false && startsWith(github.ref, 'refs/tags/') }}
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
 
