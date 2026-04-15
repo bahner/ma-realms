@@ -302,11 +302,12 @@ async fn ensure_inbox_listener_with_secret(secret_key: SecretKey) -> Result<Stri
     Ok(endpoint_id)
 }
 
-async fn create_stream_cache(
+async fn create_stream_cache_on_lane(
     target_id_str: &str,
     relay_hint: Option<&str>,
+    lane_alpn: &'static [u8],
 ) -> Result<WorldConnCache, JsValue> {
-    let requested_alpn = String::from_utf8_lossy(INBOX_ALPN).to_string();
+    let requested_alpn = String::from_utf8_lossy(lane_alpn).to_string();
     let target: EndpointId = target_id_str
         .trim()
         .parse()
@@ -322,7 +323,7 @@ async fn create_stream_cache(
 
     let mut endpoint_addr = EndpointAddr::new(target);
     let relay_source = core_normalize_relay_url(relay_hint.unwrap_or(DEFAULT_WORLD_RELAY_URL));
-    
+
     match relay_source.parse::<RelayUrl>() {
         Ok(relay_url) => {
             endpoint_addr = endpoint_addr.with_relay_url(relay_url);
@@ -332,13 +333,13 @@ async fn create_stream_cache(
         }
     }
 
-    let connection = endpoint.connect(endpoint_addr, INBOX_ALPN)
+    let connection = endpoint.connect(endpoint_addr, lane_alpn)
         .await
         .map_err(|e| js_err(format!(
             "endpoint.connect() failed: {} (requested_alpn={} target={})",
             e, requested_alpn, target_id_str
         )))?;
-    
+
     let (send_stream, recv_stream) = connection.open_bi()
         .await
         .map_err(|e| js_err(format!(
@@ -353,6 +354,13 @@ async fn create_stream_cache(
         recv_stream,
         target_id: target_id_str.to_string(),
     })
+}
+
+async fn create_stream_cache(
+    target_id_str: &str,
+    relay_hint: Option<&str>,
+) -> Result<WorldConnCache, JsValue> {
+    create_stream_cache_on_lane(target_id_str, relay_hint, AVATAR_ALPN).await
 }
 
 async fn get_or_create_stream_cache(
@@ -428,11 +436,12 @@ use ma_core::{
     IpfsPublishDidResponse,
     parse_capability_acl_text,
     parse_message,
+    ActorCommand,
     MessageEnvelope,
     resolve_inbox_endpoint_id as core_resolve_inbox_endpoint_id,
     resolve_alias_input as core_resolve_alias_input,
     RoomEvent, WorldCommand, WorldRequest, WorldResponse,
-    PRESENCE_ALPN, INBOX_ALPN, IPFS_ALPN,
+    AVATAR_ALPN, PRESENCE_ALPN, INBOX_ALPN, IPFS_ALPN,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -922,6 +931,18 @@ async fn send_world_request(endpoint_id: &str, request: WorldRequest) -> Result<
     }
 
     Err(last_error.unwrap_or_else(|| js_err("world request failed")))
+}
+
+async fn send_world_request_once_on_lane(
+    endpoint_id: &str,
+    request: WorldRequest,
+    lane_alpn: &'static [u8],
+) -> Result<WorldResponse, JsValue> {
+    let mut cache = create_stream_cache_on_lane(endpoint_id, None, lane_alpn).await?;
+    let result = exchange_on_stream(&mut cache, &request).await;
+    cache.connection.close(0u32.into(), b"done");
+    cache.endpoint.close().await;
+    result
 }
 
 /// Close and drop the cached world connection (call on lock/logout).
@@ -2399,12 +2420,32 @@ pub async fn send_world_message_with_ttl(
     text: &str,
     ttl_seconds: u64,
 ) -> Result<String, JsValue> {
+    fn is_world_knock_command(envelope: &MessageEnvelope) -> bool {
+        let MessageEnvelope::ActorCommand { target, command } = envelope else {
+            return false;
+        };
+        if !target.eq_ignore_ascii_case("world") {
+            return false;
+        }
+        let ActorCommand::Raw { command } = command else {
+            return false;
+        };
+        let head = command
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        head == "knock"
+    }
+
     let timestamp_ms = js_sys::Date::now() as u64;
     let envelope = parse_message(text);
+    let is_world_knock = is_world_knock_command(&envelope);
     let is_admin_world_command =
         matches!(&envelope, ma_core::MessageEnvelope::ActorCommand { target, .. } if target.eq_ignore_ascii_case("world"));
     if !is_admin_world_command {
-        return Err(js_err("ma/inbox/1 only accepts @world commands for send_world_message"));
+        return Err(js_err("ma/avatar/1 only accepts @world commands for send_world_message"));
     }
     let request = build_signed_world_request(
         passphrase,
@@ -2418,7 +2459,11 @@ pub async fn send_world_message_with_ttl(
         timestamp_ms,
         ttl_seconds,
     )?;
-    let response = send_world_request(endpoint_id, request).await?;
+    let response = if is_world_knock {
+        send_world_request_once_on_lane(endpoint_id, request, INBOX_ALPN).await?
+    } else {
+        send_world_request(endpoint_id, request).await?
+    };
     update_room_did_cache_from_response(&response);
 
     serde_json::to_string(&WorldActionResult {

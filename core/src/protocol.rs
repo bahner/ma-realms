@@ -85,6 +85,35 @@ impl WorldLane {
             Self::Avatar => Some(CONTENT_TYPE_WORLD),
         }
     }
+
+    pub fn supports_command(self, command: &WorldCommand) -> bool {
+        match self {
+            Self::Avatar => true,
+            Self::Inbox => Self::is_knock_command(command),
+        }
+    }
+
+    fn is_knock_command(command: &WorldCommand) -> bool {
+        let WorldCommand::Message { envelope, .. } = command else {
+            return false;
+        };
+        let crate::parser::MessageEnvelope::ActorCommand {
+            target,
+            command: crate::parser::ActorCommand::Raw { command },
+        } = envelope else {
+            return false;
+        };
+        if !target.eq_ignore_ascii_case("world") {
+            return false;
+        }
+        let head = command
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        head == "knock"
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

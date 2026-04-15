@@ -2423,37 +2423,38 @@ impl World {
                                 );
                             }
                         }
-                        if room_entry.acl_cid.trim().is_empty() {
-                            return Err(anyhow!(
-                                "missing acl_cid metadata for room '{}' in world index {}",
+                        let mut loaded_acl = if room_entry.acl_cid.trim().is_empty() {
+                            warn!(
+                                "room '{}' in world index {} is missing acl_cid metadata; using inline/default ACL until state restore or re-save",
                                 room_name,
                                 root_cid
-                            ));
-                        }
+                            );
+                            loaded_room.acl.clone()
+                        } else {
+                            let acl_yaml = kubo::cat_cid(&kubo_url, &room_entry.acl_cid).await
+                                .map_err(|e| anyhow!(
+                                    "failed loading acl {} for room '{}': {}",
+                                    room_entry.acl_cid,
+                                    room_name,
+                                    e
+                                ))?;
+                            let acl_doc: RoomAclDoc = serde_yaml::from_str(&acl_yaml)
+                                .map_err(|e| anyhow!(
+                                    "invalid ACL doc at {} for room '{}': {}",
+                                    room_entry.acl_cid,
+                                    room_name,
+                                    e
+                                ))?;
+                            if acl_doc.kind != "ma_room_acl" || acl_doc.version != 1 {
+                                return Err(anyhow!(
+                                    "unsupported ACL doc kind/version at {} for room '{}'",
+                                    room_entry.acl_cid,
+                                    room_name
+                                ));
+                            }
 
-                        let acl_yaml = kubo::cat_cid(&kubo_url, &room_entry.acl_cid).await
-                            .map_err(|e| anyhow!(
-                                "failed loading acl {} for room '{}': {}",
-                                room_entry.acl_cid,
-                                room_name,
-                                e
-                            ))?;
-                        let acl_doc: RoomAclDoc = serde_yaml::from_str(&acl_yaml)
-                            .map_err(|e| anyhow!(
-                                "invalid ACL doc at {} for room '{}': {}",
-                                room_entry.acl_cid,
-                                room_name,
-                                e
-                            ))?;
-                        if acl_doc.kind != "ma_room_acl" || acl_doc.version != 1 {
-                            return Err(anyhow!(
-                                "unsupported ACL doc kind/version at {} for room '{}'",
-                                room_entry.acl_cid,
-                                room_name
-                            ));
-                        }
-
-                        let mut loaded_acl = acl_doc.acl;
+                            acl_doc.acl
+                        };
                         loaded_acl.owner = room_entry.owner.clone();
                         if let Some(owner) = loaded_acl.owner.clone() {
                             loaded_acl.allow.insert(owner.clone());
@@ -7926,6 +7927,12 @@ impl WorldProtocol {
         }
         let command: WorldCommand = serde_json::from_slice(&message.content)
             .map_err(|err| anyhow!("invalid command payload: {}", err))?;
+        if !self.lane.supports_command(&command) {
+            return Err(anyhow!(
+                "lane '{}' does not support command on this request type",
+                self.lane.label()
+            ));
+        }
         if let Some(method) = command.internal_method() {
             debug!("processing internal method '{}' on lane '{}'", method, self.lane.label());
         }
@@ -8020,7 +8027,7 @@ impl WorldProtocol {
                 };
 
                 info!(
-                    "[{}] worldentry {} did={} lane={} remote={} push={}",
+                    "[{}] worldentry {} did={} ingress_lane={} remote={} push={}",
                     actual_room,
                     handle,
                     avatar_did_str,
@@ -10059,6 +10066,23 @@ async fn main() -> Result<()> {
                 state_cid,
                 root_cid
             );
+        }
+
+        // Publish runtime ma links promptly on startup so DID consumers can IPLD-traverse
+        // via ma.world/ma.state_cid without waiting for the periodic publish timer.
+        {
+            let initial_state_cid = world.state_cid().await;
+            let initial_root_cid = world.world_cid().await;
+            if initial_state_cid.is_some() && initial_root_cid.is_some() {
+                let world_for_initial_ipns = world.clone();
+                tokio::spawn(async move {
+                    info!("Startup IPNS publish: refreshing DID ma runtime links");
+                    match world_for_initial_ipns.publish_to_ipns().await {
+                        Ok(()) => info!("Startup IPNS publish: completed"),
+                        Err(err) => warn!("Startup IPNS publish failed: {}", err),
+                    }
+                });
+            }
         }
 
         {
