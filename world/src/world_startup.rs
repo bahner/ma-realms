@@ -19,6 +19,7 @@ fn load_ma_world_projection_fields() -> Result<Vec<String>> {
         "world_did",
         "entry_acl",
         "owner",
+        "lang_cid",
         "lang",
         "state_cid",
         "public",
@@ -30,7 +31,13 @@ fn load_ma_world_projection_fields() -> Result<Vec<String>> {
     let mut selected: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for raw in parsed.fields {
-        let field = raw.trim().to_string();
+        let input_field = raw.trim().to_string();
+        let field = if input_field == "lang_cid" {
+            // Projection format is canonical `lang` IPLD link; `lang_cid` is accepted as config alias.
+            "lang".to_string()
+        } else {
+            input_field
+        };
         if field.is_empty() {
             return Err(anyhow!("ma world projection config contains an empty field name"));
         }
@@ -1492,15 +1499,15 @@ pub(crate) async fn run_main() -> Result<()> {
         .unwrap_or_else(|| default_kubo_url.clone());
     let status_api_enabled = runtime_cfg.status_api_enabled.unwrap_or(true);
     let admin_api_enabled = runtime_cfg.admin_api_enabled.unwrap_or(false);
-    let admin_api_token = if admin_api_enabled {
+    let admin_api_password = if admin_api_enabled {
         Some(
-            std::env::var("MA_WORLD_ADMIN_API_TOKEN")
+            std::env::var("MA_WORLD_ADMIN_API_PASSWORD")
                 .ok()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
                 .or_else(|| {
                     runtime_cfg
-                        .admin_api_token
+                        .admin_api_password
                         .as_deref()
                         .map(str::trim)
                         .filter(|value| !value.is_empty())
@@ -1508,7 +1515,7 @@ pub(crate) async fn run_main() -> Result<()> {
                 })
                 .ok_or_else(|| {
                     anyhow!(
-                        "missing admin API token: set admin_api_token in {} or MA_WORLD_ADMIN_API_TOKEN",
+                        "missing admin API password: set admin_api_password in {} or MA_WORLD_ADMIN_API_PASSWORD",
                         runtime_cfg_path.display()
                     )
                 })?,
@@ -1856,7 +1863,7 @@ pub(crate) async fn run_main() -> Result<()> {
             let status_world = world.clone();
             let status_info = world_info.clone();
             let status_www_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("www");
-            let admin_api_token = admin_api_token.clone();
+            let admin_api_password = admin_api_password.clone();
             tokio::spawn(async move {
                 if let Err(err) = status::serve(
                     listener,
@@ -1864,7 +1871,7 @@ pub(crate) async fn run_main() -> Result<()> {
                     status_info,
                     status_www_root,
                     admin_api_enabled,
-                    admin_api_token,
+                    admin_api_password,
                 )
                 .await
                 {

@@ -1,0 +1,148 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>間 World</title>
+    <link rel="stylesheet" href="/style.css">
+    <link rel="icon" type="image/svg+xml" href="/favicon.ico">
+</head>
+<body>
+
+<!-- Locked view -->
+<main id="locked-view" hidden>
+    <section class="card">
+        <div class="badge">world locked</div>
+        <h1 id="locked-title"></h1>
+        <p>Unlock this world to access the regular status and world controls.</p>
+        <div class="metrics">
+            <div class="metric"><span>World Slug</span><code id="locked-slug-metric"></code></div>
+            <div class="metric"><span>World DID</span><code id="locked-world-did-metric"></code></div>
+            <div class="metric"><span>Runtime Lock</span><code>locked</code></div>
+            <div class="metric"><span>Kubo API</span><code id="locked-kubo-metric"></code></div>
+            <div class="metric"><span>Iroh Endpoint ID</span><code id="locked-endpoint-metric"></code></div>
+        </div>
+    </section>
+
+    <section class="card">
+        <h2>Unlock</h2>
+        <div class="unlock-layout">
+            <div class="group">
+                <form class="group api-form" method="post" action="/world/slug">
+                    <label for="locked-slug-input">Slug</label>
+                    <input id="locked-slug-input" name="slug" type="text" required />
+                    <div class="row"><button type="submit">Update slug</button></div>
+                </form>
+
+                <form class="group api-form" method="post" action="/bundle/create">
+                    <label for="bundle-passphrase">Passphrase</label>
+                    <input id="bundle-passphrase" name="passphrase" type="password" required />
+                    <div class="row"><button type="submit">Create bundle</button></div>
+                </form>
+                <p class="note">Create and keep a fresh bundle in a safe place before unlocking on new machines.</p>
+            </div>
+
+            <form class="group api-form" method="post" action="/unlock">
+                <label for="unlock-passphrase">Unlock passphrase</label>
+                <input id="unlock-passphrase" name="passphrase" type="password" required />
+                <label for="bundle-input">Bundle JSON</label>
+                <textarea id="bundle-input" name="bundle" placeholder="Paste bundle JSON here" required></textarea>
+                <div class="row">
+                    <button class="primary" type="submit">Unlock world</button>
+                    <button type="button" id="copy-bundle">Copy bundle</button>
+                    <button type="button" id="reset-local-cache">Reset local cache</button>
+                </div>
+                <p class="note">Unlock reloads this page and opens full world status and controls.</p>
+            </form>
+        </div>
+
+        <div id="locked-result" class="result" hidden></div>
+    </section>
+</main>
+
+<!-- Unlocked view -->
+<div id="lock-countdown" class="lock-countdown" hidden>LOCK 01:00</div>
+<section id="screen-lock-overlay" class="screen-lock" hidden>
+    <article class="screen-lock-card" id="screen-lock-card">
+        <h2 class="screen-lock-title">Pan-Galactic Pause</h2>
+        <p class="screen-lock-sub">Klikk en gang for å lande tilbake i status.</p>
+        <canvas id="screen-lock-canvas" width="1400" height="760"></canvas>
+        <p class="screen-lock-tip">One click to continue</p>
+    </article>
+</section>
+
+<main id="unlocked-view" hidden>
+    <section class="card">
+        <div class="badge">world status</div>
+        <h1 id="unlocked-title"></h1>
+        <p>Operational dashboard for world metadata and persistence actions.</p>
+        <div class="metrics">
+            <div class="metric"><span>World Pin Alias</span><code id="world-alias-metric"></code></div>
+            <div class="metric"><span>World DID</span><code id="world-did-metric"></code></div>
+            <div class="metric"><span>Iroh Endpoint ID</span><code id="endpoint-metric"></code></div>
+            <div class="metric"><span>Actor Web Version</span><code id="actor-web-version-metric"></code></div>
+            <div class="metric"><span>Encrypted State CID</span><code id="state-cid-metric"></code></div>
+            <div class="metric"><span>Language Pack CID</span><code id="lang-cid-metric"></code></div>
+            <div class="metric"><span>Runtime</span><code>unlocked</code></div>
+            <div class="metric"><span>Rooms (live)</span><code id="room-count-metric"></code></div>
+            <div class="metric"><span>Avatars (live)</span><code id="avatar-count-metric"></code></div>
+        </div>
+    </section>
+
+    <section class="card">
+        <div class="controls">
+            <section class="control">
+                <h3>Slug</h3>
+                <form method="post" action="/world/slug" class="api-form">
+                    <input id="slug-input" name="slug" required />
+                    <button type="submit">Update slug</button>
+                </form>
+            </section>
+            <section class="control">
+                <h3>Kubo API</h3>
+                <form method="post" action="/world/kubo" class="api-form">
+                    <input id="kubo-url-input" name="kubo_url" required />
+                    <button type="submit">Update Kubo API</button>
+                </form>
+            </section>
+            <section class="control">
+                <h3>World owner</h3>
+                <form method="post" action="/world/owner" class="api-form">
+                    <input id="owner-input" name="owner" placeholder="did:ma:..." required />
+                    <button type="submit">Set owner</button>
+                </form>
+            </section>
+            <section class="control">
+                <h3>Save world</h3>
+                <form method="post" action="/world/save" class="api-form">
+                    <button type="submit">Save world</button>
+                </form>
+            </section>
+            <section class="control">
+                <h3>Load by State CID</h3>
+                <form method="post" action="/world/load" class="api-form">
+                    <input id="state-cid-input" name="state_cid" placeholder="bafy..." required />
+                    <button type="submit">Load state</button>
+                </form>
+            </section>
+            <section class="control">
+                <h3>Load by Root CID</h3>
+                <form method="post" action="/world/load-root" class="api-form">
+                    <input id="root-cid-input" name="root_cid" placeholder="bafy..." required />
+                    <button type="submit">Load root</button>
+                </form>
+            </section>
+        </div>
+        <div id="unlocked-result" class="result" hidden></div>
+    </section>
+
+    <section class="card lists">
+        <section><h3>Direct Addresses</h3><ul id="direct-addrs-list"></ul></section>
+        <section><h3>Multiaddrs</h3><ul id="multiaddrs-list"></ul></section>
+        <section><h3>Relay URLs</h3><ul id="relay-urls-list"></ul></section>
+    </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>

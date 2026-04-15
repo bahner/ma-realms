@@ -9,26 +9,34 @@ set -euo pipefail
 #   mw_status
 
 MW_BASE_URL="${MW_BASE_URL:-http://127.0.0.1:5002}"
-MW_ADMIN_API_TOKEN="${MW_ADMIN_API_TOKEN:-}"
+MW_ADMIN_API_SLUG="${MW_ADMIN_API_SLUG:-}"
+MW_ADMIN_API_PASSWORD="${MW_ADMIN_API_PASSWORD:-}"
 
-mw_set_token() {
-    if [[ $# -ne 1 ]]; then
-        echo "usage: mw_set_token <token>" >&2
+mw_set_basic_auth() {
+    if [[ $# -ne 2 ]]; then
+        echo "usage: mw_set_basic_auth <slug> <password>" >&2
         return 2
     fi
-    MW_ADMIN_API_TOKEN="$1"
+    MW_ADMIN_API_SLUG="$1"
+    MW_ADMIN_API_PASSWORD="$2"
 }
 
-mw_require_token() {
-    if [[ -z "${MW_ADMIN_API_TOKEN}" ]]; then
-        echo "mw: missing admin API token (set MW_ADMIN_API_TOKEN or run mw_set_token <token>)" >&2
+mw_require_basic_auth() {
+    if [[ -z "${MW_ADMIN_API_SLUG}" || -z "${MW_ADMIN_API_PASSWORD}" ]]; then
+        echo "mw: missing admin basic auth (set MW_ADMIN_API_SLUG and MW_ADMIN_API_PASSWORD or run mw_set_basic_auth <slug> <password>)" >&2
         return 2
     fi
 }
 
 mw_auth_args() {
-    mw_require_token || return 2
-    printf '%s\n' "-H" "X-MA-API-Token: ${MW_ADMIN_API_TOKEN}"
+    mw_require_basic_auth || return 2
+    printf '%s\n' "-u" "${MW_ADMIN_API_SLUG}:${MW_ADMIN_API_PASSWORD}"
+}
+
+mw_optional_auth_args() {
+    if [[ -n "${MW_ADMIN_API_SLUG}" && -n "${MW_ADMIN_API_PASSWORD}" ]]; then
+        printf '%s\n' "-u" "${MW_ADMIN_API_SLUG}:${MW_ADMIN_API_PASSWORD}"
+    fi
 }
 
 mw_set_base() {
@@ -44,11 +52,15 @@ mw_base() {
 }
 
 mw_status() {
-    curl -s "$MW_BASE_URL/status.json"
+    local -a auth
+    mapfile -t auth < <(mw_optional_auth_args)
+    curl -s "$MW_BASE_URL/status.json" "${auth[@]}"
 }
 
 mw_openapi() {
-    curl -s "$MW_BASE_URL/openapi.json"
+    local -a auth
+    mapfile -t auth < <(mw_optional_auth_args)
+    curl -s "$MW_BASE_URL/openapi.json" "${auth[@]}"
 }
 
 mw_set_slug() {

@@ -1,14 +1,16 @@
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use axum::{
     middleware,
     http::header,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     extract::Request,
     Json, Router,
     Form, extract::State,
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use ma_core::LaneCapability;
@@ -65,7 +67,7 @@ pub struct WorldInfo {
 struct StatusState {
     world: Arc<World>,
     world_info: WorldInfo,
-    admin_api_token: Option<String>,
+    admin_api_password: Option<String>,
     admin_api_enabled: bool,
 }
 
@@ -75,12 +77,12 @@ pub async fn serve(
     world_info: WorldInfo,
     www_root: PathBuf,
     admin_api_enabled: bool,
-    admin_api_token: Option<String>,
+    admin_api_password: Option<String>,
 ) -> Result<()> {
     let state = StatusState {
         world,
         world_info,
-        admin_api_token,
+        admin_api_password,
         admin_api_enabled,
     };
     let cors = CorsLayer::new().allow_origin(Any);
@@ -90,6 +92,15 @@ pub async fn serve(
         .route("/status.json", get(status_json));
 
     if admin_api_enabled {
+        let protected_root = Router::new()
+            .route("/", get(root_status))
+            .route("/index.html", get(status_index_html))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_basic_auth,
+            ));
+        app = app.merge(protected_root);
+
         let protected = Router::new()
             .route("/unlock", post(unlock_runtime))
             .route("/bundle/create", post(create_unlock_bundle))
@@ -101,9 +112,13 @@ pub async fn serve(
             .route("/world/load-root", post(load_world_root_index))
             .route_layer(middleware::from_fn_with_state(
                 state.clone(),
-                require_api_token,
+                require_basic_auth,
             ));
         app = app.merge(protected);
+    } else {
+        app = app
+            .route("/", get(root_status))
+            .route("/index.html", get(status_index_html));
     }
 
     let app = app
@@ -115,23 +130,16 @@ pub async fn serve(
     Ok(())
 }
 
-fn extract_api_token(headers: &HeaderMap) -> Option<String> {
-    if let Some(raw) = headers.get("x-ma-api-token") {
-        if let Ok(value) = raw.to_str() {
-            let token = value.trim();
-            if !token.is_empty() {
-                return Some(token.to_string());
-            }
-        }
-    }
-
+fn extract_basic_auth(headers: &HeaderMap) -> Option<(String, String)> {
     if let Some(raw) = headers.get(header::AUTHORIZATION) {
         if let Ok(value) = raw.to_str() {
-            let token = value.trim();
-            if let Some(rest) = token.strip_prefix("Bearer ") {
-                let bearer = rest.trim();
-                if !bearer.is_empty() {
-                    return Some(bearer.to_string());
+            let auth = value.trim();
+            if let Some(rest) = auth.strip_prefix("Basic ") {
+                let decoded = B64.decode(rest.trim()).ok()?;
+                let decoded = String::from_utf8(decoded).ok()?;
+                let (username, password) = decoded.split_once(':')?;
+                if !username.trim().is_empty() && !password.is_empty() {
+                    return Some((username.to_string(), password.to_string()));
                 }
             }
         }
@@ -140,12 +148,12 @@ fn extract_api_token(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-async fn require_api_token(
+async fn require_basic_auth(
     State(state): State<StatusState>,
     request: Request,
     next: middleware::Next,
 ) -> Response {
-    let Some(expected) = state.admin_api_token.as_deref().map(str::trim) else {
+    let Some(expected_password) = state.admin_api_password.as_deref().map(str::trim) else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
@@ -155,24 +163,40 @@ async fn require_api_token(
         )
             .into_response();
     };
-    let provided = extract_api_token(request.headers());
+    let expected_username = state.world_info.name.trim();
+    let provided = extract_basic_auth(request.headers());
     let authorized = provided
-        .as_deref()
-        .map(|token| token == expected)
+        .as_ref()
+        .map(|(username, password)| {
+            username.trim() == expected_username && password.as_str() == expected_password
+        })
         .unwrap_or(false);
 
     if !authorized {
-        return (
+        let mut response = (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
                 "ok": false,
-                "message": "missing or invalid API token"
+                "message": "missing or invalid basic auth credentials"
             })),
         )
             .into_response();
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Basic realm=\"ma-world\""),
+        );
+        return response;
     }
 
     next.run(request).await
+}
+
+async fn root_status() -> impl IntoResponse {
+        Redirect::temporary("/index.html")
+}
+
+async fn status_index_html() -> impl IntoResponse {
+        Html(include_str!("../www/index.html"))
 }
 
 async fn favicon_ico() -> impl IntoResponse {
@@ -393,10 +417,9 @@ async fn openapi_json(State(state): State<StatusState>) -> Json<serde_json::Valu
         "components": {
             "securitySchemes": {
                 "ApiToken": {
-                    "type": "apiKey",
-                    "in": "header",
-                    "name": "X-MA-API-Token",
-                    "description": "Send either X-MA-API-Token or Authorization: Bearer <token> for mutating endpoints."
+                    "type": "http",
+                    "scheme": "basic",
+                    "description": "Use HTTP Basic auth with username=<world slug> and password=<admin_api_password>."
                 }
             }
         }

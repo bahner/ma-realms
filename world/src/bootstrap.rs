@@ -41,7 +41,7 @@ pub fn print_cli_help() {
     println!("  MA_KUBO_API_URL               Kubo API URL");
     println!("  MA_LISTEN                     HTTP status listen socket");
     println!("  MA_WORLD_OWNER                World owner DID for 'run' command");
-    println!("  MA_WORLD_ADMIN_API_TOKEN      Admin API token (overrides runtime config admin_api_token)");
+    println!("  MA_WORLD_ADMIN_API_PASSWORD   Admin API password (overrides runtime config admin_api_password)");
     println!("  MA_LOG_LEVEL                  Log level for 'run' command");
     println!("  MA_LOG_FILE                   Log file path for 'run' command");
     println!();
@@ -63,7 +63,7 @@ pub struct RuntimeFileConfig {
     #[serde(default)]
     pub log_file: Option<String>,
     #[serde(default)]
-    pub admin_api_token: Option<String>,
+    pub admin_api_password: Option<String>,
     #[serde(default)]
     pub status_api_enabled: Option<bool>,
     #[serde(default)]
