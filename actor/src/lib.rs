@@ -2105,7 +2105,7 @@ pub async fn ping_world(
     .map_err(js_err)
 }
 
-/// Compatibility wrapper: enter_world now sends a Ping.
+/// Enter or re-enter a room explicitly.
 #[wasm_bindgen]
 pub async fn enter_world(
     endpoint_id: &str,
@@ -2114,7 +2114,26 @@ pub async fn enter_world(
     actor_name: &str,
     room: &str,
 ) -> Result<String, JsValue> {
-    ping_world(endpoint_id, passphrase, encrypted_bundle_json, actor_name, room).await
+    let timestamp_ms = js_sys::Date::now() as u64;
+    let request = build_signed_world_request(
+        passphrase,
+        encrypted_bundle_json,
+        actor_name,
+        WorldCommand::Enter {
+            room_did: room.trim().to_string(),
+        },
+        CONTENT_TYPE_WORLD,
+        timestamp_ms,
+        DEFAULT_MESSAGE_TTL_SECS,
+    )?;
+    let response = send_world_request(endpoint_id, request).await?;
+    update_room_did_cache_from_response(&response);
+
+    serde_json::to_string(&WorldActionResult {
+        response,
+        pending_whispers: vec![],
+    })
+    .map_err(js_err)
 }
 
 /// Send a signed `application/x-ma-chat` message to a room.

@@ -1,6 +1,0 @@
-version: 1
-schema_version: 1
-default_lang: en_UK
-files:
-  en_UK: TODO_CID_EN_UK
-  nb_NO: TODO_CID_NB_NO

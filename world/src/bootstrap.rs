@@ -33,6 +33,7 @@ pub fn print_cli_help() {
     println!("  --owner <did>          Set world owner DID at startup");
     println!("  --log-level <level>    Log level: trace, debug, info (default), warn, error");
     println!("  --log-file <path>      Write logs to file (appends to existing file)");
+    println!("  lang_cid in config     Override world language-map CID at runtime startup");
     println!("  runtime config file:   $XDG_CONFIG_HOME/ma/<slug>.yaml (or ~/.config/ma/<slug>.yaml)");
     println!("  iroh secret default:   $XDG_CONFIG_HOME/ma/<slug>_iroh.bin (or ~/.config/ma/<slug>_iroh.bin)");
     println!();
@@ -71,6 +72,8 @@ pub struct RuntimeFileConfig {
     pub unlock_passphrase: Option<String>,
     #[serde(default)]
     pub unlock_bundle_file: Option<String>,
+    #[serde(default)]
+    pub lang_cid: Option<String>,
 }
 
 fn xdg_config_home() -> PathBuf {
@@ -113,4 +116,16 @@ pub fn load_runtime_file_config(path: &Path) -> Result<RuntimeFileConfig> {
         .map_err(|e| anyhow!("failed reading runtime config {}: {}", path.display(), e))?;
     serde_yaml::from_str::<RuntimeFileConfig>(&raw)
         .map_err(|e| anyhow!("invalid runtime config {}: {}", path.display(), e))
+}
+
+pub fn save_runtime_file_config(path: &Path, cfg: &RuntimeFileConfig) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| anyhow!("failed creating runtime config dir {}: {}", parent.display(), e))?;
+    }
+    let raw = serde_yaml::to_string(cfg)
+        .map_err(|e| anyhow!("failed serializing runtime config {}: {}", path.display(), e))?;
+    fs::write(path, raw)
+        .map_err(|e| anyhow!("failed writing runtime config {}: {}", path.display(), e))?;
+    Ok(())
 }

@@ -1,6 +1,8 @@
 use crate::actor::Avatar;
-use ma_core::ExitData;
-use std::collections::{HashMap, HashSet};
+use ma_core::{ExitData, RoomEvent, TtlCache};
+use std::{collections::{HashMap, HashSet, VecDeque}, time::Duration};
+
+const DEFAULT_AVATAR_STATE_TTL_SECS: u64 = 30;
 
 /// Access control list for a room.
 /// Evaluation order: deny list → allow list (with * wildcard).
@@ -63,10 +65,73 @@ pub struct Room {
     pub titles: HashMap<String, String>,
     #[serde(skip)]
     pub avatars: HashMap<String, Avatar>,
+    #[serde(skip)]
+    pub state: RoomState,
     pub exits: Vec<ExitData>,
     pub acl: RoomAcl,
     pub descriptions: HashMap<String, String>,
     pub did: String, // Full DID (with IPNS fragment)
+}
+
+#[derive(Clone, Debug)]
+pub struct RoomState {
+    pub avatars: TtlCache<String, String>,
+    pub dispatch_queue: VecDeque<RoomDispatchTask>,
+    pub events: VecDeque<RoomEvent>,
+    pub next_event_sequence: u64,
+}
+
+#[derive(Clone, Debug)]
+pub enum RoomDispatchTask {
+    PresenceSnapshot,
+    PresenceRoomStateTo(String),
+    PresenceRefreshRequest,
+    RoomEventsSince(u64),
+    WorldBroadcast(String),
+}
+
+impl Default for RoomState {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(DEFAULT_AVATAR_STATE_TTL_SECS))
+    }
+}
+
+impl RoomState {
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            avatars: TtlCache::with_capacity(ttl, 1024),
+            dispatch_queue: VecDeque::new(),
+            events: VecDeque::new(),
+            next_event_sequence: 0,
+        }
+    }
+
+    pub fn set_avatar_ttl(&mut self, ttl: Duration) {
+        self.avatars.set_default_max_cache(ttl);
+    }
+
+    pub fn touch_avatar(&mut self, did: &str, handle: &str) {
+        self.avatars.insert(did.to_string(), handle.to_string());
+    }
+
+    pub fn remove_avatar(&mut self, did: &str) {
+        self.avatars.remove(&did.to_string());
+    }
+
+    pub fn enqueue_dispatch(&mut self, task: RoomDispatchTask) {
+        self.dispatch_queue.push_back(task);
+    }
+
+    pub fn drain_dispatch_queue(&mut self) -> Vec<RoomDispatchTask> {
+        self.dispatch_queue.drain(..).collect()
+    }
+
+    pub fn push_event(&mut self, max_events: usize, entry: RoomEvent) {
+        if self.events.len() >= max_events {
+            self.events.pop_front();
+        }
+        self.events.push_back(entry);
+    }
 }
 
 fn default_room_title(name: &str) -> String {
@@ -92,6 +157,7 @@ impl Room {
             name,
             titles: HashMap::new(),
             avatars: HashMap::new(),
+            state: RoomState::default(),
             exits: Vec::new(),
             acl: RoomAcl::open(),
             descriptions: HashMap::new(),
@@ -125,11 +191,14 @@ impl Room {
     }
 
     pub fn add_avatar(&mut self, avatar: Avatar) {
+        self.state.touch_avatar(&avatar.agent_did.id(), &avatar.inbox);
         self.avatars.insert(avatar.inbox.clone(), avatar);
     }
 
     pub fn remove_avatar(&mut self, name: &str) {
-        self.avatars.remove(name);
+        if let Some(avatar) = self.avatars.remove(name) {
+            self.state.remove_avatar(&avatar.agent_did.id());
+        }
     }
 }
 

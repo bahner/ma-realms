@@ -9,6 +9,7 @@ import init, {
   normalize_bip39_phrase,
   connect_world,
   connect_world_with_relay,
+  enter_world,
   ping_world,
   poll_world_events,
   send_world_chat,
@@ -43,13 +44,12 @@ import { createUiFlow } from './ui.js';
 import { createDidTargetMetaPollHandler } from './meta-poll.js';
 import {
   createRoomInspectFlow,
-  createRoomPresencePayloadFlow,
-  createRoomPresenceFlow,
   createRoomStorage,
   humanRoomTitle,
   parseExitYamlSummary,
   sanitizeRoomYamlForEdit,
 } from './room.js';
+import { createHereFlow } from './here.js';
 import {
   normalizeLanguageOrder as normalizeLanguageOrderValue,
   normalizeUiLang,
@@ -1404,6 +1404,17 @@ async function sendCurrentHomePresencePing() {
         state.currentHome.handle = response.handle;
       }
 
+      if (Array.isArray(response.avatars) && response.avatars.length > 0) {
+        clearRoomPresence();
+        for (const avatar of response.avatars) {
+          const handle = String(avatar?.handle || '').trim();
+          const did = String(avatar?.did || '').trim();
+          if (handle) {
+            trackRoomPresence(handle, did);
+          }
+        }
+      }
+
       updateRoomHeading(state.currentHome.roomTitle || '', state.currentHome.roomDescription || '');
       syncSpecialAliasesFromCurrentHome();
       saveActiveHomeSnapshot();
@@ -1884,42 +1895,21 @@ const { updateDocumentTitle, updateLocationContext } = createWorldTitleFlow({
   properName: PROPER_NAME,
 });
 
-const { trackRoomPresence, removeRoomPresence, clearRoomPresence } = createRoomPresenceFlow({
-  state,
-  cacheRoomDidLookup,
-  dropCachedRoomDidLookup,
+const {
   renderAvatarPanel,
-});
-
-function renderAvatarPanel() {
-  const list = byId('avatar-list');
-  if (!list) return;
-  list.innerHTML = '';
-  const sorted = Array.from(state.roomPresence.values()).sort((a, b) => {
-    const left = String(a?.handle || a?.did || '').toLowerCase();
-    const right = String(b?.handle || b?.did || '').toLowerCase();
-    return left.localeCompare(right);
-  });
-  for (const entry of sorted) {
-    const li = document.createElement('li');
-    li.className = 'avatar-item';
-    const didText = String(entry?.did || '').trim();
-    const handle = String(entry?.handle || '').trim();
-    li.textContent = handle || (didText ? formatDidForDialog(didText) : '');
-    if (didText) {
-      li.title = didText;
-    }
-    list.appendChild(li);
-  }
-}
-
-const { applyPresencePayload } = createRoomPresencePayloadFlow({
-  state,
-  updateRoomHeading: (...args) => updateRoomHeading(...args),
   trackRoomPresence,
   removeRoomPresence,
   clearRoomPresence,
+  applyPresencePayload,
+} = createHereFlow({
+  state,
+  byId,
+  cacheRoomDidLookup,
+  dropCachedRoomDidLookup,
+  updateRoomHeading: (...args) => updateRoomHeading(...args),
   appendMessage: (...args) => appendMessage(...args),
+  formatDidForDialog,
+  didParts,
 });
 
 function setCurrentPublishInfo({ ipns = '', cid = '' } = {}) {
@@ -2454,8 +2444,8 @@ const inboundDispatcher = createInboundDispatcher({
       }
       // Do not move event cursor from presence hints; poll cursor advances only from processed events.
 
-      clearRoomPresence();
-      if (Array.isArray(payload?.avatars)) {
+      if (Array.isArray(payload?.avatars) && payload.avatars.length > 0) {
+        clearRoomPresence();
         for (const avatar of payload.avatars) {
           const handle = String(avatar?.handle || '').trim();
           const did = String(avatar?.did || '').trim();
@@ -2546,7 +2536,7 @@ async function pollCurrentHomeEvents() {
     }
 
     // Poll responses carry a full room roster so clients converge even if a push is missed.
-    if (Array.isArray(result.avatars)) {
+    if (Array.isArray(result.avatars) && result.avatars.length > 0) {
       clearRoomPresence();
       for (const avatar of result.avatars) {
         const handle = String(avatar?.handle || '').trim();
@@ -3436,7 +3426,7 @@ async function enterWorldWithRetry(endpointId, actorName, room) {
       logger.log(`connect.attempt.${attempt}`, `phase 2/2: sending ping request`);
       const requestStart = Date.now();
       const response = await withTimeout(
-        ping_world(endpointId, state.passphrase, state.encryptedBundle, actorName, room),
+        enter_world(endpointId, state.passphrase, state.encryptedBundle, actorName, room),
         12000,
         'ping request timed out'
       );

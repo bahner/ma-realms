@@ -432,7 +432,8 @@ export function createWorldDispatchFlow({
     if (!target) {
       return '';
     }
-    if (target.toLowerCase() === 'home') {
+    const plainTarget = target.startsWith('@') ? target.slice(1).trim() : target;
+    if (plainTarget.toLowerCase() === 'home') {
       const configuredHome = String((typeof getMyHomeTarget === 'function' ? getMyHomeTarget() : state.myHome) || '').trim();
       if (isMaDid(configuredHome)) {
         return configuredHome;
@@ -1214,6 +1215,20 @@ export function createWorldDispatchFlow({
       }
 
       const inputPrefix = classifyInputPrefix(trimmedText);
+
+      const goMatch = trimmedText.match(/^go\s+(.+)$/i);
+      if (goMatch) {
+        const target = String(goMatch[1] || '').trim();
+        const connectTarget = resolveWorldConnectTarget(target);
+        const looksLikeDid = isMaDid(target);
+        const looksLikeAlias = Boolean(connectTarget);
+        const looksLikeEndpoint = isLikelyIrohAddress(normalizeIrohAddress(target));
+        if (looksLikeDid || looksLikeAlias || looksLikeEndpoint) {
+          await enterHome(connectTarget || target);
+          return;
+        }
+      }
+
       if (inputPrefix === 'say') {
         await sendSayShortcut(trimmedText);
         return;
@@ -1351,7 +1366,7 @@ export function createWorldResponseFlow({
     }
 
     function applyPresenceRosterPatch() {
-      if (!Array.isArray(result.avatars)) {
+      if (!Array.isArray(result.avatars) || result.avatars.length === 0) {
         return;
       }
       const responseRoom = String(result.room || '').trim();

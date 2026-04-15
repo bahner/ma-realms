@@ -67,6 +67,7 @@ within that namespace — an avatar, a room, a mailbox, etc.
 | Property | Key | Type | Description |
 | --- | --- | --- | --- |
 | Type | type | string | Subject type label. Allowed: world, agent, avatar, room, object. |
+| IPNS Path | ipns | string | Convenience copy/paste IPNS path for the DID root, for example `/ipns/k51...`. |
 | Inbox | inbox | string | Canonical message address for this subject. |
 | World | world | string | World DID root that this subject belongs to or targets. |
 | Language | language | string | Preferred GNU LANGUAGE list, for example nb_NO:en_UK:en. |
@@ -76,6 +77,7 @@ within that namespace — an avatar, a room, a mailbox, etc.
 
 Notes:
 
+1. ipns, when present, MUST be a full `/ipns/<identifier>` path for the document root.
 1. inbox is canonical and SHOULD be present for all types in this profile.
 1. currentInbox MUST NOT be used.
 1. presenceHint MUST NOT be used.
@@ -168,6 +170,7 @@ Rules for optional types:
 {
   "ma": {
     "type": "world",
+    "ipns": "/ipns/k51qzi5uqu5dj9807pbuod1pplf0vxh8m4lfy3ewl9qbm2s8dsf9ugdf9gedhr",
     "inbox": "did:ma:k51qzi5uqu5dj9807pbuod1pplf0vxh8m4lfy3ewl9qbm2s8dsf9ugdf9gedhr",
     "transports": [
       "/ma-iroh/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/ma/inbox/1",
@@ -184,6 +187,7 @@ Rules for optional types:
 {
   "ma": {
     "type": "agent",
+    "ipns": "/ipns/k51agentroot",
     "inbox": "did:ma:k51agentroot#self",
     "transports": [
       "/ma-iroh/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ma/inbox/1"

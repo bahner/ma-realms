@@ -1,0 +1,10 @@
+fields:
+  - name
+  - world_did
+  - entry_acl
+  - owner
+  - lang_cid
+  - lang
+  - state_cid
+  - public
+  - root

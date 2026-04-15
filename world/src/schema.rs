@@ -637,6 +637,8 @@ pub(crate) struct RoomStateDoc {
     pub did: String,
     #[serde(default)]
     pub avatars: Vec<AvatarStateDoc>,
+    pub room_events: Vec<RoomEvent>,
+    pub next_event_sequence: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -646,9 +648,6 @@ pub(crate) struct RuntimeStateDoc {
     pub rooms: HashMap<String, RoomStateDoc>,
     #[serde(default)]
     pub events: Vec<String>,
-    #[serde(default)]
-    pub room_events: HashMap<String, Vec<RoomEvent>>,
-    pub next_room_event_sequence: u64,
     #[serde(default)]
     pub handle_to_did: HashMap<String, String>,
     #[serde(default)]

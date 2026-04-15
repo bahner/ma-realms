@@ -50,6 +50,7 @@ pub struct IpfsPublishDidResponse {
 pub const ROOM_METHOD_EVENTS_POLL: &str = "room.events.poll";
 pub const ROOM_METHOD_BROADCAST_SEND: &str = "room.broadcast.send";
 pub const ROOM_METHOD_PRESENCE_LIST: &str = "room.presence.list";
+pub const AVATAR_METHOD_ENTER: &str = "avatar.enter";
 pub const AVATAR_METHOD_PING: &str = "avatar.ping";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,8 +213,11 @@ pub struct WorldResponse {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorldCommand {
-    /// Ping with a room DID — ensures avatar exists in that room, returns pong with room state.
-    /// Also serves as keepalive and room-change (ping a different room = move).
+    /// Enter or move avatar into a room and return authoritative room state.
+    Enter {
+        room_did: String,
+    },
+    /// Keepalive for an existing avatar; returns the current authoritative room state.
     Ping {
         room_did: String,
     },
@@ -230,6 +234,7 @@ pub enum WorldCommand {
 impl WorldCommand {
     pub fn internal_method(&self) -> Option<&'static str> {
         match self {
+            Self::Enter { .. } => Some(AVATAR_METHOD_ENTER),
             Self::Ping { .. } => Some(AVATAR_METHOD_PING),
             Self::Message { .. } => Some(ROOM_METHOD_BROADCAST_SEND),
             Self::RoomEvents { .. } => Some(ROOM_METHOD_EVENTS_POLL),

@@ -1,4 +1,4 @@
-.PHONY: build build-dev build-release cid show-cid serve publish release test-web clean distclean
+.PHONY: build build-dev build-release write-version cid show-cid serve publish release test-web clean distclean
 
 HOME_RS := $(shell find src -type f -name '*.rs')
 DID_MA_RS := $(shell find ../../did/src -type f -name '*.rs')
@@ -19,13 +19,21 @@ STAMP_VERSION := $(shell printf '%s' "$(MA_ACTOR_VERSION_EFFECTIVE)" | tr -c 'A-
 PKG_STAMP := .build/pkg.$(STAMP_VERSION).stamp
 PKG_DEV_STAMP := .build/pkg-dev.$(STAMP_VERSION).stamp
 TEST_WEB_STAMP := .build/test-web.stamp
+ACTOR_VERSION_FILE := www/pkg/build-version.js
+ACTOR_VERSION_JSON_FILE := www/pkg/build-version.json
 
 
-build: $(PKG_DEV_STAMP) cid
+build: $(PKG_DEV_STAMP) write-version cid
 
-build-dev: $(PKG_DEV_STAMP)
+build-dev: $(PKG_DEV_STAMP) write-version
 
-build-release: $(PKG_STAMP)
+build-release: $(PKG_STAMP) write-version
+
+write-version:
+	@mkdir -p $(dir $(ACTOR_VERSION_FILE))
+	@printf "globalThis.MA_ACTOR_VERSION = '%s';\n" "$(MA_ACTOR_VERSION_EFFECTIVE)" > $(ACTOR_VERSION_FILE)
+	@printf '{\n  "ma_actor_version": "%s"\n}\n' "$(MA_ACTOR_VERSION_EFFECTIVE)" > $(ACTOR_VERSION_JSON_FILE)
+	@echo "Wrote $(ACTOR_VERSION_FILE): $(MA_ACTOR_VERSION_EFFECTIVE)"
 
 $(PKG_STAMP): $(BUILD_INPUTS) $(TEST_WEB_STAMP)
 	mkdir -p .build
@@ -125,9 +133,6 @@ publish:
 
 test-web:
 	@$(MAKE) --no-print-directory $(TEST_WEB_STAMP)
-
-atlas: build-release
-	scp -r www atlas:/home/ma/
 
 clean:
 	rm -rf www/pkg

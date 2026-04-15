@@ -1,4 +1,4 @@
-.PHONY: build clean distclean run serve help
+.PHONY: build clean distclean run serve lang_cid help
 
 BINARY := target/debug/ma-world
 RELEASE_BINARY := target/release/ma-world
@@ -11,6 +11,8 @@ help:
 	@echo "  make build        - Build the world server (debug)"
 	@echo "  make release      - Build optimized release binary"
 	@echo "  make run          - Build and run the world server"
+	@echo "  make .lang_cid    - Rebuild world default language CID file from lang/*.ftl"
+	@echo "  make lang_cid     - Publish lang/*.ftl and generate DAG-CBOR language map CID"
 	@echo "  make clean        - Remove build artifacts"
 	@echo "  make distclean    - Clean + cargo clean"
 
@@ -27,6 +29,12 @@ release: Cargo.toml src/*.rs ../../did/src/*.rs ../core/src/*.rs
 
 run: build
 	MA_WORLD_VERSION="$(MA_WORLD_VERSION)" ./$(BINARY)
+
+.lang_cid: lang/*.ftl scripts/publish-lang-map.sh
+	./scripts/publish-lang-map.sh
+
+lang_cid:
+	$(MAKE) .lang_cid
 
 clean:
 	rm -f $(STAMP)
