@@ -411,7 +411,7 @@ function syncSpecialAliasesFromCurrentHome() {
   const room = String(state.currentHome?.room || '').trim();
   const worldDid = String(state.currentHome?.worldDid || '').trim();
 
-  if (isMaDidTarget(worldDid) && worldDid.includes('#') && !isUnconfiguredDidTarget(worldDid)) {
+  if (isMaDidTarget(worldDid) && !isUnconfiguredDidTarget(worldDid)) {
     next['@world'] = worldDid;
   }
 
@@ -1148,10 +1148,17 @@ async function resolveCommandTargetDidOrToken(targetToken) {
     throw new Error('Usage: @target <command>');
   }
   const rawLower = raw.toLowerCase();
-  if (rawLower === 'i' || rawLower === 'me' || rawLower === 'avatar') {
+  if (rawLower === 'i' || rawLower === 'avatar') {
+    const avatarDid = String(state.aliasBook?.['@avatar'] || '').trim();
+    if (!isMaDid(avatarDid)) {
+      throw new Error(`@${raw} requires an active avatar (enter a world first).`);
+    }
+    return avatarDid;
+  }
+  if (rawLower === 'me') {
     const actorDid = String(state.identity?.did || '').trim();
     if (!isMaDid(actorDid)) {
-      throw new Error(`@${raw} requires an active identity.`);
+      throw new Error('@me requires an active identity.');
     }
     return actorDid;
   }

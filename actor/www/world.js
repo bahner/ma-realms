@@ -540,10 +540,17 @@ export function createWorldDispatchFlow({
       if ((lower === 'here' || lower === 'world') && input[offset + match.length] === '.') {
         return match;
       }
-      if (lower === 'me' || lower === 'avatar' || lower === 'i') {
+      if (lower === 'i' || lower === 'avatar') {
+        const did = String(state.aliasBook?.['@avatar'] || '').trim();
+        if (!isMaDid(did)) {
+          throw new Error(`@${lower} requires an active avatar (enter a world first).`);
+        }
+        return `@${did}`;
+      }
+      if (lower === 'me') {
         const did = String(state.identity?.did || '').trim();
         if (!isMaDid(did)) {
-          throw new Error(`@${lower} requires an active identity.`);
+          throw new Error('@me requires an active identity.');
         }
         return `@${did}`;
       }
@@ -917,7 +924,9 @@ export function createWorldDispatchFlow({
   }
 
   async function sendAtTargetCommand(trimmedText) {
-    const trimmed = String(trimmedText || '').trim().replace(/^@+/, '@');
+    // @I <verb> → @I.<verb>  (@I is the subject; verb becomes dot-method)
+    let trimmed = String(trimmedText || '').trim().replace(/^@+/, '@');
+    trimmed = trimmed.replace(/^@([Ii])\s+(\S)/, '@$1.$2');
     const whisperSep = trimmed.indexOf(" '");
     if (whisperSep > 1) {
       const target = trimmed.substring(1, whisperSep).trim();
@@ -938,7 +947,10 @@ export function createWorldDispatchFlow({
             || state.currentHome?.worldDid
             || ''
           ).trim();
-        } else if (lowerBase === 'me' || lowerBase === 'avatar' || lowerBase === 'i') {
+        } else if (lowerBase === 'i' || lowerBase === 'avatar') {
+          resolvedBase = String(state.aliasBook?.['@avatar'] || '').trim();
+          if (!isMaDid(resolvedBase)) throw new Error('@I/@avatar requires an active avatar (enter a world first).');
+        } else if (lowerBase === 'me') {
           resolvedBase = String(state.identity?.did || '').trim();
         } else {
           resolvedBase = isMaDid(baseRaw)
@@ -992,7 +1004,20 @@ export function createWorldDispatchFlow({
         || state.currentHome?.worldDid
         || ''
       ).trim();
-    } else if (lowerBase === 'me' || lowerBase === 'avatar' || lowerBase === 'i') {
+    } else if (lowerBase === 'i') {
+      // @I <verb> → @avatar.<verb>  (I is the subject acting in the world)
+      resolvedBase = String(state.aliasBook?.['@avatar'] || '').trim();
+      if (!isMaDid(resolvedBase)) throw new Error('@I requires an active avatar (enter a world first).');
+      if (!pathRaw && remainder) {
+        const verbEnd = remainder.indexOf(' ');
+        const verb = verbEnd === -1 ? remainder : remainder.slice(0, verbEnd);
+        const rest = verbEnd === -1 ? '' : remainder.slice(verbEnd + 1);
+        return sendAtTargetCommand(`@${resolvedBase}.${verb}${rest ? ' ' + rest : ''}`);
+      }
+    } else if (lowerBase === 'avatar') {
+      resolvedBase = String(state.aliasBook?.['@avatar'] || '').trim();
+      if (!isMaDid(resolvedBase)) throw new Error('@avatar requires an active avatar (enter a world first).');
+    } else if (lowerBase === 'me') {
       resolvedBase = String(state.identity?.did || '').trim();
     } else {
       resolvedBase = isMaDid(baseRaw)
