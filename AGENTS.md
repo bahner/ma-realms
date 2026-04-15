@@ -74,15 +74,40 @@ Actor runtime invariants (chat/input routing):
 
 - `@` in user input means target routing. Resolve aliases behind `@...` to DID before evaluation.
 - Explicit DID targets (`@did:ma:...`) must be preserved as typed in send paths and must not be rewritten to alias labels.
-- For DID path routing:
-	- `@did:ma:<world>.<method>` routes as world method.
-	- `@did:ma:<world>.<object>.<method>` routes as object method (`did root + #object` target).
+- For DID path routing, `@did:ma:<world>.<method>` routes as world method.
+- For DID path routing, `@did:ma:<world>.<object>.<method>` routes as object method (`did root + #object` target).
 - DID/object commands should work statelessly (without requiring active room presence state). Avatar/room presence commands may still require presence.
 - Dynamic special aliases are actor-local conveniences only: `@world`, `@here`, `@me`, `@avatar`.
-	- They are system-managed and may be auto-refreshed in actor `.aliases`.
-	- World runtime must not parse, dispatch, or depend on these alias names.
-	- Actor must resolve them to DID targets before send.
-	- Actor must never send `@world/@here/@me/@avatar` (or any other alias label) over the wire; outbound targets must always be full `did:ma:...` values.
+- Dynamic aliases are system-managed and may be auto-refreshed in actor `.aliases`.
+- World runtime must not parse, dispatch, or depend on dynamic alias names.
+- Actor must resolve dynamic aliases to DID targets before send.
+- Actor must never send `@world/@here/@me/@avatar` (or any other alias label) over the wire; outbound targets must always be full `did:ma:...` values.
 - Error text for target resolution should prefer raw DID visibility over alias-humanized display when debugging unknown-target failures.
 
-DIDs are always fully qualified. The world DID itself is fragment-less (`did:ma:<ipns-key>`); fragments identify objects within the world, not the world itself. The slug is a local convenience name. You might need to get the .ipns for ipfs feature or to verify the ipns key or things like that, but that is backoffice stuff. Plumbing. The ma-realms never uses root_cid or base_id's. They are not a thing. There is no real "identity" behind anything. Each did is discrete, in the greater scheme of things. The fact that we share ipns is incidental and just an implementation detail for world, where we don't want so many keys. DIDs should still be treated as full identities nonetheless.
+## DID Identity and DID URL Fragments
+
+- DIDs are always fully qualified and must be treated as real identities in the system.
+- The world DID is fragment-less: `did:ma:<ipns-key>`.
+- Object identity inside a world is expressed with DID URL fragments: `did:ma:<ipns-key>#<object-id>`.
+- Fragments are stable object identifiers, not aliases, slugs, labels, or nicknames.
+- The world slug is local convenience only and is never part of a DID.
+- `root_cid` and `base_id` are not identity fields in ma-realms and must not be used as substitutes for DIDs.
+- Shared IPNS key material is an implementation detail; identity handling still uses full DIDs and DID URLs.
+
+## Security: Secret File Storage
+
+Sensitive files must only be written under XDG home roots (for example
+`XDG_CONFIG_HOME/ma` and `XDG_DATA_HOME/ma`, with HOME-based fallbacks).
+
+- Never write sensitive runtime files to `/tmp`.
+- Always use shared secure file helpers from core for sensitive writes.
+- Treat runtime config, unlock bundles, and iroh secret files as sensitive.
+
+Cross-platform hardening policy:
+
+- Unix/macOS directories: `0700`
+- Unix/macOS runtime/sensitive files: `0600`
+- Unix/macOS iroh secret files: `0400`
+- Windows files and directories: current-user ACL only
+
+Fail hard if secure permission/ACL hardening fails.
