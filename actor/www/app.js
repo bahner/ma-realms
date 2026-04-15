@@ -1411,8 +1411,9 @@ async function sendCurrentHomePresencePing() {
         for (const avatar of response.avatars) {
           const handle = String(avatar?.handle || '').trim();
           const did = String(avatar?.did || '').trim();
+          const identity = String(avatar?.identity || '').trim();
           if (handle) {
-            trackRoomPresence(handle, did);
+            trackRoomPresence(handle, did, identity);
           }
         }
       }
@@ -2451,8 +2452,9 @@ const inboundDispatcher = createInboundDispatcher({
         for (const avatar of payload.avatars) {
           const handle = String(avatar?.handle || '').trim();
           const did = String(avatar?.did || '').trim();
+          const identity = String(avatar?.identity || '').trim();
           if (handle) {
-            trackRoomPresence(handle, did);
+            trackRoomPresence(handle, did, identity);
           }
         }
       }
@@ -2542,7 +2544,7 @@ async function pollCurrentHomeEvents() {
       clearRoomPresence();
       for (const avatar of result.avatars) {
         const handle = String(avatar?.handle || '').trim();
-        if (handle) trackRoomPresence(handle, String(avatar?.did || ''));
+        if (handle) trackRoomPresence(handle, String(avatar?.did || ''), String(avatar?.identity || ''));
       }
     }
     if (typeof result.room_did === 'string' && result.room_did) {
@@ -2568,7 +2570,7 @@ async function pollCurrentHomeEvents() {
 
       // Track presence from event metadata.
       if (event.sender) {
-        trackRoomPresence(event.sender, event.sender_did || '');
+        trackRoomPresence(event.sender, event.sender_did || '', event.sender_did || '');
       }
       // Detect leave events: system message of the form "<handle> left <room>".
       if (event.kind === 'system') {
@@ -3532,6 +3534,11 @@ async function enterHome(target, preferredRoom = null) {
   const resolvedDid = isMaDidTarget(String(resolvedInput)) ? String(resolvedInput).trim() : '';
   const resolvedDidFragment = aliasRoomFragment || (String(resolvedInput).includes('#') ? String(resolvedInput).split('#')[1] : '');
   let endpointId = '';
+
+  if (isMaDid(String(resolvedInput)) && !isMaDidTarget(String(resolvedInput))) {
+    throw new Error('go requires a DID target with fragment: did:ma:<world>#<room>. A root DID (did:ma:<world>) is an identity DID, not a connect target.');
+  }
+
   if (!isMaDid(String(resolvedInput))) {
     endpointId = normalizeIrohAddress(resolvedBase);
   }
@@ -3608,7 +3615,7 @@ async function enterHome(target, preferredRoom = null) {
       );
     }
     throw new Error(
-      `Alias ${alias} is not a valid endpoint id (expected 64 hex chars, got ${endpointId.length}).`
+      `Target ${alias} did not resolve to a connect endpoint (/iroh/<endpoint-id> or 64-hex endpoint id).`
     );
   }
 
@@ -3680,10 +3687,10 @@ async function enterHome(target, preferredRoom = null) {
   if (Array.isArray(result.avatars) && result.avatars.length > 0) {
     for (const avatar of result.avatars) {
       const handle = String(avatar?.handle || '').trim();
-      if (handle) trackRoomPresence(handle, String(avatar?.did || ''));
+      if (handle) trackRoomPresence(handle, String(avatar?.did || ''), String(avatar?.identity || ''));
     }
   } else {
-    trackRoomPresence(result.handle || state.aliasName, state.identity?.did || '');
+    trackRoomPresence(result.handle || state.aliasName, state.identity?.did || '', state.identity?.did || '');
   }
   updateIdentityLine();
   updateRoomHeading(state.currentHome.roomTitle, state.currentHome.roomDescription);

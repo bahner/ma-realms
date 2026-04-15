@@ -162,6 +162,8 @@ impl LaneCapability {
 pub struct PresenceAvatar {
     pub handle: String,
     pub did: String,
+    #[serde(default)]
+    pub identity: String,
 }
 
 /// A single event stored in a room's event log.

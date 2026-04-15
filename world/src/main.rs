@@ -722,6 +722,7 @@ mod tests {
         let did = Did::try_from("did:ma:k51test#pixie").unwrap();
         let req = AvatarRequest {
             did: did.clone(),
+            identity: did.id(),
             owner: "did:ma:k51test".to_string(),
             agent_endpoint: "ep-1".to_string(),
             language_order: "nb_NO:en_UK".to_string(),
@@ -732,6 +733,7 @@ mod tests {
 
         let req2 = AvatarRequest {
             did,
+            identity: "did:ma:k51test#pixie".to_string(),
             owner: "did:ma:k51test".to_string(),
             agent_endpoint: "ep-2".to_string(),
             language_order: "nb_NO:en_UK".to_string(),
@@ -759,7 +761,8 @@ mod tests {
 
         let did = Did::try_from("did:ma:k51stale#agent").unwrap();
         let req = AvatarRequest {
-            did,
+            did: did.clone(),
+            identity: did.id(),
             owner: "did:ma:k51stale".to_string(),
             agent_endpoint: "ep-stale".to_string(),
             language_order: "nb_NO:en_UK".to_string(),

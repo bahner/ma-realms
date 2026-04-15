@@ -106,9 +106,13 @@ export function createRoomPresenceFlow({
   dropCachedRoomDidLookup,
   renderAvatarPanel,
 }) {
-  function trackRoomPresence(handle, did) {
+  function trackRoomPresence(handle, did, identity) {
     if (!handle) return;
-    state.roomPresence.set(handle, { handle, did: did || '' });
+    state.roomPresence.set(handle, {
+      handle,
+      did: did || '',
+      identity: identity || ''
+    });
     if (isMaDid(String(did || ''))) {
       cacheRoomDidLookup(handle, did);
     }
@@ -284,8 +288,9 @@ export function createRoomPresencePayloadFlow({
     for (const avatar of payload.avatars) {
       const handle = String(avatar?.handle || '').trim();
       const did = String(avatar?.did || '').trim();
+      const identity = String(avatar?.identity || '').trim();
       if (handle) {
-        trackRoomPresence(handle, did);
+        trackRoomPresence(handle, did, identity);
       }
     }
   }
@@ -293,16 +298,17 @@ export function createRoomPresencePayloadFlow({
   function applyPresenceJoin(payload) {
     const handle = String(payload.actor_handle || '').trim();
     const did = String(payload.actor_did || '').trim();
+    const identity = String(payload.actor_identity || '').trim();
     if (handle) {
-      trackRoomPresence(handle, did);
+      trackRoomPresence(handle, did, identity);
     }
     if (typeof appendMessage === 'function') {
-      if (handle && did) {
-        appendMessage('world', `${handle} entered the room. (${did})`);
+      if (handle && (identity || did)) {
+        appendMessage('world', `${handle} entered the room. (${identity || did})`);
       } else if (handle) {
         appendMessage('world', `${handle} entered the room.`);
-      } else if (did) {
-        appendMessage('world', `${did} entered the room.`);
+      } else if (identity || did) {
+        appendMessage('world', `${identity || did} entered the room.`);
       }
     }
   }
@@ -310,16 +316,17 @@ export function createRoomPresencePayloadFlow({
   function applyPresenceLeave(payload) {
     const handle = String(payload.actor_handle || '').trim();
     const did = String(payload.actor_did || '').trim();
+    const identity = String(payload.actor_identity || '').trim();
     if (handle) {
       removeRoomPresence(handle);
     }
     if (typeof appendMessage === 'function') {
-      if (handle && did) {
-        appendMessage('world', `${handle} left the room. (${did})`);
+      if (handle && (identity || did)) {
+        appendMessage('world', `${handle} left the room. (${identity || did})`);
       } else if (handle) {
         appendMessage('world', `${handle} left the room.`);
-      } else if (did) {
-        appendMessage('world', `${did} left the room.`);
+      } else if (identity || did) {
+        appendMessage('world', `${identity || did} left the room.`);
       }
     }
   }

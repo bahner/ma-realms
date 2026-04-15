@@ -452,6 +452,7 @@ impl World {
 
         let avatar_req = AvatarRequest {
             did: avatar_did.clone(),
+            identity: sender_did.id(),
             owner: sender_did.base_id(),
             agent_endpoint: agent_endpoint.to_string(),
             language_order,
@@ -2213,15 +2214,17 @@ impl World {
             if let Some(mut avatar) = moved {
                 let endpoint_changed = avatar.agent_endpoint != req.agent_endpoint;
                 let language_changed = avatar.language_order != req.language_order;
+                let identity_changed = avatar.identity != req.identity;
                 let owner_changed = avatar.owner != req.owner;
                 let encryption_changed = avatar.encryption_pubkey_multibase != req.encryption_pubkey_multibase;
                 avatar.agent_endpoint = req.agent_endpoint.clone();
                 avatar.language_order = req.language_order.clone();
+                avatar.identity = req.identity.clone();
                 avatar.owner = req.owner.clone();
                 avatar.encryption_pubkey_multibase = req.encryption_pubkey_multibase.clone();
                 avatar.touch_presence();
                 let moved_handle = avatar.inbox.clone();
-                let refresh_registry = endpoint_changed || language_changed || owner_changed || encryption_changed;
+                let refresh_registry = endpoint_changed || language_changed || identity_changed || owner_changed || encryption_changed;
 
                 if let Some(room) = rooms.get_mut(room_name) {
                     room.add_avatar(avatar);
@@ -2279,16 +2282,18 @@ impl World {
         {
             let endpoint_changed = existing.agent_endpoint != req.agent_endpoint;
             let language_changed = existing.language_order != req.language_order;
+            let identity_changed = existing.identity != req.identity;
             let owner_changed = existing.owner != req.owner;
             let encryption_changed = existing.encryption_pubkey_multibase != req.encryption_pubkey_multibase;
             existing.agent_endpoint = req.agent_endpoint.clone();
             existing.language_order = req.language_order.clone();
+            existing.identity = req.identity.clone();
             existing.owner = req.owner.clone();
             existing.encryption_pubkey_multibase = req.encryption_pubkey_multibase.clone();
             existing.touch_presence();
             info!("[{}] {} already present ({:?})", room_name, existing_handle, req.did);
             let existing_handle_value = existing_handle.clone();
-            let refresh_registry = endpoint_changed || language_changed || owner_changed || encryption_changed;
+            let refresh_registry = endpoint_changed || language_changed || identity_changed || owner_changed || encryption_changed;
             drop(rooms);
             self.rebuild_avatar_room_index().await;
             if refresh_registry {
@@ -2311,6 +2316,7 @@ impl World {
             req.did.clone(),
             req.agent_endpoint.clone(),
             req.language_order.clone(),
+            req.identity.clone(),
             req.owner.clone(),
             req.signing_secret,
             req.encryption_pubkey_multibase.clone(),
@@ -2678,6 +2684,7 @@ impl World {
             .map(|(handle, avatar)| PresenceAvatar {
                 handle: handle.clone(),
                 did: avatar.agent_did.id(),
+                identity: avatar.identity.clone(),
             })
             .collect();
         avatars.sort_by(|a, b| a.handle.cmp(&b.handle));
@@ -2830,6 +2837,7 @@ impl World {
                         agent_did: avatar.agent_did.id(),
                         agent_endpoint: avatar.agent_endpoint.clone(),
                         language_order: avatar.language_order.clone(),
+                        identity: avatar.identity.clone(),
                         owner: avatar.owner.clone(),
                         descriptions: avatar.descriptions.clone(),
                         acl: avatar.acl.clone(),
@@ -3283,6 +3291,11 @@ impl World {
                     avatar_did,
                     avatar_doc.agent_endpoint,
                     avatar_doc.language_order,
+                    if avatar_doc.identity.trim().is_empty() {
+                        avatar_doc.owner.clone()
+                    } else {
+                        avatar_doc.identity.clone()
+                    },
                     avatar_doc.owner.clone(),
                     [0u8; 32], // Restored avatars have no signing key — agent must re-Enter.
                     avatar_doc.encryption_pubkey_multibase,

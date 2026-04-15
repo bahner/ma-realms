@@ -620,6 +620,8 @@ pub(crate) struct AvatarStateDoc {
     pub agent_endpoint: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub language_order: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub identity: String,
     pub owner: String,
     pub descriptions: HashMap<String, String>,
     pub acl: ActorAcl,

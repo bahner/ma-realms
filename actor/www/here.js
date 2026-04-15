@@ -12,22 +12,27 @@ export function createHereFlow({
 }) {
   function labelForPresenceEntry(entry) {
     const didText = String(entry?.did || '').trim();
+    const identityText = String(entry?.identity || '').trim();
     const handle = String(entry?.handle || '').trim();
-    if (!didText) {
+    if (!didText && !identityText) {
       return handle;
     }
 
     const parts = typeof didParts === 'function'
-      ? didParts(didText)
+      ? didParts(identityText || didText)
       : { root: '', fragment: '' };
     const fragment = String(parts?.fragment || '').trim();
     const identityRoot = String(parts?.root || '').trim();
+    const displayName = handle || fragment;
+    const identityLabel = identityRoot
+      ? formatDidForDialog(identityRoot)
+      : '';
 
-    if (fragment && identityRoot) {
-      return `${fragment}(${identityRoot})`;
+    if (displayName && identityLabel) {
+      return `${displayName}(${identityLabel})`;
     }
-    if (handle && identityRoot) {
-      return `${handle}(${identityRoot})`;
+    if (identityLabel) {
+      return identityLabel;
     }
     return handle || formatDidForDialog(didText);
   }

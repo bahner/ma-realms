@@ -8,6 +8,7 @@ pub type AvatarSigningSecret = [u8; 32];
 #[derive(Clone, Debug)]
 pub(crate) struct AvatarRequest {
     pub did: Did,
+    pub identity: String,
     pub owner: String,
     pub agent_endpoint: String,
     pub language_order: String,
@@ -59,6 +60,7 @@ pub struct Avatar {
     pub agent_did: Did,
     pub agent_endpoint: String,
     pub language_order: String,
+    pub identity: String,
     pub owner: String,
     pub descriptions: HashMap<String, String>,
     pub object_shortcuts: HashMap<String, String>,
@@ -77,6 +79,7 @@ impl Avatar {
         agent_did: Did,
         agent_endpoint: String,
         language_order: String,
+        identity: String,
         owner: String,
         signing_secret: AvatarSigningSecret,
         encryption_pubkey_multibase: Option<String>,
@@ -86,6 +89,7 @@ impl Avatar {
             agent_did,
             agent_endpoint,
             language_order,
+            identity,
             owner,
             descriptions: HashMap::new(),
             object_shortcuts: HashMap::new(),

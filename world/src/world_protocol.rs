@@ -52,6 +52,7 @@ impl WorldProtocol {
             avatars.push(PresenceAvatar {
                 handle: handle.clone(),
                 did: avatar.agent_did.id(),
+                identity: avatar.identity.clone(),
             });
             endpoints.push(avatar.agent_endpoint.clone());
         }

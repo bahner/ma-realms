@@ -1322,12 +1322,12 @@ export function createWorldResponseFlow({
       if (Array.isArray(avatars) && avatars.length > 0) {
         for (const avatar of avatars) {
           const handle = String(avatar?.handle || '').trim();
-          if (handle) trackRoomPresence(handle, String(avatar?.did || ''));
+          if (handle) trackRoomPresence(handle, String(avatar?.did || ''), String(avatar?.identity || ''));
         }
         return;
       }
       // Fallback: seed with self only (snapshot push will fill the rest).
-      trackRoomPresence(state.currentHome.handle || state.aliasName, state.identity?.did || '');
+      trackRoomPresence(state.currentHome.handle || state.aliasName, state.identity?.did || '', state.identity?.did || '');
     }
 
     function applyRoomChange(nextRoom) {
