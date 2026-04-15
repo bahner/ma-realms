@@ -1,4 +1,5 @@
 use crate::parse_property_command_for_keys;
+use crate::reply::{Reply, Scope};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoomActorAction {
@@ -41,19 +42,34 @@ pub struct RoomActorContext<'a> {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-fn none_result(response: String) -> RoomActorResult {
-    RoomActorResult { response, action: RoomActorAction::None }
+fn none(reply: Reply) -> RoomActorResult {
+    RoomActorResult { response: reply.to_string(), action: RoomActorAction::None }
+}
+
+fn with_action(reply: Reply, action: RoomActorAction) -> RoomActorResult {
+    RoomActorResult { response: reply.to_string(), action }
 }
 
 fn room_not_found(ctx: &RoomActorContext<'_>) -> RoomActorResult {
-    none_result(format!("@here room '{}' not found", ctx.room_name))
+    none(Reply::here(format!("room '{}' not found", ctx.room_name)))
+}
+
+fn require_room(ctx: &RoomActorContext<'_>) -> Option<RoomActorResult> {
+    if ctx.room_exists { None } else { Some(room_not_found(ctx)) }
+}
+
+fn require_owner(ctx: &RoomActorContext<'_>, action_name: &str) -> Option<RoomActorResult> {
+    if let Some(err) = require_room(ctx) { return Some(err); }
+    if is_owner(ctx) { return None; }
+    Some(none(Reply::here(format!(
+        "only the room owner can {} in '{}'", action_name, ctx.room_name
+    ))))
 }
 
 fn is_owner(ctx: &RoomActorContext<'_>) -> bool {
     let Some(owner) = ctx.acl_owner_did else {
         return false;
     };
-
     ctx.caller_did.map(|caller| caller == owner).unwrap_or(false)
         || ctx
             .caller_owner_did
@@ -90,6 +106,17 @@ fn split_method_arg(input: &str) -> (String, String) {
     (method, arg)
 }
 
+fn format_avatar_list(pairs: &[(String, String)]) -> String {
+    if pairs.is_empty() {
+        "(none)".to_string()
+    } else {
+        pairs.iter()
+            .map(|(handle, identity)| format!("{}({})", handle, identity))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 // ─── Built-in commands ──────────────────────────────────────────────────────
 
 const BUILTIN_COMMANDS: &[&str] = &[
@@ -102,94 +129,73 @@ const BUILTIN_COMMANDS: &[&str] = &[
 ];
 
 fn cmd_help(_ctx: &RoomActorContext<'_>) -> RoomActorResult {
-    let commands = BUILTIN_COMMANDS.join(" | ");
-    none_result(format!("@here commands: {}", commands))
+    none(Reply::here(format!("commands: {}", BUILTIN_COMMANDS.join(" | "))))
 }
 
 fn cmd_who(ctx: &RoomActorContext<'_>) -> RoomActorResult {
-    if !ctx.room_exists { return room_not_found(ctx); }
+    if let Some(err) = require_room(ctx) { return err; }
     let mut pairs = ctx.avatars.clone();
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
-    if pairs.is_empty() {
-        none_result(format!("@here.avatars in '{}': (none)", ctx.room_name))
-    } else {
-        let entries: Vec<String> = pairs.iter()
-            .map(|(handle, identity)| format!("{}({})", handle, identity))
-            .collect();
-        none_result(format!("@here.avatars in '{}': {}", ctx.room_name, entries.join(", ")))
-    }
+    none(Reply::here_attr("avatars", format!("in '{}': {}", ctx.room_name, format_avatar_list(&pairs))))
 }
 
 fn cmd_list(ctx: &RoomActorContext<'_>) -> RoomActorResult {
-    if !ctx.room_exists { return room_not_found(ctx); }
+    if let Some(err) = require_room(ctx) { return err; }
     let mut pairs = ctx.avatars.clone();
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
-    let avatars = if pairs.is_empty() {
-        "(none)".to_string()
-    } else {
-        pairs.iter()
-            .map(|(handle, identity)| format!("{}({})", handle, identity))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+    let avatars = format_avatar_list(&pairs);
     let mut things = ctx.things.clone();
     things.sort();
     let things = if things.is_empty() { "(none)".to_string() } else { things.join(", ") };
-    none_result(format!("@here room='{}' .avatars=[{}] .things=[{}]", ctx.room_name, avatars, things))
+    none(Reply::here(format!("room='{}' .avatars=[{}] .things=[{}]", ctx.room_name, avatars, things)))
 }
 
 fn cmd_acl(ctx: &RoomActorContext<'_>) -> RoomActorResult {
-    if !ctx.room_exists { return room_not_found(ctx); }
+    if let Some(err) = require_room(ctx) { return err; }
     let owner = ctx.acl_owner_did.unwrap_or("(none)");
-    none_result(format!("@here acl for '{}': owner={} policy={}", ctx.room_name, owner, ctx.acl_summary))
+    none(Reply::here_attr("acl", format!("for '{}': owner={} policy={}", ctx.room_name, owner, ctx.acl_summary)))
 }
 
 fn cmd_describe(ctx: &RoomActorContext<'_>) -> RoomActorResult {
-    if !ctx.room_exists { return room_not_found(ctx); }
+    if let Some(err) = require_room(ctx) { return err; }
     let desc = if ctx.description.is_empty() { "(no description)" } else { ctx.description };
-    none_result(format!("@here {} — {}", ctx.room_name, desc))
+    none(Reply::here(format!("{} — {}", ctx.room_name, desc)))
 }
 
 fn cmd_show(ctx: &RoomActorContext<'_>) -> RoomActorResult {
-    if !ctx.room_exists { return room_not_found(ctx); }
+    if let Some(err) = require_room(ctx) { return err; }
     let owner = ctx.acl_owner_did.unwrap_or("(none)");
     let did = ctx.did.unwrap_or("(unknown)");
-    none_result(format!("@here '{}': did={} owner={}", ctx.room_name, did, owner))
+    none(Reply::here(format!("'{}': did={} owner={}", ctx.room_name, did, owner)))
 }
 
 fn cmd_invite_deny_kick(method: &str, arg: &str, ctx: &RoomActorContext<'_>) -> RoomActorResult {
-    if !ctx.room_exists { return room_not_found(ctx); }
-    if !is_owner(ctx) {
-        return none_result(format!("@here only the room owner can run /{} in '{}'", method, ctx.room_name));
-    }
+    if let Some(err) = require_owner(ctx, &format!("run /{}", method)) { return err; }
     if arg.is_empty() {
         let usage = if method == "kick" { "kick <handle>" } else { "invite <did> | deny <did>" };
-        return none_result(format!("@here usage: @here {}", usage));
+        return none(Reply::here(format!("usage: @here {}", usage)));
     }
     match method {
-        "invite" => RoomActorResult {
-            response: format!("@here {} invited to '{}'", arg, ctx.room_name),
-            action: RoomActorAction::Invite { did: arg.to_string() },
-        },
-        "deny" => RoomActorResult {
-            response: format!("@here {} denied from '{}'", arg, ctx.room_name),
-            action: RoomActorAction::Deny { did: arg.to_string() },
-        },
-        "kick" => RoomActorResult {
-            response: format!("@here {} was kicked from '{}'", arg, ctx.room_name),
-            action: RoomActorAction::Kick { handle: arg.to_string() },
-        },
-        _ => none_result(format!("@here unknown command: {}", method)),
+        "invite" => with_action(
+            Reply::here(format!("{} invited to '{}'", arg, ctx.room_name)),
+            RoomActorAction::Invite { did: arg.to_string() },
+        ),
+        "deny" => with_action(
+            Reply::here(format!("{} denied from '{}'", arg, ctx.room_name)),
+            RoomActorAction::Deny { did: arg.to_string() },
+        ),
+        "kick" => with_action(
+            Reply::here(format!("{} was kicked from '{}'", arg, ctx.room_name)),
+            RoomActorAction::Kick { handle: arg.to_string() },
+        ),
+        _ => none(Reply::here(format!("unknown command: {}", method))),
     }
 }
 
 fn cmd_dig(arg: &str, ctx: &RoomActorContext<'_>) -> RoomActorResult {
-    if !ctx.room_exists { return room_not_found(ctx); }
-    if !is_owner(ctx) {
-        return none_result(format!("@here only the room owner can dig exits in '{}'", ctx.room_name));
-    }
+    if let Some(err) = require_owner(ctx, "dig exits") { return err; }
     if arg.is_empty() {
-        return none_result("@here usage: @here dig <direction> [to|til <#dest|did:ma:...#room>]".to_string());
+        return none(Reply::here("usage: @here dig <direction> [to|til <#dest|did:ma:...#room>]".to_string()));
     }
     let (exit_name, destination) = if let Some((dir, dest)) = arg
         .split_once(" to ")
@@ -201,31 +207,26 @@ fn cmd_dig(arg: &str, ctx: &RoomActorContext<'_>) -> RoomActorResult {
         (arg.to_string(), None)
     };
     let dest_display = destination.as_deref().unwrap_or("(auto)");
-    RoomActorResult {
-        response: format!("@here exit '{}' dug from '{}' → {}", exit_name, ctx.room_name, dest_display),
-        action: RoomActorAction::Dig { exit_name, destination },
-    }
+    with_action(
+        Reply::here(format!("exit '{}' dug from '{}' → {}", exit_name, ctx.room_name, dest_display)),
+        RoomActorAction::Dig { exit_name, destination },
+    )
 }
 
 fn cmd_bury(arg: &str, ctx: &RoomActorContext<'_>) -> RoomActorResult {
-    if !ctx.room_exists { return room_not_found(ctx); }
-    if !is_owner(ctx) {
-        return none_result(format!("@here only the room owner can bury exits in '{}'", ctx.room_name));
-    }
+    if let Some(err) = require_owner(ctx, "bury exits") { return err; }
     let exit_name = arg.trim();
     if exit_name.is_empty() {
-        return none_result("@here usage: @here bury <direction>".to_string());
+        return none(Reply::here("usage: @here bury <direction>".to_string()));
     }
-    RoomActorResult {
-        response: format!("@here exit '{}' buried in '{}'", exit_name, ctx.room_name),
-        action: RoomActorAction::Bury {
-            exit_name: exit_name.to_string(),
-        },
-    }
+    with_action(
+        Reply::here(format!("exit '{}' buried in '{}'", exit_name, ctx.room_name)),
+        RoomActorAction::Bury { exit_name: exit_name.to_string() },
+    )
 }
 
 fn cmd_set(arg: &str, ctx: &RoomActorContext<'_>) -> RoomActorResult {
-    if !ctx.room_exists { return room_not_found(ctx); }
+    if let Some(err) = require_room(ctx) { return err; }
 
     let mut kv = arg.splitn(2, char::is_whitespace);
     let key = kv.next().unwrap_or_default().trim().to_ascii_lowercase();
@@ -238,56 +239,56 @@ fn cmd_set(arg: &str, ctx: &RoomActorContext<'_>) -> RoomActorResult {
     let value = unquote(&value_raw);
 
     if key.is_empty() || value.is_empty() {
-        return none_result("@here usage: @here.<owner|title|description|cid|content-b64|exit-content-b64> [value]".to_string());
+        return none(Reply::here("usage: @here.<owner|title|description|cid|content-b64|exit-content-b64> [value]".to_string()));
     }
 
     match key.as_str() {
         "owner" => {
             if !is_owner_or_unclaimed(ctx) {
-                return none_result(format!("@here only the room owner can change ownership of '{}'", ctx.room_name));
+                return none(Reply::here(format!("only the room owner can change ownership of '{}'", ctx.room_name)));
             }
-            RoomActorResult {
-                response: format!("@here '{}' is now owned by {}", ctx.room_name, value),
-                action: RoomActorAction::SetAttribute { key, value },
-            }
+            with_action(
+                Reply::here(format!("'{}' is now owned by {}", ctx.room_name, value)),
+                RoomActorAction::SetAttribute { key, value },
+            )
         }
         "title" | "description" => {
             if !is_owner(ctx) {
-                return none_result(format!("@here only the room owner can change {} of '{}'", key, ctx.room_name));
+                return none(Reply::here(format!("only the room owner can change {} of '{}'", key, ctx.room_name)));
             }
-            RoomActorResult {
-                response: format!("@here {} for '{}' updated", key, ctx.room_name),
-                action: RoomActorAction::SetAttribute { key, value },
-            }
+            with_action(
+                Reply::here(format!("{} for '{}' updated", key, ctx.room_name)),
+                RoomActorAction::SetAttribute { key, value },
+            )
         }
         "cid" => {
             if !is_owner_or_unclaimed(ctx) {
-                return none_result(format!("@here only the room owner can replace the CID of '{}'", ctx.room_name));
+                return none(Reply::here(format!("only the room owner can replace the CID of '{}'", ctx.room_name)));
             }
-            RoomActorResult {
-                response: format!("@here loading room '{}' from {}", ctx.room_name, value),
-                action: RoomActorAction::SetAttribute { key, value },
-            }
+            with_action(
+                Reply::here(format!("loading room '{}' from {}", ctx.room_name, value)),
+                RoomActorAction::SetAttribute { key, value },
+            )
         }
         "content" | "content-b64" => {
             if !is_owner_or_unclaimed(ctx) {
-                return none_result(format!("@here only the room owner can replace room content for '{}'", ctx.room_name));
+                return none(Reply::here(format!("only the room owner can replace room content for '{}'", ctx.room_name)));
             }
-            RoomActorResult {
-                response: format!("@here publishing room '{}' from inline content", ctx.room_name),
-                action: RoomActorAction::SetAttribute { key, value },
-            }
+            with_action(
+                Reply::here(format!("publishing room '{}' from inline content", ctx.room_name)),
+                RoomActorAction::SetAttribute { key, value },
+            )
         }
         "exit-content-b64" => {
             if !is_owner_or_unclaimed(ctx) {
-                return none_result(format!("@here only the room owner can replace exit content for '{}'", ctx.room_name));
+                return none(Reply::here(format!("only the room owner can replace exit content for '{}'", ctx.room_name)));
             }
-            RoomActorResult {
-                response: format!("@here publishing exit content for '{}'", ctx.room_name),
-                action: RoomActorAction::SetAttribute { key, value },
-            }
+            with_action(
+                Reply::here(format!("publishing exit content for '{}'", ctx.room_name)),
+                RoomActorAction::SetAttribute { key, value },
+            )
         }
-        _ => none_result(format!("@here unknown set attribute '{}'. Supported: owner, title, description, cid, content-b64, exit-content-b64", key)),
+        _ => none(Reply::here(format!("unknown set attribute '{}'. Supported: owner, title, description, cid, content-b64, exit-content-b64", key))),
     }
 }
 
@@ -308,13 +309,13 @@ fn cmd_property(command: &str, ctx: &RoomActorContext<'_>) -> Option<RoomActorRe
     if key == "_list" {
         let owner = ctx.acl_owner_did.unwrap_or("(none)");
         let did = ctx.did.unwrap_or("(unknown)");
-        return Some(none_result(format!(
-            "@ .here.owner {}\n@ .here.title {}\n@ .here.description {}\n@ .here.did {}",
-            owner,
-            ctx.title,
-            ctx.description,
-            did
-        )));
+        let response = Reply::attr_list(Scope::Here, &[
+            ("owner", owner),
+            ("title", ctx.title),
+            ("description", ctx.description),
+            ("did", did),
+        ]);
+        return Some(RoomActorResult { response, action: RoomActorAction::None });
     }
 
     let Some(value) = property.value else {
@@ -322,19 +323,16 @@ fn cmd_property(command: &str, ctx: &RoomActorContext<'_>) -> Option<RoomActorRe
             "owner" => ctx.acl_owner_did.unwrap_or("(none)").to_string(),
             "title" => ctx.title.to_string(),
             "description" => ctx.description.to_string(),
-            "cid" | "content-b64" | "exit-content-b64" => {
-                "(write-only)".to_string()
-            }
-            _ => format!(
-                "@here unknown attribute '{}'. Supported: owner, title, description, cid, content-b64, exit-content-b64",
+            "cid" | "content-b64" | "exit-content-b64" => "(write-only)".to_string(),
+            _ => Reply::here(format!(
+                "unknown attribute '{}'. Supported: owner, title, description, cid, content-b64, exit-content-b64",
                 key
-            ),
+            )).to_string(),
         };
-        return Some(none_result(response));
+        return Some(none(Reply::here(response)));
     };
 
-    let result = cmd_set(&format!("{} {}", key, value), ctx);
-    Some(result)
+    Some(cmd_set(&format!("{} {}", key, value), ctx))
 }
 
 // ─── Main dispatch ──────────────────────────────────────────────────────────
@@ -351,9 +349,9 @@ pub fn execute_room_actor_command(command: &str, ctx: &RoomActorContext<'_>) -> 
     }
 
     if normalized.to_ascii_lowercase().starts_with("set ") {
-        return none_result(
-            "@here 'set ...' is deprecated. Use dot notation: @here.<owner|title|description|cid|content-b64|exit-content-b64> [value]".to_string()
-        );
+        return none(Reply::here(
+            "'set ...' is deprecated. Use dot notation: @here.<owner|title|description|cid|content-b64|exit-content-b64> [value]".to_string()
+        ));
     }
 
     if let Some(result) = cmd_property(normalized, ctx) {
@@ -379,14 +377,6 @@ pub fn execute_room_actor_command(command: &str, ctx: &RoomActorContext<'_>) -> 
         "bury"                     => return cmd_bury(&arg, ctx),
         _ => {}
     }
-
-    // TODO: Evaluator-registered commands go here.
-    // When Lua/Guile evaluators are integrated, this is where user-defined
-    // verbs would be dispatched, e.g.:
-    //
-    //   if let Some(result) = ctx.try_evaluator_command(&method, &arg) {
-    //       return result;
-    //   }
 
     cmd_help(ctx)
 }
@@ -440,7 +430,7 @@ mod tests {
     #[test]
     fn empty_command_defaults_to_show() {
         let result = execute_room_actor_command("", &sample_ctx());
-        assert!(result.response.contains("@here 'lobby': did=did:ma:world#lobby owner=did:ma:owner"));
+        assert!(result.response.contains("'lobby': did=did:ma:world#lobby owner=did:ma:owner"));
         assert!(matches!(result.action, RoomActorAction::None));
     }
 
@@ -458,5 +448,18 @@ mod tests {
         assert!(result.response.starts_with("@here commands:"));
         assert!(result.response.contains("owner [did]"));
         assert!(matches!(result.action, RoomActorAction::None));
+    }
+
+    #[test]
+    fn who_uses_dot_notation() {
+        let result = execute_room_actor_command("who", &sample_ctx());
+        assert!(result.response.starts_with("@here.avatars"));
+        assert!(result.response.contains("aurora(did:ma:k51actor123)"));
+    }
+
+    #[test]
+    fn acl_uses_dot_notation() {
+        let result = execute_room_actor_command("acl", &sample_ctx());
+        assert!(result.response.starts_with("@here.acl"));
     }
 }

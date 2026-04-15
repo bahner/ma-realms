@@ -8,11 +8,55 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
+use ma_core::LaneCapability;
 use tokio::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 
-use crate::{World, WorldInfo};
+use crate::World;
+
+// ── Snapshot / info types ────────────────────────────────────────────
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct AvatarSnapshot {
+    pub inbox: String,
+    pub agent_did: String,
+    pub agent_endpoint: String,
+    pub owner: String,
+    pub description: String,
+    pub acl: String,
+    pub joined_at: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RoomSnapshot {
+    pub name: String,
+    pub avatars: Vec<AvatarSnapshot>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct WorldSnapshot {
+    pub rooms: Vec<RoomSnapshot>,
+    pub recent_events: Vec<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct WorldInfo {
+    pub name: String,
+    pub world_did: String,
+    pub status_url: String,
+    pub endpoint_id: String,
+    pub direct_addresses: Vec<String>,
+    pub multiaddrs: Vec<String>,
+    pub relay_urls: Vec<String>,
+    pub kubo_url: String,
+    pub location_hint: String,
+    pub entry_acl: String,
+    pub started_at: String,
+    pub capabilities: Vec<LaneCapability>,
+}
+
+// ── Status HTTP service ──────────────────────────────────────────────
 
 #[derive(Clone)]
 struct StatusState {

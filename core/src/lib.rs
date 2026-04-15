@@ -12,16 +12,21 @@ pub use ma_core::pinning;
 pub use ma_core::ttl_cache;
 
 // Realms-specific modules stay here.
+pub mod document_helpers;
 pub mod domain;
 pub mod identity;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ipfs_publish;
 pub mod interfaces;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod iroh;
 pub mod object_runtime;
 pub mod parser;
 pub mod protocol;
+pub mod reply;
 pub mod requirements;
 pub mod room_actor;
+pub mod util;
 
 pub use ma_core::{
     create_world_did, did_root, find_alias_for_address, find_did_by_endpoint,
@@ -51,6 +56,15 @@ pub use identity::{
     create_agent_identity_from_private_keys,
 };
 pub use interfaces::AclRuntime;
+pub use reply::{Reply, Scope};
+pub use document_helpers::{
+    extract_did_description_from_json, normalize_language_for_did_document,
+    sender_encryption_pubkey_multibase_from_document, sender_profile_from_document,
+    sender_push_endpoint_from_document,
+};
+pub use util::{expand_tilde_path, format_system_time, is_valid_nanoid_id, parse_rfc3339_unix};
+#[cfg(not(target_arch = "wasm32"))]
+pub use iroh::{generate_iroh_secret_file, load_persisted_iroh_secret_key, socket_addr_to_multiaddr};
 pub use object_runtime::{
     MAILBOX_COMMANDS_INLINE,
     ObjectCommandOutput, ObjectCommandResult, ObjectDefinition, ObjectInboxMessage,

@@ -4,6 +4,17 @@ use std::collections::HashMap;
 /// 32-byte Ed25519 private key for avatar signing, held by the world.
 pub type AvatarSigningSecret = [u8; 32];
 
+/// Request to join a world room, carrying all the agent-provided identity fields.
+#[derive(Clone, Debug)]
+pub(crate) struct AvatarRequest {
+    pub did: Did,
+    pub owner_did: String,
+    pub agent_endpoint: String,
+    pub language_order: String,
+    pub signing_secret: AvatarSigningSecret,
+    pub encryption_pubkey_multibase: Option<String>,
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ActorAcl {
     pub allow_all: bool,

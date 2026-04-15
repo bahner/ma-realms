@@ -132,3 +132,33 @@ impl Room {
         self.avatars.remove(name);
     }
 }
+
+pub fn parse_room_inbox_symbol(symbol: &str) -> Option<&str> {
+    let trimmed = symbol.trim();
+    let rest = trimmed.strip_prefix("room.")?;
+    let object = rest.strip_suffix(".inbox")?;
+    let object = object.trim();
+    if object.is_empty() {
+        None
+    } else {
+        Some(object)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_room_inbox_symbol() {
+        assert_eq!(parse_room_inbox_symbol("room.lobby.inbox"), Some("lobby"));
+        assert_eq!(parse_room_inbox_symbol("room.abc-123.inbox"), Some("abc-123"));
+    }
+
+    #[test]
+    fn rejects_invalid_inbox_symbols() {
+        assert_eq!(parse_room_inbox_symbol("room..inbox"), None);
+        assert_eq!(parse_room_inbox_symbol("notaroom.lobby.inbox"), None);
+        assert_eq!(parse_room_inbox_symbol("room.lobby"), None);
+    }
+}

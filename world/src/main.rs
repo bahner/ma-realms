@@ -4,13 +4,12 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     env,
     fs,
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
     path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime},
 };
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+
 
 use anyhow::{Result, anyhow};
 use base64::Engine;
@@ -43,10 +42,15 @@ use ma_core::{
     execute_room_actor_command,
     normalize_spoken_text, parse_capability_acl_text, parse_object_local_capability_acl,
     parse_property_command, parse_property_command_for_keys,
+    Reply, Scope,
     LegacyRequirement, RequirementChecker, RequirementSet, RequirementValue,
     pin_update_add_rm,
-    resolve_inbox_endpoint_id as core_resolve_inbox_endpoint_id,
     TtlCache,
+    expand_tilde_path, format_system_time, is_valid_nanoid_id, parse_rfc3339_unix,
+    extract_did_description_from_json, normalize_language_for_did_document,
+    sender_encryption_pubkey_multibase_from_document, sender_profile_from_document,
+    sender_push_endpoint_from_document,
+    generate_iroh_secret_file, load_persisted_iroh_secret_key, socket_addr_to_multiaddr,
 };
 use moka::sync::Cache;
 use nanoid::nanoid;
@@ -70,7 +74,7 @@ mod room;
 mod schema;
 mod status;
 
-use actor::Avatar;
+use actor::{Avatar, AvatarRequest};
 use lang::{
     collapse_world_language_order_strict,
     supported_world_languages_text,
@@ -84,9 +88,14 @@ use kubo::{
 };
 use room::{Room, RoomAcl};
 use schema::{
-    ActorSecretBundle, default_world_dir, did_fragment, load_world_authoring,
+    ActorSecretBundle, AvatarRegistryEntry, AvatarStateDoc, ExitYamlDoc, IpldLink,
+    LegacyRoomYaml, PersistedWorldEnvelope, RoomAclDoc, RoomStateDoc, RoomYamlDocV2,
+    RuntimeStateDoc, WorldRootIndex, WorldRootIndexDag, WorldRootPrivateDag,
+    WorldRootPublicDag, WorldRootRoomDagValue, WorldRootRoomEntry,
+    default_world_dir, did_fragment, load_world_authoring,
     normalize_world_key_name, unlock_actor_secret_bundles, validate_world_authoring,
 };
+use status::{AvatarSnapshot, RoomSnapshot, WorldInfo, WorldSnapshot};
 
 const DEFAULT_ROOM: &str = "lobby";
 const DEFAULT_ENTRY_ACL: &str = "*";
@@ -134,16 +143,6 @@ struct CachedDidDocument {
     dirty: bool,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct AvatarRequest {
-    pub did: Did,
-    pub owner_did: String,
-    pub agent_endpoint: String,
-    pub language_order: String,
-    pub signing_secret: actor::AvatarSigningSecret,
-    pub encryption_pubkey_multibase: Option<String>,
-}
-
 #[derive(Clone, Debug, Serialize)]
 struct WorldBroadcastEnvelope {
     v: u8,
@@ -153,45 +152,6 @@ struct WorldBroadcastEnvelope {
     message: String,
     ts: String,
 }
-#[derive(Clone, Debug, Serialize)]
-pub struct AvatarSnapshot {
-    pub inbox: String,
-    pub agent_did: String,
-    pub agent_endpoint: String,
-    pub owner: String,
-    pub description: String,
-    pub acl: String,
-    pub joined_at: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct RoomSnapshot {
-    pub name: String,
-    pub avatars: Vec<AvatarSnapshot>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct WorldSnapshot {
-    pub rooms: Vec<RoomSnapshot>,
-    pub recent_events: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct WorldInfo {
-    pub name: String,
-    pub world_did: String,
-    pub status_url: String,
-    pub endpoint_id: String,
-    pub direct_addresses: Vec<String>,
-    pub multiaddrs: Vec<String>,
-    pub relay_urls: Vec<String>,
-    pub kubo_url: String,
-    pub location_hint: String,
-    pub entry_acl: String,
-    pub started_at: String,
-    pub capabilities: Vec<LaneCapability>,
-}
-
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum OutboxRequest {
@@ -338,24 +298,6 @@ struct InboxRoute {
     object_id: String,
 }
 
-fn parse_room_inbox_symbol(symbol: &str) -> Option<&str> {
-    let trimmed = symbol.trim();
-    let rest = trimmed.strip_prefix("room.")?;
-    let object = rest.strip_suffix(".inbox")?;
-    let object = object.trim();
-    if object.is_empty() {
-        None
-    } else {
-        Some(object)
-    }
-}
-
-fn parse_rfc3339_unix(value: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|dt| dt.timestamp())
-}
-
 impl RequirementChecker for ObjectRequirementRuntime {
     fn resolve_symbol(&self, symbol: &str) -> Option<RequirementValue> {
         match symbol {
@@ -382,7 +324,7 @@ impl RequirementChecker for ObjectRequirementRuntime {
             "world.slug" => Some(RequirementValue::String(DEFAULT_WORLD_SLUG.to_string())),
             "inbox" => Some(RequirementValue::String(format!("room.{}.inbox", self.room_name))),
             _ => {
-                if parse_room_inbox_symbol(symbol).is_some() {
+                if room::parse_room_inbox_symbol(symbol).is_some() {
                     return Some(RequirementValue::String(symbol.to_string()));
                 }
                 if let Some(state_key) = symbol.strip_prefix("state.") {
@@ -454,32 +396,6 @@ struct AvatarLocationEntry {
     room: String,
     endpoint: String,
     seen_at: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct AvatarRegistryEntry {
-    did: String,
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    description: String,
-    #[serde(default)]
-    owner: String,
-    #[serde(default)]
-    fragment: String,
-    #[serde(default)]
-    lang: String,
-    #[serde(default)]
-    endpoint: String,
-    #[serde(default)]
-    room: String,
-    #[serde(default)]
-    key_agreement: String,
-    #[serde(default)]
-    acl: String,
-    #[serde(default)]
-    shortcuts: HashMap<String, String>,
-    doc: IpldLink,
 }
 
 #[derive(Debug)]
@@ -667,12 +583,6 @@ fn decrypt_world_access_bundle(passphrase: &str, bundle_json: &str) -> Result<Wo
         world_encryption_private_key,
     })
 }
-fn is_valid_nanoid_id(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-}
 
 fn normalize_local_object_id(input: &str) -> String {
     input
@@ -684,162 +594,6 @@ fn normalize_local_object_id(input: &str) -> String {
         .to_string()
 }
 
-/// Root index persisted in IPFS: maps room_name → room CID.
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-struct WorldRootIndex {
-    rooms: HashMap<String, String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct IpldLink {
-    #[serde(rename = "/")]
-    cid: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-struct WorldRootRoomEntry {
-    #[serde(rename = "/")]
-    cid: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    title: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    did: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    owner: Option<String>,
-    acl_cid: String,
-    /// Legacy field — ignored on read, never written.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    owner_cid: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(untagged)]
-enum WorldRootRoomDagValue {
-    Link(IpldLink),
-    Entry(WorldRootRoomEntry),
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-struct WorldRootIndexDag {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    config: Option<WorldRootConfigDag>,
-    #[serde(default)]
-    public: WorldRootPublicDag,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    private: Option<WorldRootPrivateDag>,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    rooms: HashMap<String, WorldRootRoomDagValue>,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    avatars: HashMap<String, AvatarRegistryEntry>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    state_cid: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    lang_cid: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-struct WorldRootConfigDag {
-    #[serde(default)]
-    schema: String,
-    #[serde(default)]
-    version: u32,
-    #[serde(default)]
-    world_did: String,
-    #[serde(default)]
-    generated_at: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-struct WorldRootPublicDag {
-    #[serde(default)]
-    rooms: HashMap<String, WorldRootRoomDagValue>,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    avatars: HashMap<String, AvatarRegistryEntry>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    lang_cid: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-struct WorldRootPrivateDag {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    state_cid: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct PersistedWorldEnvelope {
-    kind: String,
-    version: u32,
-    created_at: String,
-    signer_did: String,
-    signature_b64: String,
-    nonce_b64: String,
-    ciphertext_b64: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct RoomAclDoc {
-    kind: String,
-    version: u32,
-    acl: RoomAcl,
-}
-
-
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct AvatarStateDoc {
-    inbox: String,
-    agent_did: String,
-    agent_endpoint: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    language_order: String,
-    owner: String,
-    descriptions: HashMap<String, String>,
-    acl: actor::ActorAcl,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    encryption_pubkey_multibase: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct RoomStateDoc {
-    name: String,
-    #[serde(default)]
-    titles: HashMap<String, String>,
-    exits: Vec<ExitData>,
-    descriptions: HashMap<String, String>,
-    did: String,
-    #[serde(default)]
-    avatars: Vec<AvatarStateDoc>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct RuntimeStateDoc {
-    kind: String,
-    version: u32,
-    rooms: HashMap<String, RoomStateDoc>,
-    #[serde(default)]
-    events: Vec<String>,
-    #[serde(default)]
-    room_events: HashMap<String, Vec<RoomEvent>>,
-    next_room_event_sequence: u64,
-    #[serde(default)]
-    handle_to_did: HashMap<String, String>,
-    #[serde(default)]
-    did_to_handle: HashMap<String, String>,
-    owner_did: Option<String>,
-    #[serde(default)]
-    room_cids: HashMap<String, String>,
-    #[serde(default)]
-    room_objects: HashMap<String, Vec<ObjectRuntimeState>>,
-    #[serde(default)]
-    avatar_registry: HashMap<String, AvatarRegistryEntry>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    lang_cid: Option<String>,
-}
-
 fn build_exit_entry(id: String, name: String, to: String) -> ExitData {
     let normalized = "und".to_string();
     let mut exit = ExitData::new(id, name.clone(), to);
@@ -848,93 +602,6 @@ fn build_exit_entry(id: String, name: String, to: String) -> ExitData {
         exit.names.insert(normalized, name);
     }
     exit
-}
-
-fn sender_profile_from_document(document: &Document) -> String {
-    if let Some(ma) = document.ma.as_ref() {
-        if let Some(language) = ma.language.as_ref() {
-            let normalized = language.trim();
-            if !normalized.is_empty() {
-                return normalized.to_string();
-            }
-        }
-    }
-    "und".to_string()
-}
-
-fn normalize_language_for_did_document(language_order: &str) -> Option<String> {
-    let tokens = language_order
-        .split(|ch: char| ch == ':' || ch == ';' || ch == ',' || ch.is_ascii_whitespace())
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-        .collect::<Vec<_>>();
-
-    if tokens.is_empty() {
-        None
-    } else {
-        Some(tokens.join(":"))
-    }
-}
-
-fn sender_push_endpoint_from_document(document: &Document) -> Option<String> {
-    let ma = document.ma.as_ref()?;
-    let endpoint = core_resolve_inbox_endpoint_id(
-        ma.current_inbox.as_deref(),
-        ma.presence_hint.as_deref(),
-        ma.transports.as_ref(),
-    )?;
-    let trimmed = endpoint.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
-fn sender_encryption_pubkey_multibase_from_document(document: &Document) -> Result<String> {
-    let ka_id = document.key_agreement.first()
-        .ok_or_else(|| anyhow!("sender DID document has no keyAgreement"))?;
-    let vm = document
-        .get_verification_method_by_id(ka_id)
-        .map_err(|e| anyhow!("sender DID document missing keyAgreement verification method: {}", e))?;
-    let key = vm.public_key_multibase.trim();
-    if key.is_empty() {
-        return Err(anyhow!("sender DID document keyAgreement publicKeyMultibase is empty"));
-    }
-    Ok(key.to_string())
-}
-
-fn extract_did_description_from_json(document_json: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(document_json).ok()?;
-
-    let ma_desc = value
-        .get("ma")
-        .and_then(|ma| ma.get("description"))
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .map(str::to_string);
-    if ma_desc.is_some() {
-        return ma_desc;
-    }
-
-    let top_desc = value
-        .get("description")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .map(str::to_string);
-    if top_desc.is_some() {
-        return top_desc;
-    }
-
-    value
-        .get("profile")
-        .and_then(|profile| profile.get("description"))
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .map(str::to_string)
 }
 
 fn format_public_inspect_value(value: &serde_json::Value) -> String {
@@ -971,56 +638,6 @@ fn resolve_public_inspect_path<'a>(value: &'a serde_json::Value, path: &str) -> 
         }
     }
     Some(current)
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ExitYamlDoc {
-    kind: String,
-    version: u32,
-    exit: ExitData,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct RoomYamlDocV2 {
-    kind: String,
-    version: u32,
-    id: String,
-    #[serde(default)]
-    titles: HashMap<String, String>,
-    #[serde(default)]
-    descriptions: HashMap<String, String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    did: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    exits: Vec<ExitData>,
-    #[serde(default)]
-    exit_cids: HashMap<String, String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-struct LegacyRoomAclYaml {
-    owner: Option<String>,
-    #[serde(default)]
-    allow_all: bool,
-    #[serde(default)]
-    allow: HashSet<String>,
-    #[serde(default)]
-    deny: HashSet<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-struct LegacyRoomYaml {
-    name: String,
-    #[serde(default)]
-    title: String,
-    #[serde(default)]
-    exits: Vec<ExitData>,
-    #[serde(default)]
-    acl: LegacyRoomAclYaml,
-    #[serde(default)]
-    descriptions: HashMap<String, String>,
-    #[serde(default)]
-    did: String,
 }
 
 impl World {
@@ -1713,7 +1330,7 @@ impl World {
                 .map(|object| object.id.clone());
         }
 
-        if let Some(token) = parse_room_inbox_symbol(normalized) {
+        if let Some(token) = room::parse_room_inbox_symbol(normalized) {
             return self.resolve_room_object_id(room_name, token).await;
         }
 
@@ -5986,9 +5603,9 @@ impl World {
 
         if method == "broadcast" {
             if arg.is_empty() {
-                return "@world usage: @world.broadcast <message>".to_string();
+                return Reply::world("usage: @world.broadcast <message>").to_string();
             }
-            return format!("@world broadcast sent to room '{}'", room_name);
+            return Reply::world(format!("broadcast sent to room '{}'", room_name)).to_string();
         }
 
         if let Some(property) = parse_property_command_for_keys(
@@ -6031,10 +5648,12 @@ impl World {
                             .await
                             .clone()
                             .unwrap_or_else(|| "(none)".to_string());
-                        return format!(
-                            "@world.owner {}\n@world.did {}\n@world.rooms {}\n@world.lang_cid {}",
-                            owner, did, rooms, lang_cid
-                        );
+                        return Reply::attr_list(Scope::World, &[
+                            ("owner", &owner),
+                            ("did", &did),
+                            ("rooms", &rooms),
+                            ("lang_cid", &lang_cid),
+                        ]);
                     }
                     "owner" => {
                         return self
@@ -6070,10 +5689,10 @@ impl World {
                             .unwrap_or_else(|| "(none)".to_string())
                     }
                     _ => {
-                        return format!(
-                            "@world unknown attribute '{}'. Allowed: owner, did, rooms, lang_cid",
+                        return Reply::world(format!(
+                            "unknown attribute '{}'. Allowed: owner, did, rooms, lang_cid",
                             path
-                        )
+                        )).to_string()
                     }
                 }
             }
@@ -6092,7 +5711,7 @@ impl World {
                     let normalized = value.trim();
                     return match self.set_owner_did(normalized).await {
                         Ok(root) => root,
-                        Err(err) => format!("@world invalid owner DID '{}': {}", value, err),
+                        Err(err) => Reply::world(format!("invalid owner DID '{}': {}", value, err)).to_string(),
                     };
                 }
                 "lang_cid" => {
@@ -6106,10 +5725,10 @@ impl World {
                     return format!("@world.{} is read-only", path);
                 }
                 _ => {
-                    return format!(
-                        "@world unknown attribute '{}'. Allowed: owner, did, rooms, lang_cid",
+                    return Reply::world(format!(
+                        "unknown attribute '{}'. Allowed: owner, did, rooms, lang_cid",
                         path
-                    )
+                    )).to_string()
                 }
             }
         }
@@ -6129,11 +5748,11 @@ impl World {
 
                 if path == "avatars" || path == "avatars._list" {
                     if registry.is_empty() {
-                        return "@world avatars: (none)".to_string();
+                        return Reply::world("avatars: (none)").to_string();
                     }
                     let mut fragments = registry.keys().cloned().collect::<Vec<_>>();
                     fragments.sort();
-                    return format!("@world avatars:\n{}", fragments.join("\n"));
+                    return Reply::world(format!("avatars:\n{}", fragments.join("\n"))).to_string();
                 }
 
                 let mut parts = path.split('.');
@@ -6141,28 +5760,27 @@ impl World {
                 let fragment = parts.next().unwrap_or_default().trim();
                 let key = parts.collect::<Vec<_>>().join(".");
                 if root != "avatars" || fragment.is_empty() {
-                    return "@world avatar path usage: @world.avatars.<fragment>.<field>".to_string();
+                    return Reply::world("avatar path usage: @world.avatars.<fragment>.<field>").to_string();
                 }
                 let Some(entry) = registry.get(fragment) else {
-                    return format!("@world avatar '{}' not found", fragment);
+                    return Reply::world(format!("avatar '{}' not found", fragment)).to_string();
                 };
 
                 if key.is_empty() || key == "_list" {
-                    return format!(
-                        "@ .world.avatars.{0}.did {1}\n@ .world.avatars.{0}.name {2}\n@ .world.avatars.{0}.description {3}\n@ .world.avatars.{0}.owner {4}\n@ .world.avatars.{0}.fragment {5}\n@ .world.avatars.{0}.lang {6}\n@ .world.avatars.{0}.endpoint {7}\n@ .world.avatars.{0}.room {8}\n@ .world.avatars.{0}.key_agreement {9}\n@ .world.avatars.{0}.acl {10}\n@ .world.avatars.{0}.doc {11}",
-                        fragment,
-                        entry.did,
-                        entry.name,
-                        entry.description,
-                        entry.owner,
-                        entry.fragment,
-                        entry.lang,
-                        entry.endpoint,
-                        entry.room,
-                        entry.key_agreement,
-                        entry.acl,
-                        entry.doc.cid,
-                    );
+                    let p = format!("avatars.{}", fragment);
+                    return Reply::join(&[
+                        Reply::world_attr(format!("{p}.did"), &entry.did),
+                        Reply::world_attr(format!("{p}.name"), &entry.name),
+                        Reply::world_attr(format!("{p}.description"), &entry.description),
+                        Reply::world_attr(format!("{p}.owner"), &entry.owner),
+                        Reply::world_attr(format!("{p}.fragment"), &entry.fragment),
+                        Reply::world_attr(format!("{p}.lang"), &entry.lang),
+                        Reply::world_attr(format!("{p}.endpoint"), &entry.endpoint),
+                        Reply::world_attr(format!("{p}.room"), &entry.room),
+                        Reply::world_attr(format!("{p}.key_agreement"), &entry.key_agreement),
+                        Reply::world_attr(format!("{p}.acl"), &entry.acl),
+                        Reply::world_attr(format!("{p}.doc"), &entry.doc.cid),
+                    ]);
                 }
 
                 return match key.as_str() {
@@ -6190,10 +5808,10 @@ impl World {
                             rows.join("\n")
                         }
                     }
-                    _ => format!(
-                        "@world unknown avatar attribute '{}'. Allowed: did, name, description, owner, fragment, lang, endpoint, room, key_agreement, acl, shortcuts, doc",
+                    _ => Reply::world(format!(
+                        "unknown avatar attribute '{}'. Allowed: did, name, description, owner, fragment, lang, endpoint, room, key_agreement, acl, shortcuts, doc",
                         key
-                    ),
+                    )).to_string(),
                 };
             }
         }
@@ -6218,7 +5836,7 @@ impl World {
                 .map(|(id, title)| format!("{} => {}", id, title))
                 .collect::<Vec<_>>()
                 .join("\n");
-            return format!("@world objects:\n{}", payload);
+            return Reply::world(format!("objects:\n{}", payload)).to_string();
         }
 
         // Caller's DID is directly available from from_did
@@ -6252,9 +5870,9 @@ impl World {
             let current_owner = self.owner_did.read().await.clone();
             if let Some(owner) = current_owner {
                 if owner == caller_did {
-                    return format!("@world already claimed by {}", owner);
+                    return Reply::world(format!("already claimed by {}", owner)).to_string();
                 }
-                return format!("@world already claimed by {}", owner);
+                return Reply::world(format!("already claimed by {}", owner)).to_string();
             }
 
             {
@@ -6263,7 +5881,7 @@ impl World {
             }
             self.allow_entry_did(&from_did.id()).await;
             info!("World claimed by {}", from_did.id());
-            return format!("@world claimed by {}", from_did.id());
+            return Reply::world(format!("claimed by {}", from_did.id())).to_string();
         }
 
         // All remaining commands require world-owner privilege.
@@ -6310,33 +5928,33 @@ impl World {
                         item.requested_at
                     ));
                 }
-                return format!("@world knock inbox:\n{}", lines.join("\n"));
+                return Reply::world(format!("knock inbox:\n{}", lines.join("\n"))).to_string();
             }
 
             if sub == "accept" {
                 let Some(id_raw) = parts.next() else {
-                    return "@world usage: @world.knock accept <id>".to_string();
+                    return Reply::world("usage: @world.knock accept <id>").to_string();
                 };
                 let id = match Self::parse_knock_id_arg(id_raw) {
                     Ok(value) => value,
-                    Err(err) => return format!("@world {}", err),
+                    Err(err) => return Reply::world(format!("{}", err)).to_string(),
                 };
                 return match self.accept_knock(id).await {
-                    Ok(item) => format!(
-                        "@world knock accepted id={} did={} room={} (entry allowlist updated)",
+                    Ok(item) => Reply::world(format!(
+                        "knock accepted id={} did={} room={} (entry allowlist updated)",
                         item.id, item.requester_did, item.room
-                    ),
-                    Err(err) => format!("@world knock accept failed: {}", err),
+                    )).to_string(),
+                    Err(err) => Reply::world(format!("knock accept failed: {}", err)).to_string(),
                 };
             }
 
             if sub == "reject" {
                 let Some(id_raw) = parts.next() else {
-                    return "@world usage: @world.knock reject <id> [note]".to_string();
+                    return Reply::world("usage: @world.knock reject <id> [note]").to_string();
                 };
                 let id = match Self::parse_knock_id_arg(id_raw) {
                     Ok(value) => value,
-                    Err(err) => return format!("@world {}", err),
+                    Err(err) => return Reply::world(format!("{}", err)).to_string(),
                 };
                 let note = {
                     let rest = parts.collect::<Vec<_>>().join(" ");
@@ -6347,41 +5965,41 @@ impl World {
                     }
                 };
                 return match self.reject_knock(id, note).await {
-                    Ok(item) => format!(
-                        "@world knock rejected id={} did={} room={}",
+                    Ok(item) => Reply::world(format!(
+                        "knock rejected id={} did={} room={}",
                         item.id, item.requester_did, item.room
-                    ),
-                    Err(err) => format!("@world knock reject failed: {}", err),
+                    )).to_string(),
+                    Err(err) => Reply::world(format!("knock reject failed: {}", err)).to_string(),
                 };
             }
 
             if sub == "delete" {
                 let Some(id_raw) = parts.next() else {
-                    return "@world usage: @world.knock delete <id>".to_string();
+                    return Reply::world("usage: @world.knock delete <id>").to_string();
                 };
                 let id = match id_raw.parse::<u64>() {
                     Ok(value) => value,
-                    Err(_) => return format!("@world invalid knock id '{}'", id_raw),
+                    Err(_) => return Reply::world(format!("invalid knock id '{}'", id_raw)).to_string(),
                 };
                 return match self.delete_knock(id).await {
-                    Ok(()) => format!("@world knock deleted id={}", id),
-                    Err(err) => format!("@world knock delete failed: {}", err),
+                    Ok(()) => Reply::world(format!("knock deleted id={}", id)).to_string(),
+                    Err(err) => Reply::world(format!("knock delete failed: {}", err)).to_string(),
                 };
             }
 
-            return "@world usage: @world.knock list [all] | @world.knock accept <id> | @world.knock reject <id> [note] | @world.knock delete <id>"
+            return Reply::world("usage: @world.knock list [all] | @world.knock accept <id> | @world.knock reject <id> [note] | @world.knock delete <id>")
                 .to_string();
         }
 
         if method == "invite" {
             let mut parts = arg.split_whitespace();
             let Some(target_did_raw) = parts.next() else {
-                return "@world usage: @world.invite <did> [note]".to_string();
+                return Reply::world("usage: @world.invite <did> [note]").to_string();
             };
 
             let target_did = match Self::parse_invite_did_arg(target_did_raw) {
                 Ok(root) => root,
-                Err(err) => return format!("@world {}", err),
+                Err(err) => return Reply::world(format!("{}", err)).to_string(),
             };
 
             let invite_note = {
@@ -6394,24 +6012,24 @@ impl World {
             };
 
             self.allow_entry_did(&target_did).await;
-            return format!(
-                "@world invited {} (allowlisted). note='{}'",
+            return Reply::world(format!(
+                "invited {} (allowlisted). note='{}'",
                 target_did,
                 invite_note
-            );
+            )).to_string();
         }
 
         if method == "flush" {
             let scope = arg.trim().to_ascii_lowercase();
             if scope.is_empty() || scope == "all" {
                 let knocks = self.flush_knock_inbox().await;
-                return format!("@world flush all: knocks={}", knocks);
+                return Reply::world(format!("flush all: knocks={}", knocks)).to_string();
             }
             if scope == "knock" || scope == "knocks" {
                 let removed = self.flush_knock_inbox().await;
-                return format!("@world flush knock: removed={}", removed);
+                return Reply::world(format!("flush knock: removed={}", removed)).to_string();
             }
-            return "@world usage: @world.flush [knock|all]".to_string();
+            return Reply::world("usage: @world.flush [knock|all]").to_string();
         }
 
         if method == "migrate-index" {
@@ -6423,19 +6041,19 @@ impl World {
             };
 
             if room_names.is_empty() {
-                return "@world migrate-index: no rooms to persist".to_string();
+                return Reply::world("migrate-index: no rooms to persist").to_string();
             }
 
             match self.save_rooms_and_world_index(&room_names).await {
                 Ok(new_cid) => {
-                    return format!(
-                        "@world migrate-index complete: root_cid={} rooms={}",
+                    return Reply::world(format!(
+                        "migrate-index complete: root_cid={} rooms={}",
                         new_cid,
                         room_names.len()
-                    );
+                    )).to_string();
                 }
                 Err(e) => {
-                    return format!("@world migrate-index failed: {}", e);
+                    return Reply::world(format!("migrate-index failed: {}", e)).to_string();
                 }
             }
         }
@@ -6443,10 +6061,10 @@ impl World {
         if method == "publish" {
             match self.publish_to_ipns().await {
                 Ok(()) => {
-                    return "@world published to IPNS".to_string();
+                    return Reply::world("published to IPNS").to_string();
                 }
                 Err(e) => {
-                    return format!("@world publish failed: {}", e);
+                    return Reply::world(format!("publish failed: {}", e)).to_string();
                 }
             }
         }
@@ -6454,37 +6072,37 @@ impl World {
         if method == "save" {
             match self.save_and_publish().await {
                 Ok((state_cid, root_cid)) => {
-                    return format!(
-                        "@world saved and published: state_cid={} root_cid={}",
+                    return Reply::world(format!(
+                        "saved and published: state_cid={} root_cid={}",
                         state_cid, root_cid
-                    );
+                    )).to_string();
                 }
                 Err(e) => {
-                    return format!("@world save failed: {}", e);
+                    return Reply::world(format!("save failed: {}", e)).to_string();
                 }
             }
         }
 
         if method == "load" {
             if arg.is_empty() {
-                return "@world usage: @world.load <cid>".to_string();
+                return Reply::world("usage: @world.load <cid>").to_string();
             }
             match self.load_encrypted_state(arg.as_str()).await {
                 Ok(root_cid) => {
-                    return format!(
-                        "@world loaded encrypted runtime state from {} (root_cid={})",
+                    return Reply::world(format!(
+                        "loaded encrypted runtime state from {} (root_cid={})",
                         arg, root_cid
-                    );
+                    )).to_string();
                 }
                 Err(e) => {
-                    return format!("@world load failed: {}", e);
+                    return Reply::world(format!("load failed: {}", e)).to_string();
                 }
             }
         }
 
         if method == "dig" {
             if arg.is_empty() {
-                return "@world usage: @world.dig <direction> [to|til <#dest|did:ma:...#room>]".to_string();
+                return Reply::world("usage: @world.dig <direction> [to|til <#dest|did:ma:...#room>]").to_string();
             }
 
             let (exit_name, destination) = if let Some((dir, dest)) = arg
@@ -6507,7 +6125,7 @@ impl World {
                 Ok(did) => {
                     if self.is_local_world_ipns(&did.ipns).await {
                         let Some(fragment) = did.fragment.clone() else {
-                            return "@world usage: @world.dig <direction> [to <#dest|did:ma:...#room>]".to_string();
+                            return Reply::world("usage: @world.dig <direction> [to <#dest|did:ma:...#room>]").to_string();
                         };
                         exit_target = fragment.clone();
                         local_room_to_create = Some(fragment);
@@ -6517,14 +6135,14 @@ impl World {
                 }
                 Err(e) => {
                     if destination_input.contains(':') {
-                        return format!("@world invalid destination DID '{}': {}", destination_input, e);
+                        return Reply::world(format!("invalid destination DID '{}': {}", destination_input, e)).to_string();
                     }
                     let local_id = normalize_local_object_id(&destination_input);
                     if !is_valid_nanoid_id(&local_id) {
-                        return format!(
-                            "@world invalid destination id '{}': expected nanoid-compatible id ([A-Za-z0-9_-]+)",
+                        return Reply::world(format!(
+                            "invalid destination id '{}': expected nanoid-compatible id ([A-Za-z0-9_-]+)",
                             destination_input
-                        );
+                        )).to_string();
                     }
                     exit_target = local_id.clone();
                     local_room_to_create = Some(local_id);
@@ -6556,7 +6174,7 @@ impl World {
                     e
                 );
             }
-            return format!("@world exit '{}' dug from '{}' → '{}'", exit_name, room_name, exit_target);
+            return Reply::world(format!("exit '{}' dug from '{}' → '{}'", exit_name, room_name, exit_target)).to_string();
         }
 
         if method == "room" {
@@ -6570,49 +6188,49 @@ impl World {
             let sub_arg = room_parts.next().unwrap_or_default().trim().to_string();
 
             if room_name_arg.is_empty() || sub.is_empty() {
-                return "@world usage: @world.room <name> acl show|open|close|allow <did>|deny <did> | @world.room <name> owner <did:ma:...#fragment>".to_string();
+                return Reply::world("usage: @world.room <name> acl show|open|close|allow <did>|deny <did> | @world.room <name> owner <did:ma:...#fragment>").to_string();
             }
 
             if sub == "owner" {
                 if sub_arg.is_empty() {
-                    return format!(
-                        "@world usage: @world.room {} owner <did:ma:...#fragment>",
+                    return Reply::world(format!(
+                        "usage: @world.room {} owner <did:ma:...#fragment>",
                         room_name_arg
-                    );
+                    )).to_string();
                 }
                 if !sub_arg.contains('#') {
-                    return format!(
-                        "@world invalid owner DID '{}': missing #fragment",
+                    return Reply::world(format!(
+                        "invalid owner DID '{}': missing #fragment",
                         sub_arg
-                    );
+                    )).to_string();
                 }
                 let target_did = match Did::try_from(sub_arg.as_str()) {
                     Ok(d) => {
                         if d.fragment.is_none() {
-                            return format!(
-                                "@world invalid owner DID '{}': missing #fragment",
+                            return Reply::world(format!(
+                                "invalid owner DID '{}': missing #fragment",
                                 sub_arg
-                            );
+                            )).to_string();
                         }
                         d.id()
                     }
-                    Err(e) => return format!("@world invalid owner DID '{}': {}", sub_arg, e),
+                    Err(e) => return Reply::world(format!("invalid owner DID '{}': {}", sub_arg, e)).to_string(),
                 };
 
                 let mut rooms = self.rooms.write().await;
                 let Some(room) = rooms.get_mut(&room_name_arg) else {
-                    return format!("@world room '{}' not found", room_name_arg);
+                    return Reply::world(format!("room '{}' not found", room_name_arg)).to_string();
                 };
                 room.acl.owner = Some(target_did.clone());
                 room.acl.allow.insert(target_did.clone());
                 room.acl.deny.remove(&target_did);
                 drop(rooms);
                 let _ = self.save_rooms_and_world_index(&[room_name_arg.clone()]).await;
-                return format!("@world room '{}' owner set to {}", room_name_arg, target_did);
+                return Reply::world(format!("room '{}' owner set to {}", room_name_arg, target_did)).to_string();
             }
 
             if sub != "acl" {
-                return "@world usage: @world.room <name> acl show|open|close|allow <did>|deny <did> | @world.room <name> owner <did:ma:...#fragment>".to_string();
+                return Reply::world("usage: @world.room <name> acl show|open|close|allow <did>|deny <did> | @world.room <name> owner <did:ma:...#fragment>").to_string();
             }
 
             let mut acl_parts = sub_arg.splitn(2, char::is_whitespace);
@@ -6623,84 +6241,84 @@ impl World {
                 "" | "show" => {
                     let rooms = self.rooms.read().await;
                     let Some(room) = rooms.get(&room_name_arg) else {
-                        return format!("@world room '{}' not found", room_name_arg);
+                        return Reply::world(format!("room '{}' not found", room_name_arg)).to_string();
                     };
-                    return format!(
-                        "@world room '{}' acl: {} owner={}",
+                    return Reply::world(format!(
+                        "room '{}' acl: {} owner={}",
                         room_name_arg,
                         room.acl.summary(),
                         room.acl.owner.as_deref().unwrap_or("(none)")
-                    );
+                    )).to_string();
                 }
                 "open" => {
                     let mut rooms = self.rooms.write().await;
                     let Some(room) = rooms.get_mut(&room_name_arg) else {
-                        return format!("@world room '{}' not found", room_name_arg);
+                        return Reply::world(format!("room '{}' not found", room_name_arg)).to_string();
                     };
                     room.acl.allow.insert("*".to_string());
                     drop(rooms);
                     let _ = self.save_rooms_and_world_index(&[room_name_arg.clone()]).await;
-                    return format!("@world room '{}' acl opened (public)", room_name_arg);
+                    return Reply::world(format!("room '{}' acl opened (public)", room_name_arg)).to_string();
                 }
                 "close" => {
                     let mut rooms = self.rooms.write().await;
                     let Some(room) = rooms.get_mut(&room_name_arg) else {
-                        return format!("@world room '{}' not found", room_name_arg);
+                        return Reply::world(format!("room '{}' not found", room_name_arg)).to_string();
                     };
                     room.acl.allow.remove("*");
                     drop(rooms);
                     let _ = self.save_rooms_and_world_index(&[room_name_arg.clone()]).await;
-                    return format!("@world room '{}' acl closed (private)", room_name_arg);
+                    return Reply::world(format!("room '{}' acl closed (private)", room_name_arg)).to_string();
                 }
                 "allow" => {
                     if acl_arg.is_empty() {
-                        return format!("@world usage: @world.room {} acl allow <did>", room_name_arg);
+                        return Reply::world(format!("usage: @world.room {} acl allow <did>", room_name_arg)).to_string();
                     }
                     let target_did = match Did::try_from(acl_arg.as_str()) {
                         Ok(d) => d.id(),
-                        Err(e) => return format!("@world invalid DID '{}': {}", acl_arg, e),
+                        Err(e) => return Reply::world(format!("invalid DID '{}': {}", acl_arg, e)).to_string(),
                     };
                     let mut rooms = self.rooms.write().await;
                     let Some(room) = rooms.get_mut(&room_name_arg) else {
-                        return format!("@world room '{}' not found", room_name_arg);
+                        return Reply::world(format!("room '{}' not found", room_name_arg)).to_string();
                     };
                     room.acl.allow.insert(target_did.clone());
                     room.acl.deny.remove(&target_did);
                     drop(rooms);
                     let _ = self.save_rooms_and_world_index(&[room_name_arg.clone()]).await;
-                    return format!("@world room '{}' acl: allowed {}", room_name_arg, target_did);
+                    return Reply::world(format!("room '{}' acl: allowed {}", room_name_arg, target_did)).to_string();
                 }
                 "deny" => {
                     if acl_arg.is_empty() {
-                        return format!("@world usage: @world.room {} acl deny <did>", room_name_arg);
+                        return Reply::world(format!("usage: @world.room {} acl deny <did>", room_name_arg)).to_string();
                     }
                     let target_did = match Did::try_from(acl_arg.as_str()) {
                         Ok(d) => d.id(),
-                        Err(e) => return format!("@world invalid DID '{}': {}", acl_arg, e),
+                        Err(e) => return Reply::world(format!("invalid DID '{}': {}", acl_arg, e)).to_string(),
                     };
                     let mut rooms = self.rooms.write().await;
                     let Some(room) = rooms.get_mut(&room_name_arg) else {
-                        return format!("@world room '{}' not found", room_name_arg);
+                        return Reply::world(format!("room '{}' not found", room_name_arg)).to_string();
                     };
                     if room.acl.owner.as_deref() == Some(target_did.as_str()) {
-                        return format!("@world room '{}' owner cannot be denied", room_name_arg);
+                        return Reply::world(format!("room '{}' owner cannot be denied", room_name_arg)).to_string();
                     }
                     room.acl.deny.insert(target_did.clone());
                     room.acl.allow.remove(&target_did);
                     drop(rooms);
                     let _ = self.save_rooms_and_world_index(&[room_name_arg.clone()]).await;
-                    return format!("@world room '{}' acl: denied {}", room_name_arg, target_did);
+                    return Reply::world(format!("room '{}' acl: denied {}", room_name_arg, target_did)).to_string();
                 }
                 _ => {
-                    return format!(
-                        "@world unknown acl subcommand '{}'. usage: @world.room {} acl show|open|close|allow <did>|deny <did>",
+                    return Reply::world(format!(
+                        "unknown acl subcommand '{}'. usage: @world.room {} acl show|open|close|allow <did>|deny <did>",
                         acl_cmd, room_name_arg
-                    );
+                    )).to_string();
                 }
             }
         }
 
-        format!("@world unknown command: {}", normalized)
+        Reply::world(format!("unknown command: {}", normalized)).to_string()
     }
 
     async fn room_command(
@@ -10453,19 +10071,7 @@ async fn bind_status_listener(listen_addr: &str) -> Result<TcpListener> {
         .map_err(|e| anyhow!("failed to bind status listener on {}: {}", socket, e))
 }
 
-fn format_system_time(time: SystemTime) -> String {
-    match time.duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_secs().to_string(),
-        Err(_) => "0".to_string(),
-    }
-}
 
-fn socket_addr_to_multiaddr(addr: &SocketAddr) -> String {
-    match addr.ip() {
-        IpAddr::V4(ip) => format!("/ip4/{}/udp/{}/quic-v1", ip, addr.port()),
-        IpAddr::V6(ip) => format!("/ip6/{}/udp/{}/quic-v1", ip, addr.port()),
-    }
-}
 
 fn trim_console(input: &str, width: usize) -> String {
     let mut output = input.chars().take(width).collect::<String>();
@@ -10699,58 +10305,7 @@ mod tests {
     }
 }
 
-fn load_persisted_iroh_secret_key(path: &PathBuf) -> Result<Option<SecretKey>> {
-    if !path.exists() {
-        return Ok(None);
-    }
 
-    let bytes = fs::read(path)?;
-    let key_bytes: [u8; 32] = bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("invalid iroh secret key file length in {}", path.display()))?;
 
-    Ok(Some(SecretKey::from_bytes(&key_bytes)))
-}
 
-fn expand_tilde_path(raw: &str) -> PathBuf {
-    let trimmed = raw.trim();
-    if trimmed == "~" {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home);
-        }
-        return PathBuf::from(trimmed);
-    }
-    if let Some(rest) = trimmed.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    PathBuf::from(trimmed)
-}
-
-fn generate_iroh_secret_file(path: &PathBuf) -> Result<()> {
-    if path.exists() {
-        return Err(anyhow!("iroh secret already exists at {}", path.display()));
-    }
-
-    if let Some(parent) = path.parent() {
-        if parent.as_os_str().is_empty() {
-            // Relative file in current directory, no directory to create.
-        } else {
-            fs::create_dir_all(parent)?;
-        }
-    }
-
-    let mut key_bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut key_bytes);
-    fs::write(path, key_bytes)?;
-
-    #[cfg(unix)]
-    {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o400))?;
-    }
-
-    Ok(())
-}
 

@@ -7,8 +7,11 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
-use ma_core::ObjectProgramRef;
+use ma_core::{ExitData, ObjectProgramRef, ObjectRuntimeState, RoomEvent};
 use serde::{Deserialize, Serialize};
+
+use crate::actor::ActorAcl;
+use crate::room::RoomAcl;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EvaluatorRef {
@@ -503,4 +506,238 @@ where
     let value = serde_yaml::from_str::<T>(&raw)
         .map_err(|e| anyhow!("invalid YAML in {}: {}", path.display(), e))?;
     Ok(value)
+}
+
+// ── IPFS DAG / persistence schema types ──────────────────────────────
+
+/// Root index persisted in IPFS: maps room_name → room CID.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct WorldRootIndex {
+    pub rooms: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct IpldLink {
+    #[serde(rename = "/")]
+    pub cid: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct WorldRootRoomEntry {
+    #[serde(rename = "/")]
+    pub cid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub did: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    pub acl_cid: String,
+    /// Legacy field — ignored on read, never written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_cid: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum WorldRootRoomDagValue {
+    Link(IpldLink),
+    Entry(WorldRootRoomEntry),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct WorldRootIndexDag {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<WorldRootConfigDag>,
+    #[serde(default)]
+    pub public: WorldRootPublicDag,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private: Option<WorldRootPrivateDag>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub rooms: HashMap<String, WorldRootRoomDagValue>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub avatars: HashMap<String, AvatarRegistryEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_cid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang_cid: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct WorldRootConfigDag {
+    #[serde(default)]
+    pub schema: String,
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub world_did: String,
+    #[serde(default)]
+    pub generated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct WorldRootPublicDag {
+    #[serde(default)]
+    pub rooms: HashMap<String, WorldRootRoomDagValue>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub avatars: HashMap<String, AvatarRegistryEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang_cid: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct WorldRootPrivateDag {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_cid: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct PersistedWorldEnvelope {
+    pub kind: String,
+    pub version: u32,
+    pub created_at: String,
+    pub signer_did: String,
+    pub signature_b64: String,
+    pub nonce_b64: String,
+    pub ciphertext_b64: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct RoomAclDoc {
+    pub kind: String,
+    pub version: u32,
+    pub acl: RoomAcl,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct AvatarStateDoc {
+    pub inbox: String,
+    pub agent_did: String,
+    pub agent_endpoint: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub language_order: String,
+    pub owner: String,
+    pub descriptions: HashMap<String, String>,
+    pub acl: ActorAcl,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_pubkey_multibase: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct RoomStateDoc {
+    pub name: String,
+    #[serde(default)]
+    pub titles: HashMap<String, String>,
+    pub exits: Vec<ExitData>,
+    pub descriptions: HashMap<String, String>,
+    pub did: String,
+    #[serde(default)]
+    pub avatars: Vec<AvatarStateDoc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct RuntimeStateDoc {
+    pub kind: String,
+    pub version: u32,
+    pub rooms: HashMap<String, RoomStateDoc>,
+    #[serde(default)]
+    pub events: Vec<String>,
+    #[serde(default)]
+    pub room_events: HashMap<String, Vec<RoomEvent>>,
+    pub next_room_event_sequence: u64,
+    #[serde(default)]
+    pub handle_to_did: HashMap<String, String>,
+    #[serde(default)]
+    pub did_to_handle: HashMap<String, String>,
+    pub owner_did: Option<String>,
+    #[serde(default)]
+    pub room_cids: HashMap<String, String>,
+    #[serde(default)]
+    pub room_objects: HashMap<String, Vec<ObjectRuntimeState>>,
+    #[serde(default)]
+    pub avatar_registry: HashMap<String, AvatarRegistryEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang_cid: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct ExitYamlDoc {
+    pub kind: String,
+    pub version: u32,
+    pub exit: ExitData,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct RoomYamlDocV2 {
+    pub kind: String,
+    pub version: u32,
+    pub id: String,
+    #[serde(default)]
+    pub titles: HashMap<String, String>,
+    #[serde(default)]
+    pub descriptions: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub did: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exits: Vec<ExitData>,
+    #[serde(default)]
+    pub exit_cids: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct LegacyRoomAclYaml {
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub allow_all: bool,
+    #[serde(default)]
+    pub allow: std::collections::HashSet<String>,
+    #[serde(default)]
+    pub deny: std::collections::HashSet<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct LegacyRoomYaml {
+    pub name: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub exits: Vec<ExitData>,
+    #[serde(default)]
+    pub acl: LegacyRoomAclYaml,
+    #[serde(default)]
+    pub descriptions: HashMap<String, String>,
+    #[serde(default)]
+    pub did: String,
+}
+
+// ── Avatar registry entry (used in DAG + runtime) ────────────────────
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct AvatarRegistryEntry {
+    pub did: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub owner: String,
+    #[serde(default)]
+    pub fragment: String,
+    #[serde(default)]
+    pub lang: String,
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub room: String,
+    #[serde(default)]
+    pub key_agreement: String,
+    #[serde(default)]
+    pub acl: String,
+    #[serde(default)]
+    pub shortcuts: HashMap<String, String>,
+    pub doc: IpldLink,
 }
