@@ -15,8 +15,8 @@ pub fn create_agent_identity_from_private_keys(
     encryption_private_key: [u8; 32],
 ) -> Result<GeneratedAgentIdentity> {
     let root_did = Did::new(ipns, fragment)?;
-    let sign_did = Did::new(ipns, fragment)?;
-    let enc_did = Did::new(ipns, fragment)?;
+    let sign_did = Did::new_root(ipns)?;
+    let enc_did = Did::new_root(ipns)?;
 
     let signing_key = SigningKey::from_private_key_bytes(sign_did, signing_private_key)?;
     let encryption_key = EncryptionKey::from_private_key_bytes(enc_did, encryption_private_key)?;
@@ -56,8 +56,8 @@ pub fn create_agent_identity_from_private_keys(
 }
 
 pub fn create_agent_identity(ipns: &str, fragment: &str) -> Result<GeneratedAgentIdentity> {
-    let sign_did = Did::new(ipns, fragment)?;
-    let enc_did = Did::new(ipns, fragment)?;
+    let sign_did = Did::new_root(ipns)?;
+    let enc_did = Did::new_root(ipns)?;
     let signing_key = SigningKey::generate(sign_did)?;
     let encryption_key = EncryptionKey::generate(enc_did)?;
     create_agent_identity_from_private_keys(

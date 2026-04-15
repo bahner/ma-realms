@@ -8339,27 +8339,42 @@ async fn ensure_world_did_document(
 
     let document_cid = dag_put_dag_cbor(kubo_url, &document).await?;
 
-    let ipns_options = IpnsPublishOptions {
-        timeout: Duration::from_secs(45),
-        ..IpnsPublishOptions::default()
-    };
-
-    let published = ipns_publish_with_retry(
-        kubo_url,
-        &key_name,
-        &document_cid,
-        &ipns_options,
-        8,
-        Duration::from_millis(1500),
-    )
-    .await?;
-
     info!(
-        "Upserted world DID document {} as CID {} (IPNS {})",
+        "World DID document {} stored as CID {} — IPNS publish continues in background",
         world_did.id(),
-        document_cid,
-        published
+        document_cid
     );
+
+    // Spawn IPNS publish in background so startup is not blocked by slow Kubo publishes.
+    let bg_kubo_url = kubo_url.to_string();
+    let bg_key_name = key_name.clone();
+    let bg_document_cid = document_cid.clone();
+    let bg_world_did_id = world_did.id();
+    tokio::spawn(async move {
+        let ipns_options = IpnsPublishOptions {
+            timeout: Duration::from_secs(45),
+            ..IpnsPublishOptions::default()
+        };
+        match ipns_publish_with_retry(
+            &bg_kubo_url,
+            &bg_key_name,
+            &bg_document_cid,
+            &ipns_options,
+            8,
+            Duration::from_millis(1500),
+        )
+        .await
+        {
+            Ok(published) => info!(
+                "Background IPNS publish complete for {} CID {} (IPNS {})",
+                bg_world_did_id, bg_document_cid, published
+            ),
+            Err(err) => warn!(
+                "Background IPNS publish failed for {} CID {}: {}",
+                bg_world_did_id, bg_document_cid, err
+            ),
+        }
+    });
 
     Ok(world_did.id())
 }
@@ -9721,7 +9736,13 @@ async fn main() -> Result<()> {
         world.set_world_did(&world_did).await?;
         info!("Runtime world DID: {}", world_did);
 
-        let restore_root = resolve_world_root_cid_from_did(&kubo_url, &world_did).await?;
+        let restore_root = match resolve_world_root_cid_from_did(&kubo_url, &world_did).await {
+            Ok(r) => r,
+            Err(err) => {
+                warn!("Failed resolving world root CID from DID {}: {} — starting fresh", world_did, err);
+                None
+            }
+        };
         if let Some(root_cid) = restore_root {
             match world.load_from_world_cid(&root_cid).await {
                 Ok(rooms_loaded) => info!(
@@ -9749,9 +9770,9 @@ async fn main() -> Result<()> {
         }
 
         if world.world_cid().await.is_none() {
-            let (state_cid, root_cid) = world.save_and_publish().await?;
+            let (state_cid, root_cid) = world.save_encrypted_state().await?;
             info!(
-                "Bootstrapped world state with lobby snapshot: state_cid={} root_cid={}",
+                "Bootstrapped world state with lobby snapshot: state_cid={} root_cid={} — IPNS deferred to background publisher",
                 state_cid,
                 root_cid
             );

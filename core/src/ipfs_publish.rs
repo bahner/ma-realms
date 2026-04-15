@@ -13,7 +13,7 @@ use crate::protocol::{
     CONTENT_TYPE_DOC, IpfsPublishDidRequest, IpfsPublishDidResponse,
 };
 use ma_core::kubo::{
-    IpnsPublishOptions, import_key, ipfs_add, list_keys, name_publish_with_retry,
+    IpnsPublishOptions, dag_put, import_key, list_keys, name_publish_with_retry,
 };
 
 /// The validated artefacts from an incoming `ma/ipfs/1` request.
@@ -145,7 +145,7 @@ pub async fn publish_did_document_to_kubo(
         ));
     };
 
-    let document_cid = ipfs_add(kubo_url, did_document_json.as_bytes().to_vec()).await?;
+    let document_cid = dag_put(kubo_url, &document).await?;
     let ipns_options = IpnsPublishOptions::default();
     name_publish_with_retry(
         kubo_url,

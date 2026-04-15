@@ -12,7 +12,6 @@ use did_ma::{DID_PREFIX, Did, Document, SigningKey};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey, endpoint::presets};
 use ma_core::{AVATAR_ALPN, CONTENT_TYPE_WORLD, DEFAULT_WORLD_RELAY_URL, INBOX_ALPN, MessageEnvelope, WorldCommand, WorldRequest, WorldResponse, create_agent_identity_from_private_keys, default_ma_config_root, normalize_relay_url, parse_message, resolve_inbox_endpoint_id};
 use rand::RngCore;
-use reqwest::multipart;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -720,14 +719,6 @@ struct KuboKeyItem {
 }
 
 #[derive(Debug, Deserialize)]
-struct IpfsAddResponse {
-    #[serde(rename = "Hash")]
-    hash_upper: Option<String>,
-    #[serde(rename = "hash")]
-    hash_lower: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 struct NameResolveResponse {
     #[serde(rename = "Path")]
     path_upper: Option<String>,
@@ -800,33 +791,6 @@ async fn kubo_list_keys(kubo_url: &str) -> Result<Vec<KuboKeyInfo>> {
             }
         })
         .collect())
-}
-
-async fn kubo_ipfs_add(kubo_url: &str, data: Vec<u8>) -> Result<String> {
-    let base = kubo_url.trim_end_matches('/');
-    let url = format!("{base}/api/v0/add");
-    let part = multipart::Part::bytes(data)
-        .file_name("did.json")
-        .mime_str("application/json")?;
-    let form = multipart::Form::new().part("file", part);
-
-    let body = reqwest::Client::new()
-        .post(url)
-        .query(&[("pin", "true"), ("cid-version", "1")])
-        .multipart(form)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-
-    let parsed: IpfsAddResponse = serde_json::from_str(&body)
-        .map_err(|e| anyhow!("failed parsing add response: {} body={}", e, body))?;
-    let cid = parsed.hash_upper.or(parsed.hash_lower).unwrap_or_default();
-    if cid.trim().is_empty() {
-        return Err(anyhow!("missing hash in add response: {}", body));
-    }
-    Ok(cid)
 }
 
 async fn kubo_ipns_publish(kubo_url: &str, key_name: &str, cid: &str) -> Result<()> {
@@ -1034,9 +998,7 @@ async fn ensure_world_root_did_published(state: &AppState) -> Result<String> {
     if let Some(version) = read_agent_version() {
         document.set_ma_version(version);
     }
-    let document_json = document.marshal()
-        .map_err(|e| anyhow!("failed to marshal world root DID document: {}", e))?;
-    let cid = kubo_ipfs_add(kubo_url, document_json.into_bytes()).await?;
+    let cid = ma_core::kubo::dag_put(kubo_url, &document).await?;
     kubo_ipns_publish(kubo_url, &world_key_name, &cid).await?;
 
     if cfg.world_did_root != root_did {

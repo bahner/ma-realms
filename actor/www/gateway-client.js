@@ -1,3 +1,5 @@
+import { decodeDagCbor } from './cbor.js';
+
 const DEFAULT_LOCAL_GATEWAY_BASE = 'http://localhost:8080';
 
 export function normalizeIpfsGatewayBase(value) {
@@ -50,6 +52,11 @@ export async function fetchGatewayTextByPath(contentPath, { getApiBase, fallback
           throw new Error(lastError);
         }
         continue;
+      }
+      const contentType = (response.headers.get('content-type') || '').toLowerCase();
+      if (contentType.includes('dag-cbor') || contentType.includes('application/cbor')) {
+        const buf = await response.arrayBuffer();
+        return JSON.stringify(decodeDagCbor(buf));
       }
       return await response.text();
     } catch (error) {
