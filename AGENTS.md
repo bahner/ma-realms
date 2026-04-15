@@ -50,7 +50,7 @@ Don't mutate data that's is badly formed. Raise an error instead.
 
 When validating input always check if input is valid and else fail. You should mot explicitly search for previously mention errors and just raise an error for arbitrary values, unless this is required. Don't create a set of error values, but of valid values and check for membership in that else fail.
 
-## CRITICAL: Aliases are ALWAYS local to the actor. All messages to world use full DIDs.
+## CRITICAL: Aliases are ALWAYS local to the actor. All messages to world use full DID urls
 
 This is an absolute, non-negotiable rule:
 

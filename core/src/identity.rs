@@ -25,7 +25,7 @@ pub fn create_agent_identity_from_private_keys(
 
     let assertion_vm = VerificationMethod::new(
         root_did.base_id(),
-        root_did.id(),
+        root_did.base_id(),
         signing_key.key_type.clone(),
         signing_key.did.fragment.as_deref().unwrap_or_default(),
         signing_key.public_key_multibase.clone(),
@@ -33,7 +33,7 @@ pub fn create_agent_identity_from_private_keys(
 
     let key_agreement_vm = VerificationMethod::new(
         root_did.base_id(),
-        root_did.id(),
+        root_did.base_id(),
         encryption_key.key_type.clone(),
         encryption_key.did.fragment.as_deref().unwrap_or_default(),
         encryption_key.public_key_multibase.clone(),
@@ -42,8 +42,8 @@ pub fn create_agent_identity_from_private_keys(
     let assertion_vm_id = assertion_vm.id.clone();
     document.add_verification_method(assertion_vm.clone())?;
     document.add_verification_method(key_agreement_vm.clone())?;
-    document.assertion_method = assertion_vm_id;
-    document.key_agreement = key_agreement_vm.id.clone();
+    document.assertion_method = vec![assertion_vm_id];
+    document.key_agreement = vec![key_agreement_vm.id.clone()];
     document.set_ma_type("agent")?;
     document.sign(&signing_key, &assertion_vm)?;
 

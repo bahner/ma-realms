@@ -892,8 +892,10 @@ fn sender_push_endpoint_from_document(document: &Document) -> Option<String> {
 }
 
 fn sender_encryption_pubkey_multibase_from_document(document: &Document) -> Result<String> {
+    let ka_id = document.key_agreement.first()
+        .ok_or_else(|| anyhow!("sender DID document has no keyAgreement"))?;
     let vm = document
-        .get_verification_method_by_id(&document.key_agreement)
+        .get_verification_method_by_id(ka_id)
         .map_err(|e| anyhow!("sender DID document missing keyAgreement verification method: {}", e))?;
     let key = vm.public_key_multibase.trim();
     if key.is_empty() {
@@ -1275,8 +1277,8 @@ impl World {
         document
             .add_verification_method(key_agreement_vm)
             .map_err(|e| anyhow!("failed adding avatar keyAgreement method: {}", e))?;
-        document.assertion_method = assertion_vm_id;
-        document.key_agreement = key_agreement_vm_id;
+        document.assertion_method = vec![assertion_vm_id];
+        document.key_agreement = vec![key_agreement_vm_id];
         document.set_ma_type("avatar")?;
         if let Some(did_language_order) = normalize_language_for_did_document(&language_order) {
             if let Err(err) = document.set_language(did_language_order.clone()) {
@@ -8600,9 +8602,12 @@ async fn publish_world_did_runtime_ma(
     document.set_ma_world(serde_json::json!({ "/": root_cid }));
     document.set_ma_state_cid(state_cid);
 
+    let assertion_id = document.assertion_method.first()
+        .ok_or_else(|| anyhow!("world DID has no assertionMethod"))?
+        .clone();
     let assertion_vm = document
-        .get_verification_method_by_id(&document.assertion_method)
-        .map_err(|e| anyhow!("world DID missing assertion method '{}': {}", document.assertion_method, e))?
+        .get_verification_method_by_id(&assertion_id)
+        .map_err(|e| anyhow!("world DID missing assertion method '{}': {}", assertion_id, e))?
         .clone();
     document.sign(&signing_key, &assertion_vm)?;
 
@@ -8695,8 +8700,8 @@ async fn ensure_world_did_document(
     let key_agreement_vm_id = key_agreement_vm.id.clone();
     document.add_verification_method(assertion_vm.clone())?;
     document.add_verification_method(key_agreement_vm)?;
-    document.assertion_method = assertion_vm_id;
-    document.key_agreement = key_agreement_vm_id;
+    document.assertion_method = vec![assertion_vm_id];
+    document.key_agreement = vec![key_agreement_vm_id];
     document.set_ma_type("world")?;
     let transport_paths = vec![
         format!("/ma-iroh/{endpoint_id}/{}", String::from_utf8_lossy(INBOX_ALPN)),

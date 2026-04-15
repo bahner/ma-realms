@@ -1230,9 +1230,7 @@ fn build_signed_world_request(
             ));
         }
         (_, Some(value)) => value,
-        (_, None) => Did::try_from(plain.document.id.as_str())
-            .map(|did| did.base_id())
-            .unwrap_or_else(|_| plain.document.id.clone()),
+        (_, None) => plain.document.id.clone(),
     };
 
     let content = serde_json::to_vec(&command).map_err(js_err)?;
@@ -1439,9 +1437,12 @@ where
     }
 
     let signing_key = restore_signing_key(&plain.ipns, &plain.signing_private_key_hex)?;
+    let assertion_id = plain.document.assertion_method.first()
+        .ok_or_else(|| js_err("no assertionMethod"))?
+        .clone();
     let assertion_method = plain
         .document
-        .get_verification_method_by_id(&plain.document.assertion_method)
+        .get_verification_method_by_id(&assertion_id)
         .map_err(js_err)?
         .clone();
     plain.document.sign(&signing_key, &assertion_method).map_err(js_err)?;
@@ -1462,9 +1463,9 @@ where
 }
 
 fn validate_full_did_key_references(document: &Document) -> Result<(), String> {
-    let doc_root = Did::try_from(document.id.as_str())
-        .map_err(|e| format!("invalid document DID '{}': {}", document.id, e))?
-        .base_id();
+    Did::validate(&document.id)
+        .map_err(|e| format!("invalid document DID '{}': {}", document.id, e))?;
+    let doc_root = document.id.clone();
 
     for method in &document.verification_method {
         let method_id = method.id.trim();
@@ -1484,9 +1485,11 @@ fn validate_full_did_key_references(document: &Document) -> Result<(), String> {
         }
     }
 
+    let assertion_ref = document.assertion_method.first().map(String::as_str).unwrap_or("");
+    let agreement_ref = document.key_agreement.first().map(String::as_str).unwrap_or("");
     for (label, value) in [
-        ("assertionMethod", document.assertion_method.as_str()),
-        ("keyAgreement", document.key_agreement.as_str()),
+        ("assertionMethod", assertion_ref),
+        ("keyAgreement", agreement_ref),
         ("proof.verificationMethod", document.proof.verification_method.as_str()),
     ] {
         let reference = value.trim();
@@ -1571,9 +1574,12 @@ fn create_identity_internal(
     let created_at = now_unix_secs();
     initialize_document_lifecycle_metadata(&mut generated.document, created_at);
     let signing_key = restore_signing_key(ipns, &hex::encode(generated.signing_private_key))?;
+    let assertion_id = generated.document.assertion_method.first()
+        .ok_or_else(|| js_err("no assertionMethod"))?
+        .clone();
     let assertion_method = generated
         .document
-        .get_verification_method_by_id(&generated.document.assertion_method)
+        .get_verification_method_by_id(&assertion_id)
         .map_err(js_err)?
         .clone();
     generated
@@ -1740,17 +1746,21 @@ fn validate_identity_bundle_keys_internal(
         return Err("identity bundle encryption private key is all zeros".to_string());
     }
 
+    let assertion_id = plain.document.assertion_method.first()
+        .ok_or_else(|| "no assertionMethod in document".to_string())?;
     let assertion_vm = plain
         .document
-        .get_verification_method_by_id(&plain.document.assertion_method)
+        .get_verification_method_by_id(assertion_id)
         .map_err(|e| e.to_string())?;
     if assertion_vm.public_key_multibase != signing_key.public_key_multibase {
         return Err("signing private key does not match document assertionMethod public key".to_string());
     }
 
+    let agreement_id = plain.document.key_agreement.first()
+        .ok_or_else(|| "no keyAgreement in document".to_string())?;
     let agreement_vm = plain
         .document
-        .get_verification_method_by_id(&plain.document.key_agreement)
+        .get_verification_method_by_id(agreement_id)
         .map_err(|e| e.to_string())?;
     if agreement_vm.public_key_multibase != encryption_key.public_key_multibase {
         return Err("encryption private key does not match document keyAgreement public key".to_string());
@@ -2009,9 +2019,7 @@ pub async fn publish_did_document_via_world_ipfs(
         .marshal()
         .map_err(|e| js_err(format!("failed to marshal DID document: {e}")))?;
 
-    let target_did = Did::try_from(plain.document.id.as_str())
-        .map(|did| did.base_id())
-        .unwrap_or_else(|_| plain.document.id.clone());
+    let target_did = plain.document.id.clone();
 
     let payload = IpfsPublishDidRequest {
         did_document_json,
@@ -2571,9 +2579,12 @@ mod tests {
         let mut generated = create_agent_identity(ipns, "tester").expect("generate identity");
         let signing_key = restore_signing_key_internal(ipns, &hex::encode(generated.signing_private_key))
             .expect("restore signing key");
+        let assertion_id = generated.document.assertion_method.first()
+            .expect("assertion method ref")
+            .clone();
         let assertion_method = generated
             .document
-            .get_verification_method_by_id(&generated.document.assertion_method)
+            .get_verification_method_by_id(&assertion_id)
             .expect("assertion method")
             .clone();
         generated
@@ -2712,8 +2723,8 @@ mod tests {
                     .unwrap_or_else(|| "sig".to_string());
                 method.id = format!("#{}", fragment);
             }
-            plain.document.assertion_method = "#sig".to_string();
-            plain.document.key_agreement = "#enc".to_string();
+            plain.document.assertion_method = vec!["#sig".to_string()];
+            plain.document.key_agreement = vec!["#enc".to_string()];
             plain.document.proof.verification_method = "#sig".to_string();
         });
 

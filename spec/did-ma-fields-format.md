@@ -1,13 +1,60 @@
-# did:ma Extension Fields (ma namespace)
+# did:ma Extension Fields (ma namespace) — Realm Profile
 
-Version: 0.0.4
+Version: 0.0.5
 Status: Draft
 
 ## Abstract
 
-This document defines method-specific fields under the top-level `ma` key in
-`did:ma` documents. It specifies type profiles, transport format, validation
-rules, and the inbox addressing model.
+This document defines the ma-realms implementation profile for method-specific
+fields under the top-level `ma` key in `did:ma` documents. It specifies type
+profiles, transport format, validation rules, the inbox addressing model, and
+the fragment requirement for realm DID URLs.
+
+For the generic `ma` namespace structure and reserved field names, see the
+foundational [did-ma-fields-format.md](https://github.com/bahner/ma-spec/blob/main/did-ma-fields-format.md).
+
+## 0. DID vs DID URL — Fragment Requirement
+
+Per W3C DID Core §3.1, a DID is the bare identifier with no fragment:
+
+```text
+did:ma:k51qzi5uqu5dj9807pbuod1pplf0vxh8m4lfy3ewl9qbm2s8dsf9ugdf9gedhr
+```
+
+Per W3C DID Core §3.2, a DID URL MAY include a fragment:
+
+```text
+did:ma:k51qzi5uqu5dj9807pbuod1pplf0vxh8m4lfy3ewl9qbm2s8dsf9ugdf9gedhr#bahner
+```
+
+In the ma-realms runtime, the bare DID identifies the IPNS namespace (the
+document identity). The DID URL with fragment identifies an addressable object
+within that namespace — an avatar, a room, a mailbox, etc.
+
+### 0.1 Fragment Rules (per W3C DID Core §8.1 rule 11)
+
+1. All addressable realm objects MUST be referenced by DID URL (with fragment).
+1. DID document `id` and `controller` fields MUST be bare DIDs (no fragment),
+   per W3C §5.1.1 and §5.1.2.
+1. Verification method `id` fields MUST be DID URLs (with fragment), per W3C
+   §5.2.
+1. The fragment is the local identifier within the world's namespace. The world
+   passes fragments internally; DID URLs are the external messaging addresses.
+1. When no specific fragment is warranted (e.g. a standalone agent identity),
+   the RECOMMENDED default fragment is `#ma`.
+
+### 0.2 Where DIDs and DID URLs Appear
+
+| Context | Form | Example |
+| --- | --- | --- |
+| Document `id` | bare DID | `did:ma:k51...` |
+| Document `controller` | bare DID | `did:ma:k51...` |
+| Verification method `id` | DID URL | `did:ma:k51...#signing` |
+| Verification method `controller` | bare DID | `did:ma:k51...` |
+| `ma.inbox` | DID URL | `did:ma:k51...#bahner` |
+| `ma.world` | bare DID | `did:ma:k51...` |
+| `assertionMethod` / `keyAgreement` refs | DID URL | `did:ma:k51...#signing` |
+| Message `from` / `to` | DID URL | `did:ma:k51...#bahner` |
 
 ## 1. Namespace Rules
 

@@ -6,9 +6,11 @@ define realm runtime behavior.
 
 ## Documents
 
-- [did:ma Extension Fields](did-ma-fields-format.md) — Type profiles
-  (world/agent/avatar/room/object), transport ALPN registry, world root DAG
-  structure, IPLD link semantics, and validation rules.
+- [did:ma Extension Fields — Realm Profile](did-ma-fields-format.md) — Fragment
+  requirement (DID vs DID URL), type profiles
+  (world/agent/avatar/room/object), transport ALPN registry, and validation
+  rules. Builds on the foundational
+  [did-ma-fields-format.md](https://github.com/bahner/ma-spec/blob/main/did-ma-fields-format.md).
 
 - [Access Control v1](access-control-v1.md) — Capability-based ACL model with
   wildcard patterns, avatar binding gate, owner semantics, and evaluation
