@@ -1981,8 +1981,10 @@ async fn send_ipfs_publish_request(
     recv.read_exact(&mut bytes).await.map_err(js_err)?;
 
     let _ = send.finish();
-    connection.close(0u32.into(), b"ok");
-    endpoint.close().await;
+    drop(recv);
+    drop(send);
+    // Let the one-shot ma/ipfs lane wind down naturally instead of tearing the
+    // entire connection and endpoint down immediately after the response.
 
     serde_json::from_slice::<IpfsPublishDidResponse>(&bytes).map_err(js_err)
 }

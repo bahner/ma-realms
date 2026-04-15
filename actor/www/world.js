@@ -241,6 +241,7 @@ export function createWorldDispatchFlow({
   state,
   appendMessage,
   enterHome,
+  getMyHomeTarget,
   resolveWorldEndpointForDid,
   isLikelyIrohAddress,
   normalizeIrohAddress,
@@ -430,6 +431,12 @@ export function createWorldDispatchFlow({
     const target = String(rawTarget || '').trim();
     if (!target) {
       return '';
+    }
+    if (target.toLowerCase() === 'home') {
+      const configuredHome = String((typeof getMyHomeTarget === 'function' ? getMyHomeTarget() : state.myHome) || '').trim();
+      if (isMaDid(configuredHome)) {
+        return configuredHome;
+      }
     }
     if (isMaDid(target)) {
       return target;
@@ -1361,9 +1368,7 @@ export function createWorldResponseFlow({
       applyRoomMetadataPatch();
     }
 
-    state.currentHome.lastEventSequence = toSequenceNumber(
-      result.latest_event_sequence || state.currentHome.lastEventSequence || 0
-    );
+    // Do not advance poll cursor from hints. Cursor moves only when events are actually processed.
 
     primeDidLookupCacheFromRoomObjectDids(result.room_object_dids);
 

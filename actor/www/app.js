@@ -108,6 +108,7 @@ const PROPER_NAME = '間';
 const BRAND_SUBTITLE_STATIC = 'A text-first world for literate play';
 const API_KEY = `${STORAGE_PREFIX}.gatewayApi`;
 const ALIAS_BOOK_KEY = `${STORAGE_PREFIX}.aliasBook`;
+const MY_HOME_KEY = `${STORAGE_PREFIX}.my.home`;
 const LAST_ALIAS_KEY = `${STORAGE_PREFIX}.lastAlias`;
 const TAB_ALIAS_KEY = `${STORAGE_PREFIX}.tabAlias`;
 const DEBUG_KEY = `${STORAGE_PREFIX}.debug`;
@@ -200,6 +201,7 @@ const state = {
     commands: [],
   },
   aliasBook: {},
+  myHome: '',
   systemAliases: {},
   currentHome: null,
   roomPollTimer: null,
@@ -1894,15 +1896,16 @@ function renderAvatarPanel() {
   if (!list) return;
   list.innerHTML = '';
   const sorted = Array.from(state.roomPresence.values()).sort((a, b) => {
-    const left = String(a?.did || a?.handle || '').toLowerCase();
-    const right = String(b?.did || b?.handle || '').toLowerCase();
+    const left = String(a?.handle || a?.did || '').toLowerCase();
+    const right = String(b?.handle || b?.did || '').toLowerCase();
     return left.localeCompare(right);
   });
   for (const entry of sorted) {
     const li = document.createElement('li');
     li.className = 'avatar-item';
     const didText = String(entry?.did || '').trim();
-    li.textContent = didText ? formatDidForDialog(didText) : String(entry?.handle || '').trim();
+    const handle = String(entry?.handle || '').trim();
+    li.textContent = handle || (didText ? formatDidForDialog(didText) : '');
     if (didText) {
       li.title = didText;
     }
@@ -2449,12 +2452,7 @@ const inboundDispatcher = createInboundDispatcher({
       if (typeof payload?.room_description === 'string') {
         state.currentHome.roomDescription = payload.room_description;
       }
-      if (typeof payload?.latest_event_sequence === 'number') {
-        state.currentHome.lastEventSequence = Math.max(
-          toSequenceNumber(state.currentHome.lastEventSequence || 0),
-          toSequenceNumber(payload.latest_event_sequence)
-        );
-      }
+      // Do not move event cursor from presence hints; poll cursor advances only from processed events.
 
       clearRoomPresence();
       if (Array.isArray(payload?.avatars)) {
@@ -2592,10 +2590,7 @@ async function pollCurrentHomeEvents() {
       nextSequence = eventSequence;
     }
 
-    state.currentHome.lastEventSequence = Math.max(
-      nextSequence,
-      toSequenceNumber(result.latest_event_sequence || home.lastEventSequence || 0)
-    );
+    state.currentHome.lastEventSequence = nextSequence;
     state.consecutivePollFailures = 0;
     state.pollErrorShown = false;
   } catch (error) {
@@ -2842,6 +2837,8 @@ const { parseDot, parseLocalCommand } = createDotCommands({
   appendSystemUi,
   appendMessage,
   uiText,
+  setMyHomeTarget,
+  getMyHomeTarget,
   humanizeIdentifier,
   isPrintableAliasLabel,
   saveAliasBook,
@@ -2945,6 +2942,77 @@ async function publishIdentityToWorldDid(worldDid) {
   );
 
   return JSON.parse(String(raw || '{}'));
+}
+
+function configuredHomeWorldDid() {
+  const target = String(state.myHome || '').trim();
+  if (!isMaDid(target)) {
+    return '';
+  }
+  return didParts(target).root;
+}
+
+function setMyHomeTarget(target) {
+  const value = String(target || '').trim();
+  state.myHome = value;
+  try {
+    if (value) {
+      localStorage.setItem(MY_HOME_KEY, value);
+    } else {
+      localStorage.removeItem(MY_HOME_KEY);
+    }
+  } catch (_) {
+    // Ignore storage write failures.
+  }
+}
+
+function getMyHomeTarget() {
+  return String(state.myHome || '').trim();
+}
+
+function scheduleAutoIdentityPublishForConfiguredHomeWorld() {
+  if (state.didPublishPromise) {
+    return;
+  }
+
+  const worldDid = String(state.currentHome?.worldDid || '').trim();
+  if (!isMaDid(worldDid)) {
+    return;
+  }
+
+  const configuredHomeDid = configuredHomeWorldDid();
+  if (!configuredHomeDid || configuredHomeDid !== didParts(worldDid).root) {
+    return;
+  }
+
+  state.didPublishError = '';
+  appendMessage('system', `Auto-publishing identity to ${worldDid} via ma/ipfs/1...`);
+
+  state.didPublishPromise = Promise.resolve()
+    .then(async () => {
+      const result = await publishIdentityToWorldDid(worldDid);
+      if (result?.ok) {
+        const publishedDid = String(result.did || '').trim();
+        const ipns = publishedDid.startsWith('did:ma:')
+          ? didParts(publishedDid).root.slice('did:ma:'.length)
+          : '';
+        setCurrentPublishInfo({ ipns, cid: String(result.cid || '').trim() });
+        appendMessage('system', result.message || 'DID document published successfully.');
+        return;
+      }
+
+      const message = String(result?.message || 'Publish failed (world returned ok=false).');
+      state.didPublishError = message;
+      appendMessage('system', `Automatic identity publish failed: ${message}`);
+    })
+    .catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      state.didPublishError = message;
+      appendMessage('system', `Automatic identity publish failed: ${message}`);
+    })
+    .finally(() => {
+      state.didPublishPromise = null;
+    });
 }
 
 function saveIdentityRecord(aliasName, encryptedBundle) {
@@ -3601,6 +3669,7 @@ async function enterHome(target, preferredRoom = null) {
   const inboxEndpointId = await ensureInboxListener();
   syncBundleTransportsFromEndpoint(inboxEndpointId);
   updateIdentityLine();
+  scheduleAutoIdentityPublishForConfiguredHomeWorld();
 
   startHomeEventPolling();
 
@@ -3630,6 +3699,7 @@ worldDispatchFlow = createWorldDispatchFlow({
   state,
   appendMessage,
   enterHome,
+  getMyHomeTarget,
   resolveWorldEndpointForDid,
   isLikelyIrohAddress,
   normalizeIrohAddress,
@@ -3820,6 +3890,32 @@ function restoreSavedValues() {
   }
 
   state.aliasBook = loadAliasBook();
+  const storedMyHome = String(localStorage.getItem(MY_HOME_KEY) || '').trim();
+  const legacyMyHome = String(state.aliasBook?.home || '').trim();
+  if (storedMyHome) {
+    state.myHome = storedMyHome;
+  } else if (legacyMyHome) {
+    state.myHome = legacyMyHome;
+    try {
+      localStorage.setItem(MY_HOME_KEY, legacyMyHome);
+    } catch (_) {
+      // Ignore storage write failures.
+    }
+  }
+
+  let aliasBookChanged = false;
+  if (Object.prototype.hasOwnProperty.call(state.aliasBook, 'home')) {
+    delete state.aliasBook.home;
+    aliasBookChanged = true;
+  }
+  if (Object.prototype.hasOwnProperty.call(state.aliasBook, '@home')) {
+    delete state.aliasBook['@home'];
+    aliasBookChanged = true;
+  }
+  if (aliasBookChanged) {
+    saveAliasBook();
+  }
+
   state.debug = readStoredDebugFlag();
   state.messageTtl.chat = readStoredMessageTtl(MSG_CHAT_TTL_KEY, DEFAULT_CHAT_TTL_SECONDS);
   state.messageTtl.cmd = readStoredMessageTtl(MSG_CMD_TTL_KEY, DEFAULT_CMD_TTL_SECONDS);

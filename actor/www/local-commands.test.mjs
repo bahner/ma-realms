@@ -13,6 +13,7 @@ function createHarness() {
       document_json: '{"id":"did:ma:test#hero"}',
     },
     aliasBook: {},
+    myHome: '',
     aliasRewriteEnabled: true,
     mailbox: [
       {
@@ -90,8 +91,8 @@ test('@my.home stores explicit room DID as home alias', () => {
   const harness = createHarness();
 
   assert.equal(harness.parseLocalCommand('@my.home did:ma:testworld#lobby'), true);
-  assert.equal(harness.state.aliasBook.home, 'did:ma:testworld#lobby');
-  assert.equal(harness.messages[0], 'Home set: home => did:ma:testworld#lobby');
+  assert.equal(harness.state.myHome, 'did:ma:testworld#lobby');
+  assert.equal(harness.messages[0], 'Home set: did:ma:testworld#lobby');
   assert.equal(harness.messages[1], 'Birth: publishing identity to your home world now (first time can take a little while).');
   assert.equal(harness.messages[2], 'Publishing identity to did:ma:testworld#lobby via ma/ipfs/1...');
 });
@@ -100,7 +101,7 @@ test('@actor.home is read-only and does not mutate home alias', () => {
   const harness = createHarness();
 
   assert.equal(harness.parseLocalCommand('@actor.home did:ma:testworld#atrium'), true);
-  assert.equal(harness.state.aliasBook.home, undefined);
+  assert.equal(harness.state.myHome, '');
   assert.equal(harness.messages[0], '@actor.* is read-only for now. Use @my.* for mutating commands.');
 });
 

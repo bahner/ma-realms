@@ -5,6 +5,8 @@ export function createDotCommands({
   appendSystemUi,
   appendMessage,
   uiText,
+  setMyHomeTarget,
+  getMyHomeTarget,
   humanizeIdentifier,
   isPrintableAliasLabel,
   saveAliasBook,
@@ -112,7 +114,7 @@ export function createDotCommands({
 
     let worldDid = '';
     if (args.length === 0) {
-      const home = String(state.aliasBook?.home || '').trim();
+      const home = String((typeof getMyHomeTarget === 'function' ? getMyHomeTarget() : state.myHome) || '').trim();
       if (home && isMaDid(home)) {
         worldDid = home;
       }
@@ -146,23 +148,32 @@ export function createDotCommands({
   }
 
   function setHome(args) {
+    if (args.length === 0) {
+      const current = String((typeof getMyHomeTarget === 'function' ? getMyHomeTarget() : state.myHome) || '').trim();
+      appendMessage('system', current || '(home not set)');
+      return true;
+    }
+
     if (args.length !== 1) {
-      appendMessage('system', 'Usage: my.home <did:ma:<world>#<room>>');
+      appendMessage('system', 'Usage: my.home [<did:ma:<world>#<room>>]');
       return true;
     }
 
     const target = String(args[0] || '').trim();
     if (!isMaDid(target) || !target.includes('#')) {
-      appendMessage('system', 'Usage: my.home <did:ma:<world>#<room>>');
+      appendMessage('system', 'Usage: my.home [<did:ma:<world>#<room>>]');
       return true;
     }
 
-    state.aliasBook.home = target;
-    saveAliasBook();
+    if (typeof setMyHomeTarget === 'function') {
+      setMyHomeTarget(target);
+    } else {
+      state.myHome = target;
+    }
     if (typeof onAliasBookChanged === 'function') {
       onAliasBookChanged();
     }
-    appendMessage('system', `Home set: home => ${target}`);
+    appendMessage('system', `Home set: ${target}`);
 
     if (!state.identity) {
       appendSystemUi(
@@ -559,7 +570,7 @@ export function createDotCommands({
       appendSystemUi('  @my.did               - show your identity DID', '  @my.did               - vis identitets-DID-en din');
       appendSystemUi('  @my.identity          - show local pre-publish DID document as raw JSON', '  @my.identity          - vis lokalt DID-dokument (før publisering) som rå JSON');
       appendSystemUi('  @my.identity.publish [<did:ma:world>] - publish DID document to world via ma/ipfs/1 (defaults to home world)', '  @my.identity.publish [<did:ma:world>] - publiser DID-dokument til verden via ma/ipfs/1 (standard: hjemmeverden)');
-      appendSystemUi('  @my.home <did:ma:...#room> - set home target', '  @my.home <did:ma:...#room> - sett home-mål');
+      appendSystemUi('  @my.home [<did:ma:...#room>] - show/set home target', '  @my.home [<did:ma:...#room>] - vis/sett home-mål');
       appendSystemUi('    birth flow: @my.home also auto-publishes your identity; first publish can take a little while', '    fødselsflyt: @my.home publiserer også identiteten automatisk; første publisering kan ta litt tid');
       appendSystemUi('  @my.aliases add <name> <target> - add/update alias (no spaces in target)', '  @my.aliases add <navn> <mål> - legg til/oppdater alias (ingen mellomrom i mål)');
       appendSystemUi('    note: @here/@me/@world/@avatar are updated automatically', '    merk: @here/@me/@world/@avatar oppdateres automatisk');

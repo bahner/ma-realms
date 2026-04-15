@@ -151,9 +151,13 @@ export function createInboundDispatcher(deps) {
       return;
     }
     const expectedRoomDid = state.currentHome?.roomDid;
+    const expectedRoom = String(state.currentHome?.room || '').trim();
     const kind = String(payload?.kind || '').trim();
+    const payloadRoom = String(payload?.room || '').trim();
     const allowCrossRoomSender = kind === 'presence.room_state';
-    if (!allowCrossRoomSender && (!expectedRoomDid || evt.senderDid !== expectedRoomDid)) {
+    const senderMatchesExpectedRoomDid = Boolean(expectedRoomDid) && evt.senderDid === expectedRoomDid;
+    const payloadMatchesCurrentRoom = Boolean(expectedRoom) && Boolean(payloadRoom) && payloadRoom === expectedRoom;
+    if (!allowCrossRoomSender && !senderMatchesExpectedRoomDid && !payloadMatchesCurrentRoom) {
       logger.log('inbox.presence', `dropped presence from unexpected sender ${evt.senderDid || '(none)'} (expected room did ${expectedRoomDid || 'none'})`);
       return;
     }
@@ -202,12 +206,7 @@ export function createInboundDispatcher(deps) {
         state.currentHome.lastEventSequence = seq;
       }
     }
-    if (typeof payload.latest_event_sequence === 'number' && state.currentHome) {
-      state.currentHome.lastEventSequence = Math.max(
-        state.currentHome.lastEventSequence || 0,
-        payload.latest_event_sequence
-      );
-    }
+    // Do not move event cursor from latest-event hints. Cursor advances on processed events only.
 
     logger.log('inbox.event', `processed room event for room '${eventRoom}' seq=${seq} latest_seq=${payload.latest_event_sequence || 0}`);
   }
