@@ -85,6 +85,7 @@ pub(crate) async fn publish_world_did_runtime_ma(
     let did_identifier = ensure_kubo_key_id(kubo_url, &world_key_name).await?;
     let world_did = Did::new(&did_identifier, world_slug)
         .map_err(|e| anyhow!("failed to build world DID from key id '{}': {}", did_identifier, e))?;
+    let world_ipns_path = format!("/ipns/{}", world_did.ipns);
 
     let signing_did = Did::new_root(&did_identifier)
         .map_err(|e| anyhow!("failed to build signing DID: {}", e))?;
@@ -176,6 +177,13 @@ pub(crate) async fn publish_world_did_runtime_ma(
     )
     .await?;
 
+    info!(
+        "World runtime document available at {} (CID {})",
+        world_ipns_path,
+        document_cid
+    );
+    info!("Copy/paste: ipfs dag get {}", world_ipns_path);
+
     Ok(())
 }
 
@@ -204,6 +212,7 @@ async fn ensure_world_did_document(
 
     let world_did = Did::new(&did_identifier, world_slug)
         .map_err(|e| anyhow!("failed to build world DID from IPNS key '{}' slug '{}': {}", did_identifier, world_slug, e))?;
+    let world_ipns_path = format!("/ipns/{}", did_identifier);
 
     let signing_did = Did::new_root(&did_identifier)
         .map_err(|e| anyhow!("failed to build signing DID: {}", e))?;
@@ -270,6 +279,8 @@ async fn ensure_world_did_document(
         world_did.base_id(),
         document_cid
     );
+    info!("World document available at {}", world_ipns_path);
+    info!("Copy/paste: ipfs dag get {}", world_ipns_path);
 
     // Spawn IPNS publish in background so startup is not blocked by slow Kubo publishes.
     let bg_kubo_url = kubo_url.to_string();
