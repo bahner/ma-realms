@@ -287,6 +287,7 @@ async fn ensure_world_did_document(
     let bg_key_name = key_name.clone();
     let bg_document_cid = document_cid.clone();
     let bg_world_did_id = world_did.base_id();
+    let bg_world_ipns = world_did.ipns.clone();
     tokio::spawn(async move {
         let ipns_options = IpnsPublishOptions {
             timeout: Duration::from_secs(45),
@@ -302,9 +303,9 @@ async fn ensure_world_did_document(
         )
         .await
         {
-            Ok(published) => info!(
-                "Background IPNS publish complete for {} CID {} (IPNS {})",
-                bg_world_did_id, bg_document_cid, published
+            Ok(_) => info!(
+                "Background Identity publication complete for {}: /ipns/{} -> /ipfs/{}",
+                bg_world_did_id, bg_world_ipns, bg_document_cid
             ),
             Err(err) => warn!(
                 "Background IPNS publish failed for {} CID {}: {}",
