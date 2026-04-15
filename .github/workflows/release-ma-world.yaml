@@ -3,7 +3,7 @@ name: Release ma-world
 on:
   push:
     tags:
-      - "v*"
+      - "v*.*.*"
   workflow_dispatch:
 
 permissions:
