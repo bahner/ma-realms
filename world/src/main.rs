@@ -3135,7 +3135,7 @@ impl World {
         let (response, broadcasted, effective_room) = match envelope {
             MessageEnvelope::Chatter { text } => {
                 let speech = normalize_spoken_text(&text);
-                info!("[{}] {}: {}", room_name, sender_key, speech);
+                debug!("[{}] {}: {}", room_name, sender_key, speech);
                 self.record_event(format!("[{room_name}] {sender_key}: {speech}")).await;
                 let rendered = format!("{}: {}", sender_key, speech);
                 self.record_room_event(room_name, "speech", Some(sender_key.clone()), Some(from_did.id()), None, speech.clone())
@@ -3148,7 +3148,7 @@ impl World {
                 let response = self
                     .room_command(room_name, &command, &sender_key, sender_profile, Some(caller_did.as_str()))
                     .await;
-                info!("[{}] {} -> @here: {} -> {}", room_name, sender_key, command, response);
+                debug!("[{}] {} -> @here: {} -> {}", room_name, sender_key, command, response);
                 self.record_event(format!("[{room_name}] {sender_key} -> @here: {command} => {}", response))
                     .await;
                 (response, broadcasted, room_name.to_string())
@@ -3159,7 +3159,7 @@ impl World {
                     .handle_actor_command(room_name, &sender_key, from_did, sender_profile, &target, command)
                     .await;
                 self.rebuild_avatar_room_index().await;
-                info!("[{}] {} -> @{} -> {}", room_name, sender_key, target, response);
+                debug!("[{}] {} -> @{} -> {}", room_name, sender_key, target, response);
                 self.record_event(format!(
                     "[{room_name}] {sender_key} -> @{target} => {}",
                     response.replace('\n', " ")

@@ -11,7 +11,7 @@ function makeDispatchFlow(stateOverrides = {}) {
       roomDid: 'did:ma:testroom#lobby',
       worldDid: 'did:ma:testworld#world',
     },
-    aliasBook: { '@world': 'did:ma:testworld#world', myfriend: 'did:ma:testfriend#bob' },
+    aliasBook: { '@world': 'did:ma:testworld#world', '@avatar': 'did:ma:testactor#alice', myfriend: 'did:ma:testfriend#bob' },
     ...stateOverrides,
   };
   const flow = createWorldDispatchFlow({
