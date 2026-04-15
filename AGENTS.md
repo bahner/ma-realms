@@ -22,7 +22,15 @@ Terminology for command scripting:
 - scoped commands must be expressed as dot-notated methods, not space form (for example avatar.apply, not "avatar apply")
 - verb is only used for natural-language interpretation, not as the primary term in scripted paths
 
-WE NEVER EVER GENERATE SHORTENED DIDs THEY MUST BE FULL INCLUDING FRAGMENTS
+WE NEVER EVER GENERATE SHORTENED DIDs THEY MUST BE FULL
+
+DID structure in did:ma:
+
+- A **world DID** is fragment-less: `did:ma:<ipns-key>`. The slug (e.g. "panteia") is a local nickname and NOT part of the DID.
+- An **object DID** (room, avatar, etc.) uses a fragment to identify the object within the world: `did:ma:<ipns-key>#<object-id>`.
+- Fragments are meaningful object identifiers, not slugs or nicknames.
+- When code needs the world DID (e.g. status.json `world_did`), use the root DID without fragment.
+- When referring to a specific room or object, include the fragment.
 
 We use classic dot notation for objects and methods, so @did:ma:someipns#fragment.name shows the name, while @did:ma:someipns#fragment.whisper Hello sends a whisper with the content "Hello" to @did:ma:someipns#fragment.name. This is fairly standard object notation. In practice, that means scripts can be stored in YAML format.
 
@@ -77,4 +85,4 @@ Actor runtime invariants (chat/input routing):
 	- Actor must never send `@world/@here/@me/@avatar` (or any other alias label) over the wire; outbound targets must always be full `did:ma:...` values.
 - Error text for target resolution should prefer raw DID visibility over alias-humanized display when debugging unknown-target failures.
 
-DIDs are always fully qualified. You might need to get the .ipns for ipfs feature or to veridy the ipns key or things like that, but that is backoffice stuff. Plumbing. The ma-realms never uses root_cid ir base_id's. They are not a thing. There is no real "identity" behind anything. Each did is discreet, in the greater scheme of things. The fact that we share ipns is incidental and just an implementation detail for world, where we don't want so many keys. DIDs should still be treated as full identities nontheless.
+DIDs are always fully qualified. The world DID itself is fragment-less (`did:ma:<ipns-key>`); fragments identify objects within the world, not the world itself. The slug is a local convenience name. You might need to get the .ipns for ipfs feature or to verify the ipns key or things like that, but that is backoffice stuff. Plumbing. The ma-realms never uses root_cid or base_id's. They are not a thing. There is no real "identity" behind anything. Each did is discrete, in the greater scheme of things. The fact that we share ipns is incidental and just an implementation detail for world, where we don't want so many keys. DIDs should still be treated as full identities nonetheless.

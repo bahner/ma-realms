@@ -31,10 +31,10 @@ pub struct RoomActorContext<'a> {
     /// (handle, identity DID) pairs for avatars present in the room.
     pub avatars: Vec<(String, String)>,
     pub things: Vec<String>,
-    pub acl_owner_did: Option<&'a str>,
+    pub acl_owner: Option<&'a str>,
     pub acl_summary: &'a str,
     pub caller_did: Option<&'a str>,
-    pub caller_owner_did: Option<&'a str>,
+    pub caller_owner: Option<&'a str>,
     pub description: &'a str,
     pub title: &'a str,
     pub did: Option<&'a str>,
@@ -67,18 +67,18 @@ fn require_owner(ctx: &RoomActorContext<'_>, action_name: &str) -> Option<RoomAc
 }
 
 fn is_owner(ctx: &RoomActorContext<'_>) -> bool {
-    let Some(owner) = ctx.acl_owner_did else {
+    let Some(owner) = ctx.acl_owner else {
         return false;
     };
     ctx.caller_did.map(|caller| caller == owner).unwrap_or(false)
         || ctx
-            .caller_owner_did
+            .caller_owner
             .map(|caller_owner| caller_owner == owner)
             .unwrap_or(false)
 }
 
 fn is_owner_or_unclaimed(ctx: &RoomActorContext<'_>) -> bool {
-    match (ctx.acl_owner_did, ctx.caller_did, ctx.caller_owner_did) {
+    match (ctx.acl_owner, ctx.caller_did, ctx.caller_owner) {
         (None, _, _) => true,
         (Some(owner), Some(caller), caller_owner) => {
             owner == caller || caller_owner.map(|value| value == owner).unwrap_or(false)
@@ -152,7 +152,7 @@ fn cmd_list(ctx: &RoomActorContext<'_>) -> RoomActorResult {
 
 fn cmd_acl(ctx: &RoomActorContext<'_>) -> RoomActorResult {
     if let Some(err) = require_room(ctx) { return err; }
-    let owner = ctx.acl_owner_did.unwrap_or("(none)");
+    let owner = ctx.acl_owner.unwrap_or("(none)");
     none(Reply::here_attr("acl", format!("for '{}': owner={} policy={}", ctx.room_name, owner, ctx.acl_summary)))
 }
 
@@ -164,7 +164,7 @@ fn cmd_describe(ctx: &RoomActorContext<'_>) -> RoomActorResult {
 
 fn cmd_show(ctx: &RoomActorContext<'_>) -> RoomActorResult {
     if let Some(err) = require_room(ctx) { return err; }
-    let owner = ctx.acl_owner_did.unwrap_or("(none)");
+    let owner = ctx.acl_owner.unwrap_or("(none)");
     let did = ctx.did.unwrap_or("(unknown)");
     none(Reply::here(format!("'{}': did={} owner={}", ctx.room_name, did, owner)))
 }
@@ -307,7 +307,7 @@ fn cmd_property(command: &str, ctx: &RoomActorContext<'_>) -> Option<RoomActorRe
     let key = property.key;
 
     if key == "_list" {
-        let owner = ctx.acl_owner_did.unwrap_or("(none)");
+        let owner = ctx.acl_owner.unwrap_or("(none)");
         let did = ctx.did.unwrap_or("(unknown)");
         let response = Reply::attr_list(Scope::Here, &[
             ("owner", owner),
@@ -320,7 +320,7 @@ fn cmd_property(command: &str, ctx: &RoomActorContext<'_>) -> Option<RoomActorRe
 
     let Some(value) = property.value else {
         let response = match key.as_str() {
-            "owner" => ctx.acl_owner_did.unwrap_or("(none)").to_string(),
+            "owner" => ctx.acl_owner.unwrap_or("(none)").to_string(),
             "title" => ctx.title.to_string(),
             "description" => ctx.description.to_string(),
             "cid" | "content-b64" | "exit-content-b64" => "(write-only)".to_string(),
@@ -391,10 +391,10 @@ mod tests {
             room_exists: true,
             avatars: vec![("aurora".to_string(), "did:ma:k51actor123".to_string())],
             things: Vec::new(),
-            acl_owner_did: Some("did:ma:owner"),
+            acl_owner: Some("did:ma:owner"),
             acl_summary: "*",
             caller_did: Some("did:ma:owner"),
-            caller_owner_did: Some("did:ma:owner-root"),
+            caller_owner: Some("did:ma:owner-root"),
             title: "Lobby",
             description: "Welcome",
             did: Some("did:ma:world#lobby"),

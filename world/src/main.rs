@@ -1004,7 +1004,7 @@ impl World {
         sender_encryption_pubkey_multibase: &str,
         room: &str,
     ) -> Result<(Did, String, bool)> {
-        let is_new = self.resolve_avatar_did_for_owner(&sender_did.id()).await.is_none();
+        let is_new = self.resolve_avatar_did_for_owner(&sender_did.base_id()).await.is_none();
 
         if is_new && !self.can_enter(sender_did).await {
             return Err(anyhow!("entry denied by ACL for {}", sender_did.id()));
@@ -1037,7 +1037,7 @@ impl World {
 
         let avatar_req = AvatarRequest {
             did: avatar_did.clone(),
-            owner_did: sender_did.id(),
+            owner: sender_did.base_id(),
             agent_endpoint: agent_endpoint.to_string(),
             language_order,
             signing_secret: signing_key.private_key_bytes(),
@@ -1444,7 +1444,7 @@ impl World {
             let Some(object) = room_map.get(object_id) else {
                 return Ok(false);
             };
-            (object.owner_did.clone(), object.state.clone())
+            (object.owner.clone(), object.state.clone())
         };
 
         let world_owner = self.owner_did.read().await.clone();
@@ -1673,9 +1673,10 @@ impl World {
         let parsed = Did::try_from(world_did)
             .map_err(|e| anyhow!("invalid world DID '{}': {}", world_did, e))?;
         let ipns = parsed.ipns.clone();
+        let bare = parsed.base_id();
 
         *self.world_ipns.write().await = Some(ipns.clone());
-        *self.world_did.write().await = Some(world_did.to_string());
+        *self.world_did.write().await = Some(bare.clone());
 
         // Keep runtime rooms aligned with the configured world IPNS.
         // This fixes stale values like did:ma:unconfigured#lobby created before DID bootstrap.
@@ -1691,8 +1692,8 @@ impl World {
         // This keeps entry ACL policy-driven while avoiding owner lockout.
         let owner_missing = self.owner_did.read().await.is_none();
         if owner_missing {
-            *self.owner_did.write().await = Some(world_did.to_string());
-            self.allow_entry_did(world_did).await;
+            *self.owner_did.write().await = Some(bare.clone());
+            self.allow_entry_did(&bare).await;
         }
 
         Ok(())
@@ -2745,11 +2746,11 @@ impl World {
             if let Some(mut avatar) = moved {
                 let endpoint_changed = avatar.agent_endpoint != req.agent_endpoint;
                 let language_changed = avatar.language_order != req.language_order;
-                let owner_changed = avatar.owner != req.owner_did;
+                let owner_changed = avatar.owner != req.owner;
                 let encryption_changed = avatar.encryption_pubkey_multibase != req.encryption_pubkey_multibase;
                 avatar.agent_endpoint = req.agent_endpoint.clone();
                 avatar.language_order = req.language_order.clone();
-                avatar.owner = req.owner_did.clone();
+                avatar.owner = req.owner.clone();
                 avatar.encryption_pubkey_multibase = req.encryption_pubkey_multibase.clone();
                 avatar.touch_presence();
                 let moved_handle = avatar.inbox.clone();
@@ -2808,11 +2809,11 @@ impl World {
         {
             let endpoint_changed = existing.agent_endpoint != req.agent_endpoint;
             let language_changed = existing.language_order != req.language_order;
-            let owner_changed = existing.owner != req.owner_did;
+            let owner_changed = existing.owner != req.owner;
             let encryption_changed = existing.encryption_pubkey_multibase != req.encryption_pubkey_multibase;
             existing.agent_endpoint = req.agent_endpoint.clone();
             existing.language_order = req.language_order.clone();
-            existing.owner = req.owner_did.clone();
+            existing.owner = req.owner.clone();
             existing.encryption_pubkey_multibase = req.encryption_pubkey_multibase.clone();
             existing.touch_presence();
             info!("[{}] {} already present ({:?})", room_name, existing_handle, req.did);
@@ -2843,7 +2844,7 @@ impl World {
             req.did.clone(),
             req.agent_endpoint.clone(),
             req.language_order.clone(),
-            req.owner_did.clone(),
+            req.owner.clone(),
             req.signing_secret,
             req.encryption_pubkey_multibase.clone(),
         );
@@ -3251,11 +3252,11 @@ impl World {
     pub async fn set_owner_did(&self, did_raw: &str) -> Result<String> {
         let parsed = Did::try_from(did_raw.trim())
             .map_err(|e| anyhow!("invalid owner DID '{}': {}", did_raw, e))?;
-        let full = parsed.id();
-        *self.owner_did.write().await = Some(full.clone());
-        self.allow_entry_did(&full).await;
-        info!("World owner set to {}", full);
-        Ok(full)
+        let bare = parsed.base_id();
+        *self.owner_did.write().await = Some(bare.clone());
+        self.allow_entry_did(&bare).await;
+        info!("World owner set to {}", bare);
+        Ok(bare)
     }
 
     pub async fn world_cid(&self) -> Option<String> {
@@ -3380,7 +3381,7 @@ impl World {
             next_room_event_sequence,
             handle_to_did,
             did_to_handle,
-            owner_did,
+            owner: owner_did,
             room_cids,
             room_objects,
             avatar_registry,
@@ -3828,7 +3829,7 @@ impl World {
         *self.handle_to_did.write().await = state.handle_to_did;
         *self.did_to_handle.write().await = state.did_to_handle;
         *self.avatar_registry.write().await = state.avatar_registry;
-        let loaded_owner_did = state.owner_did;
+        let loaded_owner_did = state.owner;
         *self.owner_did.write().await = loaded_owner_did.clone();
         if let Some(owner) = loaded_owner_did {
             self.allow_entry_did(&owner).await;
@@ -3962,7 +3963,7 @@ impl World {
                 let rooms = self.rooms.read().await;
                 if let Some(room) = rooms.get(room_name) {
                     let is_owner_match = room.avatars.get(from)
-                        .map(|a| a.owner == target_did.id())
+                        .map(|a| a.owner == target_did.base_id())
                         .unwrap_or(false);
                     if is_owner_match {
                         drop(rooms);
@@ -4000,7 +4001,7 @@ impl World {
                                     for (candidate_room, room_map) in objects.iter() {
                                         if let Some(object) = room_map.get(fragment.as_str()) {
                                             let owner = object
-                                                .owner_did
+                                                .owner
                                                 .clone()
                                                 .or(world_owner.clone())
                                                 .unwrap_or_else(|| "(none)".to_string());
@@ -4351,7 +4352,7 @@ impl World {
                 ObjectRequirementRuntime {
                     room_name: room_name.to_string(),
                     user: caller_did.clone(),
-                    owner: object.owner_did.clone().or_else(|| world_owner.clone()),
+                    owner: object.owner.clone().or_else(|| world_owner.clone()),
                     location,
                     opened_by: object.opened_by.clone(),
                     world_owner,
@@ -4464,7 +4465,7 @@ impl World {
                     device.ephemeral_inbox_len(),
                     device.pending_outbox.len(),
                     device
-                        .owner_did
+                        .owner
                         .clone()
                         .or(world_owner)
                         .unwrap_or_else(|| "(none)".to_string()),
@@ -4522,17 +4523,17 @@ impl World {
                 let object = room_map.get(&object_id)?;
                 (
                     object.name.clone(),
-                    object.owner_did.clone(),
+                    object.owner.clone(),
                     owner
                         .as_deref()
-                        .map(|did| did == caller_did.as_str())
+                        .map(|did| did == from_did.base_id().as_str())
                         .unwrap_or(false),
                 )
             };
 
             let is_object_owner = object_owner
                 .as_deref()
-                .map(|did| did == caller_did.as_str())
+                .map(|did| did == from_did.base_id().as_str())
                 .unwrap_or(false);
             if !is_object_owner && !is_world_owner {
                 return Some((
@@ -5159,8 +5160,8 @@ impl World {
                         };
                     }
 
-                    let caller_did = from_did.id();
-                    let can_mutate = target_avatar.owner == caller_did;
+                    let caller_base = from_did.base_id();
+                    let can_mutate = target_avatar.owner == caller_base;
                     if !can_mutate {
                         return (
                             "You don't have access to this.".to_string(),
@@ -5615,8 +5616,6 @@ impl World {
             let path = property.key;
             let value = property.value.unwrap_or_default();
 
-            let caller_did = from_did.id();
-
             if value.is_empty() {
                 match path.as_str() {
                     "_list" => {
@@ -5700,7 +5699,7 @@ impl World {
             let owner_did = self.owner_did.read().await.clone();
             let is_owner = owner_did
                 .as_ref()
-                .map(|owner| owner == &caller_did)
+                .map(|owner| owner == &from_did.base_id())
                 .unwrap_or(false);
 
             match path.as_str() {
@@ -5868,8 +5867,9 @@ impl World {
         // @world.claim — set world owner to caller DID if unclaimed.
         if method == "claim" {
             let current_owner = self.owner_did.read().await.clone();
+            let caller_base = from_did.base_id();
             if let Some(owner) = current_owner {
-                if owner == caller_did {
+                if owner == caller_base {
                     return Reply::world(format!("already claimed by {}", owner)).to_string();
                 }
                 return Reply::world(format!("already claimed by {}", owner)).to_string();
@@ -5877,19 +5877,20 @@ impl World {
 
             {
                 let mut owner = self.owner_did.write().await;
-                *owner = Some(from_did.id());
+                *owner = Some(caller_base.clone());
             }
-            self.allow_entry_did(&from_did.id()).await;
-            info!("World claimed by {}", from_did.id());
-            return Reply::world(format!("claimed by {}", from_did.id())).to_string();
+            self.allow_entry_did(&caller_base).await;
+            info!("World claimed by {}", caller_base);
+            return Reply::world(format!("claimed by {}", caller_base)).to_string();
         }
 
         // All remaining commands require world-owner privilege.
         // Escalate: accept the caller if they are the world owner directly, or
         // if they are an avatar whose registered owner DID is the world owner.
         let owner_did = self.owner_did.read().await.clone();
+        let caller_base = from_did.base_id();
         let is_owner = if let Some(ref owner) = owner_did {
-            owner == &caller_did
+            owner == &caller_base
                 || self
                     .avatar_registry
                     .read()
@@ -6356,10 +6357,10 @@ impl World {
             room_exists,
             avatars,
             things,
-            acl_owner_did: acl_owner.as_deref(),
+            acl_owner: acl_owner.as_deref(),
             acl_summary: &acl_summary,
             caller_did,
-            caller_owner_did: caller_owner.as_deref(),
+            caller_owner: caller_owner.as_deref(),
             title: &title,
             description: &description,
             did: did.as_deref(),
@@ -8341,7 +8342,7 @@ async fn ensure_world_did_document(
 
     info!(
         "World DID document {} stored as CID {} — IPNS publish continues in background",
-        world_did.id(),
+        world_did.base_id(),
         document_cid
     );
 
@@ -8349,7 +8350,7 @@ async fn ensure_world_did_document(
     let bg_kubo_url = kubo_url.to_string();
     let bg_key_name = key_name.clone();
     let bg_document_cid = document_cid.clone();
-    let bg_world_did_id = world_did.id();
+    let bg_world_did_id = world_did.base_id();
     tokio::spawn(async move {
         let ipns_options = IpnsPublishOptions {
             timeout: Duration::from_secs(45),
@@ -8376,7 +8377,7 @@ async fn ensure_world_did_document(
         }
     });
 
-    Ok(world_did.id())
+    Ok(world_did.base_id())
 }
 
 #[tokio::main]
@@ -10208,7 +10209,7 @@ mod tests {
         let did = Did::try_from("did:ma:k51test#pixie").unwrap();
         let req = AvatarRequest {
             did: did.clone(),
-            owner_did: "did:ma:k51test".to_string(),
+            owner: "did:ma:k51test".to_string(),
             agent_endpoint: "ep-1".to_string(),
             language_order: "nb_NO:en_UK".to_string(),
             signing_secret: [0u8; 32],
@@ -10218,7 +10219,7 @@ mod tests {
 
         let req2 = AvatarRequest {
             did,
-            owner_did: "did:ma:k51test".to_string(),
+            owner: "did:ma:k51test".to_string(),
             agent_endpoint: "ep-2".to_string(),
             language_order: "nb_NO:en_UK".to_string(),
             signing_secret: [0u8; 32],
@@ -10246,7 +10247,7 @@ mod tests {
         let did = Did::try_from("did:ma:k51stale#agent").unwrap();
         let req = AvatarRequest {
             did,
-            owner_did: "did:ma:k51stale".to_string(),
+            owner: "did:ma:k51stale".to_string(),
             agent_endpoint: "ep-stale".to_string(),
             language_order: "nb_NO:en_UK".to_string(),
             signing_secret: [0u8; 32],

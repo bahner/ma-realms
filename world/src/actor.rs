@@ -8,7 +8,7 @@ pub type AvatarSigningSecret = [u8; 32];
 #[derive(Clone, Debug)]
 pub(crate) struct AvatarRequest {
     pub did: Did,
-    pub owner_did: String,
+    pub owner: String,
     pub agent_endpoint: String,
     pub language_order: String,
     pub signing_secret: AvatarSigningSecret,

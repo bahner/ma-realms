@@ -213,8 +213,8 @@ pub struct ObjectRuntimeState {
     pub aliases: Vec<String>,
     #[serde(default)]
     pub receivers: Vec<ObjectReceiverListener>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "owner")]
-    pub owner_did: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     #[serde(default)]
     pub durable: bool,
     #[serde(default = "default_object_persistence_policy")]
@@ -345,7 +345,7 @@ impl ObjectRuntimeState {
                 role: Some("world-inbox".to_string()),
                 address: None,
             }],
-            owner_did: None,
+            owner: None,
             durable: true,
             persistence: ObjectPersistencePolicy::DurableImmediate,
             ttl_secs: None,

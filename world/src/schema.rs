@@ -653,7 +653,8 @@ pub(crate) struct RuntimeStateDoc {
     pub handle_to_did: HashMap<String, String>,
     #[serde(default)]
     pub did_to_handle: HashMap<String, String>,
-    pub owner_did: Option<String>,
+    #[serde(alias = "owner_did")]
+    pub owner: Option<String>,
     #[serde(default)]
     pub room_cids: HashMap<String, String>,
     #[serde(default)]

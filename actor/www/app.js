@@ -2844,6 +2844,7 @@ const { parseDot, parseLocalCommand } = createDotCommands({
   onDotEdit,
   onDotEval,
   onDotInspect,
+  resolveAliasInput,
   resolveCommandTargetDidOrToken,
   lookupDidInCurrentRoom,
   sendWorldCommandQuery,

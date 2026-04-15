@@ -26,6 +26,7 @@ export function createDotCommands({
   onDotEdit,
   onDotEval,
   onDotInspect,
+  resolveAliasInput,
   resolveCommandTargetDidOrToken,
   lookupDidInCurrentRoom,
   sendWorldCommandQuery,
@@ -108,11 +109,26 @@ export function createDotCommands({
       appendSystemUi('No identity loaded. Create or unlock an identity first.', 'Ingen identitet lastet. Opprett eller lås opp en identitet først.');
       return true;
     }
-    if (args.length !== 1 || !isMaDid(String(args[0] || ''))) {
-      appendMessage('system', 'Usage: my.identity.publish <did:ma:world>');
+
+    let worldDid = '';
+    if (args.length === 0) {
+      const home = String(state.aliasBook?.home || '').trim();
+      if (home && isMaDid(home)) {
+        worldDid = home;
+      }
+      if (!worldDid) {
+        appendMessage('system', 'Usage: my.identity.publish [<did:ma:world>] (no home set — use my.home first)');
+        return true;
+      }
+    } else {
+      const raw = String(args[0] || '').trim();
+      worldDid = isMaDid(raw) ? raw : String(resolveAliasInput(raw) || '').trim();
+    }
+
+    if (!isMaDid(worldDid)) {
+      appendMessage('system', 'Usage: my.identity.publish [<did:ma:world>]');
       return true;
     }
-    const worldDid = String(args[0]).trim();
     appendMessage('system', `Publishing identity to ${worldDid} via ma/ipfs/1...`);
     Promise.resolve()
       .then(async () => {
@@ -459,7 +475,7 @@ export function createDotCommands({
       appendSystemUi('My namespace (self/config):', 'My-navnerom (selv/konfig):');
       appendSystemUi('  my.did                    - show your identity DID', '  my.did                    - vis identitets-DID-en din');
       appendSystemUi('  my.identity               - show local pre-publish DID document as raw JSON', '  my.identity               - vis lokalt DID-dokument (før publisering) som rå JSON');
-      appendSystemUi('  my.identity.publish <did:ma:world> - publish DID document to world via ma/ipfs/1', '  my.identity.publish <did:ma:world> - publiser DID-dokument til verden via ma/ipfs/1');
+      appendSystemUi('  my.identity.publish [<did:ma:world>] - publish DID document to world via ma/ipfs/1 (defaults to home world)', '  my.identity.publish [<did:ma:world>] - publiser DID-dokument til verden via ma/ipfs/1 (standard: hjemmeverden)');
       appendSystemUi('  my.home <did:ma:...#room> - set home target', '  my.home <did:ma:...#room> - sett home-mål');
       appendSystemUi('  my.aliases add <name> <target> - add/update alias (no spaces in target)', '  my.aliases add <navn> <mål> - legg til/oppdater alias (ingen mellomrom i mål)');
       appendSystemUi('    note: @here/@me/@world/@avatar are updated automatically', '    merk: @here/@me/@world/@avatar oppdateres automatisk');
