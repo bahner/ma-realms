@@ -6717,7 +6717,9 @@ impl World {
             if let Some(room) = rooms.get(room_name) {
                 (
                     true,
-                    room.avatars.keys().cloned().collect::<Vec<_>>(),
+                    room.avatars.iter()
+                        .map(|(handle, avatar)| (handle.clone(), avatar.agent_did.id()))
+                        .collect::<Vec<_>>(),
                     room.acl.owner.clone(),
                     room.acl.summary(),
                     room.avatars.get(from).map(|avatar| avatar.owner.clone()),

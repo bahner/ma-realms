@@ -195,7 +195,7 @@ impl ExitData {
 ///
 /// Like exits, objects are owned by the room's content graph, not independently published.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ObjectData {
+pub struct Object {
     pub id: String,
     pub name: String,
     pub description: String,

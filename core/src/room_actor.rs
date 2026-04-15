@@ -27,7 +27,8 @@ pub struct RoomActorResult {
 pub struct RoomActorContext<'a> {
     pub room_name: &'a str,
     pub room_exists: bool,
-    pub avatars: Vec<String>,
+    /// (handle, identity DID) pairs for avatars present in the room.
+    pub avatars: Vec<(String, String)>,
     pub things: Vec<String>,
     pub acl_owner_did: Option<&'a str>,
     pub acl_summary: &'a str,
@@ -107,24 +108,34 @@ fn cmd_help(_ctx: &RoomActorContext<'_>) -> RoomActorResult {
 
 fn cmd_who(ctx: &RoomActorContext<'_>) -> RoomActorResult {
     if !ctx.room_exists { return room_not_found(ctx); }
-    let mut names = ctx.avatars.clone();
-    names.sort();
-    if names.is_empty() {
-        none_result(format!("@here room '{}' has no actors", ctx.room_name))
+    let mut pairs = ctx.avatars.clone();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    if pairs.is_empty() {
+        none_result(format!("@here.avatars in '{}': (none)", ctx.room_name))
     } else {
-        none_result(format!("@here actors in '{}': {}", ctx.room_name, names.join(", ")))
+        let entries: Vec<String> = pairs.iter()
+            .map(|(handle, identity)| format!("{}({})", handle, identity))
+            .collect();
+        none_result(format!("@here.avatars in '{}': {}", ctx.room_name, entries.join(", ")))
     }
 }
 
 fn cmd_list(ctx: &RoomActorContext<'_>) -> RoomActorResult {
     if !ctx.room_exists { return room_not_found(ctx); }
-    let mut names = ctx.avatars.clone();
-    names.sort();
-    let avatars = if names.is_empty() { "(none)".to_string() } else { names.join(", ") };
+    let mut pairs = ctx.avatars.clone();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    let avatars = if pairs.is_empty() {
+        "(none)".to_string()
+    } else {
+        pairs.iter()
+            .map(|(handle, identity)| format!("{}({})", handle, identity))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     let mut things = ctx.things.clone();
     things.sort();
     let things = if things.is_empty() { "(none)".to_string() } else { things.join(", ") };
-    none_result(format!("@here room='{}' avatars=[{}] things=[{}]", ctx.room_name, avatars, things))
+    none_result(format!("@here room='{}' .avatars=[{}] .things=[{}]", ctx.room_name, avatars, things))
 }
 
 fn cmd_acl(ctx: &RoomActorContext<'_>) -> RoomActorResult {
@@ -388,7 +399,7 @@ mod tests {
         RoomActorContext {
             room_name: "lobby",
             room_exists: true,
-            avatars: vec!["aurora".to_string()],
+            avatars: vec![("aurora".to_string(), "did:ma:k51actor123".to_string())],
             things: Vec::new(),
             acl_owner_did: Some("did:ma:owner"),
             acl_summary: "*",

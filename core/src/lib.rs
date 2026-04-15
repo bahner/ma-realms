@@ -44,7 +44,7 @@ pub use ma_core::{PinUpdateOutcome, pin_update_add_rm};
 #[cfg(not(target_arch = "wasm32"))]
 pub use ma_core::KuboKey;
 pub use ma_core::TtlCache;
-pub use domain::{ActorType, AvatarActor, ExitData, ObjectData, RoomActor, WorldActor};
+pub use domain::{ActorType, AvatarActor, ExitData, Object, RoomActor, WorldActor};
 pub use identity::{
     GeneratedAgentIdentity,
     create_agent_identity,
