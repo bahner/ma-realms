@@ -936,7 +936,7 @@ impl World {
             .map_err(|e| anyhow!("failed marshaling avatar DID document: {}", e))?;
         let document_value: serde_json::Value = serde_json::from_str(&document_json)
             .map_err(|e| anyhow!("failed converting avatar DID document to JSON value: {}", e))?;
-        let doc_cid = dag_put_dag_cbor(&kubo_url, &document_value).await?;
+        dag_put_dag_cbor(&kubo_url, &document_value).await?;
 
         let next_entry = AvatarRegistryEntry {
             did: avatar_did.id(),
@@ -950,7 +950,9 @@ impl World {
             key_agreement: encryption_pubkey,
             acl: acl_summary,
             shortcuts,
-            doc: IpldLink { cid: doc_cid },
+            identity: IpldLink {
+                cid: format!("/ipns/{}", avatar_did.ipns),
+            },
         };
 
         let changed = {
@@ -967,7 +969,7 @@ impl World {
                     || entry.key_agreement != next_entry.key_agreement
                     || entry.acl != next_entry.acl
                     || entry.shortcuts != next_entry.shortcuts
-                    || entry.doc.cid != next_entry.doc.cid
+                    || entry.identity.cid != next_entry.identity.cid
             }).unwrap_or(true);
             registry.insert(fragment, next_entry);
             changed
@@ -5779,7 +5781,7 @@ impl World {
                         Reply::world_attr(format!("{p}.room"), &entry.room),
                         Reply::world_attr(format!("{p}.key_agreement"), &entry.key_agreement),
                         Reply::world_attr(format!("{p}.acl"), &entry.acl),
-                        Reply::world_attr(format!("{p}.doc"), &entry.doc.cid),
+                        Reply::world_attr(format!("{p}.identity"), &entry.identity.cid),
                     ]);
                 }
 
@@ -5794,7 +5796,7 @@ impl World {
                     "room" => entry.room.clone(),
                     "key_agreement" => entry.key_agreement.clone(),
                     "acl" => entry.acl.clone(),
-                    "doc" => entry.doc.cid.clone(),
+                    "identity" | "doc" => entry.identity.cid.clone(),
                     "shortcuts" => {
                         if entry.shortcuts.is_empty() {
                             "(none)".to_string()
@@ -5809,7 +5811,7 @@ impl World {
                         }
                     }
                     _ => Reply::world(format!(
-                        "unknown avatar attribute '{}'. Allowed: did, name, description, owner, fragment, lang, endpoint, room, key_agreement, acl, shortcuts, doc",
+                        "unknown avatar attribute '{}'. Allowed: did, name, description, owner, fragment, lang, endpoint, room, key_agreement, acl, shortcuts, identity",
                         key
                     )).to_string(),
                 };

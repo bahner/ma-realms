@@ -740,5 +740,6 @@ pub(crate) struct AvatarRegistryEntry {
     pub acl: String,
     #[serde(default)]
     pub shortcuts: HashMap<String, String>,
-    pub doc: IpldLink,
+    #[serde(alias = "doc")]
+    pub identity: IpldLink,
 }
