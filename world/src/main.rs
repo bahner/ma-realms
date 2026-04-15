@@ -8019,6 +8019,16 @@ impl WorldProtocol {
                     (pinged_room.clone(), h, c)
                 };
 
+                info!(
+                    "[{}] worldentry {} did={} lane={} remote={} push={}",
+                    actual_room,
+                    handle,
+                    avatar_did_str,
+                    self.lane.label(),
+                    agent_endpoint,
+                    sender_push_endpoint
+                );
+
                 if created {
                     self.push_presence_snapshot(&actual_room).await;
                 }
