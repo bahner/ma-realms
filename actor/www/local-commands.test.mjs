@@ -86,28 +86,43 @@ function createHarness() {
   return { state, messages, useBindings, resolverCalls, ...commandApi };
 }
 
-test('my.home stores explicit room DID as home alias', () => {
+test('@my.home stores explicit room DID as home alias', () => {
   const harness = createHarness();
 
-  assert.equal(harness.parseLocalCommand('my.home did:ma:testworld#lobby'), true);
+  assert.equal(harness.parseLocalCommand('@my.home did:ma:testworld#lobby'), true);
   assert.equal(harness.state.aliasBook.home, 'did:ma:testworld#lobby');
   assert.equal(harness.messages.at(-1), 'Home set: home => did:ma:testworld#lobby');
 });
 
-test('my.aliases supports dotted and spaced forms', () => {
+test('@actor.home aliases @my.home for local self command', () => {
   const harness = createHarness();
 
-  assert.equal(harness.parseLocalCommand('my.aliases.add friend did:ma:test#friend'), true);
+  assert.equal(harness.parseLocalCommand('@actor.home did:ma:testworld#atrium'), true);
+  assert.equal(harness.state.aliasBook.home, 'did:ma:testworld#atrium');
+  assert.equal(harness.messages.at(-1), 'Home set: home => did:ma:testworld#atrium');
+});
+
+test('@my aliases @actor for actor namespace commands', () => {
+  const harness = createHarness();
+
+  assert.equal(harness.parseLocalCommand('@my.mail'), true);
+  assert.equal(harness.messages[0], 'Mailbox (1):');
+});
+
+test('@my.aliases supports dotted and spaced forms', () => {
+  const harness = createHarness();
+
+  assert.equal(harness.parseLocalCommand('@my.aliases.add friend did:ma:test#friend'), true);
   assert.equal(harness.state.aliasBook.friend, 'did:ma:test#friend');
 
-  assert.equal(harness.parseLocalCommand('my.aliases del friend'), true);
+  assert.equal(harness.parseLocalCommand('@my.aliases del friend'), true);
   assert.equal(Object.prototype.hasOwnProperty.call(harness.state.aliasBook, 'friend'), false);
 });
 
-test('my.mail list is handled locally', () => {
+test('@my.mail list is handled locally', () => {
   const harness = createHarness();
 
-  assert.equal(harness.parseLocalCommand('my.mail'), true);
+  assert.equal(harness.parseLocalCommand('@my.mail'), true);
   assert.equal(harness.messages[0], 'Mailbox (1):');
   assert.match(harness.messages[1], /#1 from=did:ma:test#friend/);
 });

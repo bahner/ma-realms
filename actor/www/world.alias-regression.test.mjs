@@ -86,6 +86,11 @@ test('normalizeInputAliases: @me expands to actor DID with @ prefix', () => {
   assert.equal(flow.normalizeInputAliases('@me.id'), '@did:ma:testactor#alice.id');
 });
 
+test('normalizeInputAliases: @I expands to actor DID with @ prefix', () => {
+  const { flow } = makeDispatchFlow();
+  assert.equal(flow.normalizeInputAliases('@I.emote dance'), '@did:ma:testactor#alice.emote dance');
+});
+
 test('normalizeInputAliases: @here expands to room DID when standalone', () => {
   const { flow } = makeDispatchFlow();
   assert.equal(flow.normalizeInputAliases('@here'), '@did:ma:testroom#lobby');

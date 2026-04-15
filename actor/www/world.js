@@ -530,7 +530,7 @@ export function createWorldDispatchFlow({
     if (!text.trim()) {
       return text;
     }
-    return text.replace(/\\?@(avatar|me|here|world|my\.[a-z0-9_-]{1,32})\b/gi, (match, token, offset, input) => {
+    return text.replace(/\\?@(avatar|me|i|here|world|my\.[a-z0-9_-]{1,32})\b/gi, (match, token, offset, input) => {
       if (match.startsWith('\\')) {
         return `@${token}`;
       }
@@ -540,7 +540,7 @@ export function createWorldDispatchFlow({
       if ((lower === 'here' || lower === 'world') && input[offset + match.length] === '.') {
         return match;
       }
-      if (lower === 'me' || lower === 'avatar') {
+      if (lower === 'me' || lower === 'avatar' || lower === 'i') {
         const did = String(state.identity?.did || '').trim();
         if (!isMaDid(did)) {
           throw new Error(`@${lower} requires an active identity.`);
@@ -758,7 +758,7 @@ export function createWorldDispatchFlow({
         || state.currentHome?.worldDid
         || ''
       ).trim();
-    } else if (lowerBase === 'me' || lowerBase === 'avatar') {
+    } else if (lowerBase === 'me' || lowerBase === 'avatar' || lowerBase === 'i') {
       resolvedBase = String(state.identity?.did || '').trim();
     } else {
       resolvedBase = isMaDid(baseRaw)
@@ -832,6 +832,222 @@ export function createWorldDispatchFlow({
     return String(result.message || '');
   }
 
+  function classifyInputPrefix(trimmedText) {
+    const input = String(trimmedText || '').trim();
+    if (!input) {
+      return 'empty';
+    }
+    if (input.startsWith('@')) {
+      return 'target';
+    }
+    if (input.startsWith("'")) {
+      return 'say';
+    }
+    if (input.startsWith(':')) {
+      return 'emote';
+    }
+    return 'plain';
+  }
+
+  async function sendSayShortcut(trimmedText) {
+    const payload = String(trimmedText || '').substring(1).trim();
+    if (!payload) {
+      return true;
+    }
+    const sendStart = Date.now();
+    logger.log('send.say', `room=${state.currentHome.room} actor=${activeActorName()} msg_len=${payload.length}`);
+
+    const result = JSON.parse(
+      await sendWorldCmdWithTtl(
+        state.currentHome.endpointId,
+        state.passphrase,
+        state.encryptedBundle,
+        activeActorName(),
+        state.currentHome.room,
+        `say ${payload}`,
+        BigInt(resolveTtlSeconds('cmd'))
+      )
+    );
+    const elapsed = Date.now() - sendStart;
+    logger.log('send.say', `response ok=${result.ok} broadcasted=${result.broadcasted} latest_seq=${result.latest_event_sequence || 0} in ${elapsed}ms`);
+
+    if (!result.ok) {
+      throw new Error(result.message || 'say failed');
+    }
+
+    pollCurrentHomeEvents().catch((error) => {
+      logger.log('poll.events', `non-fatal fallback poll after broadcast failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+    appendAmbientProseAfterSpeech().catch((err) => {
+      logger.log('ambient.prose', `failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+    return true;
+  }
+
+  async function sendEmoteShortcut(trimmedText) {
+    const payload = String(trimmedText || '').substring(1).trim();
+    if (!payload) {
+      return true;
+    }
+    const sendStart = Date.now();
+    logger.log('send.emote', `room=${state.currentHome.room} actor=${activeActorName()} msg_len=${payload.length}`);
+
+    const result = JSON.parse(
+      await sendWorldCmdWithTtl(
+        state.currentHome.endpointId,
+        state.passphrase,
+        state.encryptedBundle,
+        activeActorName(),
+        state.currentHome.room,
+        `emote ${payload}`,
+        BigInt(resolveTtlSeconds('cmd'))
+      )
+    );
+    const elapsed = Date.now() - sendStart;
+    logger.log('send.emote', `response ok=${result.ok} broadcasted=${result.broadcasted} latest_seq=${result.latest_event_sequence || 0} in ${elapsed}ms`);
+
+    if (!result.ok) {
+      throw new Error(result.message || 'emote failed');
+    }
+
+    pollCurrentHomeEvents().catch((error) => {
+      logger.log('poll.events', `non-fatal fallback poll after broadcast failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+    return true;
+  }
+
+  async function sendAtTargetCommand(trimmedText) {
+    const trimmed = String(trimmedText || '').trim().replace(/^@+/, '@');
+    const whisperSep = trimmed.indexOf(" '");
+    if (whisperSep > 1) {
+      const target = trimmed.substring(1, whisperSep).trim();
+      const payload = trimmed.substring(whisperSep + 2);
+      const dotIdx = target.indexOf('.');
+      const baseRaw = String(dotIdx === -1 ? target : target.slice(0, dotIdx)).trim();
+      const pathRaw = String(dotIdx === -1 ? '' : target.slice(dotIdx + 1)).trim();
+
+      try {
+        // Resolve built-in aliases to their DID
+        let resolvedBase;
+        const lowerBase = baseRaw.toLowerCase();
+        if (lowerBase === 'here') {
+          resolvedBase = String(state.currentHome?.roomDid || '').trim();
+        } else if (lowerBase === 'world') {
+          resolvedBase = String(
+            state.aliasBook?.['@world']
+            || state.currentHome?.worldDid
+            || ''
+          ).trim();
+        } else if (lowerBase === 'me' || lowerBase === 'avatar' || lowerBase === 'i') {
+          resolvedBase = String(state.identity?.did || '').trim();
+        } else {
+          resolvedBase = isMaDid(baseRaw)
+            ? baseRaw
+            : await resolveCommandTargetDidOrToken(baseRaw);
+        }
+        const normalizedDid = String(resolvedBase || '').trim().replace(/^@+/, '');
+        const { targetDid, targetPath, routeWorld } = normalizeDidTargetPath(normalizedDid, pathRaw);
+        const isDirectDidTarget = isMaDid(String(targetDid)) && String(targetDid).includes('#') && !routeWorld && !targetPath;
+
+        if (isDirectDidTarget) {
+          await sendWhisperToDid(targetDid, payload, { ttlSeconds: resolveTtlSeconds('whisper') });
+          appendMessage('system', `Message sent to ${targetDid}.`);
+          return true;
+        }
+      } catch (err) {
+        appendMessage('system', `Error sending message to ${target}: ${err.message}`);
+        return true;
+      }
+    }
+
+    const spaceIdx = trimmed.indexOf(' ');
+    const rawTarget = (spaceIdx === -1
+      ? trimmed.substring(1)
+      : trimmed.substring(1, spaceIdx)).trim();
+    const remainder = (spaceIdx === -1
+      ? ''
+      : trimmed.substring(spaceIdx + 1)).trim();
+
+    if (!rawTarget) {
+      appendMessage('system', '?');
+      return true;
+    }
+
+    const dotIdx = rawTarget.indexOf('.');
+    const baseRaw = String(dotIdx === -1 ? rawTarget : rawTarget.slice(0, dotIdx)).trim();
+    const pathRaw = String(dotIdx === -1 ? '' : rawTarget.slice(dotIdx + 1)).trim();
+    if (!baseRaw) {
+      appendMessage('system', '?');
+      return true;
+    }
+
+    // Resolve built-in aliases to their DID
+    let resolvedBase;
+    const lowerBase = baseRaw.toLowerCase();
+    if (lowerBase === 'here') {
+      resolvedBase = String(state.currentHome?.roomDid || '').trim();
+    } else if (lowerBase === 'world') {
+      resolvedBase = String(
+        state.aliasBook?.['@world']
+        || state.currentHome?.worldDid
+        || ''
+      ).trim();
+    } else if (lowerBase === 'me' || lowerBase === 'avatar' || lowerBase === 'i') {
+      resolvedBase = String(state.identity?.did || '').trim();
+    } else {
+      resolvedBase = isMaDid(baseRaw)
+        ? baseRaw
+        : await resolveCommandTargetDidOrToken(baseRaw);
+    }
+    const normalizedDid = String(resolvedBase || '').trim().replace(/^@+/, '');
+    if (!isMaDid(normalizedDid)) {
+      throw new Error('Target after @ must resolve to did:ma.');
+    }
+
+    const { targetDid, targetPath, routeWorld } = normalizeDidTargetPath(normalizedDid, pathRaw);
+    const normalizedTarget = routeWorld
+      ? `world.${targetPath}`
+      : (targetPath ? `${targetDid}.${targetPath}` : targetDid);
+
+    if (remainder && await tryHandleDidTargetMetaPoll(normalizedTarget, remainder)) {
+      return true;
+    }
+
+    const normalized = remainder
+      ? `@${normalizedTarget} ${remainder}`
+      : `@${normalizedTarget}`;
+
+    const sendStart = Date.now();
+    logger.log('send.command', `room=${state.currentHome.room} actor=${activeActorName()} msg_len=${trimmed.length}`);
+    const result = JSON.parse(
+      await sendWorldCmdWithTtl(
+        state.currentHome.endpointId,
+        state.passphrase,
+        state.encryptedBundle,
+        activeActorName(),
+        state.currentHome.room,
+        normalized,
+        BigInt(resolveTtlSeconds('cmd'))
+      )
+    );
+    const elapsed = Date.now() - sendStart;
+    logger.log('send.command', `response ok=${result.ok} broadcasted=${result.broadcasted} latest_seq=${result.latest_event_sequence || 0} in ${elapsed}ms`);
+
+    if (!result.ok) {
+      throw new Error(result.message || 'send failed');
+    }
+
+    if (!result.broadcasted) {
+      applyWorldResponse(result);
+      return true;
+    }
+
+    pollCurrentHomeEvents().catch((error) => {
+      logger.log('poll.events', `non-fatal fallback poll after broadcast failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+    return true;
+  }
+
   async function sendCurrentWorldMessage(text, options = {}) {
     const attempt = (options && typeof options === 'object' && Number.isFinite(options.attempt))
       ? Number(options.attempt)
@@ -841,13 +1057,14 @@ export function createWorldDispatchFlow({
       : 0;
 
     try {
+      const rawTrimmedText = String(text || '').trim();
+      if (typeof parseLocalCommand === 'function' && parseLocalCommand(rawTrimmedText)) {
+        return;
+      }
+
       const preNormalizedInput = normalizeInputAliases(text);
       const rewrittenInput = rewriteAliasesToDid(preNormalizedInput);
       const trimmedText = rewrittenInput.trim();
-
-      if (typeof parseLocalCommand === 'function' && parseLocalCommand(trimmedText)) {
-        return;
-      }
 
       if (!state.identity) {
         appendMessage('system', 'Create or unlock an identity first.');
@@ -911,7 +1128,7 @@ export function createWorldDispatchFlow({
           }
         }
 
-        appendMessage('system', 'Not connected. Use go did:ma:<world>#<room> or go home (after my.home did:ma:<world>#<room>).');
+        appendMessage('system', 'Not connected. Use go did:ma:<world>#<room> or go home (after @my.home did:ma:<world>#<room>).');
         return;
       }
 
@@ -955,198 +1172,19 @@ export function createWorldDispatchFlow({
         }
       }
 
-      if (trimmedText.startsWith("'")) {
-        const payload = trimmedText.substring(1).trim();
-        if (!payload) return;
-        const sendStart = Date.now();
-        logger.log('send.say', `room=${state.currentHome.room} actor=${activeActorName()} msg_len=${payload.length}`);
-
-        const result = JSON.parse(
-          await sendWorldCmdWithTtl(
-            state.currentHome.endpointId,
-            state.passphrase,
-            state.encryptedBundle,
-            activeActorName(),
-            state.currentHome.room,
-            `say ${payload}`,
-            BigInt(resolveTtlSeconds('cmd'))
-          )
-        );
-        const elapsed = Date.now() - sendStart;
-        logger.log('send.say', `response ok=${result.ok} broadcasted=${result.broadcasted} latest_seq=${result.latest_event_sequence || 0} in ${elapsed}ms`);
-
-        if (!result.ok) {
-          throw new Error(result.message || 'say failed');
-        }
-
-        pollCurrentHomeEvents().catch((error) => {
-          logger.log('poll.events', `non-fatal fallback poll after broadcast failed: ${error instanceof Error ? error.message : String(error)}`);
-        });
-        appendAmbientProseAfterSpeech().catch((err) => {
-          logger.log('ambient.prose', `failed: ${err instanceof Error ? err.message : String(err)}`);
-        });
+      const inputPrefix = classifyInputPrefix(trimmedText);
+      if (inputPrefix === 'say') {
+        await sendSayShortcut(trimmedText);
         return;
       }
 
-      if (trimmedText.startsWith(':')) {
-        const payload = trimmedText.substring(1).trim();
-        if (!payload) return;
-        const sendStart = Date.now();
-        logger.log('send.emote', `room=${state.currentHome.room} actor=${activeActorName()} msg_len=${payload.length}`);
-
-        const result = JSON.parse(
-          await sendWorldCmdWithTtl(
-            state.currentHome.endpointId,
-            state.passphrase,
-            state.encryptedBundle,
-            activeActorName(),
-            state.currentHome.room,
-            `emote ${payload}`,
-            BigInt(resolveTtlSeconds('cmd'))
-          )
-        );
-        const elapsed = Date.now() - sendStart;
-        logger.log('send.emote', `response ok=${result.ok} broadcasted=${result.broadcasted} latest_seq=${result.latest_event_sequence || 0} in ${elapsed}ms`);
-
-        if (!result.ok) {
-          throw new Error(result.message || 'emote failed');
-        }
-
-        pollCurrentHomeEvents().catch((error) => {
-          logger.log('poll.events', `non-fatal fallback poll after broadcast failed: ${error instanceof Error ? error.message : String(error)}`);
-        });
+      if (inputPrefix === 'emote') {
+        await sendEmoteShortcut(trimmedText);
         return;
       }
 
-      if (trimmedText.startsWith('@')) {
-        const trimmed = trimmedText.replace(/^@+/, '@');
-        const whisperSep = trimmed.indexOf(" '");
-        if (whisperSep > 1) {
-          const target = trimmed.substring(1, whisperSep).trim();
-          const payload = trimmed.substring(whisperSep + 2);
-          const dotIdx = target.indexOf('.');
-          const baseRaw = String(dotIdx === -1 ? target : target.slice(0, dotIdx)).trim();
-          const pathRaw = String(dotIdx === -1 ? '' : target.slice(dotIdx + 1)).trim();
-
-          try {
-            // Resolve built-in aliases to their DID
-            let resolvedBase;
-            const lowerBase = baseRaw.toLowerCase();
-            if (lowerBase === 'here') {
-              resolvedBase = String(state.currentHome?.roomDid || '').trim();
-            } else if (lowerBase === 'world') {
-              resolvedBase = String(
-                state.aliasBook?.['@world']
-                || state.currentHome?.worldDid
-                || ''
-              ).trim();
-            } else if (lowerBase === 'me' || lowerBase === 'avatar') {
-              resolvedBase = String(state.identity?.did || '').trim();
-            } else {
-              resolvedBase = isMaDid(baseRaw)
-                ? baseRaw
-                : await resolveCommandTargetDidOrToken(baseRaw);
-            }
-            const normalizedDid = String(resolvedBase || '').trim().replace(/^@+/, '');
-            const { targetDid, targetPath, routeWorld } = normalizeDidTargetPath(normalizedDid, pathRaw);
-            const isDirectDidTarget = isMaDid(String(targetDid)) && String(targetDid).includes('#') && !routeWorld && !targetPath;
-
-            if (isDirectDidTarget) {
-              await sendWhisperToDid(targetDid, payload, { ttlSeconds: resolveTtlSeconds('whisper') });
-              appendMessage('system', `Message sent to ${targetDid}.`);
-              return;
-            }
-          } catch (err) {
-            appendMessage('system', `Error sending message to ${target}: ${err.message}`);
-            return;
-          }
-        }
-
-        const spaceIdx = trimmed.indexOf(' ');
-        const rawTarget = (spaceIdx === -1
-          ? trimmed.substring(1)
-          : trimmed.substring(1, spaceIdx)).trim();
-        const remainder = (spaceIdx === -1
-          ? ''
-          : trimmed.substring(spaceIdx + 1)).trim();
-
-        if (!rawTarget) {
-          appendMessage('system', '?');
-          return;
-        }
-
-        const dotIdx = rawTarget.indexOf('.');
-        const baseRaw = String(dotIdx === -1 ? rawTarget : rawTarget.slice(0, dotIdx)).trim();
-        const pathRaw = String(dotIdx === -1 ? '' : rawTarget.slice(dotIdx + 1)).trim();
-        if (!baseRaw) {
-          appendMessage('system', '?');
-          return;
-        }
-
-        // Resolve built-in aliases to their DID
-        let resolvedBase;
-        const lowerBase = baseRaw.toLowerCase();
-        if (lowerBase === 'here') {
-          resolvedBase = String(state.currentHome?.roomDid || '').trim();
-        } else if (lowerBase === 'world') {
-          resolvedBase = String(
-            state.aliasBook?.['@world']
-            || state.currentHome?.worldDid
-            || ''
-          ).trim();
-        } else if (lowerBase === 'me' || lowerBase === 'avatar') {
-          resolvedBase = String(state.identity?.did || '').trim();
-        } else {
-          resolvedBase = isMaDid(baseRaw)
-            ? baseRaw
-            : await resolveCommandTargetDidOrToken(baseRaw);
-        }
-        const normalizedDid = String(resolvedBase || '').trim().replace(/^@+/, '');
-        if (!isMaDid(normalizedDid)) {
-          throw new Error('Target after @ must resolve to did:ma.');
-        }
-
-        const { targetDid, targetPath, routeWorld } = normalizeDidTargetPath(normalizedDid, pathRaw);
-        const normalizedTarget = routeWorld
-          ? `world.${targetPath}`
-          : (targetPath ? `${targetDid}.${targetPath}` : targetDid);
-
-        if (remainder && await tryHandleDidTargetMetaPoll(normalizedTarget, remainder)) {
-          return;
-        }
-
-        const normalized = remainder
-          ? `@${normalizedTarget} ${remainder}`
-          : `@${normalizedTarget}`;
-
-        const sendStart = Date.now();
-        logger.log('send.command', `room=${state.currentHome.room} actor=${activeActorName()} msg_len=${trimmed.length}`);
-        const result = JSON.parse(
-          await sendWorldCmdWithTtl(
-            state.currentHome.endpointId,
-            state.passphrase,
-            state.encryptedBundle,
-            activeActorName(),
-            state.currentHome.room,
-            normalized,
-            BigInt(resolveTtlSeconds('cmd'))
-          )
-        );
-        const elapsed = Date.now() - sendStart;
-        logger.log('send.command', `response ok=${result.ok} broadcasted=${result.broadcasted} latest_seq=${result.latest_event_sequence || 0} in ${elapsed}ms`);
-
-        if (!result.ok) {
-          throw new Error(result.message || 'send failed');
-        }
-
-        if (!result.broadcasted) {
-          applyWorldResponse(result);
-          return;
-        }
-
-        pollCurrentHomeEvents().catch((error) => {
-          logger.log('poll.events', `non-fatal fallback poll after broadcast failed: ${error instanceof Error ? error.message : String(error)}`);
-        });
+      if (inputPrefix === 'target') {
+        await sendAtTargetCommand(trimmedText);
         return;
       }
 

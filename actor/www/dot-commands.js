@@ -172,12 +172,12 @@ export function createDotCommands({
       return true;
     }
     if (args.length !== 1) {
-      appendMessage('system', 'Usage: my.aliases.rewrite [on|off]');
+      appendMessage('system', 'Usage: @my.aliases.rewrite [on|off]');
       return true;
     }
     const mode = String(args[0] || '').trim().toLowerCase();
     if (mode !== 'on' && mode !== 'off') {
-      appendMessage('system', 'Usage: my.aliases.rewrite [on|off]');
+      appendMessage('system', 'Usage: @my.aliases.rewrite [on|off]');
       return true;
     }
     if (typeof setAliasRewriteEnabled === 'function') {
@@ -195,7 +195,7 @@ export function createDotCommands({
         return true;
       }
       for (const [name, address] of entries) {
-        appendMessage('system', `my.aliases.${name} ${address}`);
+        appendMessage('system', `@my.aliases.${name} ${address}`);
       }
       return true;
     }
@@ -212,26 +212,26 @@ export function createDotCommands({
       const inputAliasName = normalizeAliasNameToken(pathSuffix);
       const aliasName = resolveAliasBookKey(inputAliasName);
       if (!aliasName) {
-        appendMessage('system', 'Usage: my.aliases.<name>');
+        appendMessage('system', 'Usage: @my.aliases.<name>');
         return true;
       }
       if (!Object.prototype.hasOwnProperty.call(state.aliasBook, aliasName)) {
         appendMessage('system', `Alias not found: ${inputAliasName}`);
         return true;
       }
-      appendMessage('system', `my.aliases.${aliasName} ${state.aliasBook[aliasName]}`);
+      appendMessage('system', `@my.aliases.${aliasName} ${state.aliasBook[aliasName]}`);
       return true;
     }
 
     const action = String(subcommand || '').trim().toLowerCase();
     if (!action) {
-      appendMessage('system', 'Usage: my.aliases | my.aliases add <name> <target> | my.aliases del <name> | my.aliases.<name> | my.aliases.rewrite [on|off]');
+      appendMessage('system', 'Usage: @my.aliases | @my.aliases add <name> <target> | @my.aliases del <name> | @my.aliases.<name> | @my.aliases.rewrite [on|off]');
       return true;
     }
 
     if (action === 'add') {
       if (args.length !== 2) {
-        appendMessage('system', 'Usage: my.aliases add <name> <target>');
+        appendMessage('system', 'Usage: @my.aliases add <name> <target>');
         return true;
       }
 
@@ -264,7 +264,7 @@ export function createDotCommands({
 
     if (action === 'del') {
       if (args.length !== 1) {
-        appendMessage('system', 'Usage: my.aliases del <name>');
+        appendMessage('system', 'Usage: @my.aliases del <name>');
         return true;
       }
       const inputName = normalizeAliasNameToken(args[0]);
@@ -290,7 +290,7 @@ export function createDotCommands({
       return handleAliasRewrite(args);
     }
 
-    appendMessage('system', 'Usage: my.aliases | my.aliases add <name> <target> | my.aliases del <name> | my.aliases.<name> | my.aliases.rewrite [on|off]');
+    appendMessage('system', 'Usage: @my.aliases | @my.aliases add <name> <target> | @my.aliases del <name> | @my.aliases.<name> | @my.aliases.rewrite [on|off]');
     return true;
   }
 
@@ -311,7 +311,7 @@ export function createDotCommands({
           `  #${entry.id} from=${humanizeIdentifier(entry.from_did || '(unknown)')} type=${entry.content_type || '(unknown)'} text=${preview}`
         );
       }
-      appendSystemUi('Use my.mail pick <id>, my.mail reply <id> <text>, or my.mail delete <id>.', 'Bruk my.mail pick <id>, my.mail reply <id> <tekst>, eller my.mail delete <id>.');
+      appendSystemUi('Use @my.mail pick <id>, @my.mail reply <id> <text>, or @my.mail delete <id>.', 'Bruk @my.mail pick <id>, @my.mail reply <id> <tekst>, eller @my.mail delete <id>.');
       return true;
     }
 
@@ -388,7 +388,7 @@ export function createDotCommands({
       return true;
     }
 
-    appendMessage('system', 'Usage: my.mail [list|pick <id>|reply <id> <text>|delete <id>|clear]');
+    appendMessage('system', 'Usage: @my.mail [list|pick <id>|reply <id> <text>|delete <id>|clear]');
     return true;
   }
 
@@ -403,7 +403,13 @@ export function createDotCommands({
 
     const [verbRaw, ...args] = trimmed.split(/\s+/);
     const verbToken = String(verbRaw || '').trim();
-    const command = verbToken.toLowerCase();
+    const rawCommand = verbToken.toLowerCase();
+    let command = rawCommand;
+    if (rawCommand.startsWith('@actor.')) {
+      command = `my.${rawCommand.slice('@actor.'.length)}`;
+    } else if (rawCommand.startsWith('@my.')) {
+      command = `my.${rawCommand.slice('@my.'.length)}`;
+    }
     if (!command.startsWith('my.')) {
       return false;
     }
@@ -473,17 +479,18 @@ export function createDotCommands({
       appendSystemUi('Local commands:', 'Lokale kommandoer:');
       appendSystemUi('  .help                      - this message', '  .help                      - denne meldingen');
       appendSystemUi('My namespace (self/config):', 'My-navnerom (selv/konfig):');
-      appendSystemUi('  my.did                    - show your identity DID', '  my.did                    - vis identitets-DID-en din');
-      appendSystemUi('  my.identity               - show local pre-publish DID document as raw JSON', '  my.identity               - vis lokalt DID-dokument (før publisering) som rå JSON');
-      appendSystemUi('  my.identity.publish [<did:ma:world>] - publish DID document to world via ma/ipfs/1 (defaults to home world)', '  my.identity.publish [<did:ma:world>] - publiser DID-dokument til verden via ma/ipfs/1 (standard: hjemmeverden)');
-      appendSystemUi('  my.home <did:ma:...#room> - set home target', '  my.home <did:ma:...#room> - sett home-mål');
-      appendSystemUi('  my.aliases add <name> <target> - add/update alias (no spaces in target)', '  my.aliases add <navn> <mål> - legg til/oppdater alias (ingen mellomrom i mål)');
+      appendSystemUi('  @my.did               - show your identity DID', '  @my.did               - vis identitets-DID-en din');
+      appendSystemUi('  @my.identity          - show local pre-publish DID document as raw JSON', '  @my.identity          - vis lokalt DID-dokument (før publisering) som rå JSON');
+      appendSystemUi('  @my.identity.publish [<did:ma:world>] - publish DID document to world via ma/ipfs/1 (defaults to home world)', '  @my.identity.publish [<did:ma:world>] - publiser DID-dokument til verden via ma/ipfs/1 (standard: hjemmeverden)');
+      appendSystemUi('  @my.home <did:ma:...#room> - set home target', '  @my.home <did:ma:...#room> - sett home-mål');
+      appendSystemUi('  @my.aliases add <name> <target> - add/update alias (no spaces in target)', '  @my.aliases add <navn> <mål> - legg til/oppdater alias (ingen mellomrom i mål)');
       appendSystemUi('    note: @here/@me/@world/@avatar are updated automatically', '    merk: @here/@me/@world/@avatar oppdateres automatisk');
-      appendSystemUi('  my.aliases del <name>      - remove alias', '  my.aliases del <navn>      - fjern alias');
-      appendSystemUi('  my.aliases                 - list aliases', '  my.aliases                 - list alias');
-      appendSystemUi('  my.aliases.<name>          - show address for one alias', '  my.aliases.<navn>          - vis adresse for ett alias');
-      appendSystemUi('  my.aliases.rewrite [on|off]- rewrite aliases to DID before parsing', '  my.aliases.rewrite [on|off]- skriv alias om til DID før parsing');
-      appendSystemUi('  my.mail [list|pick|reply|delete|clear] - inspect mailbox queue', '  my.mail [list|pick|reply|delete|clear] - inspiser mailbox-kø');
+      appendSystemUi('  @my.aliases del <name>      - remove alias', '  @my.aliases del <navn>      - fjern alias');
+      appendSystemUi('  @my.aliases                 - list aliases', '  @my.aliases                 - list alias');
+      appendSystemUi('  @my.aliases.<name>          - show address for one alias', '  @my.aliases.<navn>          - vis adresse for ett alias');
+      appendSystemUi('  @my.aliases.rewrite [on|off]- rewrite aliases to DID before parsing', '  @my.aliases.rewrite [on|off]- skriv alias om til DID før parsing');
+      appendSystemUi('  @my.mail [list|pick|reply|delete|clear] - inspect mailbox queue', '  @my.mail [list|pick|reply|delete|clear] - inspiser mailbox-kø');
+      appendSystemUi('  @actor.<command>          - alias for @my.<command>', '  @actor.<kommando>          - alias for @my.<kommando>');
       appendSystemUi('Dot commands (local tools):', 'Punktkommandoer (lokale verktøy):');
       appendSystemUi('  .inspect @here|@me|@exit <name>|<object>- inspect room/me/exit/object and discover DID/CIDs', '  .inspect @here|@me|@exit <navn>|<objekt>- inspiser rom/meg/utgang/objekt og finn DID/CID');
       appendSystemUi('  .use <object|did> [as alias] - set local default target', '  .use <objekt|did> [as alias] - sett lokal standardtarget');
@@ -534,6 +541,14 @@ export function createDotCommands({
         }
       }
       return true;
+    }
+
+    if (dotCommand === 'my.aliases') {
+      return handleAliases(args[0] || '', args.slice(1));
+    }
+
+    if (dotCommand.startsWith('my.aliases.')) {
+      return handleAliases('', args, dotCommand.slice('my.aliases.'.length));
     }
 
     if (dotCommand === 'log') {

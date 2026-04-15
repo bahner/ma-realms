@@ -1148,6 +1148,14 @@ async function resolveCommandTargetDidOrToken(targetToken) {
     throw new Error('Usage: @target <command>');
   }
   const rawLower = raw.toLowerCase();
+  if (rawLower === 'i' || rawLower === 'me' || rawLower === 'avatar') {
+    const actorDid = String(state.identity?.did || '').trim();
+    if (!isMaDid(actorDid)) {
+      throw new Error(`@${raw} requires an active identity.`);
+    }
+    return actorDid;
+  }
+
   if (rawLower.startsWith('my.')) {
     const aliasName = String(raw.slice(3) || '').trim();
     if (!aliasName) {
@@ -2051,11 +2059,13 @@ function dialogText(text) {
     return source;
   }
 
-  if (lowered.startsWith('my.aliases')
+  if (lowered.startsWith('@actor.aliases')
+    || lowered.startsWith('@my.aliases')
     || lowered.startsWith('alias saved:')
     || lowered.startsWith('alias removed:')
     || lowered.startsWith('alias not found:')
-    || lowered.startsWith('usage: my.aliases')
+    || lowered.startsWith('usage: @actor.aliases')
+    || lowered.startsWith('usage: @my.aliases')
     || lowered.startsWith('resolving did target ')
     || lowered.startsWith('connecting to ')
     || lowered.startsWith('send failed:')
