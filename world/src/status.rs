@@ -2,10 +2,13 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use axum::{
+    middleware,
     http::header,
+    http::{HeaderMap, StatusCode},
+    extract::Request,
     Json, Router,
     Form, extract::State,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use ma_core::LaneCapability;
@@ -62,29 +65,114 @@ pub struct WorldInfo {
 struct StatusState {
     world: Arc<World>,
     world_info: WorldInfo,
+    admin_api_token: Option<String>,
+    admin_api_enabled: bool,
 }
 
-pub async fn serve(listener: TcpListener, world: Arc<World>, world_info: WorldInfo, www_root: PathBuf) -> Result<()> {
-    let state = StatusState { world, world_info };
+pub async fn serve(
+    listener: TcpListener,
+    world: Arc<World>,
+    world_info: WorldInfo,
+    www_root: PathBuf,
+    admin_api_enabled: bool,
+    admin_api_token: Option<String>,
+) -> Result<()> {
+    let state = StatusState {
+        world,
+        world_info,
+        admin_api_token,
+        admin_api_enabled,
+    };
     let cors = CorsLayer::new().allow_origin(Any);
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/favicon.ico", get(favicon_ico))
         .route("/openapi.json", get(openapi_json))
-        .route("/unlock", post(unlock_runtime))
-        .route("/bundle/create", post(create_unlock_bundle))
-        .route("/world/kubo", post(update_kubo_api))
-        .route("/world/owner", post(update_world_owner))
-        .route("/world/slug", post(update_world_slug))
-        .route("/world/save", post(save_world_state))
-        .route("/world/load", post(load_world_state))
-        .route("/world/load-root", post(load_world_root_index))
-        .route("/status.json", get(status_json))
+        .route("/status.json", get(status_json));
+
+    if admin_api_enabled {
+        let protected = Router::new()
+            .route("/unlock", post(unlock_runtime))
+            .route("/bundle/create", post(create_unlock_bundle))
+            .route("/world/kubo", post(update_kubo_api))
+            .route("/world/owner", post(update_world_owner))
+            .route("/world/slug", post(update_world_slug))
+            .route("/world/save", post(save_world_state))
+            .route("/world/load", post(load_world_state))
+            .route("/world/load-root", post(load_world_root_index))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_api_token,
+            ));
+        app = app.merge(protected);
+    }
+
+    let app = app
         .layer(cors)
         .with_state(state)
         .fallback_service(ServeDir::new(www_root));
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn extract_api_token(headers: &HeaderMap) -> Option<String> {
+    if let Some(raw) = headers.get("x-ma-api-token") {
+        if let Ok(value) = raw.to_str() {
+            let token = value.trim();
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
+    }
+
+    if let Some(raw) = headers.get(header::AUTHORIZATION) {
+        if let Ok(value) = raw.to_str() {
+            let token = value.trim();
+            if let Some(rest) = token.strip_prefix("Bearer ") {
+                let bearer = rest.trim();
+                if !bearer.is_empty() {
+                    return Some(bearer.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+async fn require_api_token(
+    State(state): State<StatusState>,
+    request: Request,
+    next: middleware::Next,
+) -> Response {
+    let Some(expected) = state.admin_api_token.as_deref().map(str::trim) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "message": "mutating status API is disabled"
+            })),
+        )
+            .into_response();
+    };
+    let provided = extract_api_token(request.headers());
+    let authorized = provided
+        .as_deref()
+        .map(|token| token == expected)
+        .unwrap_or(false);
+
+    if !authorized {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "ok": false,
+                "message": "missing or invalid API token"
+            })),
+        )
+            .into_response();
+    }
+
+    next.run(request).await
 }
 
 async fn favicon_ico() -> impl IntoResponse {
@@ -136,8 +224,8 @@ async fn status_json(State(state): State<StatusState>) -> Json<StatusDocument> {
     })
 }
 
-async fn openapi_json() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
+async fn openapi_json(State(state): State<StatusState>) -> Json<serde_json::Value> {
+    let mut doc = serde_json::json!({
         "openapi": "3.1.0",
         "info": {
             "title": "ma-world status API",
@@ -157,6 +245,7 @@ async fn openapi_json() -> Json<serde_json::Value> {
             "/bundle/create": {
                 "post": {
                     "summary": "Create unlock bundle",
+                    "security": [{ "ApiToken": [] }],
                     "requestBody": {
                         "required": true,
                         "content": {
@@ -176,6 +265,7 @@ async fn openapi_json() -> Json<serde_json::Value> {
             "/unlock": {
                 "post": {
                     "summary": "Unlock runtime",
+                    "security": [{ "ApiToken": [] }],
                     "requestBody": {
                         "required": true,
                         "content": {
@@ -196,6 +286,7 @@ async fn openapi_json() -> Json<serde_json::Value> {
             "/world/slug": {
                 "post": {
                     "summary": "Update world slug / pin alias",
+                    "security": [{ "ApiToken": [] }],
                     "requestBody": {
                         "required": true,
                         "content": {
@@ -215,6 +306,7 @@ async fn openapi_json() -> Json<serde_json::Value> {
             "/world/kubo": {
                 "post": {
                     "summary": "Update runtime Kubo API URL",
+                    "security": [{ "ApiToken": [] }],
                     "requestBody": {
                         "required": true,
                         "content": {
@@ -234,6 +326,7 @@ async fn openapi_json() -> Json<serde_json::Value> {
             "/world/owner": {
                 "post": {
                     "summary": "Set world owner DID",
+                    "security": [{ "ApiToken": [] }],
                     "requestBody": {
                         "required": true,
                         "content": {
@@ -252,12 +345,14 @@ async fn openapi_json() -> Json<serde_json::Value> {
             },
             "/world/save": {
                 "post": {
-                    "summary": "Save encrypted runtime state"
+                    "summary": "Save encrypted runtime state",
+                    "security": [{ "ApiToken": [] }]
                 }
             },
             "/world/load": {
                 "post": {
                     "summary": "Load encrypted runtime state",
+                    "security": [{ "ApiToken": [] }],
                     "requestBody": {
                         "required": true,
                         "content": {
@@ -277,6 +372,7 @@ async fn openapi_json() -> Json<serde_json::Value> {
             "/world/load-root": {
                 "post": {
                     "summary": "Load world root index",
+                    "security": [{ "ApiToken": [] }],
                     "requestBody": {
                         "required": true,
                         "content": {
@@ -293,8 +389,41 @@ async fn openapi_json() -> Json<serde_json::Value> {
                     }
                 }
             }
+        },
+        "components": {
+            "securitySchemes": {
+                "ApiToken": {
+                    "type": "apiKey",
+                    "in": "header",
+                    "name": "X-MA-API-Token",
+                    "description": "Send either X-MA-API-Token or Authorization: Bearer <token> for mutating endpoints."
+                }
+            }
         }
-    }))
+    });
+
+    if !state.admin_api_enabled {
+        if let Some(paths) = doc.get_mut("paths").and_then(|value| value.as_object_mut()) {
+            paths.remove("/bundle/create");
+            paths.remove("/unlock");
+            paths.remove("/world/slug");
+            paths.remove("/world/kubo");
+            paths.remove("/world/owner");
+            paths.remove("/world/save");
+            paths.remove("/world/load");
+            paths.remove("/world/load-root");
+        }
+        if let Some(components) = doc.get_mut("components").and_then(|value| value.as_object_mut()) {
+            components.remove("securitySchemes");
+            if components.is_empty() {
+                if let Some(root) = doc.as_object_mut() {
+                    root.remove("components");
+                }
+            }
+        }
+    }
+
+    Json(doc)
 }
 
 async fn unlock_runtime(

@@ -19,3 +19,7 @@ tokio = { version = "1.37", features = ["io-util"] }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 libp2p-identity = { version = "0.2", features = ["ed25519", "peerid", "rand"] }
 moka = { version = "0.12", features = ["sync"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-acl = "0.3"
+winapi = { version = "0.3", features = ["winnt"] }

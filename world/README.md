@@ -97,9 +97,27 @@ Default output path is `~/.config/ma/<slug>_bundle.json`.
 Then set in runtime config:
 
 ```yaml
+status_api_enabled: true
+admin_api_enabled: false
 unlock_passphrase: <secret>
 unlock_bundle_file: /home/user/.config/ma/<slug>_bundle.json
 ```
+
+Status API runtime options in `<slug>.yaml`:
+
+- `status_api_enabled: true` => start status HTTP socket (`/`, `/status.json`, `/openapi.json`)
+- `status_api_enabled: false` => disable status HTTP socket entirely
+- `admin_api_enabled: true` => enable mutating POST endpoints under status API
+- `admin_api_enabled: false` => disable mutating POST endpoints (status/read-only mode)
+- `admin_api_token: <secret>` => required only when `admin_api_enabled: true`
+
+`MA_WORLD_ADMIN_API_TOKEN` can override `admin_api_token` at runtime.
+
+Sensitive runtime files are hardened after write:
+
+- On Unix/macOS: `<slug>.yaml` uses mode `0600`, iroh secret uses `0400`
+- On Windows: current-user ACL is applied via `windows-acl`
+- Hardening failures are fatal (startup/config generation fails)
 
 One-shot remote/headless setup (writes config + iroh key + unlock bundle):
 
@@ -316,6 +334,9 @@ The axum status surface exposes:
 - **`/status.json`** — JSON `{ world, snapshot, runtime }` for programmatic access
 - `world.capabilities` lists lane capabilities (`inbox`) with ALPN + supported request kinds
 - Transport-level request rejections include `transport_ack` in `WorldResponse` (`lane`, `code`, `detail`)
+
+When both `status_api_enabled: true` and `admin_api_enabled: true`, the status surface also exposes mutating POST endpoints:
+
 - **`/world/slug`** — POST form endpoint to set world slug used as named pin alias
 - **`/world/kubo`** — POST form endpoint to set runtime Kubo API URL
 - **`/world/save`** — POST endpoint to save encrypted runtime state and update root CID
@@ -324,7 +345,7 @@ The axum status surface exposes:
 - **`/bundle/create`** — POST form endpoint to create a compact encrypted unlock bundle from a passphrase
 - **`/unlock`** — POST form endpoint to unlock runtime using passphrase + bundle
 
-All write endpoints use `application/x-www-form-urlencoded` and return JSON.
+All mutating endpoints require `X-MA-API-Token: <token>` (or `Authorization: Bearer <token>`), use `application/x-www-form-urlencoded`, and return JSON.
 
 ### Scripted API (curl)
 
@@ -332,6 +353,7 @@ Example base URL:
 
 ```bash
 BASE="http://127.0.0.1:5002"
+TOKEN="your-status-api-token"
 ```
 
 Check status + OpenAPI:
@@ -345,6 +367,7 @@ Update world slug (pin alias):
 
 ```bash
 curl -s -X POST "$BASE/world/slug" \
+    -H "X-MA-API-Token: $TOKEN" \
     -H "Content-Type: application/x-www-form-urlencoded" \
     --data-urlencode "slug=panteia" | jq
 ```
@@ -353,6 +376,7 @@ Update runtime Kubo API URL:
 
 ```bash
 curl -s -X POST "$BASE/world/kubo" \
+    -H "X-MA-API-Token: $TOKEN" \
     -H "Content-Type: application/x-www-form-urlencoded" \
     --data-urlencode "kubo_url=http://127.0.0.1:5001" | jq
 ```
@@ -363,11 +387,13 @@ Create unlock bundle + unlock runtime:
 PASS="your-passphrase-here"
 
 BUNDLE_JSON=$(curl -s -X POST "$BASE/bundle/create" \
+    -H "X-MA-API-Token: $TOKEN" \
     -H "Content-Type: application/x-www-form-urlencoded" \
     --data-urlencode "passphrase=$PASS" \
     | jq -r '.bundle')
 
 curl -s -X POST "$BASE/unlock" \
+    -H "X-MA-API-Token: $TOKEN" \
     -H "Content-Type: application/x-www-form-urlencoded" \
     --data-urlencode "passphrase=$PASS" \
     --data-urlencode "bundle=$BUNDLE_JSON" | jq
@@ -376,7 +402,7 @@ curl -s -X POST "$BASE/unlock" \
 Save runtime state and capture CIDs:
 
 ```bash
-SAVE_JSON=$(curl -s -X POST "$BASE/world/save")
+SAVE_JSON=$(curl -s -X POST "$BASE/world/save" -H "X-MA-API-Token: $TOKEN")
 STATE_CID=$(echo "$SAVE_JSON" | jq -r '.state_cid')
 ROOT_CID=$(echo "$SAVE_JSON" | jq -r '.root_cid')
 echo "state_cid=$STATE_CID"
@@ -387,6 +413,7 @@ Load by encrypted state CID:
 
 ```bash
 curl -s -X POST "$BASE/world/load" \
+    -H "X-MA-API-Token: $TOKEN" \
     -H "Content-Type: application/x-www-form-urlencoded" \
     --data-urlencode "state_cid=$STATE_CID" | jq
 ```
@@ -395,6 +422,7 @@ Load by world root CID:
 
 ```bash
 curl -s -X POST "$BASE/world/load-root" \
+    -H "X-MA-API-Token: $TOKEN" \
     -H "Content-Type: application/x-www-form-urlencoded" \
     --data-urlencode "root_cid=$ROOT_CID" | jq
 ```
@@ -413,6 +441,7 @@ Then call helper functions:
 
 ```bash
 mw_set_base http://127.0.0.1:5002
+mw_set_token "your-status-api-token"
 mw_status | jq
 mw_set_slug panteia | jq
 mw_set_kubo http://127.0.0.1:5001 | jq

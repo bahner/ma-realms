@@ -6,6 +6,8 @@ use anyhow::{Result, anyhow};
 use iroh::SecretKey;
 use rand::RngCore;
 
+use crate::secure_fs::{SecureFileKind, write_secure_file};
+
 /// Convert a socket address to a multiaddr string (QUIC-v1 over UDP).
 pub fn socket_addr_to_multiaddr(addr: &SocketAddr) -> String {
     match addr.ip() {
@@ -35,23 +37,9 @@ pub fn generate_iroh_secret_file(path: &PathBuf) -> Result<()> {
         return Err(anyhow!("iroh secret already exists at {}", path.display()));
     }
 
-    if let Some(parent) = path.parent() {
-        if parent.as_os_str().is_empty() {
-            // Relative file in current directory, no directory to create.
-        } else {
-            fs::create_dir_all(parent)?;
-        }
-    }
-
     let mut key_bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut key_bytes);
-    fs::write(path, key_bytes)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o400))?;
-    }
+    write_secure_file(path, &key_bytes, SecureFileKind::IrohSecret)?;
 
     Ok(())
 }
@@ -60,6 +48,15 @@ pub fn generate_iroh_secret_file(path: &PathBuf) -> Result<()> {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn repo_tmp_file(name: &str) -> PathBuf {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("tmp")
+            .join("core-tests");
+        fs::create_dir_all(&root).expect("failed creating repo tmp test directory");
+        root.join(name)
+    }
 
     #[test]
     fn multiaddr_ipv4() {
@@ -75,13 +72,15 @@ mod tests {
 
     #[test]
     fn load_missing_key_returns_none() {
-        let path = PathBuf::from("/tmp/ma-test-nonexistent-iroh-key");
+        let path = repo_tmp_file("ma-test-nonexistent-iroh-key");
+        let _ = fs::remove_file(&path);
         assert!(load_persisted_iroh_secret_key(&path).unwrap().is_none());
     }
 
     #[test]
     fn generate_refuses_existing() {
-        let path = PathBuf::from("/tmp/ma-test-iroh-gen-existing");
+        let path = repo_tmp_file("ma-test-iroh-gen-existing");
+        let _ = fs::remove_file(&path);
         fs::write(&path, b"x").ok();
         let result = generate_iroh_secret_file(&path);
         assert!(result.is_err());
@@ -90,7 +89,7 @@ mod tests {
 
     #[test]
     fn roundtrip_generate_and_load() {
-        let path = PathBuf::from("/tmp/ma-test-iroh-roundtrip-key");
+        let path = repo_tmp_file("ma-test-iroh-roundtrip-key");
         let _ = fs::remove_file(&path);
         generate_iroh_secret_file(&path).unwrap();
         let key = load_persisted_iroh_secret_key(&path).unwrap();

@@ -163,6 +163,20 @@ export function createDotCommands({
       onAliasBookChanged();
     }
     appendMessage('system', `Home set: home => ${target}`);
+
+    if (!state.identity) {
+      appendSystemUi(
+        'No identity loaded yet. Create or unlock identity, then publish with @my.identity.publish.',
+        'Ingen identitet lastet enda. Opprett eller lås opp identitet, og publiser med @my.identity.publish.'
+      );
+      return true;
+    }
+
+    appendSystemUi(
+      'Birth: publishing identity to your home world now (first time can take a little while).',
+      'Fødsel: publiserer identiteten din til hjemmeverden nå (første gang kan ta litt tid).'
+    );
+    publishIdentity([target]);
     return true;
   }
 
@@ -483,6 +497,7 @@ export function createDotCommands({
       appendSystemUi('  @my.identity          - show local pre-publish DID document as raw JSON', '  @my.identity          - vis lokalt DID-dokument (før publisering) som rå JSON');
       appendSystemUi('  @my.identity.publish [<did:ma:world>] - publish DID document to world via ma/ipfs/1 (defaults to home world)', '  @my.identity.publish [<did:ma:world>] - publiser DID-dokument til verden via ma/ipfs/1 (standard: hjemmeverden)');
       appendSystemUi('  @my.home <did:ma:...#room> - set home target', '  @my.home <did:ma:...#room> - sett home-mål');
+      appendSystemUi('    birth flow: @my.home also auto-publishes your identity; first publish can take a little while', '    fødselsflyt: @my.home publiserer også identiteten automatisk; første publisering kan ta litt tid');
       appendSystemUi('  @my.aliases add <name> <target> - add/update alias (no spaces in target)', '  @my.aliases add <navn> <mål> - legg til/oppdater alias (ingen mellomrom i mål)');
       appendSystemUi('    note: @here/@me/@world/@avatar are updated automatically', '    merk: @here/@me/@world/@avatar oppdateres automatisk');
       appendSystemUi('  @my.aliases del <name>      - remove alias', '  @my.aliases del <navn>      - fjern alias');

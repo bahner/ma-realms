@@ -51,6 +51,7 @@ use ma_core::{
     sender_encryption_pubkey_multibase_from_document, sender_profile_from_document,
     sender_push_endpoint_from_document,
     generate_iroh_secret_file, load_persisted_iroh_secret_key, socket_addr_to_multiaddr,
+    SecureFileKind, ensure_private_dir, write_secure_file,
 };
 use moka::sync::Cache;
 use nanoid::nanoid;
@@ -8472,7 +8473,7 @@ async fn main() -> Result<()> {
                     .parent()
                     .map(PathBuf::from)
                     .ok_or_else(|| anyhow!("invalid runtime config path {}", runtime_cfg_path.display()))?;
-                fs::create_dir_all(&cfg_dir)?;
+                ensure_private_dir(&cfg_dir)?;
 
                 let iroh_path = cfg_dir.join(format!("{}_iroh.bin", normalized_slug));
                 let bundle_path = cfg_dir.join(format!("{}_bundle.json", normalized_slug));
@@ -8502,16 +8503,18 @@ async fn main() -> Result<()> {
                 );
                 world.set_world_master_key(world_master_key).await;
                 let bundle_json = world.create_unlock_bundle(&passphrase).await?;
-                fs::write(&bundle_path, bundle_json.as_bytes())?;
+                write_secure_file(&bundle_path, bundle_json.as_bytes(), SecureFileKind::SensitiveData)?;
 
                 let cfg = bootstrap::RuntimeFileConfig {
                     iroh_secret: Some(iroh_path.display().to_string()),
+                    status_api_enabled: Some(true),
+                    admin_api_enabled: Some(false),
                     unlock_passphrase: Some(passphrase.clone()),
                     unlock_bundle_file: Some(bundle_path.display().to_string()),
                     ..Default::default()
                 };
                 let yaml = serde_yaml::to_string(&cfg)?;
-                fs::write(&config_path, yaml.as_bytes())?;
+                write_secure_file(&config_path, yaml.as_bytes(), SecureFileKind::RuntimeConfig)?;
 
                 println!("generated headless config artifacts for slug '{}':", normalized_slug);
                 println!("  iroh_secret: {}", iroh_path.display());
@@ -8592,10 +8595,7 @@ async fn main() -> Result<()> {
                     runtime_config_path(&normalized_slug)
                         .with_file_name(format!("{}_bundle.json", normalized_slug))
                 });
-                if let Some(parent) = out_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(&out_path, bundle_json.as_bytes())?;
+                write_secure_file(&out_path, bundle_json.as_bytes(), SecureFileKind::SensitiveData)?;
                 println!("created unlock bundle: {}", out_path.display());
                 return Ok(());
             }
@@ -9574,6 +9574,32 @@ async fn main() -> Result<()> {
         .or_else(|| runtime_cfg.kubo_api_url.clone())
         .or_else(|| std::env::var("MA_KUBO_API_URL").ok())
         .unwrap_or_else(|| default_kubo_url.clone());
+    let status_api_enabled = runtime_cfg.status_api_enabled.unwrap_or(true);
+    let admin_api_enabled = runtime_cfg.admin_api_enabled.unwrap_or(false);
+    let admin_api_token = if admin_api_enabled {
+        Some(
+            std::env::var("MA_WORLD_ADMIN_API_TOKEN")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    runtime_cfg
+                        .admin_api_token
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned)
+                })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "missing admin API token: set admin_api_token in {} or MA_WORLD_ADMIN_API_TOKEN",
+                        runtime_cfg_path.display()
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
     let entry_acl = load_entry_acl()?;
     let world = Arc::new(World::new(
         entry_acl,
@@ -9582,6 +9608,8 @@ async fn main() -> Result<()> {
     ));
     info!("Runtime world slug: {}", world_slug);
     info!("Runtime config path: {}", runtime_cfg_path.display());
+    info!("Status API enabled: {}", status_api_enabled);
+    info!("Admin API enabled: {}", admin_api_enabled);
 
     if let Some(owner) = owner_override.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
         world.set_owner_did(owner).await?;
@@ -9685,9 +9713,17 @@ async fn main() -> Result<()> {
     }
 
     // Bind status listener before iroh endpoint setup so listen failures abort early.
-    let listener = bind_status_listener(&listen_addr).await?;
-    let status_addr = listener.local_addr()?;
-    let status_url = format!("http://{}", status_addr);
+    let listener = if status_api_enabled {
+        Some(bind_status_listener(&listen_addr).await?)
+    } else {
+        None
+    };
+    let status_url = listener
+        .as_ref()
+        .map(|socket| socket.local_addr())
+        .transpose()?
+        .map(|addr| format!("http://{}/status.json", addr))
+        .unwrap_or_else(|| "disabled".to_string());
 
     let key_path = runtime_cfg
         .iroh_secret
@@ -9865,14 +9901,26 @@ async fn main() -> Result<()> {
             ],
         };
 
-        let status_world = world.clone();
-        let status_info = world_info.clone();
-        let status_www_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("www");
-        tokio::spawn(async move {
-            if let Err(err) = status::serve(listener, status_world, status_info, status_www_root).await {
-                error!("status server failed: {}", err);
-            }
-        });
+        if let Some(listener) = listener {
+            let status_world = world.clone();
+            let status_info = world_info.clone();
+            let status_www_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("www");
+            let admin_api_token = admin_api_token.clone();
+            tokio::spawn(async move {
+                if let Err(err) = status::serve(
+                    listener,
+                    status_world,
+                    status_info,
+                    status_www_root,
+                    admin_api_enabled,
+                    admin_api_token,
+                )
+                .await
+                {
+                    error!("status server failed: {}", err);
+                }
+            });
+        }
 
         info!("Created default room: {}", DEFAULT_ROOM);
         info!("World endpoint id: {}", world_info.endpoint_id);

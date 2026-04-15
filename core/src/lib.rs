@@ -26,6 +26,7 @@ pub mod protocol;
 pub mod reply;
 pub mod requirements;
 pub mod room_actor;
+pub mod secure_fs;
 pub mod util;
 
 pub use ma_core::{
@@ -63,6 +64,7 @@ pub use document_helpers::{
     sender_push_endpoint_from_document,
 };
 pub use util::{expand_tilde_path, format_system_time, is_valid_nanoid_id, parse_rfc3339_unix};
+pub use secure_fs::{SecureFileKind, ensure_private_dir, write_secure_file};
 #[cfg(not(target_arch = "wasm32"))]
 pub use iroh::{generate_iroh_secret_file, load_persisted_iroh_secret_key, socket_addr_to_multiaddr};
 pub use object_runtime::{
