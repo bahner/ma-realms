@@ -299,6 +299,14 @@ struct InboxRoute {
     object_id: String,
 }
 
+#[derive(Clone, Debug)]
+struct IncomingExitRef {
+    from_room: String,
+    exit_id: String,
+    exit_name: String,
+    to: String,
+}
+
 impl RequirementChecker for ObjectRequirementRuntime {
     fn resolve_symbol(&self, symbol: &str) -> Option<RequirementValue> {
         match symbol {
@@ -468,6 +476,8 @@ pub struct World {
     avatar_registry: Arc<RwLock<HashMap<String, AvatarRegistryEntry>>>,
     /// Fast lookup from object DID to room/object inbox route.
     object_inbox_index: Cache<String, InboxRoute>,
+    /// Reverse exit lookup: destination room id -> incoming exits that target it.
+    exit_reverse_index: Arc<RwLock<HashMap<String, Vec<IncomingExitRef>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -687,6 +697,7 @@ impl World {
             ))),
             avatar_registry: Arc::new(RwLock::new(HashMap::new())),
             object_inbox_index: Cache::new(OBJECT_INBOX_INDEX_CAPACITY),
+            exit_reverse_index: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -1088,6 +1099,49 @@ impl World {
         }
         drop(rooms);
         *self.avatar_room_index.write().await = next;
+    }
+
+    async fn rebuild_exit_reverse_index(&self) {
+        let rooms = self.rooms.read().await;
+        let mut next: HashMap<String, Vec<IncomingExitRef>> = HashMap::new();
+        for (from_room, room) in rooms.iter() {
+            for exit in room.exits.iter() {
+                let to = String::from(exit.to.trim());
+                if to.is_empty() {
+                    continue;
+                }
+                next.entry(to.clone())
+                    .or_default()
+                    .push(IncomingExitRef {
+                        from_room: from_room.clone(),
+                        exit_id: exit.id.clone(),
+                        exit_name: exit.name.clone(),
+                        to,
+                    });
+            }
+        }
+        drop(rooms);
+
+        for entries in next.values_mut() {
+            entries.sort_by(|left, right| {
+                left.from_room
+                    .cmp(&right.from_room)
+                    .then_with(|| left.exit_name.cmp(&right.exit_name))
+                    .then_with(|| left.exit_id.cmp(&right.exit_id))
+                    .then_with(|| left.to.cmp(&right.to))
+            });
+        }
+
+        *self.exit_reverse_index.write().await = next;
+    }
+
+    async fn incoming_exit_count(&self, room_name: &str) -> usize {
+        self.exit_reverse_index
+            .read()
+            .await
+            .get(room_name)
+            .map(|entries| entries.len())
+            .unwrap_or(0)
     }
 
     async fn find_avatar_presence_by_did(
@@ -2466,6 +2520,8 @@ impl World {
                 }
             }
         }
+
+        self.rebuild_exit_reverse_index().await;
 
         Ok(loaded)
     }
@@ -3871,6 +3927,7 @@ impl World {
         *self.lang_cid.write().await = state.lang_cid;
         *self.state_cid.write().await = Some(state_cid.to_string());
         self.rebuild_avatar_room_index().await;
+        self.rebuild_exit_reverse_index().await;
 
         self.ensure_lobby_intrinsic_objects().await;
 
@@ -6321,6 +6378,9 @@ impl World {
             }
             drop(rooms);
 
+            self.rebuild_exit_reverse_index().await;
+            let incoming_count = self.incoming_exit_count(&exit_target).await;
+
             if let Err(e) = self.save_rooms_and_world_index(&changed_rooms).await {
                 warn!(
                     "Failed to persist world dig room snapshots for {:?}: {}",
@@ -6328,7 +6388,13 @@ impl World {
                     e
                 );
             }
-            return Reply::world(format!("exit '{}' dug from '{}' → '{}'", exit_name, room_name, exit_target)).to_string();
+            return Reply::world(format!(
+                "exit '{}' dug from '{}' → '{}' (incoming refs to target: {})",
+                exit_name,
+                room_name,
+                exit_target,
+                incoming_count
+            )).to_string();
         }
 
         if method == "room" {
@@ -6888,6 +6954,7 @@ impl World {
                                         }
                                         rooms.insert(room_name.to_string(), loaded);
                                     }
+                                    self.rebuild_exit_reverse_index().await;
                                     self.room_cids
                                         .write()
                                         .await
@@ -6986,6 +7053,10 @@ impl World {
                     }
                 }
             }
+        }
+
+        if !changed_rooms.is_empty() {
+            self.rebuild_exit_reverse_index().await;
         }
 
         if !changed_rooms.is_empty() {
@@ -7677,7 +7748,7 @@ impl WorldProtocol {
         match self.handle_request(request, agent_endpoint).await {
             Ok(resp) => resp,
             Err(err) => {
-                warn!("request error: {}", err);
+                warn!("request error on lane '{}': {}", self.lane.label(), err);
                 let detail = err.to_string();
                 let ack_code = if detail.contains("does not support this request type") {
                     TransportAckCode::UnsupportedRequestType
@@ -7869,6 +7940,19 @@ impl WorldProtocol {
         sender_document: Document,
         agent_endpoint: String,
     ) -> Result<WorldResponse> {
+        let command_kind = match &command {
+            WorldCommand::Ping { .. } => "ping",
+            WorldCommand::Message { .. } => "message",
+            WorldCommand::RoomEvents { .. } => "room_events",
+        };
+        debug!(
+            "request lane='{}' kind='{}' from='{}' to='{}'",
+            self.lane.label(),
+            command_kind,
+            sender_did.id(),
+            message.to,
+        );
+
         let sender_profile = sender_profile_from_document(&sender_document);
         let sender_push_endpoint = sender_push_endpoint_from_document(&sender_document)
             .unwrap_or_else(|| agent_endpoint.clone());
@@ -10078,6 +10162,7 @@ async fn main() -> Result<()> {
         info!("World endpoint id: {}", world_info.endpoint_id);
         info!("World status page: {}", world_info.status_url);
         info!("Inbox protocol ALPN: {}", String::from_utf8_lossy(INBOX_ALPN));
+        info!("Avatar protocol ALPN: {}", String::from_utf8_lossy(AVATAR_ALPN));
         info!("IPFS protocol ALPN (citizenship): {}", String::from_utf8_lossy(IPFS_ALPN));
         info!("Presence protocol ALPN (outbound push to agents): {}", String::from_utf8_lossy(PRESENCE_ALPN));
         info!("World entry ACL: {}", world_info.entry_acl);
