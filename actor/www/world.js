@@ -1350,6 +1350,19 @@ export function createWorldResponseFlow({
       syncRoomHeading();
     }
 
+    function applyPresenceRosterPatch() {
+      if (!Array.isArray(result.avatars)) {
+        return;
+      }
+      const responseRoom = String(result.room || '').trim();
+      const currentRoom = String(state.currentHome?.room || '').trim();
+      if (responseRoom && currentRoom && responseRoom !== currentRoom) {
+        return;
+      }
+      clearRoomPresence();
+      seedPresenceFromResultAvatars(result.avatars);
+    }
+
     function applyDirectMessageResponse() {
       primeDidLookupCacheFromWorldMessage(result.message);
       appendMessage('world', result.message || '(no response)');
@@ -1367,6 +1380,8 @@ export function createWorldResponseFlow({
     } else if (result.room_description !== undefined || result.room_title !== undefined) {
       applyRoomMetadataPatch();
     }
+
+    applyPresenceRosterPatch();
 
     // Do not advance poll cursor from hints. Cursor moves only when events are actually processed.
 
