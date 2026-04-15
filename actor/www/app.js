@@ -221,6 +221,7 @@ const state = {
   mailboxSeq: 0,
   commandHistory: [],
   commandQueue: Promise.resolve(),
+  commandQueueEpoch: 0,
   historyIndex: -1,
   historyDraft: '',
   roomPresence: new Map(),
@@ -232,6 +233,7 @@ const state = {
   didPublishPendingCache: new Map(),
   worldPingIntervalMs: null,
   reentryInProgress: null,
+  reentryToken: 0,
   reentryFibPrev: 3000,
   reentryFibCurr: 3000,
   pingFibPrev: PING_FIB_START,
@@ -2605,6 +2607,7 @@ function requestReentry(reason) {
   const fallbackTarget = buildCurrentHomeResumeTarget() || home.endpointId;
   const room = String(home.room || '').trim() || 'lobby';
   const delayMs = state.reentryFibCurr;
+  const reentryToken = Number(state.reentryToken || 0);
 
   stopHomeEventPolling();
   logger.log('reconnect', `reentry requested (${reason || 'unknown'}) delay=${delayMs}ms endpoint=${home.endpointId.slice(0, 8)}...`);
@@ -2618,8 +2621,18 @@ function requestReentry(reason) {
   }
 
   const work = delay(delayMs)
-    .then(() => enterHome(fallbackTarget, room, { silent: true }))
-    .then(() => {
+    .then(async () => {
+      if (reentryToken !== Number(state.reentryToken || 0)) {
+        logger.log('reconnect', 're-entry canceled (manual connect superseded pending retry)');
+        return { canceled: true };
+      }
+      await enterHome(fallbackTarget, room, { silent: true });
+      return { canceled: false };
+    })
+    .then((result) => {
+      if (result && result.canceled) {
+        return;
+      }
       state.reentryFibPrev = 3000;
       state.reentryFibCurr = 3000;
       state.pingFibPrev = PING_FIB_START;
@@ -3470,6 +3483,13 @@ async function enterWorldWithRetry(endpointId, actorName, room) {
 async function enterHome(target, preferredRoom = null) {
   const options = (typeof arguments[2] === 'object' && arguments[2] !== null) ? arguments[2] : {};
   const silent = Boolean(options.silent);
+
+  // Manual world switches supersede pending automatic re-entry retries.
+  if (!silent) {
+    state.reentryToken = Number(state.reentryToken || 0) + 1;
+    state.reentryInProgress = null;
+  }
+
   if (!state.identity) {
     throw new Error('Load or create an identity before entering a home.');
   }
@@ -3590,6 +3610,18 @@ async function enterHome(target, preferredRoom = null) {
     throw new Error(
       `Alias ${alias} is not a valid endpoint id (expected 64 hex chars, got ${endpointId.length}).`
     );
+  }
+
+  const previousEndpoint = String(state.currentHome?.endpointId || '').trim();
+  const switchingEndpoint = previousEndpoint && previousEndpoint !== endpointId;
+  if (switchingEndpoint) {
+    logger.log('connect.home', `switching endpoint ${previousEndpoint.slice(0, 8)}... -> ${endpointId.slice(0, 8)}...`);
+    stopHomeEventPolling();
+    try {
+      await withTimeout(disconnect_world(), 2000, 'disconnect timed out');
+    } catch (disconnectError) {
+      logger.log('connect.home', `non-fatal disconnect before switch failed: ${disconnectError instanceof Error ? disconnectError.message : String(disconnectError)}`);
+    }
   }
 
   if (!silent) {
@@ -3735,6 +3767,34 @@ function enqueueCommandText(text) {
     return;
   }
 
+  function isPriorityWorldConnectCommand(value) {
+    const match = String(value || '').trim().match(/^go\s+(.+)$/i);
+    if (!match) {
+      return false;
+    }
+    const target = String(match[1] || '').trim().split(/\s+/)[0] || '';
+    if (!target) {
+      return false;
+    }
+    const lowered = target.toLowerCase();
+    if (lowered === 'home') {
+      return true;
+    }
+    if (lowered.startsWith('did:ma:') || lowered.startsWith('@did:ma:')) {
+      return true;
+    }
+    if (target.startsWith('@')) {
+      return true;
+    }
+    if (/^[a-f0-9]{64}$/i.test(target)) {
+      return true;
+    }
+    if (lowered.startsWith('/iroh/') || lowered.startsWith('/ma-iroh/')) {
+      return true;
+    }
+    return false;
+  }
+
   recordCommandIo('out', commandText);
 
   // Readline-like history: keep unique latest entry and reset cursor.
@@ -3742,10 +3802,34 @@ function enqueueCommandText(text) {
   state.historyIndex = -1;
   state.historyDraft = '';
 
+  const isPriorityConnect = isPriorityWorldConnectCommand(commandText);
+  const batchBlocksPreemption = Boolean(state.batch?.collecting || state.batch?.running);
+  if (isPriorityConnect && !batchBlocksPreemption) {
+    // Supersede queued commands so manual world switch can run immediately.
+    state.commandQueueEpoch = Number(state.commandQueueEpoch || 0) + 1;
+    state.commandQueue = Promise.resolve();
+    state.reentryToken = Number(state.reentryToken || 0) + 1;
+    state.reentryInProgress = null;
+    appendSystemUi(
+      'Prioritizing world switch command; superseding pending queue.',
+      'Prioriterer world-byttekommando; overstyrer ventende kø.'
+    );
+  } else if (isPriorityConnect && batchBlocksPreemption) {
+    appendSystemUi(
+      'World switch queued behind active batch (.batch blocks preemption).',
+      'World-bytte er lagt i kø bak aktiv batch (.batch blokkerer overstyring).'
+    );
+  }
+
+  const queueEpoch = Number(state.commandQueueEpoch || 0);
   const queuedText = commandText;
   state.commandQueue = state.commandQueue
     .catch(() => {})
     .then(async () => {
+      if (queueEpoch !== Number(state.commandQueueEpoch || 0)) {
+        return;
+      }
+
       if (queuedText.startsWith('.')) {
         parseDot(queuedText);
         return;
