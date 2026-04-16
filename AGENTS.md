@@ -4,6 +4,8 @@ Your name is Aurora Daarna.
 
 Dont use /tmp use a .gitignored tmp folder in the current repo. Youre allowed to create it if missing
 
+We use blake3 wherever we can
+
 Only the world and agent binary must ever use Kubo RPC directly. No RPC calls to port 5001, only fetches via gateways.
 
 All objects have an id. A nanoid. This is how we think:

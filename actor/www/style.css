@@ -533,6 +533,11 @@ button.primary {
   color: #1f5da8;
 }
 
+.msg.broadcast p {
+  color: #0a2a6e;
+  font-style: italic;
+}
+
 .composer {
   margin-top: 0.8rem;
   display: grid;

@@ -1,23 +1,23 @@
 #![forbid(unsafe_code)]
 
-// Re-export generic modules from ma-core so existing consumers keep working.
-pub use ma_core::addressing;
-#[cfg(not(target_arch = "wasm32"))]
-pub use ma_core::bootstrap_identity;
-pub use ma_core::capability_acl;
-pub use ma_core::command_syntax;
 #[cfg(not(target_arch = "wasm32"))]
 pub use ma_core::kubo;
 pub use ma_core::pinning;
-pub use ma_core::ttl_cache;
 
 // Realms-specific modules stay here.
+pub mod addressing;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod bootstrap_identity;
+pub mod capability_acl;
+pub mod command_syntax;
 pub mod document_helpers;
 pub mod domain;
 pub mod identity;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod ipfs_publish;
+pub use ma_core::ipfs_publish;
 pub mod interfaces;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod gossip;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod iroh;
 pub mod object_runtime;
@@ -27,29 +27,32 @@ pub mod reply;
 pub mod requirements;
 pub mod room_actor;
 pub mod secure_fs;
+pub mod ttl_cache;
 pub mod util;
 
-pub use ma_core::{
+pub use addressing::{
     create_world_did, did_root, find_alias_for_address, find_did_by_endpoint,
     humanize_identifier, humanize_text,
     normalize_endpoint_id, normalize_iroh_address, normalize_relay_url, resolve_alias_input,
-    endpoint_id_from_address, endpoint_id_from_transport_value, resolve_inbox_endpoint_id,
+    endpoint_id_from_address, endpoint_id_from_transport_value, resolve_inbox_endpoint_id, same_ipns,
 };
 #[cfg(not(target_arch = "wasm32"))]
-pub use ma_core::{default_ma_config_root, ensure_local_ipns_key_file};
-pub use ma_core::{
+pub use bootstrap_identity::{default_ma_config_root, ensure_local_ipns_key_file};
+pub use capability_acl::{
     CapabilityAcl, CompiledCapabilityAcl, CompiledSubjectAcl,
     capability_pattern_matches, compile_acl, compile_acl_from_text,
     evaluate_compiled_acl, evaluate_compiled_acl_with_owner,
     parse_capability_acl_text, parse_object_local_capability_acl,
     subject_has_capability, subject_has_capability_with_owner, validate_capability_acl,
 };
-pub use ma_core::{parse_property_command, parse_property_command_for_keys, PropertyCommand};
+pub use command_syntax::{parse_property_command, parse_property_command_for_keys, PropertyCommand};
 pub use ma_core::{DidPublisher, IpfsPublisher};
 pub use ma_core::{PinUpdateOutcome, pin_update_add_rm};
 #[cfg(not(target_arch = "wasm32"))]
 pub use ma_core::KuboKey;
-pub use ma_core::TtlCache;
+#[cfg(not(target_arch = "wasm32"))]
+pub use ma_core::KuboDidPublisher;
+pub use ttl_cache::TtlCache;
 pub use domain::{ActorType, AvatarActor, ExitData, Object, RoomActor, WorldActor};
 pub use identity::{
     GeneratedAgentIdentity,
@@ -57,6 +60,12 @@ pub use identity::{
     create_agent_identity_from_private_keys,
 };
 pub use interfaces::AclRuntime;
+pub use ma_core::{
+    CONTENT_TYPE_DOC, IpfsPublishDidRequest, IpfsPublishDidResponse,
+    ValidatedIpfsPublish, validate_ipfs_publish_request,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use ma_core::{handle_ipfs_publish, publish_did_document_to_kubo};
 pub use reply::{Reply, Scope};
 pub use document_helpers::{
     extract_did_description_from_json, normalize_language_for_did_document,
@@ -65,6 +74,8 @@ pub use document_helpers::{
 };
 pub use util::{expand_tilde_path, format_system_time, is_valid_nanoid_id, parse_rfc3339_unix};
 pub use secure_fs::{SecureFileKind, ensure_private_dir, write_secure_file};
+#[cfg(not(target_arch = "wasm32"))]
+pub use gossip::{broadcast_topic_id, gossip_send, gossip_send_text, join_broadcast_channel, join_gossip_topic, topic_id_for};
 #[cfg(not(target_arch = "wasm32"))]
 pub use iroh::{generate_iroh_secret_file, load_persisted_iroh_secret_key, socket_addr_to_multiaddr};
 pub use object_runtime::{
@@ -78,13 +89,13 @@ pub use parser::{
     ActorCommand, MessageEnvelope, normalize_spoken_text, parse_actor_command, parse_message,
 };
 pub use protocol::{
-    IpfsPublishDidRequest, IpfsPublishDidResponse,
     LaneCapability, PresenceAvatar, RoomEvent, TransportAck, TransportAckCode, WorldCommand,
     WorldLane, WorldRequest, WorldResponse,
     AVATAR_ALPN, PRESENCE_ALPN, DEFAULT_WORLD_RELAY_URL, INBOX_ALPN, IPFS_ALPN,
+    BROADCAST_ALPN, BROADCAST_TOPIC,
     DEFAULT_CONTENT_TYPE, CONTENT_TYPE_CHAT, CONTENT_TYPE_PRESENCE,
     CONTENT_TYPE_WORLD, CONTENT_TYPE_EVENT, CONTENT_TYPE_BROADCAST,
-    CONTENT_TYPE_DOC, CONTENT_TYPE_WHISPER, CONTENT_TYPE_MESSAGE,
+    CONTENT_TYPE_WHISPER, CONTENT_TYPE_MESSAGE,
     ROOM_METHOD_BROADCAST_SEND, ROOM_METHOD_EVENTS_POLL, ROOM_METHOD_PRESENCE_LIST,
 };
 pub use requirements::{

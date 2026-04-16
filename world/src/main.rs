@@ -29,8 +29,11 @@ use iroh::{
     endpoint::presets,
     protocol::{AcceptError, ProtocolHandler, Router},
 };
+#[allow(unused_imports)]
+use ma_core::BROADCAST_ALPN;
 use ma_core::{
     ActorCommand, AVATAR_ALPN, PRESENCE_ALPN,
+    BROADCAST_TOPIC,
     CONTENT_TYPE_BROADCAST, CONTENT_TYPE_EVENT, CONTENT_TYPE_PRESENCE, CONTENT_TYPE_WORLD, CompiledCapabilityAcl,
     DEFAULT_WORLD_RELAY_URL,
     ExitData, LaneCapability, MessageEnvelope, ObjectDefinition, ObjectInboxMessage,
@@ -40,6 +43,7 @@ use ma_core::{
     ObjectRuntimeState, IPFS_ALPN, PresenceAvatar, RoomActorAction, RoomActorContext,
     RoomEvent, TransportAck, TransportAckCode, INBOX_ALPN, WorldCommand, WorldLane, WorldRequest,
     WorldResponse, compile_acl, create_world_did, evaluate_compiled_acl_with_owner,
+    validate_ipfs_publish_request, publish_did_document_to_kubo,
     execute_room_actor_command,
     normalize_spoken_text, parse_capability_acl_text, parse_object_local_capability_acl,
     parse_property_command, parse_property_command_for_keys,
@@ -52,6 +56,7 @@ use ma_core::{
     sender_encryption_pubkey_multibase_from_document, sender_profile_from_document,
     sender_push_endpoint_from_document,
     generate_iroh_secret_file, load_persisted_iroh_secret_key, socket_addr_to_multiaddr,
+    join_broadcast_channel, gossip_send_text,
     SecureFileKind, ensure_private_dir, write_secure_file,
 };
 use moka::sync::Cache;

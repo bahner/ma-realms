@@ -43,7 +43,9 @@ export function createDotCommands({
   publishIdentityToWorldDid,
   sendWhisperToDid,
   sendMessageToDid,
-  runSmokeTest,
+  broadcastEnabled,
+  setBroadcastEnabled,
+  broadcastSend,
 }) {
   const DYNAMIC_SPECIAL_ALIASES = new Set(['@here', '@me', '@world', '@avatar']);
 
@@ -592,6 +594,9 @@ export function createDotCommands({
       appendSystemUi('  .ping [@world|@here|@avatar]- local RTT ping via command path', '  .ping [@world|@here|@avatar]- lokal RTT-ping via kommandoløypa');
       appendSystemUi('  .smoke [alias]             - run connectivity smoke test', '  .smoke [alias]             - kjør enkel tilkoblingstest');
       appendSystemUi('  .debug [on|off]            - toggle debug logs', '  .debug [on|off]            - slå debuglogger av/på');
+      appendSystemUi('  .broadcast                 - show broadcast status', '  .broadcast                 - vis kringkastingsstatus');
+      appendSystemUi('  .broadcast.enabled [on|off] - toggle broadcast reception', '  .broadcast.enabled [på|av] - slå kringkasting av/på');
+      appendSystemUi('  .broadcast.send <message>  - send broadcast to all ma nodes', '  .broadcast.send <melding>  - send kringkasting til alle ma-noder');
       appendSystemUi('  .log                       - show log settings', '  .log                       - vis logginnstillinger');
       appendSystemUi('  .log.enabled [true|false]  - get/set console logging enabled', '  .log.enabled [true|false]  - hent/sett om konsoll-logging er aktiv');
       appendSystemUi('  .log.level [warn|info|debug|error] - get/set console log level', '  .log.level [warn|info|debug|error] - hent/sett loggnivå i konsoll');
@@ -928,6 +933,39 @@ export function createDotCommands({
         appendMessage('system', `Smoke failed: ${err instanceof Error ? err.message : String(err)}`);
       });
       return true;
+    }
+
+    if (dotCommand === 'broadcast' || dotCommand === 'broadcast.enabled' || dotCommand === 'broadcast.send') {
+      if (dotCommand === 'broadcast') {
+        appendMessage('system', `.broadcast.enabled ${broadcastEnabled() ? 'on' : 'off'}`);
+        return true;
+      }
+      if (dotCommand === 'broadcast.enabled') {
+        if (args.length === 0) {
+          appendMessage('system', `.broadcast.enabled ${broadcastEnabled() ? 'on' : 'off'}`);
+          return true;
+        }
+        const val = String(args[0] || '').trim().toLowerCase();
+        if (val === 'on' || val === '1' || val === 'true') {
+          setBroadcastEnabled(true);
+        } else if (val === 'off' || val === '0' || val === 'false') {
+          setBroadcastEnabled(false);
+        } else {
+          appendMessage('system', 'Usage: .broadcast.enabled [on|off]');
+        }
+        return true;
+      }
+      if (dotCommand === 'broadcast.send') {
+        const text = args.join(' ').trim();
+        if (!text) {
+          appendMessage('system', 'Usage: .broadcast.send <message>');
+          return true;
+        }
+        broadcastSend(text).catch((err) => {
+          appendMessage('system', `Broadcast send failed: ${err instanceof Error ? err.message : String(err)}`);
+        });
+        return true;
+      }
     }
 
     appendMessage('system', uiText(

@@ -2,12 +2,43 @@
 
 set -euo pipefail
 
-KUBO_API="${KUBO_API:-http://127.0.0.1:5001}"
+# Ops-only helper script.
+# This script intentionally calls Kubo HTTP API endpoints directly via curl.
+# Runtime world/agent code should use ma-core wrappers/publisher flow instead.
+
+KUBO_API_RAW="${KUBO_API:-http://127.0.0.1:5001}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 WORLD_DIR="$(cd -- "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd)"
+REPO_ROOT="$(cd -- "$WORLD_DIR/.." >/dev/null 2>&1 && pwd)"
+TMP_DIR="${TMP_DIR:-$REPO_ROOT/tmp}"
 DEFAULT_CID_FILE="${LANG_CID_FILE:-$WORLD_DIR/.lang_cid}"
 LANG_DIR_DEFAULT="$(cd -- "$SCRIPT_DIR/../lang" >/dev/null 2>&1 && pwd)"
 LANG_DIR="${1:-$LANG_DIR_DEFAULT}"
+
+normalize_kubo_api_base() {
+    local raw="$1"
+    local base
+
+    base="${raw%/}"
+    if [[ -z "$base" ]]; then
+        echo "error: KUBO_API is empty" >&2
+        exit 2
+    fi
+
+    # Accept both base URL and /api/v0 form from env.
+    if [[ "$base" == */api/v0 ]]; then
+        base="${base%/api/v0}"
+    fi
+
+    if [[ "$base" != http://* && "$base" != https://* ]]; then
+        echo "error: KUBO_API must start with http:// or https:// (got: $raw)" >&2
+        exit 2
+    fi
+
+    printf '%s\n' "$base"
+}
+
+KUBO_API="$(normalize_kubo_api_base "$KUBO_API_RAW")"
 
 if [[ ! -d "$LANG_DIR" ]]; then
     echo "error: language directory not found: $LANG_DIR" >&2
@@ -27,6 +58,8 @@ if ! command -v mktemp >/dev/null 2>&1; then
     echo "error: mktemp is required" >&2
     exit 2
 fi
+
+mkdir -p "$TMP_DIR"
 
 ipfs_add_file() {
     local file_path="$1"
@@ -79,8 +112,8 @@ for ftl in "${ftl_files[@]}"; do
     lang_pairs+=("$lang_tag:$cid")
 done
 
-tmp_yaml="$(mktemp)"
-tmp_json="$(mktemp)"
+tmp_yaml="$(mktemp -p "$TMP_DIR" lang-map.XXXXXX.yaml)"
+tmp_json="$(mktemp -p "$TMP_DIR" lang-map.XXXXXX.json)"
 trap 'rm -f "$tmp_yaml" "$tmp_json"' EXIT
 
 {

@@ -1014,7 +1014,7 @@ impl IpfsProtocol {
     }
 
     pub(crate) async fn handle_request(&self, request: WorldRequest) -> Result<IpfsPublishDidResponse> {
-        let validated = ma_core::ipfs_publish::validate_ipfs_publish_request(
+        let validated = validate_ipfs_publish_request(
             &request.message_cbor,
         )?;
 
@@ -1029,7 +1029,7 @@ impl IpfsProtocol {
             );
         }
 
-        let (key_name, cid) = ma_core::ipfs_publish::publish_did_document_to_kubo(
+        let (key_name, cid) = publish_did_document_to_kubo(
             &self.kubo_url,
             &validated.request.did_document_json,
             &validated.request.ipns_private_key_base64,

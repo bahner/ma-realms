@@ -32,7 +32,10 @@ import init, {
   alias_find_did_by_endpoint,
   alias_humanize_identifier,
   alias_humanize_text,
-  disconnect_world
+  disconnect_world,
+  broadcast_init,
+  broadcast_send,
+  broadcast_poll,
 } from './pkg/ma_actor.js';
 import { createInboundDispatcher, createInboxTransport } from './inbox.js';
 import { createAliasFlow, isPrintableAliasLabel, isValidAliasName } from './alias.js';
@@ -245,6 +248,8 @@ const state = {
   lockOverlayStarDrift: 0,
   lockOverlayShownAtMs: 0,
   matrixLog: [],
+  broadcastEnabled: true,
+  broadcastReady: false,
 };
 
 let worldDispatchFlow = null;
@@ -2674,6 +2679,27 @@ function startHomeEventPolling() {
       logger.log('inbox.poll', `non-fatal inbox poll failure: ${error instanceof Error ? error.message : String(error)}`);
     });
   }, ROOM_POLL_INTERVAL_MS);
+
+  // Initialise ma broadcast channel (fire-and-forget).
+  broadcast_init(JSON.stringify([])).then(() => {
+    state.broadcastReady = true;
+    setInterval(() => {
+      if (!state.broadcastEnabled) return;
+      let msgs;
+      try { msgs = JSON.parse(broadcast_poll()); } catch { return; }
+      for (const raw of msgs) {
+        try {
+          const parsed = JSON.parse(raw);
+          const text = parsed.message ?? raw;
+          appendMessage('broadcast', text);
+        } catch {
+          appendMessage('broadcast', raw);
+        }
+      }
+    }, 500);
+  }).catch((err) => {
+    logger.log('broadcast.init', `failed: ${err instanceof Error ? err.message : String(err)}`);
+  });
 }
 
 const { updateIdentityLine: updateIdentityLineFromFlow } = createIdentityLineFlow({ updateLocationContext });
@@ -2881,6 +2907,12 @@ const { parseDot, parseLocalCommand } = createDotCommands({
   sendWhisperToDid,
   sendMessageToDid,
   runSmokeTest,
+  broadcastEnabled: () => state.broadcastEnabled,
+  setBroadcastEnabled: (val) => { state.broadcastEnabled = !!val; },
+  broadcastSend: async (text) => {
+    if (!state.broadcastReady) throw new Error('broadcast not initialised');
+    await broadcast_send(text);
+  },
 });
 
 async function prepareIdentityDocumentForSend() {

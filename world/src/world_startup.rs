@@ -1969,6 +1969,9 @@ pub(crate) async fn run_main() -> Result<()> {
             .accept(IPFS_ALPN, ipfs_protocol)
             .spawn();
 
+        // Join the ma broadcast channel.
+        let broadcast_result = join_broadcast_channel(endpoint.clone()).await;
+
         let presence_probe_secs = env::var("MA_PRESENCE_PROBE_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -1986,6 +1989,37 @@ pub(crate) async fn run_main() -> Result<()> {
             .await;
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        // Announce world startup on the broadcast channel.
+        match broadcast_result {
+            Ok((_gossip, sender)) => {
+                let startup_msg = format!(
+                    r#"{{"kind":"world.online","world":"{}","ts":"{}"}}"#,
+                    world_did,
+                    Utc::now().to_rfc3339()
+                );
+                if let Err(err) = gossip_send_text(&sender, &startup_msg).await {
+                    warn!("Broadcast startup announce failed: {}", err);
+                } else {
+                    info!("Broadcast: world online announced on {}", BROADCAST_TOPIC);
+                }
+                // Keep sender alive in a background task for the shutdown announce.
+                let mut gossip_shutdown = shutdown_rx.clone();
+                let shutdown_world_did = world_did.clone();
+                tokio::spawn(async move {
+                    let _ = gossip_shutdown.changed().await;
+                    let shutdown_msg = format!(
+                        r#"{{"kind":"world.offline","world":"{}","ts":"{}"}}"#,
+                        shutdown_world_did,
+                        Utc::now().to_rfc3339()
+                    );
+                    let _ = gossip_send_text(&sender, &shutdown_msg).await;
+                });
+            }
+            Err(err) => {
+                warn!("Broadcast gossip join failed: {}", err);
+            }
+        }
 
         let inbox_presence = inbox_protocol.clone();
         let mut probe_shutdown = shutdown_rx.clone();

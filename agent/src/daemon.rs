@@ -10,7 +10,12 @@ use axum::{
 use chrono::{SecondsFormat, Utc};
 use did_ma::{DID_PREFIX, Did, Document, SigningKey};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey, endpoint::presets};
-use ma_core::{AVATAR_ALPN, CONTENT_TYPE_WORLD, DEFAULT_WORLD_RELAY_URL, INBOX_ALPN, MessageEnvelope, WorldCommand, WorldRequest, WorldResponse, create_agent_identity_from_private_keys, default_ma_config_root, normalize_relay_url, parse_message, resolve_inbox_endpoint_id};
+use ma_core::{
+    AVATAR_ALPN, CONTENT_TYPE_WORLD, DEFAULT_WORLD_RELAY_URL, INBOX_ALPN,
+    KuboDidPublisher, MessageEnvelope, WorldCommand, WorldRequest, WorldResponse,
+    create_agent_identity_from_private_keys, default_ma_config_root, normalize_relay_url,
+    parse_message, resolve_inbox_endpoint_id,
+};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -314,16 +319,27 @@ async fn alias_monitor_loop(state: AppState) {
         }
 
         let alias = kubo_key_alias(&cfg);
-        match kubo_list_keys(&cfg.kubo_api_url).await {
-            Ok(keys) => {
-                if keys.iter().any(|k| k.name == alias) {
-                    println!("alias monitor: OK alias '{}' found in Kubo", alias);
-                } else {
-                    eprintln!(
-                        "alias monitor: WARN alias '{}' not found in Kubo (waiting for manual setup)",
-                        alias
-                    );
-                }
+        let publisher = match kubo_publisher(&cfg) {
+            Ok(publisher) => publisher,
+            Err(err) => {
+                eprintln!(
+                    "alias monitor: WARN invalid kubo_api_url while checking alias '{}': {}",
+                    alias, err
+                );
+                sleep(Duration::from_secs(cfg.poll_ttl)).await;
+                continue;
+            }
+        };
+
+        match kubo_list_keys(&publisher).await {
+            Ok(keys) if keys.iter().any(|k| k.name == alias) => {
+                println!("alias monitor: OK alias '{}' found in Kubo", alias);
+            }
+            Ok(_) => {
+                eprintln!(
+                    "alias monitor: WARN alias '{}' not found in Kubo (waiting for manual setup)",
+                    alias
+                );
             }
             Err(err) => {
                 eprintln!(
@@ -698,40 +714,6 @@ fn append_agent_log_line(state: &AppState, agent_id: &str, line: &str) -> Result
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
-struct KuboKeyListResponse {
-    #[serde(rename = "Keys")]
-    keys_upper: Option<Vec<KuboKeyItem>>,
-    #[serde(rename = "keys")]
-    keys_lower: Option<Vec<KuboKeyItem>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct KuboKeyItem {
-    #[serde(rename = "Name")]
-    name_upper: Option<String>,
-    #[serde(rename = "Id")]
-    id_upper: Option<String>,
-    #[serde(rename = "name")]
-    name_lower: Option<String>,
-    #[serde(rename = "id")]
-    id_lower: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct NameResolveResponse {
-    #[serde(rename = "Path")]
-    path_upper: Option<String>,
-    #[serde(rename = "path")]
-    path_lower: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct KuboKeyInfo {
-    name: String,
-    id: String,
-}
-
 fn kubo_key_alias(cfg: &AgentdConfig) -> String {
     let alias = cfg.kubo_key_alias.trim();
     if alias.is_empty() {
@@ -741,113 +723,36 @@ fn kubo_key_alias(cfg: &AgentdConfig) -> String {
     }
 }
 
-async fn kubo_create_key(kubo_url: &str, key_name: &str) -> Result<()> {
-    let base = kubo_url.trim_end_matches('/');
-    let url = format!("{base}/api/v0/key/gen");
-
-    reqwest::Client::new()
-        .post(url)
-        .query(&[("arg", key_name), ("type", "ed25519")])
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(())
+fn kubo_publisher(cfg: &AgentdConfig) -> Result<KuboDidPublisher> {
+    KuboDidPublisher::new(&cfg.kubo_api_url)
 }
 
-async fn kubo_list_keys(kubo_url: &str) -> Result<Vec<KuboKeyInfo>> {
-    let base = kubo_url.trim_end_matches('/');
-    let url = format!("{base}/api/v0/key/list");
-    let body = reqwest::Client::new()
-        .post(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-
-    let parsed: KuboKeyListResponse = serde_json::from_str(&body)
-        .map_err(|e| anyhow!("failed parsing key/list response: {} body={}", e, body))?;
-
-    let items = parsed.keys_upper.or(parsed.keys_lower).unwrap_or_default();
-    Ok(items
-        .into_iter()
-        .filter_map(|item| {
-            let name = item
-                .name_upper
-                .or(item.name_lower)
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            let id = item
-                .id_upper
-                .or(item.id_lower)
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            if name.is_empty() || id.is_empty() {
-                None
-            } else {
-                Some(KuboKeyInfo { name, id })
-            }
-        })
-        .collect())
+async fn kubo_create_key(publisher: &KuboDidPublisher, key_name: &str) -> Result<()> {
+    ma_core::kubo::generate_key(publisher.kubo_url(), key_name).await
 }
 
-async fn kubo_ipns_publish(kubo_url: &str, key_name: &str, cid: &str) -> Result<()> {
-    let base = kubo_url.trim_end_matches('/');
-    let url = format!("{base}/api/v0/name/publish");
-    let arg = format!("/ipfs/{}", cid.trim().trim_start_matches("/ipfs/"));
-
-    reqwest::Client::new()
-        .post(url)
-        .query(&[("arg", arg.as_str()), ("key", key_name), ("allow-offline", "true")])
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(())
+async fn kubo_list_keys(publisher: &KuboDidPublisher) -> Result<Vec<ma_core::KuboKey>> {
+    ma_core::kubo::list_keys(publisher.kubo_url()).await
 }
 
-async fn kubo_name_resolve(kubo_url: &str, path: &str) -> Result<String> {
-    let base = kubo_url.trim_end_matches('/');
-    let url = format!("{base}/api/v0/name/resolve");
-    let body = reqwest::Client::new()
-        .post(url)
-        .query(&[("arg", path), ("recursive", "true")])
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-
-    let parsed: NameResolveResponse = serde_json::from_str(&body)
-        .map_err(|e| anyhow!("failed parsing name/resolve response: {} body={}", e, body))?;
-    let resolved = parsed.path_upper.or(parsed.path_lower).unwrap_or_default();
-    if resolved.trim().is_empty() {
-        return Err(anyhow!("missing path in name/resolve response: {}", body));
-    }
-    Ok(resolved)
+async fn kubo_name_resolve(publisher: &KuboDidPublisher, path: &str) -> Result<String> {
+    ma_core::kubo::name_resolve(publisher.kubo_url(), path, true).await
 }
 
-async fn kubo_cat_text(kubo_url: &str, path: &str) -> Result<String> {
-    let base = kubo_url.trim_end_matches('/');
-    let url = format!("{base}/api/v0/cat");
-    let body = reqwest::Client::new()
-        .post(url)
-        .query(&[("arg", path)])
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-    Ok(body)
+async fn kubo_cat_text(publisher: &KuboDidPublisher, path: &str) -> Result<String> {
+    ma_core::kubo::cat_text(publisher.kubo_url(), path).await
 }
 
-async fn resolved_root_did_document(kubo_url: &str, resolved_path: &str, root_did: &str) -> Result<Option<Document>> {
+async fn resolved_root_did_document(
+    publisher: &KuboDidPublisher,
+    resolved_path: &str,
+    root_did: &str,
+) -> Result<Option<Document>> {
     let path = resolved_path.trim();
     if path.is_empty() {
         return Ok(None);
     }
-    let raw = kubo_cat_text(kubo_url, path).await?;
+    let raw = kubo_cat_text(publisher, path).await?;
     let doc = Document::unmarshal(&raw)
         .map_err(|e| anyhow!("failed to decode DID document at {}: {}", path, e))?;
     if doc.id == root_did {
@@ -904,22 +809,19 @@ fn did_doc_has_required_ma_fields(doc: &Document) -> bool {
 
 async fn ensure_world_root_did_published(state: &AppState) -> Result<String> {
     let cfg = state.cfg.read().await.clone();
-    let kubo_url = cfg.kubo_api_url.trim();
-    if kubo_url.is_empty() {
-        return Err(anyhow!("kubo_api_url is empty"));
-    }
+    let publisher = kubo_publisher(&cfg)?;
 
     let world_key_name = kubo_key_alias(&cfg);
 
     let key_id = {
-        let mut keys = kubo_list_keys(kubo_url).await?;
+        let mut keys = kubo_list_keys(&publisher).await?;
         if keys.iter().all(|key| key.name != world_key_name) {
             println!(
                 "startup publish: creating missing kubo key alias '{}'",
                 world_key_name
             );
-            kubo_create_key(kubo_url, &world_key_name).await?;
-            keys = kubo_list_keys(kubo_url).await?;
+            kubo_create_key(&publisher, &world_key_name).await?;
+            keys = kubo_list_keys(&publisher).await?;
         }
 
         if let Some(existing) = keys.iter().find(|key| key.name == world_key_name) {
@@ -935,8 +837,8 @@ async fn ensure_world_root_did_published(state: &AppState) -> Result<String> {
     let root_did = format!("{DID_PREFIX}{}", key_id);
     let ipns_path = format!("/ipns/{}", key_id);
     let mut existing_created: Option<String> = None;
-    if let Ok(resolved) = kubo_name_resolve(kubo_url, &ipns_path).await {
-        match resolved_root_did_document(kubo_url, &resolved, &root_did).await {
+    if let Ok(resolved) = kubo_name_resolve(&publisher, &ipns_path).await {
+        match resolved_root_did_document(&publisher, &resolved, &root_did).await {
             Ok(Some(existing)) => {
                 if did_doc_has_required_ma_fields(&existing) {
                     if cfg.world_did_root != root_did {
@@ -998,8 +900,11 @@ async fn ensure_world_root_did_published(state: &AppState) -> Result<String> {
     if let Some(version) = read_agent_version() {
         document.set_ma_version(version);
     }
-    let cid = ma_core::kubo::dag_put(kubo_url, &document).await?;
-    kubo_ipns_publish(kubo_url, &world_key_name, &cid).await?;
+    let document_json = document.marshal()
+        .map_err(|e| anyhow!("failed to marshal DID document: {}", e))?;
+    let _ = publisher
+        .publish_document(&document_json, "", Some(&world_key_name))
+        .await?;
 
     if cfg.world_did_root != root_did {
         let mut next = cfg.clone();
@@ -1034,10 +939,13 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let cfg = state.cfg.read().await.clone();
     let paths = ensure_daemon_secret_files_for(&cfg, &state.config_path).ok();
     let alias = kubo_key_alias(&cfg);
-    let alias_found = kubo_list_keys(&cfg.kubo_api_url)
-        .await
-        .map(|keys| keys.iter().any(|k| k.name == alias))
-        .unwrap_or(false);
+    let alias_found = match kubo_publisher(&cfg) {
+        Ok(publisher) => kubo_list_keys(&publisher)
+            .await
+            .map(|keys| keys.iter().any(|k| k.name == alias))
+            .unwrap_or(false),
+        Err(_) => false,
+    };
 
     Json(HealthResponse {
         ok: true,
@@ -1131,7 +1039,19 @@ async fn validate_key_alias(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| kubo_key_alias(&cfg));
 
-    match kubo_list_keys(&cfg.kubo_api_url).await {
+    let publisher = match kubo_publisher(&cfg) {
+        Ok(publisher) => publisher,
+        Err(err) => {
+            return Json(ValidateAliasResponse {
+                ok: false,
+                alias: requested,
+                found: false,
+                message: format!("invalid kubo_api_url: {}", err),
+            });
+        }
+    };
+
+    match kubo_list_keys(&publisher).await {
         Ok(keys) => {
             let found = keys.iter().any(|k| k.name == requested);
             if found {
@@ -1420,13 +1340,14 @@ fn build_agent_signing_key(root_did: &str, sig_private: &[u8]) -> Result<Signing
 }
 
 async fn resolve_world_endpoint_id_from_did(kubo_url: &str, world_root_did: &str) -> Result<String> {
+    let publisher = KuboDidPublisher::new(kubo_url)?;
     let root = world_root_from_did_text(world_root_did)
         .ok_or_else(|| anyhow!("invalid world DID '{}'", world_root_did))?;
     let ipns_id = root
         .strip_prefix(DID_PREFIX)
         .ok_or_else(|| anyhow!("invalid world DID root '{}'", root))?;
-    let resolved = kubo_name_resolve(kubo_url, &format!("/ipns/{}", ipns_id)).await?;
-    let doc = resolved_root_did_document(kubo_url, &resolved, &root)
+    let resolved = kubo_name_resolve(&publisher, &format!("/ipns/{}", ipns_id)).await?;
+    let doc = resolved_root_did_document(&publisher, &resolved, &root)
         .await?
         .ok_or_else(|| anyhow!("resolved DID document mismatch for {}", root))?;
 

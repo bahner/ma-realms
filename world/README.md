@@ -262,6 +262,11 @@ The repository now includes starter language files for `lang_cid` workflows:
 `manifest.yaml` is a template. Replace `TODO_CID_*` values with published IPFS
 CIDs for each language file when preparing a world language pack.
 
+Publishing helper boundary:
+
+- Runtime code paths use shared Kubo/publisher logic from ma-core.
+- [scripts/publish-lang-map.sh](scripts/publish-lang-map.sh) is an ops-only helper and intentionally uses direct Kubo HTTP API calls via curl.
+
 Language packs change world response text, not world command grammar.
 Command tokens stay standard/invariant (`help`, `show`, `describe`, `lang`,
 `private`, `knock`, `invite`, `room`, `dig`). If clients want localized
@@ -500,7 +505,7 @@ CORS is open (`*`) so `ma-actor` can fetch status from the browser.
 | `src/room.rs` | `Room` and `RoomAcl` — room state, ACL evaluation, descriptions, exits |
 | `src/actor.rs` | `Avatar` and `ActorAcl` — per-avatar state and per-actor access control |
 | `src/status.rs` | axum routes (`/`, `/status.json`, world save/load/slug, unlock), HTML renderer |
-| `src/kubo.rs` | Kubo HTTP API: DID doc fetch, `dag put/get`, `ipns publish`, `ipfs add` |
+| `src/kubo.rs` | ma-core Kubo shim/re-export used by world runtime |
 | `src/schema.rs` | World skeleton init, authoring YAML, actor secret bundles, crypto |
 
 ## Key Dependencies

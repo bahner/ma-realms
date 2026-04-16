@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+pub use ma_core::ipfs_publish::{CONTENT_TYPE_DOC, IpfsPublishDidRequest, IpfsPublishDidResponse};
 use serde::{Deserialize, Serialize};
 
 // ─── ALPN Protocol Identifiers ──────────────────────────────────────────────
@@ -10,6 +11,8 @@ pub const PRESENCE_ALPN: &[u8] = b"ma/presence/1";
 pub const INBOX_ALPN: &[u8] = b"ma/inbox/1";
 pub const AVATAR_ALPN: &[u8] = b"ma/avatar/1";
 pub const IPFS_ALPN: &[u8] = b"ma/ipfs/1";
+pub const BROADCAST_ALPN: &[u8] = b"ma/broadcast/1";
+pub const BROADCAST_TOPIC: &str = "ma/broadcast/1";
 pub const DEFAULT_WORLD_RELAY_URL: &str = "https://euc1-1.relay.n0.iroh-canary.iroh.link/";
 
 // ─── Content Types (World/Home protocol usage) ─────────────────────────────
@@ -20,30 +23,8 @@ pub const CONTENT_TYPE_PRESENCE: &str = "application/x-ma-presence";
 pub const CONTENT_TYPE_WORLD: &str = "application/x-ma-world";
 pub const CONTENT_TYPE_EVENT: &str = "application/x-ma-event";
 pub const CONTENT_TYPE_BROADCAST: &str = "application/x-ma-broadcast";
-pub const CONTENT_TYPE_DOC: &str = "application/x-ma-doc";
 pub const CONTENT_TYPE_WHISPER: &str = "application/x-ma-whisper";
 pub const CONTENT_TYPE_MESSAGE: &str = "application/x-ma-message";
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct IpfsPublishDidRequest {
-    pub did_document_json: String,
-    #[serde(default)]
-    pub ipns_private_key_base64: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub desired_fragment: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct IpfsPublishDidResponse {
-    pub ok: bool,
-    pub message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub did: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cid: Option<String>,
-}
 
 // ─── Internal Method Identifiers (object-style routing) ───────────────────
 

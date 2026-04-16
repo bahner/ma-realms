@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 use did_ma::Document;
-use ma_core::resolve_inbox_endpoint_id;
+
+use crate::resolve_inbox_endpoint_id;
 
 pub fn sender_profile_from_document(document: &Document) -> String {
     if let Some(ma) = document.ma.as_ref() {
