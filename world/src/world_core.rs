@@ -109,12 +109,12 @@ impl World {
             .map(|(handle, _)| handle.clone())
     }
 
-    pub(crate) async fn derived_avatar_did(&self, sender_did: &Did) -> Result<(Did, String)> {
+    pub(crate) async fn derived_avatar_did(&self, sender_identity: &Did) -> Result<(Did, String)> {
         let world_ipns = self
             .local_world_ipns()
             .await
             .unwrap_or_else(|| "unconfigured".to_string());
-        let avatar_fragment = sender_did
+        let avatar_fragment = sender_identity
             .fragment
             .clone()
             .unwrap_or_else(|| "avatar".to_string())
@@ -126,8 +126,8 @@ impl World {
         Ok((avatar_did, avatar_fragment))
     }
 
-    pub(crate) async fn require_present_avatar(&self, sender_did: &Did) -> Result<PresentAvatar> {
-        let (avatar_did, avatar_fragment) = self.derived_avatar_did(sender_did).await?;
+    pub(crate) async fn require_present_avatar(&self, sender_identity: &Did) -> Result<PresentAvatar> {
+        let (avatar_did, avatar_fragment) = self.derived_avatar_did(sender_identity).await?;
         let room_name = self
             .avatar_room_for_did(&avatar_did.id())
             .await
@@ -137,16 +137,16 @@ impl World {
             .await
             .unwrap_or_else(|| avatar_fragment.clone());
         Ok(PresentAvatar {
-            did: avatar_did,
+            url: avatar_did,
             room_name,
             handle,
         })
     }
 
-    pub(crate) async fn touch_present_avatar(&self, sender_did: &Did) -> Result<PresentAvatar> {
-        let avatar = self.require_present_avatar(sender_did).await?;
+    pub(crate) async fn touch_present_avatar(&self, sender_identity: &Did) -> Result<PresentAvatar> {
+        let avatar = self.require_present_avatar(sender_identity).await?;
         let _ = self
-            .touch_avatar_presence_for_did(&avatar.room_name, &avatar.did.id())
+            .touch_avatar_presence_for_did(&avatar.room_name, &avatar.url.id())
             .await;
         Ok(avatar)
     }
@@ -203,7 +203,7 @@ impl World {
             rooms_json.insert(
                 room_name.clone(),
                 serde_json::json!({
-                    "did": room.did,
+                    "did": room.url,
                     "title": room.title_or_default(),
                     "description": room.description_or_default(),
                     "avatars": avatars_json,
@@ -351,7 +351,7 @@ impl World {
         dag_put_dag_cbor(&kubo_url, &document_value).await?;
 
         let next_entry = AvatarRegistryEntry {
-            did: avatar_did.id(),
+            url: avatar_did.id(),
             name: avatar_name,
             description,
             owner,
@@ -370,7 +370,7 @@ impl World {
         let changed = {
             let mut registry = self.avatar_registry.write().await;
             let changed = registry.get(&fragment).map(|entry| {
-                entry.did != next_entry.did
+                entry.url != next_entry.url
                     || entry.name != next_entry.name
                     || entry.description != next_entry.description
                     || entry.owner != next_entry.owner
@@ -413,16 +413,16 @@ impl World {
     /// Returns (avatar_did, handle, newly_created).
     pub(crate) async fn ensure_avatar(
         &self,
-        sender_did: &Did,
+        sender_identity: &Did,
         sender_profile: &str,
         agent_endpoint: &str,
         sender_encryption_pubkey_multibase: &str,
         room: &str,
     ) -> Result<(Did, String, bool)> {
-        let is_new = self.resolve_avatar_did_for_owner(&sender_did.base_id()).await.is_none();
+        let is_new = self.resolve_avatar_did_for_owner(&sender_identity.base_id()).await.is_none();
 
-        if is_new && !self.can_enter(sender_did).await {
-            return Err(anyhow!("entry denied by ACL for {}", sender_did.id()));
+        if is_new && !self.can_enter(sender_identity).await {
+            return Err(anyhow!("entry denied by ACL for {}", sender_identity.id()));
         }
 
         let language_order = collapse_world_language_order_strict(sender_profile)
@@ -436,7 +436,7 @@ impl World {
             .local_world_ipns()
             .await
             .unwrap_or_else(|| "unconfigured".to_string());
-        let avatar_fragment = sender_did
+        let avatar_fragment = sender_identity
             .fragment
             .clone()
             .unwrap_or_else(|| "avatar".to_string())
@@ -452,8 +452,8 @@ impl World {
 
         let avatar_req = AvatarRequest {
             did: avatar_did.clone(),
-            identity: sender_did.id(),
-            owner: sender_did.base_id(),
+            identity: sender_identity.id(),
+            owner: sender_identity.base_id(),
             agent_endpoint: agent_endpoint.to_string(),
             language_order,
             signing_secret: signing_key.private_key_bytes(),
@@ -905,7 +905,7 @@ impl World {
         &self,
         room_name: &str,
         object_id: &str,
-        caller_did: &str,
+        caller_identity: &str,
         capability: &str,
     ) -> Result<bool> {
         let (object_owner, object_state) = {
@@ -927,7 +927,7 @@ impl World {
                 None => true,
                 Some(acl) => evaluate_compiled_acl_with_owner(
                     acl,
-                    caller_did,
+                    caller_identity,
                     world_owner.as_deref(),
                     capability,
                 ),
@@ -952,7 +952,7 @@ impl World {
             let compiled_local = self.load_compiled_acl_from_cid_cached(&acl_cid).await?;
             evaluate_compiled_acl_with_owner(
                 &compiled_local,
-                caller_did,
+                caller_identity,
                 object_owner.as_deref(),
                 capability,
             )
@@ -964,7 +964,7 @@ impl World {
                     let compiled_local = compile_acl(acl, "object-local-acl")?;
                     evaluate_compiled_acl_with_owner(
                         &compiled_local,
-                        caller_did,
+                        caller_identity,
                         object_owner.as_deref(),
                         capability,
                     )
@@ -1155,7 +1155,7 @@ impl World {
         {
             let mut rooms = self.rooms.write().await;
             for (room_name, room) in rooms.iter_mut() {
-                room.did = create_world_did(&ipns, room_name);
+                room.url = create_world_did(&ipns, room_name);
             }
         }
 
@@ -1828,7 +1828,7 @@ impl World {
                             if trimmed.is_empty() {
                                 // Keep parsed room DID from room content if entry metadata is empty.
                             } else if Did::try_from(trimmed).is_ok() {
-                                loaded_room.did = trimmed.to_string();
+                                loaded_room.url = trimmed.to_string();
                             } else {
                                 warn!(
                                     "Ignoring invalid room DID metadata for '{}' in world index {}: {}",
@@ -1977,7 +1977,7 @@ impl World {
                 (
                     name.clone(),
                     (
-                        room.did.clone(),
+                        room.url.clone(),
                         room.title_or_default(),
                         room.description_or_default(),
                         room.acl.owner.clone(),
@@ -2424,7 +2424,7 @@ impl World {
         &self,
         room_name: &str,
         sender_handle: &str,
-        sender_did: &str,
+        sender_url: &str,
         message_cbor: Vec<u8>,
     ) -> Result<()> {
         let rooms = self.rooms.read().await;
@@ -2459,7 +2459,7 @@ impl World {
             room: room_name.to_string(),
             kind: "chat".to_string(),
             sender: Some(sender_handle.to_string()),
-            sender_did: Some(sender_did.to_string()),
+            sender_url: Some(sender_url.to_string()),
             sender_endpoint: None,
             message: String::new(),
             message_cbor_b64: Some(cbor_b64),
@@ -2670,10 +2670,10 @@ impl World {
             .unwrap_or_default()
     }
 
-    pub(crate) async fn room_did(&self, room_name: &str) -> String {
+    pub(crate) async fn room_url(&self, room_name: &str) -> String {
         let rooms = self.rooms.read().await;
         rooms.get(room_name)
-            .map(|r| r.did.clone())
+            .map(|r| r.url.clone())
             .unwrap_or_default()
     }
 
@@ -2683,7 +2683,7 @@ impl World {
         let mut avatars: Vec<PresenceAvatar> = room.avatars.iter()
             .map(|(handle, avatar)| PresenceAvatar {
                 handle: handle.clone(),
-                did: avatar.agent_did.id(),
+                url: avatar.agent_did.id(),
                 identity: avatar.identity.clone(),
             })
             .collect();
@@ -2703,7 +2703,7 @@ impl World {
             let mut links = registry
                 .values()
                 .filter_map(|entry| {
-                    let did = Did::try_from(entry.did.as_str()).ok()?;
+                    let did = Did::try_from(entry.url.as_str()).ok()?;
                     if did.base_id() != owner_root {
                         return None;
                     }
@@ -2852,7 +2852,7 @@ impl World {
                         titles: room.titles.clone(),
                         exits: room.exits.clone(),
                         descriptions: room.descriptions.clone(),
-                        did: room.did.clone(),
+                        did: room.url.clone(),
                         avatars,
                         room_events: room.state.events.iter().cloned().collect::<Vec<_>>(),
                         next_event_sequence: room.state.next_event_sequence,
@@ -3544,11 +3544,11 @@ impl World {
 
                                     let rooms = self.rooms.read().await;
                                     for (candidate_room, room) in rooms.iter() {
-                                        if room.did == target_did.id() || room.name == fragment {
+                                        if room.url == target_did.id() || room.name == fragment {
                                             return (
                                                 format!(
                                                     "@debug kind=room\n@debug did={}\n@debug room={}\n@debug title={}\n@debug description={}\n@debug avatars={}\n@debug exits={}",
-                                                    room.did,
+                                                    room.url,
                                                     candidate_room,
                                                     room.title_or_default(),
                                                     room.description_or_default(),
@@ -5288,7 +5288,7 @@ impl World {
                         } else {
                             let registry = self.avatar_registry.read().await;
                             if let Some(entry) = registry.get(token) {
-                                entry.did.clone()
+                                entry.url.clone()
                             } else {
                                 return Reply::world(format!(
                                     "invalid owner '{}': expected did:ma:... or avatar handle/fragment",
@@ -5498,7 +5498,7 @@ impl World {
                 if key.is_empty() || key == "_list" {
                     let p = format!("avatars.{}", fragment);
                     return Reply::join(&[
-                        Reply::world_attr(format!("{p}.did"), &entry.did),
+                        Reply::world_attr(format!("{p}.did"), &entry.url),
                         Reply::world_attr(format!("{p}.name"), &entry.name),
                         Reply::world_attr(format!("{p}.description"), &entry.description),
                         Reply::world_attr(format!("{p}.owner"), &entry.owner),
@@ -5513,7 +5513,7 @@ impl World {
                 }
 
                 return match key.as_str() {
-                    "did" => entry.did.clone(),
+                    "did" => entry.url.clone(),
                     "name" => entry.name.clone(),
                     "description" => entry.description.clone(),
                     "owner" => entry.owner.clone(),
@@ -5626,7 +5626,7 @@ impl World {
                     .read()
                     .await
                     .values()
-                    .any(|entry| entry.did == caller_did && entry.owner == *owner)
+                    .any(|entry| entry.url == caller_did && entry.owner == *owner)
         } else {
             false
         };
@@ -6067,7 +6067,7 @@ impl World {
         command: &str,
         from: &str,
         _sender_profile: &str,
-        caller_did: Option<&str>,
+        caller_url: Option<&str>,
     ) -> String {
 
         let (room_exists, avatars, acl_owner, acl_summary, caller_owner, title, description, did) = {
@@ -6083,7 +6083,7 @@ impl World {
                     room.avatars.get(from).map(|avatar| avatar.owner.clone()),
                     room.title_or_default(),
                     room.description_or_default(),
-                    Some(room.did.clone()),
+                    Some(room.url.clone()),
                 )
             } else {
                 (false, Vec::new(), None, "(none)".to_string(), None, String::new(), String::new(), None)
@@ -6098,16 +6098,16 @@ impl World {
             things,
             acl_owner: acl_owner.as_deref(),
             acl_summary: &acl_summary,
-            caller_did,
+            caller_url,
             caller_owner: caller_owner.as_deref(),
             title: &title,
             description: &description,
-            did: did.as_deref(),
+            url: did.as_deref(),
         };
 
         let trimmed = command.trim();
         if trimmed.eq_ignore_ascii_case("ping") || trimmed.eq_ignore_ascii_case("ping?") {
-            let who = caller_did.unwrap_or(from);
+            let who = caller_url.unwrap_or(from);
             return format!("@here pong room={} by={}", room_name, who);
         }
 
@@ -6124,7 +6124,7 @@ impl World {
                     room_name,
                     "speech",
                     Some(from.to_string()),
-                    caller_did.map(|d| d.to_string()),
+                    caller_url.map(|d| d.to_string()),
                     None,
                     speech.clone(),
                 )
@@ -6146,7 +6146,7 @@ impl World {
                     room_name,
                     "emote",
                     Some(from.to_string()),
-                    caller_did.map(|d| d.to_string()),
+                    caller_url.map(|d| d.to_string()),
                     None,
                     action.clone(),
                 )
@@ -6188,7 +6188,7 @@ impl World {
                     .unwrap_or_else(|| "@here room DID unavailable".to_string());
             }
             if token.eq_ignore_ascii_case("me") || token.eq_ignore_ascii_case("avatar") {
-                if let Some(root) = caller_did {
+                if let Some(root) = caller_url {
                     return format!("did={} source=caller handle={}", root, from);
                 }
                 return "@here caller DID unavailable".to_string();
@@ -6226,23 +6226,23 @@ impl World {
 
         match decision.action {
             RoomActorAction::None => {}
-            RoomActorAction::Invite { did } => {
+            RoomActorAction::Invite { identity } => {
                 let mut rooms = self.rooms.write().await;
                 if let Some(room) = rooms.get_mut(room_name) {
-                    room.acl.allow.insert(did.clone());
-                    room.acl.deny.remove(&did);
+                    room.acl.allow.insert(identity.clone());
+                    room.acl.deny.remove(&identity);
                     changed_rooms.push(room_name.to_string());
                 }
             }
-            RoomActorAction::Deny { did } => {
+            RoomActorAction::Deny { identity } => {
                 let mut rooms = self.rooms.write().await;
                 if let Some(room) = rooms.get_mut(room_name) {
-                    if room.acl.owner.as_deref() == Some(did.as_str()) {
+                    if room.acl.owner.as_deref() == Some(identity.as_str()) {
                         response = "@here owner cannot be denied".to_string();
                     } else {
-                        room.acl.deny.insert(did.clone());
-                        room.acl.allow.remove(&did);
-                        room.avatars.retain(|_, av| av.agent_did.id() != did);
+                        room.acl.deny.insert(identity.clone());
+                        room.acl.allow.remove(&identity);
+                        room.avatars.retain(|_, av| av.agent_did.id() != identity);
                         changed_rooms.push(room_name.to_string());
                     }
                 }
@@ -6539,9 +6539,9 @@ impl World {
                 // Create the destination room if it doesn't exist yet.
                 if let Some(local_room) = local_room_to_create.clone() {
                     if !rooms.contains_key(&local_room) {
-                        let room_did = self.build_room_did(&local_room).await;
-                        let mut room = crate::room::Room::new(local_room.clone(), room_did);
-                        if let Some(caller) = caller_did {
+                        let room_url = self.build_room_did(&local_room).await;
+                        let mut room = crate::room::Room::new(local_room.clone(), room_url);
+                        if let Some(caller) = caller_url {
                             room.acl.owner = Some(caller.to_string());
                         }
                         rooms.insert(local_room, room);
@@ -6594,7 +6594,7 @@ impl World {
                 room_name,
                 "room.update",
                 Some(from.to_string()),
-                caller_did.map(|v| v.to_string()),
+                caller_url.map(|v| v.to_string()),
                 None,
                 message,
             )
@@ -6618,7 +6618,7 @@ impl World {
         room_name: &str,
         kind: &str,
         sender: Option<String>,
-        sender_did: Option<String>,
+        sender_url: Option<String>,
         sender_endpoint: Option<String>,
         message: String,
     ) -> u64 {
@@ -6634,7 +6634,7 @@ impl World {
             room: room_name.to_string(),
             kind: kind.to_string(),
             sender,
-            sender_did,
+            sender_url,
             sender_endpoint,
             message,
             message_cbor_b64: None,

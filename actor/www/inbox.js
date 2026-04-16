@@ -46,7 +46,7 @@ export function createInboundDispatcher(deps) {
       kind: String(event.kind || 'default'),
       mimeType: String(event.mime_type || '').trim() || inferInboundMimeType(String(event.kind || 'default')),
       senderHandle: event.sender || '',
-      senderDid: event.sender_did || '',
+      senderDid: event.sender_url || event.sender_did || '',
       senderEndpoint: event.sender_endpoint || '',
       text: event.message || '',
       messageCborB64: event.message_cbor_b64 || ''
@@ -164,8 +164,8 @@ export function createInboundDispatcher(deps) {
     if (typeof onPresenceEvent === 'function') {
       await onPresenceEvent(payload, evt);
     }
-    if (kind === 'presence.refresh.request' && typeof onPresenceRefreshRequest === 'function') {
-      await onPresenceRefreshRequest(payload, evt);
+      if ((payload.room_url || payload.room_did) && state.currentHome) {
+        state.currentHome.roomDid = payload.room_url || payload.room_did;
     }
   }
 
@@ -192,8 +192,8 @@ export function createInboundDispatcher(deps) {
     if (typeof payload.room_description === 'string' && state.currentHome) {
       state.currentHome.roomDescription = payload.room_description;
     }
-    if (payload.room_did && state.currentHome) {
-      state.currentHome.roomDid = payload.room_did;
+    if ((payload.room_url || payload.room_did) && state.currentHome) {
+      state.currentHome.roomDid = payload.room_url || payload.room_did;
     }
 
     // Dispatch one contained event.

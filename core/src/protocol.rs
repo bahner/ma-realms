@@ -161,7 +161,8 @@ impl LaneCapability {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PresenceAvatar {
     pub handle: String,
-    pub did: String,
+    /// Full DID URL of the avatar (`did:ma:<ipns>#<fragment>`).
+    pub url: String,
     #[serde(default)]
     pub identity: String,
 }
@@ -174,7 +175,8 @@ pub struct RoomEvent {
     pub kind: String,
     pub sender: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sender_did: Option<String>,
+    /// Full DID URL of the sender (`did:ma:<ipns>#<fragment>`).
+    pub sender_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_endpoint: Option<String>,
     pub message: String,
@@ -200,9 +202,9 @@ pub struct WorldResponse {
     #[serde(default)]
     pub room_title: String,
     #[serde(default)]
-    pub room_did: String,
-        #[serde(default)]
-        pub world_did: String,
+    pub room_url: String,
+    #[serde(default)]
+    pub world_did: String,
     #[serde(default)]
     pub avatars: Vec<PresenceAvatar>,
     #[serde(default)]
@@ -217,11 +219,11 @@ pub struct WorldResponse {
 pub enum WorldCommand {
     /// Enter or move avatar into a room and return authoritative room state.
     Enter {
-        room_did: String,
+        room_url: String,
     },
     /// Keepalive for an existing avatar; returns the current authoritative room state.
     Ping {
-        room_did: String,
+        room_url: String,
     },
     Message {
         room: String,

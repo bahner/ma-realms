@@ -156,7 +156,7 @@ struct WorldBroadcastEnvelope {
     v: u8,
     kind: String,
     room: String,
-    room_did: String,
+    room_url: String,
     message: String,
     ts: String,
 }
@@ -177,7 +177,7 @@ struct PresenceSnapshotEvent {
     v: u8,
     kind: String,
     room: String,
-    room_did: String,
+    room_url: String,
     room_title: String,
     room_description: String,
     avatars: Vec<PresenceAvatar>,
@@ -190,7 +190,7 @@ struct PresenceRefreshRequestEvent {
     v: u8,
     kind: String,
     room: String,
-    room_did: String,
+    room_url: String,
     ts: String,
 }
 
@@ -199,7 +199,7 @@ struct PresenceRoomStateEvent {
     v: u8,
     kind: String,
     room: String,
-    room_did: String,
+    room_url: String,
     room_title: String,
     room_description: String,
     avatars: Vec<PresenceAvatar>,
@@ -213,7 +213,7 @@ struct RoomEventEnvelope {
     v: u8,
     kind: String,
     room: String,
-    room_did: String,
+    room_url: String,
     room_title: String,
     room_description: String,
     avatars: Vec<PresenceAvatar>,
@@ -484,7 +484,7 @@ struct RuntimeActorSecret {
 
 #[derive(Clone, Debug)]
 struct PresentAvatar {
-    did: Did,
+    url: Did,
     room_name: String,
     handle: String,
 }

@@ -34,11 +34,11 @@ impl ExitAcl {
         }
     }
 
-    pub fn can_use(&self, did_root: &str) -> bool {
-        if self.deny.iter().any(|entry| entry == did_root) {
+    pub fn can_use(&self, identity: &str) -> bool {
+        if self.deny.iter().any(|entry| entry == identity) {
             return false;
         }
-        self.allow.iter().any(|entry| entry == "*" || entry == did_root)
+        self.allow.iter().any(|entry| entry == "*" || entry == identity)
     }
 }
 
@@ -164,8 +164,8 @@ impl ExitData {
         self.aliases.iter().any(|value| matches_direction_stem(value))
     }
 
-    pub fn can_use(&self, did_root: &str) -> bool {
-        self.acl.can_use(did_root)
+    pub fn can_use(&self, identity: &str) -> bool {
+        self.acl.can_use(identity)
     }
 
     pub fn travel_text_for_preferences(&self, preferences: &[String]) -> Option<String> {

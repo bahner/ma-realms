@@ -720,7 +720,7 @@ pub(crate) struct LegacyRoomYaml {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct AvatarRegistryEntry {
-    pub did: String,
+    pub url: String,
     #[serde(default)]
     pub name: String,
     #[serde(default)]

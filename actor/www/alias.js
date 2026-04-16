@@ -144,15 +144,15 @@ export function createAliasFlow({
       state.roomDidLookupCache.delete(key);
       return '';
     }
-    return String(entry.did || '').trim();
+    return String(entry.url || entry.did || '').trim();
   }
 
-  function cacheRoomDidLookup(token, did) {
+  function cacheRoomDidLookup(token, url) {
     const key = roomDidLookupCacheKey(token);
-    const normalizedDid = String(did || '').trim();
-    if (!key || !isMaDid(normalizedDid)) return;
+    const normalizedUrl = String(url || '').trim();
+    if (!key || !isMaDid(normalizedUrl)) return;
     state.roomDidLookupCache.set(key, {
-      did: normalizedDid,
+      url: normalizedUrl,
       expiresAt: Date.now() + roomDidCacheTtlMs
     });
   }

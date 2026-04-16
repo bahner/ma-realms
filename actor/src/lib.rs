@@ -809,12 +809,12 @@ fn lookup_room_object_did(room: &str, object_token: &str) -> Option<String> {
 }
 
 fn update_room_did_cache_from_response(response: &WorldResponse) {
-    if response.room.is_empty() || response.room_did.is_empty() {
+    if response.room.is_empty() || response.room_url.is_empty() {
         return;
     }
     switch_active_room_cache(&response.room);
-    if Did::validate(&response.room_did).is_ok() {
-        cache_room_did(&response.room, &response.room_did);
+    if Did::validate(&response.room_url).is_ok() {
+        cache_room_did(&response.room, &response.room_url);
     }
     for (token, did_text) in &response.room_object_dids {
         if let Ok(did) = Did::try_from(did_text.as_str()) {
@@ -1247,7 +1247,7 @@ fn build_signed_world_request(
         (WorldCommand::Message { .. }, Some(value)) => value,
         (WorldCommand::Message { .. }, None) => {
             return Err(js_err(
-                "world DID target is unknown; include a did:ma target (or connect/enter once to seed world DID)",
+                "world DID target is unknown; include a did:ma target (or connect once to seed world DID)",
             ));
         }
         (_, Some(value)) => value,
@@ -1937,7 +1937,7 @@ pub fn set_bundle_updated_for_send(
     }, true)
 }
 
-/// Enter a world over iroh using the world protocol.
+/// Connect to a world over iroh using the world protocol.
 #[wasm_bindgen]
 pub async fn connect_world(endpoint_id: &str) -> Result<(), JsValue> {
     let cache = get_or_create_stream_cache(endpoint_id).await?;
@@ -2072,7 +2072,7 @@ pub async fn publish_did_document_via_world_ipfs(
     serde_json::to_string(&response).map_err(js_err)
 }
 
-/// Ping the world with a room DID (or name). Serves as keepalive and initial enter.
+/// Ping the world with a room DID (or name). Serves as keepalive and initial avatar/session sync.
 /// The world responds with the actual room the avatar is in (pong).
 /// If the pong room differs from the pinged room, the actor should adjust @here.
 #[wasm_bindgen]
@@ -2081,7 +2081,7 @@ pub async fn ping_world(
     passphrase: &str,
     encrypted_bundle_json: &str,
     actor_name: &str,
-    room_did: &str,
+    room_url: &str,
 ) -> Result<String, JsValue> {
     let timestamp_ms = js_sys::Date::now() as u64;
     let request = build_signed_world_request(
@@ -2089,38 +2089,7 @@ pub async fn ping_world(
         encrypted_bundle_json,
         actor_name,
         WorldCommand::Ping {
-            room_did: room_did.trim().to_string(),
-        },
-        CONTENT_TYPE_WORLD,
-        timestamp_ms,
-        DEFAULT_MESSAGE_TTL_SECS,
-    )?;
-    let response = send_world_request(endpoint_id, request).await?;
-    update_room_did_cache_from_response(&response);
-
-    serde_json::to_string(&WorldActionResult {
-        response,
-        pending_whispers: vec![],
-    })
-    .map_err(js_err)
-}
-
-/// Enter or re-enter a room explicitly.
-#[wasm_bindgen]
-pub async fn enter_world(
-    endpoint_id: &str,
-    passphrase: &str,
-    encrypted_bundle_json: &str,
-    actor_name: &str,
-    room: &str,
-) -> Result<String, JsValue> {
-    let timestamp_ms = js_sys::Date::now() as u64;
-    let request = build_signed_world_request(
-        passphrase,
-        encrypted_bundle_json,
-        actor_name,
-        WorldCommand::Enter {
-            room_did: room.trim().to_string(),
+            room_url: room_url.trim().to_string(),
         },
         CONTENT_TYPE_WORLD,
         timestamp_ms,
@@ -2271,7 +2240,7 @@ pub async fn send_world_whisper_with_ttl(
             handle: String::new(),
             room_description: String::new(),
             room_title: String::new(),
-            room_did: String::new(),
+            room_url: String::new(),
             world_did: String::new(),
             avatars: Vec::new(),
             room_object_dids: HashMap::new(),
@@ -2356,7 +2325,7 @@ pub async fn send_direct_message_with_ttl(
             handle: String::new(),
             room_description: String::new(),
             room_title: String::new(),
-            room_did: String::new(),
+            room_url: String::new(),
             world_did: String::new(),
             avatars: Vec::new(),
             room_object_dids: HashMap::new(),

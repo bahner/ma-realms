@@ -71,7 +71,7 @@ export function parseRoomShowMeta(message) {
   const exits = Number(attrs.exits);
   return {
     room: String(attrs.room || '').trim(),
-    did: String(attrs.did || '').replace(/[),.;]+$/, ''),
+    url: String(attrs.url || attrs.did || '').replace(/[),.;]+$/, ''),
     owner: String(attrs.owner || '').trim(),
     cid: /^[A-Za-z0-9]+$/.test(String(attrs.cid || '')) ? String(attrs.cid || '') : '',
     avatars: Number.isFinite(avatars) ? avatars : null,

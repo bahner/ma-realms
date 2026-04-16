@@ -5,22 +5,22 @@ impl WorldProtocol {
         actual == canonical || actual == legacy
     }
 
-    pub(crate) async fn room_signing_key(&self, room_did: &str) -> Result<SigningKey> {
-        let room_did_parsed = Did::try_from(room_did)
-            .map_err(|e| anyhow!("invalid room did '{}': {}", room_did, e))?;
-        let room_did_canonical = room_did_parsed.id();
-        let signing_did = Did::new_root(&room_did_parsed.ipns)
-            .map_err(|e| anyhow!("invalid signing did for room {}: {}", room_did, e))?;
+    pub(crate) async fn room_signing_key(&self, room_url: &str) -> Result<SigningKey> {
+        let room_url_parsed = Did::try_from(room_url)
+            .map_err(|e| anyhow!("invalid room did '{}': {}", room_url, e))?;
+        let room_url_canonical = room_url_parsed.id();
+        let signing_did = Did::new_root(&room_url_parsed.ipns)
+            .map_err(|e| anyhow!("invalid signing did for room {}: {}", room_url, e))?;
 
         if let Some(room_key) = {
             let slots = self.world.actor_secrets.read().await;
             slots
-                .get(room_did)
-                .or_else(|| slots.get(room_did_canonical.as_str()))
+                .get(room_url)
+                .or_else(|| slots.get(room_url_canonical.as_str()))
                 .map(|secret| secret.signing_key)
         } {
             return SigningKey::from_private_key_bytes(signing_did.clone(), room_key)
-                .map_err(|e| anyhow!("failed to restore signing key for room {}: {}", room_did, e));
+                .map_err(|e| anyhow!("failed to restore signing key for room {}: {}", room_url, e));
         }
 
         if let Some(world_key) = {
@@ -28,12 +28,12 @@ impl WorldProtocol {
             *world_key_guard
         } {
             return SigningKey::from_private_key_bytes(signing_did, world_key)
-                .map_err(|e| anyhow!("failed to restore fallback signing key for room {}: {}", room_did, e));
+                .map_err(|e| anyhow!("failed to restore fallback signing key for room {}: {}", room_url, e));
         }
 
         Err(anyhow!(
             "missing signing key for room {}: missing room actor secret and missing unlocked world signing key",
-            room_did
+            room_url
         ))
     }
 
@@ -51,7 +51,7 @@ impl WorldProtocol {
         for (handle, avatar) in &room.avatars {
             avatars.push(PresenceAvatar {
                 handle: handle.clone(),
-                did: avatar.agent_did.id(),
+                url: avatar.agent_did.id(),
                 identity: avatar.identity.clone(),
             });
             endpoints.push(avatar.agent_endpoint.clone());
@@ -61,7 +61,7 @@ impl WorldProtocol {
         endpoints.dedup();
 
         Ok((
-            room.did.clone(),
+            room.url.clone(),
             room.title_or_default(),
             room.description_or_default(),
             avatars,
@@ -232,17 +232,17 @@ impl WorldProtocol {
         target_endpoint_id: &str,
     ) {
         let context = self.room_presence_context(room_name).await;
-        let (room_did, room_title, room_description, avatars, _endpoints) = match context {
+        let (room_url, room_title, room_description, avatars, _endpoints) = match context {
             Ok(value) => value,
             Err(err) => {
                 warn!("presence snapshot context unavailable for room '{}': {}", room_name, err);
                 return;
             }
         };
-        let signing_key = match self.room_signing_key(&room_did).await {
+        let signing_key = match self.room_signing_key(&room_url).await {
             Ok(key) => key,
             Err(err) => {
-                warn!("presence snapshot signing key unavailable for {}: {}", room_did, err);
+                warn!("presence snapshot signing key unavailable for {}: {}", room_url, err);
                 return;
             }
         };
@@ -256,7 +256,7 @@ impl WorldProtocol {
             v: 1,
             kind: "presence.snapshot".to_string(),
             room: room_name.to_string(),
-            room_did: room_did.clone(),
+            room_url: room_url.clone(),
             room_title,
             room_description,
             avatars,
@@ -271,8 +271,8 @@ impl WorldProtocol {
             }
         };
         let message = match Message::new(
-            room_did.clone(),
-            room_did,
+            room_url.clone(),
+            room_url,
             CONTENT_TYPE_PRESENCE,
             content,
             &signing_key,
@@ -298,7 +298,7 @@ impl WorldProtocol {
 
     pub(crate) async fn push_presence_snapshot(&self, room_name: &str) {
         let context = self.room_presence_context(room_name).await;
-        let (_room_did, _room_title, _room_description, _avatars, endpoints) = match context {
+        let (_room_url, _room_title, _room_description, _avatars, endpoints) = match context {
             Ok(value) => value,
             Err(err) => {
                 warn!("presence snapshot context unavailable for room '{}': {}", room_name, err);
@@ -317,7 +317,7 @@ impl WorldProtocol {
         target_endpoint_id: &str,
     ) {
         let context = self.room_presence_context(room_name).await;
-        let (room_did, room_title, room_description, avatars, _endpoints) = match context {
+        let (room_url, room_title, room_description, avatars, _endpoints) = match context {
             Ok(value) => value,
             Err(err) => {
                 warn!("presence room-state context unavailable for room '{}': {}", room_name, err);
@@ -325,10 +325,10 @@ impl WorldProtocol {
             }
         };
 
-        let signing_key = match self.room_signing_key(&room_did).await {
+        let signing_key = match self.room_signing_key(&room_url).await {
             Ok(key) => key,
             Err(err) => {
-                warn!("presence room-state signing key unavailable for {}: {}", room_did, err);
+                warn!("presence room-state signing key unavailable for {}: {}", room_url, err);
                 return;
             }
         };
@@ -344,7 +344,7 @@ impl WorldProtocol {
             v: 1,
             kind: "presence.room_state".to_string(),
             room: room_name.to_string(),
-            room_did: room_did.clone(),
+            room_url: room_url.clone(),
             room_title,
             room_description,
             avatars,
@@ -360,8 +360,8 @@ impl WorldProtocol {
             }
         };
         let message = match Message::new(
-            room_did.clone(),
-            room_did,
+            room_url.clone(),
+            room_url,
             CONTENT_TYPE_PRESENCE,
             content,
             &signing_key,
@@ -387,17 +387,17 @@ impl WorldProtocol {
 
     pub(crate) async fn push_room_events(&self, room_name: &str, since_sequence: u64) {
         let context = self.room_presence_context(room_name).await;
-        let (room_did, room_title, room_description, avatars, endpoints) = match context {
+        let (room_url, room_title, room_description, avatars, endpoints) = match context {
             Ok(value) => value,
             Err(err) => {
                 warn!("room events context unavailable for '{}': {}", room_name, err);
                 return;
             }
         };
-        let signing_key = match self.room_signing_key(&room_did).await {
+        let signing_key = match self.room_signing_key(&room_url).await {
             Ok(key) => key,
             Err(err) => {
-                warn!("room event signing key unavailable for {}: {}", room_did, err);
+                warn!("room event signing key unavailable for {}: {}", room_url, err);
                 return;
             }
         };
@@ -417,7 +417,7 @@ impl WorldProtocol {
                 v: 1,
                 kind: "room.event".to_string(),
                 room: room_name.to_string(),
-                room_did: room_did.clone(),
+                room_url: room_url.clone(),
                 room_title: room_title.clone(),
                 room_description: room_description.clone(),
                 avatars: avatars.clone(),
@@ -433,8 +433,8 @@ impl WorldProtocol {
                 }
             };
             let message = match Message::new(
-                room_did.clone(),
-                room_did.clone(),
+                room_url.clone(),
+                room_url.clone(),
                 CONTENT_TYPE_EVENT,
                 content,
                 &signing_key,
@@ -472,7 +472,7 @@ impl WorldProtocol {
         }
 
         let context = self.room_presence_context(room_name).await;
-        let (room_did, _room_title, _room_description, _avatars, endpoints) = match context {
+        let (room_url, _room_title, _room_description, _avatars, endpoints) = match context {
             Ok(value) => value,
             Err(err) => {
                 warn!("world broadcast context unavailable for '{}': {}", room_name, err);
@@ -483,10 +483,10 @@ impl WorldProtocol {
             return;
         }
 
-        let signing_key = match self.room_signing_key(&room_did).await {
+        let signing_key = match self.room_signing_key(&room_url).await {
             Ok(key) => key,
             Err(err) => {
-                warn!("world broadcast signing key unavailable for {}: {}", room_did, err);
+                warn!("world broadcast signing key unavailable for {}: {}", room_url, err);
                 return;
             }
         };
@@ -495,7 +495,7 @@ impl WorldProtocol {
             v: 1,
             kind: "world.broadcast".to_string(),
             room: room_name.to_string(),
-            room_did: room_did.clone(),
+            room_url: room_url.clone(),
             message: text.to_string(),
             ts: Utc::now().to_rfc3339(),
         };
@@ -507,8 +507,8 @@ impl WorldProtocol {
             }
         };
         let message = match Message::new(
-            room_did.clone(),
-            room_did,
+            room_url.clone(),
+            room_url,
             CONTENT_TYPE_BROADCAST,
             content,
             &signing_key,
@@ -544,17 +544,17 @@ impl WorldProtocol {
         target_endpoint_id: &str,
     ) {
         let context = self.room_presence_context(room_name).await;
-        let (room_did, _room_title, _room_description, _avatars, _endpoints) = match context {
+        let (room_url, _room_title, _room_description, _avatars, _endpoints) = match context {
             Ok(value) => value,
             Err(err) => {
                 warn!("presence refresh context unavailable for room '{}': {}", room_name, err);
                 return;
             }
         };
-        let signing_key = match self.room_signing_key(&room_did).await {
+        let signing_key = match self.room_signing_key(&room_url).await {
             Ok(key) => key,
             Err(err) => {
-                warn!("presence refresh signing key unavailable for {}: {}", room_did, err);
+                warn!("presence refresh signing key unavailable for {}: {}", room_url, err);
                 return;
             }
         };
@@ -563,7 +563,7 @@ impl WorldProtocol {
             v: 1,
             kind: "presence.refresh.request".to_string(),
             room: room_name.to_string(),
-            room_did: room_did.clone(),
+            room_url: room_url.clone(),
             ts: Utc::now().to_rfc3339(),
         };
         let content = match serde_json::to_vec(&payload) {
@@ -574,8 +574,8 @@ impl WorldProtocol {
             }
         };
         let message = match Message::new(
-            room_did.clone(),
-            room_did,
+            room_url.clone(),
+            room_url,
             CONTENT_TYPE_PRESENCE,
             content,
             &signing_key,
@@ -601,7 +601,7 @@ impl WorldProtocol {
 
     pub(crate) async fn push_presence_refresh_request(&self, room_name: &str) {
         let context = self.room_presence_context(room_name).await;
-        let (_room_did, _room_title, _room_description, _avatars, endpoints) = match context {
+        let (_room_url, _room_title, _room_description, _avatars, endpoints) = match context {
             Ok(value) => value,
             Err(err) => {
                 warn!("presence refresh context unavailable for room '{}': {}", room_name, err);
@@ -667,7 +667,7 @@ impl WorldProtocol {
                     handle: String::new(),
                     room_description: String::new(),
                     room_title: String::new(),
-                    room_did: String::new(),
+                    room_url: String::new(),
                     world_did: String::new(),
                     avatars: Vec::new(),
                     room_object_dids: HashMap::new(),
@@ -848,7 +848,7 @@ impl WorldProtocol {
         let room_name_owned = room_name.to_string();
         let room_description = self.world.room_description(room_name).await;
         let room_title = self.world.room_title(room_name).await;
-        let room_did = self.world.room_did(room_name).await;
+        let room_url = self.world.room_url(room_name).await;
         let world_did = self.world.world_did.read().await.clone().unwrap_or_default();
         let avatars = self.world.room_avatars(room_name).await;
         let room_object_dids = self.world.room_object_did_map(room_name).await;
@@ -864,7 +864,7 @@ impl WorldProtocol {
             handle,
             room_description,
             room_title,
-            room_did,
+            room_url,
             world_did,
             avatars,
             room_object_dids,
@@ -909,19 +909,19 @@ impl WorldProtocol {
         }
 
         match command {
-            WorldCommand::Enter { room_did } => {
+            WorldCommand::Enter { room_url } => {
                 self.handle_enter(
                     sender_did,
                     &sender_profile,
                     &sender_push_endpoint,
                     &sender_encryption_pubkey_multibase,
                     &agent_endpoint,
-                    room_did,
+                    room_url,
                 )
                 .await
             }
-            WorldCommand::Ping { room_did } => {
-                self.handle_ping(sender_did, &sender_push_endpoint, &agent_endpoint, room_did)
+            WorldCommand::Ping { room_url } => {
+                self.handle_ping(sender_did, &sender_push_endpoint, &agent_endpoint, room_url)
                     .await
             }
             WorldCommand::Message { room: _, envelope } => {
@@ -974,7 +974,7 @@ impl ProtocolHandler for WorldProtocol {
                     handle: String::new(),
                     room_description: String::new(),
                     room_title: String::new(),
-                    room_did: String::new(),
+                    room_url: String::new(),
                     world_did: String::new(),
                     avatars: Vec::new(),
                     room_object_dids: HashMap::new(),

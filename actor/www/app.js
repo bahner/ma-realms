@@ -9,7 +9,6 @@ import init, {
   normalize_bip39_phrase,
   connect_world,
   connect_world_with_relay,
-  enter_world,
   ping_world,
   poll_world_events,
   send_world_chat,
@@ -3401,7 +3400,7 @@ async function lookupWorldRelayHint(endpointId) {
   }
 }
 
-async function enterWorldWithRetry(endpointId, actorName, room) {
+async function syncAvatarWithRetry(endpointId, actorName, room) {
   const maxAttempts = 3;
   let lastError = null;
   let announcedConnectivity = false;
@@ -3441,7 +3440,7 @@ async function enterWorldWithRetry(endpointId, actorName, room) {
       logger.log(`connect.attempt.${attempt}`, `phase 2/2: sending ping request`);
       const requestStart = Date.now();
       const response = await withTimeout(
-        enter_world(endpointId, state.passphrase, state.encryptedBundle, actorName, room),
+        ping_world(endpointId, state.passphrase, state.encryptedBundle, actorName, room),
         12000,
         'ping request timed out'
       );
@@ -3641,16 +3640,16 @@ async function enterHome(target, preferredRoom = null) {
   try {
     if (savedRoom && savedRoom !== 'lobby') {
       try {
-        result = JSON.parse(await enterWorldWithRetry(endpointId, currentActorFragment(), savedRoom));
+        result = JSON.parse(await syncAvatarWithRetry(endpointId, currentActorFragment(), savedRoom));
         if (!result.ok) {
           logger.log('connect.home', `last room '${savedRoom}' denied (${result.message}), falling back to lobby`);
-          result = JSON.parse(await enterWorldWithRetry(endpointId, currentActorFragment(), 'lobby'));
+          result = JSON.parse(await syncAvatarWithRetry(endpointId, currentActorFragment(), 'lobby'));
         }
       } catch (_) {
-        result = JSON.parse(await enterWorldWithRetry(endpointId, currentActorFragment(), 'lobby'));
+        result = JSON.parse(await syncAvatarWithRetry(endpointId, currentActorFragment(), 'lobby'));
       }
     } else {
-      result = JSON.parse(await enterWorldWithRetry(endpointId, currentActorFragment(), 'lobby'));
+      result = JSON.parse(await syncAvatarWithRetry(endpointId, currentActorFragment(), 'lobby'));
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -3659,8 +3658,8 @@ async function enterHome(target, preferredRoom = null) {
   logger.log('connect.home', `result ok=${result.ok} room=${result.room} endpoint=${result.endpoint_id?.slice(0, 8)}... latest_seq=${result.latest_event_sequence || 0}`);
 
   if (!result.ok) {
-    logger.warn('connect.home', `world enter returned ok=false: ${String(result.message || '(empty message)')}`);
-    throw new Error(result.message || 'enter failed');
+    logger.warn('connect.home', `avatar sync returned ok=false: ${String(result.message || '(empty message)')}`);
+    throw new Error(result.message || 'avatar sync failed');
   }
 
   const activeRoom = result.room || 'lobby';

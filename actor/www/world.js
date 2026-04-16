@@ -178,6 +178,7 @@ export function createWorldFlow({
     const text = String(message || '').toLowerCase();
     return (
       text.includes('not registered in room')
+      || text.includes('is not present; enter required')
       || (text.includes('unknown avatar @') && text.includes(' in room '))
     );
   }
@@ -1322,7 +1323,7 @@ export function createWorldResponseFlow({
       if (Array.isArray(avatars) && avatars.length > 0) {
         for (const avatar of avatars) {
           const handle = String(avatar?.handle || '').trim();
-          if (handle) trackRoomPresence(handle, String(avatar?.did || ''), String(avatar?.identity || ''));
+          if (handle) trackRoomPresence(handle, String(avatar?.url || avatar?.did || ''), String(avatar?.identity || ''));
         }
         return;
       }
@@ -1333,7 +1334,7 @@ export function createWorldResponseFlow({
     function applyRoomChange(nextRoom) {
       const previousRoom = state.currentHome.room;
       state.currentHome.room = nextRoom;
-      if (result.room_did) state.currentHome.roomDid = result.room_did;
+      if (result.room_url || result.room_did) state.currentHome.roomDid = result.room_url || result.room_did;
       if (result.world_did) state.currentHome.worldDid = result.world_did;
       if (result.room_title) state.currentHome.roomTitle = result.room_title;
       if (typeof result.room_description === 'string') state.currentHome.roomDescription = result.room_description;

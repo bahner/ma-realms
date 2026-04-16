@@ -3,19 +3,19 @@ use super::*;
 impl WorldProtocol {
     pub(super) async fn handle_enter(
         &self,
-        sender_did: &Did,
+        sender_identity: &Did,
         sender_profile: &str,
         sender_push_endpoint: &str,
         sender_encryption_pubkey_multibase: &str,
         agent_endpoint: &str,
-        room_did: String,
+        room_url: String,
     ) -> Result<WorldResponse> {
-        let pinged_room = if room_did.is_empty() {
+        let pinged_room = if room_url.is_empty() {
             DEFAULT_ROOM.to_string()
-        } else if let Ok(did) = Did::try_from(room_did.as_str()) {
+        } else if let Ok(did) = Did::try_from(room_url.as_str()) {
             did.fragment.clone().unwrap_or_else(|| DEFAULT_ROOM.to_string())
         } else {
-            room_did.clone() // Postel: accept plain room name
+            room_url.clone() // Postel: accept plain room name
         };
 
         let world_ipns = self
@@ -23,7 +23,7 @@ impl WorldProtocol {
             .local_world_ipns()
             .await
             .unwrap_or_else(|| "unconfigured".to_string());
-        let avatar_fragment = sender_did
+        let avatar_fragment = sender_identity
             .fragment
             .clone()
             .unwrap_or_else(|| "avatar".to_string())
@@ -35,7 +35,7 @@ impl WorldProtocol {
         let (_avatar_did, handle, created) = self
             .world
             .ensure_avatar(
-                sender_did,
+                sender_identity,
                 sender_profile,
                 sender_push_endpoint,
                 sender_encryption_pubkey_multibase,
@@ -60,7 +60,7 @@ impl WorldProtocol {
                 .enqueue_room_dispatch(&actual_room, RoomDispatchTask::PresenceSnapshot)
                 .await;
         }
-        let room_did = self.world.room_did(&actual_room).await;
+        let room_url = self.world.room_url(&actual_room).await;
         let latest_event_sequence = self
             .world
             .latest_room_event_sequence(&actual_room)
@@ -69,7 +69,7 @@ impl WorldProtocol {
         Ok(self
             .room_state_response(
                 &actual_room,
-                format!("pong {}", room_did),
+                format!("pong {}", room_url),
                 latest_event_sequence,
                 false,
                 Vec::new(),
@@ -80,31 +80,31 @@ impl WorldProtocol {
 
     pub(super) async fn handle_ping(
         &self,
-        sender_did: &Did,
+        sender_identity: &Did,
         sender_push_endpoint: &str,
         agent_endpoint: &str,
-        room_did: String,
+        room_url: String,
     ) -> Result<WorldResponse> {
-        let pinged_room = if room_did.is_empty() {
+        let pinged_room = if room_url.is_empty() {
             DEFAULT_ROOM.to_string()
-        } else if let Ok(did) = Did::try_from(room_did.as_str()) {
+        } else if let Ok(did) = Did::try_from(room_url.as_str()) {
             did.fragment.clone().unwrap_or_else(|| DEFAULT_ROOM.to_string())
         } else {
-            room_did.clone()
+            room_url.clone()
         };
-        let avatar = self.world.touch_present_avatar(sender_did).await?;
+        let avatar = self.world.touch_present_avatar(sender_identity).await?;
 
         debug!(
             "[{}] ping {} did={} requested_room={} ingress_lane={} remote={} push={}",
             avatar.room_name,
             avatar.handle,
-            avatar.did.id(),
+            avatar.url.id(),
             pinged_room,
             self.lane.label(),
             agent_endpoint,
             sender_push_endpoint
         );
-        let room_did = self.world.room_did(&avatar.room_name).await;
+        let room_url = self.world.room_url(&avatar.room_name).await;
         let latest_event_sequence = self
             .world
             .latest_room_event_sequence(&avatar.room_name)
@@ -113,7 +113,7 @@ impl WorldProtocol {
         Ok(self
             .room_state_response(
                 &avatar.room_name,
-                format!("pong {}", room_did),
+                format!("pong {}", room_url),
                 latest_event_sequence,
                 false,
                 Vec::new(),
@@ -125,16 +125,16 @@ impl WorldProtocol {
     pub(super) async fn handle_message(
         &self,
         message_to: &str,
-        sender_did: &Did,
+        sender_identity: &Did,
         sender_push_endpoint: &str,
         envelope: MessageEnvelope,
     ) -> Result<WorldResponse> {
-        let avatar = self.world.require_present_avatar(sender_did).await?;
+        let avatar = self.world.require_present_avatar(sender_identity).await?;
 
         let route_room = match &envelope {
             MessageEnvelope::ActorCommand { target, .. } if target.eq_ignore_ascii_case("avatar") => {
                 self.world
-                    .avatar_room_for_did(&avatar.did.id())
+                    .avatar_room_for_did(&avatar.url.id())
                     .await
                     .unwrap_or_else(|| avatar.room_name.clone())
             }
@@ -143,11 +143,11 @@ impl WorldProtocol {
 
         let _ = self
             .world
-            .touch_avatar_presence_for_did(&route_room, &avatar.did.id())
+            .touch_avatar_presence_for_did(&route_room, &avatar.url.id())
             .await;
         let effective_sender_profile = self
             .world
-            .avatar_language_order_for_did(&route_room, &avatar.did.id())
+            .avatar_language_order_for_did(&route_room, &avatar.url.id())
             .await
             .unwrap_or_else(|| "nb_NO:en_UK".to_string());
         let is_world_admin = matches!(
@@ -184,15 +184,15 @@ impl WorldProtocol {
         // Route command envelopes using the active room handle bound to sender DID.
         let actor_name = self
             .world
-            .avatar_handle_for_did(&route_room, &avatar.did.id())
+            .avatar_handle_for_did(&route_room, &avatar.url.id())
             .await
-            .unwrap_or_else(|| avatar.did.id());
+            .unwrap_or_else(|| avatar.url.id());
         let (message, broadcasted, effective_room) = self
             .world
             .send_message(
                 &route_room,
                 &actor_name,
-                &avatar.did,
+                &avatar.url,
                 &effective_sender_profile,
                 envelope,
             )
@@ -238,10 +238,10 @@ impl WorldProtocol {
 
     pub(super) async fn handle_room_events(
         &self,
-        sender_did: &Did,
+        sender_identity: &Did,
         since_sequence: u64,
     ) -> Result<WorldResponse> {
-        let avatar = self.world.touch_present_avatar(sender_did).await?;
+        let avatar = self.world.touch_present_avatar(sender_identity).await?;
         let (events, latest_event_sequence) = self
             .world
             .room_events_since(&avatar.room_name, since_sequence)

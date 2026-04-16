@@ -11,15 +11,15 @@ export function createHereFlow({
   didParts,
 }) {
   function labelForPresenceEntry(entry) {
-    const didText = String(entry?.did || '').trim();
+    const urlText = String(entry?.url || entry?.did || '').trim();
     const identityText = String(entry?.identity || '').trim();
     const handle = String(entry?.handle || '').trim();
-    if (!didText && !identityText) {
+    if (!urlText && !identityText) {
       return handle;
     }
 
     const parts = typeof didParts === 'function'
-      ? didParts(identityText || didText)
+      ? didParts(identityText || urlText)
       : { root: '', fragment: '' };
     const fragment = String(parts?.fragment || '').trim();
     const identityRoot = String(parts?.root || '').trim();
@@ -34,7 +34,7 @@ export function createHereFlow({
     if (identityLabel) {
       return identityLabel;
     }
-    return handle || formatDidForDialog(didText);
+    return handle || formatDidForDialog(urlText);
   }
 
   function renderAvatarPanel() {
@@ -42,17 +42,17 @@ export function createHereFlow({
     if (!list) return;
     list.innerHTML = '';
     const sorted = Array.from(state.roomPresence.values()).sort((a, b) => {
-      const left = String(a?.handle || a?.did || '').toLowerCase();
-      const right = String(b?.handle || b?.did || '').toLowerCase();
+      const left = String(a?.handle || a?.url || a?.did || '').toLowerCase();
+      const right = String(b?.handle || b?.url || b?.did || '').toLowerCase();
       return left.localeCompare(right);
     });
     for (const entry of sorted) {
       const li = document.createElement('li');
       li.className = 'avatar-item';
-      const didText = String(entry?.did || '').trim();
+      const urlText = String(entry?.url || entry?.did || '').trim();
       li.textContent = labelForPresenceEntry(entry);
-      if (didText) {
-        li.title = didText;
+      if (urlText) {
+        li.title = urlText;
       }
       list.appendChild(li);
     }

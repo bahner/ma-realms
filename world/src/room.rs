@@ -29,14 +29,14 @@ impl RoomAcl {
         }
     }
 
-    /// Returns `true` if `did` is allowed to enter this room.
-    pub fn can_enter(&self, did: &str) -> bool {
+    /// Returns `true` if `identity` is allowed to enter this room.
+    pub fn can_enter(&self, identity: &str) -> bool {
         // Explicit deny takes priority.
-        if self.deny.contains(did) {
+        if self.deny.contains(identity) {
             return false;
         }
         // Wildcard allow or explicit allow.
-        self.allow.contains("*") || self.allow.contains(did)
+        self.allow.contains("*") || self.allow.contains(identity)
     }
 
     /// Human-readable summary for status / log display.
@@ -70,7 +70,7 @@ pub struct Room {
     pub exits: Vec<ExitData>,
     pub acl: RoomAcl,
     pub descriptions: HashMap<String, String>,
-    pub did: String, // Full DID (with IPNS fragment)
+    pub url: String, // Full DID URL (did:ma:<ipns>#<room-id>)
 }
 
 #[derive(Clone, Debug)]
@@ -110,12 +110,12 @@ impl RoomState {
         self.avatars.set_default_max_cache(ttl);
     }
 
-    pub fn touch_avatar(&mut self, did: &str, handle: &str) {
-        self.avatars.insert(did.to_string(), handle.to_string());
+    pub fn touch_avatar(&mut self, url: &str, handle: &str) {
+        self.avatars.insert(url.to_string(), handle.to_string());
     }
 
-    pub fn remove_avatar(&mut self, did: &str) {
-        self.avatars.remove(&did.to_string());
+    pub fn remove_avatar(&mut self, url: &str) {
+        self.avatars.remove(&url.to_string());
     }
 
     pub fn enqueue_dispatch(&mut self, task: RoomDispatchTask) {
@@ -152,7 +152,7 @@ fn default_room_title(name: &str) -> String {
 }
 
 impl Room {
-    pub fn new(name: String, did: String) -> Self {
+    pub fn new(name: String, url: String) -> Self {
         Self {
             name,
             titles: HashMap::new(),
@@ -161,7 +161,7 @@ impl Room {
             exits: Vec::new(),
             acl: RoomAcl::open(),
             descriptions: HashMap::new(),
-            did,
+            url,
         }
     }
 

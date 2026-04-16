@@ -4,8 +4,8 @@ use crate::reply::{Reply, Scope};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoomActorAction {
     None,
-    Invite { did: String },
-    Deny { did: String },
+    Invite { identity: String },
+    Deny { identity: String },
     Kick { handle: String },
     /// Create (or link) a room and connect it via a named exit.
     /// `destination` is the room name/fragment (without `#`).
@@ -33,11 +33,14 @@ pub struct RoomActorContext<'a> {
     pub things: Vec<String>,
     pub acl_owner: Option<&'a str>,
     pub acl_summary: &'a str,
-    pub caller_did: Option<&'a str>,
+    /// Full DID URL of the caller (`did:ma:<ipns>#<fragment>`).
+    pub caller_url: Option<&'a str>,
+    /// Root DID (identity) of the caller.
     pub caller_owner: Option<&'a str>,
     pub description: &'a str,
     pub title: &'a str,
-    pub did: Option<&'a str>,
+    /// Full DID URL of this room (`did:ma:<ipns>#<room-id>`).
+    pub url: Option<&'a str>,
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -70,7 +73,7 @@ fn is_owner(ctx: &RoomActorContext<'_>) -> bool {
     let Some(owner) = ctx.acl_owner else {
         return false;
     };
-    ctx.caller_did.map(|caller| caller == owner).unwrap_or(false)
+    ctx.caller_url.map(|caller| caller == owner).unwrap_or(false)
         || ctx
             .caller_owner
             .map(|caller_owner| caller_owner == owner)
@@ -78,7 +81,7 @@ fn is_owner(ctx: &RoomActorContext<'_>) -> bool {
 }
 
 fn is_owner_or_unclaimed(ctx: &RoomActorContext<'_>) -> bool {
-    match (ctx.acl_owner, ctx.caller_did, ctx.caller_owner) {
+    match (ctx.acl_owner, ctx.caller_url, ctx.caller_owner) {
         (None, _, _) => true,
         (Some(owner), Some(caller), caller_owner) => {
             owner == caller || caller_owner.map(|value| value == owner).unwrap_or(false)
@@ -165,8 +168,8 @@ fn cmd_describe(ctx: &RoomActorContext<'_>) -> RoomActorResult {
 fn cmd_show(ctx: &RoomActorContext<'_>) -> RoomActorResult {
     if let Some(err) = require_room(ctx) { return err; }
     let owner = ctx.acl_owner.unwrap_or("(none)");
-    let did = ctx.did.unwrap_or("(unknown)");
-    none(Reply::here(format!("'{}': did={} owner={}", ctx.room_name, did, owner)))
+    let url = ctx.url.unwrap_or("(unknown)");
+    none(Reply::here(format!("'{}': url={} owner={}", ctx.room_name, url, owner)))
 }
 
 fn cmd_invite_deny_kick(method: &str, arg: &str, ctx: &RoomActorContext<'_>) -> RoomActorResult {
@@ -178,11 +181,11 @@ fn cmd_invite_deny_kick(method: &str, arg: &str, ctx: &RoomActorContext<'_>) -> 
     match method {
         "invite" => with_action(
             Reply::here(format!("{} invited to '{}'", arg, ctx.room_name)),
-            RoomActorAction::Invite { did: arg.to_string() },
+        RoomActorAction::Invite { identity: arg.to_string() },
         ),
         "deny" => with_action(
             Reply::here(format!("{} denied from '{}'", arg, ctx.room_name)),
-            RoomActorAction::Deny { did: arg.to_string() },
+        RoomActorAction::Deny { identity: arg.to_string() },
         ),
         "kick" => with_action(
             Reply::here(format!("{} was kicked from '{}'", arg, ctx.room_name)),
@@ -308,12 +311,12 @@ fn cmd_property(command: &str, ctx: &RoomActorContext<'_>) -> Option<RoomActorRe
 
     if key == "_list" {
         let owner = ctx.acl_owner.unwrap_or("(none)");
-        let did = ctx.did.unwrap_or("(unknown)");
+        let url = ctx.url.unwrap_or("(unknown)");
         let response = Reply::attr_list(Scope::Here, &[
             ("owner", owner),
             ("title", ctx.title),
             ("description", ctx.description),
-            ("did", did),
+            ("url", url),
         ]);
         return Some(RoomActorResult { response, action: RoomActorAction::None });
     }
@@ -393,11 +396,11 @@ mod tests {
             things: Vec::new(),
             acl_owner: Some("did:ma:owner"),
             acl_summary: "*",
-            caller_did: Some("did:ma:owner"),
+            caller_url: Some("did:ma:owner"),
             caller_owner: Some("did:ma:owner-root"),
             title: "Lobby",
             description: "Welcome",
-            did: Some("did:ma:world#lobby"),
+            url: Some("did:ma:world#lobby"),
         }
     }
 

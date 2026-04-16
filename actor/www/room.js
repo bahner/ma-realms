@@ -106,15 +106,15 @@ export function createRoomPresenceFlow({
   dropCachedRoomDidLookup,
   renderAvatarPanel,
 }) {
-  function trackRoomPresence(handle, did, identity) {
+  function trackRoomPresence(handle, url, identity) {
     if (!handle) return;
     state.roomPresence.set(handle, {
       handle,
-      did: did || '',
+      url: url || '',
       identity: identity || ''
     });
-    if (isMaDid(String(did || ''))) {
-      cacheRoomDidLookup(handle, did);
+    if (isMaDid(String(url || ''))) {
+      cacheRoomDidLookup(handle, url);
     }
     renderAvatarPanel();
   }
@@ -287,46 +287,46 @@ export function createRoomPresencePayloadFlow({
     }
     for (const avatar of payload.avatars) {
       const handle = String(avatar?.handle || '').trim();
-      const did = String(avatar?.did || '').trim();
+      const url = String(avatar?.url || avatar?.did || '').trim();
       const identity = String(avatar?.identity || '').trim();
       if (handle) {
-        trackRoomPresence(handle, did, identity);
+        trackRoomPresence(handle, url, identity);
       }
     }
   }
 
   function applyPresenceJoin(payload) {
     const handle = String(payload.actor_handle || '').trim();
-    const did = String(payload.actor_did || '').trim();
+    const url = String(payload.actor_url || payload.actor_did || '').trim();
     const identity = String(payload.actor_identity || '').trim();
     if (handle) {
-      trackRoomPresence(handle, did, identity);
+      trackRoomPresence(handle, url, identity);
     }
     if (typeof appendMessage === 'function') {
-      if (handle && (identity || did)) {
-        appendMessage('world', `${handle} entered the room. (${identity || did})`);
+      if (handle && (identity || url)) {
+        appendMessage('world', `${handle} entered the room. (${identity || url})`);
       } else if (handle) {
         appendMessage('world', `${handle} entered the room.`);
-      } else if (identity || did) {
-        appendMessage('world', `${identity || did} entered the room.`);
+      } else if (identity || url) {
+        appendMessage('world', `${identity || url} entered the room.`);
       }
     }
   }
 
   function applyPresenceLeave(payload) {
     const handle = String(payload.actor_handle || '').trim();
-    const did = String(payload.actor_did || '').trim();
+    const url = String(payload.actor_url || payload.actor_did || '').trim();
     const identity = String(payload.actor_identity || '').trim();
     if (handle) {
       removeRoomPresence(handle);
     }
     if (typeof appendMessage === 'function') {
-      if (handle && (identity || did)) {
-        appendMessage('world', `${handle} left the room. (${identity || did})`);
+      if (handle && (identity || url)) {
+        appendMessage('world', `${handle} left the room. (${identity || url})`);
       } else if (handle) {
         appendMessage('world', `${handle} left the room.`);
-      } else if (identity || did) {
-        appendMessage('world', `${identity || did} left the room.`);
+      } else if (identity || url) {
+        appendMessage('world', `${identity || url} left the room.`);
       }
     }
   }

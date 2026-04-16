@@ -56,8 +56,9 @@ export function createDidTargetMetaPollHandler(deps) {
 
     const showResponse = await sendWorldCommandQuery(`@world show #${roomFragment}`);
     const meta = parseRoomShowMeta(showResponse);
-    if (meta.did && isMaDid(meta.did)) {
-      cacheRoomDidLookup(roomFragment, meta.did);
+    const roomUrl = String(meta.url || meta.did || '').trim();
+    if (roomUrl && isMaDid(roomUrl)) {
+      cacheRoomDidLookup(roomFragment, roomUrl);
     } else {
       cacheRoomDidLookup(roomFragment, resolved);
     }
