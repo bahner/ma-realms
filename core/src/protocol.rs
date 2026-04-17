@@ -2,18 +2,20 @@
 
 use std::collections::HashMap;
 
-pub use ma_core::ipfs_publish::{CONTENT_TYPE_DOC, IpfsPublishDidRequest, IpfsPublishDidResponse};
+pub use ma_core::{CONTENT_TYPE_DOC, IpfsPublishDidRequest, IpfsPublishDidResponse};
 use serde::{Deserialize, Serialize};
 
-// ─── ALPN Protocol Identifiers ──────────────────────────────────────────────
+// ─── Protocol Identifiers ───────────────────────────────────────────────────
+// Core protocols (inbox, broadcast, ipfs) are re-exported from ma-core.
+// Realms-specific protocols are defined here.
 
-pub const PRESENCE_ALPN: &[u8] = b"ma/presence/1";
-pub const INBOX_ALPN: &[u8] = b"ma/inbox/1";
-pub const AVATAR_ALPN: &[u8] = b"ma/avatar/1";
-pub const IPFS_ALPN: &[u8] = b"ma/ipfs/1";
-pub const BROADCAST_ALPN: &[u8] = b"ma/broadcast/1";
-pub const BROADCAST_TOPIC: &str = "ma/broadcast/1";
-pub const DEFAULT_WORLD_RELAY_URL: &str = "https://euc1-1.relay.n0.iroh-canary.iroh.link/";
+pub use ma_core::{
+    INBOX_PROTOCOL, BROADCAST_PROTOCOL, IPFS_PROTOCOL,
+    BROADCAST_TOPIC,
+};
+
+pub const AVATAR_PROTOCOL: &[u8] = b"/ma/avatar/0.0.1";
+pub const PRESENCE_PROTOCOL: &[u8] = b"/ma/presence/0.0.1";
 
 // ─── Content Types (World/Home protocol usage) ─────────────────────────────
 
@@ -36,16 +38,16 @@ pub const AVATAR_METHOD_PING: &str = "avatar.ping";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WorldLane {
+pub enum WorldService {
     Inbox,
     Avatar,
 }
 
-impl WorldLane {
-    pub fn alpn(self) -> &'static [u8] {
+impl WorldService {
+    pub fn protocol(self) -> &'static [u8] {
         match self {
-            Self::Inbox => INBOX_ALPN,
-            Self::Avatar => AVATAR_ALPN,
+            Self::Inbox => INBOX_PROTOCOL,
+            Self::Avatar => AVATAR_PROTOCOL,
         }
     }
 
@@ -99,9 +101,9 @@ impl WorldLane {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LaneCapability {
-    pub lane: WorldLane,
-    pub alpn: String,
+pub struct ServiceCapability {
+    pub service: WorldService,
+    pub protocol: String,
     pub supports_signed: bool,
     pub supports_chat: bool,
     pub supports_whisper: bool,
@@ -124,12 +126,12 @@ pub struct TransportAck {
     pub detail: String,
 }
 
-impl LaneCapability {
-    pub fn for_lane(lane: WorldLane) -> Self {
+impl ServiceCapability {
+    pub fn for_service(service: WorldService) -> Self {
         Self {
-            lane,
-            alpn: String::from_utf8_lossy(lane.alpn()).to_string(),
-            supports_signed: matches!(lane, WorldLane::Inbox | WorldLane::Avatar),
+            service,
+            protocol: String::from_utf8_lossy(service.protocol()).to_string(),
+            supports_signed: matches!(service, WorldService::Inbox | WorldService::Avatar),
             supports_chat: false,
             supports_whisper: false,
         }

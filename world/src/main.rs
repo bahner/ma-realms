@@ -23,26 +23,26 @@ use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 use chrono::Utc;
 use did_ma::{DID_PREFIX, Did, Document, EncryptionKey, Message, SigningKey, VerificationMethod};
-use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey,
+use ma_core::{
+    Endpoint, EndpointAddr, EndpointId, RelayUrl,
     endpoint::{Connection, RecvStream, SendStream},
-    endpoint::presets,
-    protocol::{AcceptError, ProtocolHandler, Router},
+    AcceptError, ProtocolHandler, Router,
+    IrohEndpoint,
+    load_secret_key_bytes,
 };
 #[allow(unused_imports)]
-use ma_core::BROADCAST_ALPN;
+use ma_core::BROADCAST_PROTOCOL;
 use ma_core::{
-    ActorCommand, AVATAR_ALPN, PRESENCE_ALPN,
+    ActorCommand, AVATAR_PROTOCOL, PRESENCE_PROTOCOL,
     BROADCAST_TOPIC,
     CONTENT_TYPE_BROADCAST, CONTENT_TYPE_EVENT, CONTENT_TYPE_PRESENCE, CONTENT_TYPE_WORLD, CompiledCapabilityAcl,
-    DEFAULT_WORLD_RELAY_URL,
-    ExitData, LaneCapability, MessageEnvelope, ObjectDefinition, ObjectInboxMessage,
+    ExitData, ServiceCapability, MessageEnvelope, ObjectDefinition, ObjectInboxMessage,
     MAILBOX_COMMANDS_INLINE,
     IpfsPublishDidResponse,
     ObjectMessageIntent, ObjectMessageKind, ObjectMessageRetention, ObjectMessageTarget,
-    ObjectRuntimeState, IPFS_ALPN, PresenceAvatar, RoomActorAction, RoomActorContext,
-    RoomEvent, TransportAck, TransportAckCode, INBOX_ALPN, WorldCommand, WorldLane, WorldRequest,
-    WorldResponse, compile_acl, create_world_did, evaluate_compiled_acl_with_owner,
+    ObjectRuntimeState, IPFS_PROTOCOL, PresenceAvatar, RoomActorAction, RoomActorContext,
+    RoomEvent, TransportAck, TransportAckCode, INBOX_PROTOCOL, WorldCommand, WorldService, WorldRequest,
+    WorldResponse, compile_acl, create_world_url, evaluate_compiled_acl_with_owner,
     validate_ipfs_publish_request, publish_did_document_to_kubo,
     execute_room_actor_command,
     normalize_spoken_text, parse_capability_acl_text, parse_object_local_capability_acl,
@@ -55,9 +55,42 @@ use ma_core::{
     extract_did_description_from_json, normalize_language_for_did_document,
     sender_encryption_pubkey_multibase_from_document, sender_profile_from_document,
     sender_push_endpoint_from_document,
-    generate_iroh_secret_file, load_persisted_iroh_secret_key, socket_addr_to_multiaddr,
+    generate_secret_key_file, load_secret_key_bytes, socket_addr_to_multiaddr,
     join_broadcast_channel, gossip_send_text,
     SecureFileKind, ensure_private_dir, write_secure_file,
+use ma_core::{
+    // iroh transport
+    Endpoint, EndpointAddr, EndpointId, RelayUrl,
+    endpoint::{Connection, RecvStream, SendStream},
+    AcceptError, ProtocolHandler, Router,
+    IrohEndpoint,
+    // service / messaging
+    ActorCommand, AVATAR_PROTOCOL, PRESENCE_PROTOCOL,
+    BROADCAST_PROTOCOL, BROADCAST_TOPIC,
+    CONTENT_TYPE_BROADCAST, CONTENT_TYPE_EVENT, CONTENT_TYPE_PRESENCE, CONTENT_TYPE_WORLD,
+    CompiledCapabilityAcl, ExitData, ServiceCapability, MessageEnvelope,
+    ObjectDefinition, ObjectInboxMessage, MAILBOX_COMMANDS_INLINE,
+    IpfsPublishDidResponse,
+    ObjectMessageIntent, ObjectMessageKind, ObjectMessageRetention, ObjectMessageTarget,
+    ObjectRuntimeState, IPFS_PROTOCOL, PresenceAvatar, RoomActorAction, RoomActorContext,
+    RoomEvent, TransportAck, TransportAckCode, INBOX_PROTOCOL, WorldCommand, WorldService,
+    WorldRequest, WorldResponse,
+    compile_acl, create_world_url, evaluate_compiled_acl_with_owner,
+    validate_ipfs_publish_request, publish_did_document_to_kubo,
+    execute_room_actor_command,
+    normalize_spoken_text, parse_capability_acl_text, parse_object_local_capability_acl,
+    parse_property_command, parse_property_command_for_keys,
+    Reply, Scope,
+    LegacyRequirement, RequirementChecker, RequirementSet, RequirementValue,
+    pin_update_add_rm, TtlCache,
+    expand_tilde_path, format_system_time, is_valid_nanoid_id, parse_rfc3339_unix,
+    extract_did_description_from_json, normalize_language_for_did_document,
+    sender_encryption_pubkey_multibase_from_document, sender_profile_from_document,
+    sender_push_endpoint_from_document,
+    generate_secret_key_file, load_secret_key_bytes, socket_addr_to_multiaddr,
+    join_broadcast_channel, gossip_send_text,
+    SecureFileKind, ensure_private_dir, write_secure_file,
+};
 };
 use moka::sync::Cache;
 use nanoid::nanoid;
@@ -235,7 +268,7 @@ struct WorldProtocol {
     did_cache: Arc<RwLock<HashMap<String, CachedDidDocument>>>,
     push_stream_cache: Arc<Mutex<HashMap<String, PushStreamCache>>>,
     push_timeout_cooldown: Arc<Mutex<HashMap<String, Instant>>>,
-    lane: WorldLane,
+    service: WorldService,
 }
 
 #[derive(Debug)]

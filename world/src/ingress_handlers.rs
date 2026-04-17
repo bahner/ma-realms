@@ -30,7 +30,7 @@ impl WorldProtocol {
             .trim()
             .trim_start_matches('@')
             .to_string();
-        let avatar_did_str = create_world_did(&world_ipns, &avatar_fragment);
+        let avatar_did_str = create_world_url(&world_ipns, &avatar_fragment);
 
         let (_avatar_did, handle, created) = self
             .world
@@ -49,7 +49,7 @@ impl WorldProtocol {
             actual_room,
             handle,
             avatar_did_str,
-            self.lane.label(),
+            self.service.label(),
             agent_endpoint,
             sender_push_endpoint
         );
@@ -100,7 +100,7 @@ impl WorldProtocol {
             avatar.handle,
             avatar.url.id(),
             pinged_room,
-            self.lane.label(),
+            self.service.label(),
             agent_endpoint,
             sender_push_endpoint
         );

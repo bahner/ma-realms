@@ -28,14 +28,12 @@ use tokio::sync::RwLock;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 fn recipient_inbox_endpoint_id(document: &Document) -> Result<String, JsValue> {
-    if let Some(ma) = document.ma.as_ref() {
-        if let Some(endpoint) = core_resolve_inbox_endpoint_id(
-            ma.current_inbox.as_deref(),
-            ma.presence_hint.as_deref(),
-            ma.transports.as_ref(),
-        ) {
-            return Ok(endpoint);
-        }
+    if let Some(endpoint) = core_resolve_inbox_endpoint_id(
+        ma_fields::ma_current_inbox(document),
+        ma_fields::ma_presence_hint(document),
+        ma_fields::ma_services(document),
+    ) {
+        return Ok(endpoint);
     }
     Err(js_err("recipient DID document has no usable inbox transport endpoint"))
 }
@@ -43,28 +41,26 @@ fn recipient_inbox_endpoint_id(document: &Document) -> Result<String, JsValue> {
 /// Resolve the presence endpoint from a DID document, preferring `presence_hint`.
 /// Falls back to `current_inbox` since both share the same iroh endpoint ID.
 fn recipient_presence_endpoint_id(document: &Document) -> Result<String, JsValue> {
-    if let Some(ma) = document.ma.as_ref() {
-        // Prefer presence_hint — confirms the actor is listening on the presence lane.
-        if let Some(hint) = ma.presence_hint.as_deref() {
-            if let Some(endpoint) = core_resolve_inbox_endpoint_id(None, Some(hint), None) {
-                return Ok(endpoint);
-            }
-        }
-        // Fall back to inbox endpoint — same iroh node, but receiver may not accept PRESENCE_ALPN.
-        if let Some(endpoint) = core_resolve_inbox_endpoint_id(
-            ma.current_inbox.as_deref(),
-            None,
-            ma.transports.as_ref(),
-        ) {
+    // Prefer presence_hint — confirms the actor is listening on the presence lane.
+    if let Some(hint) = ma_fields::ma_presence_hint(document) {
+        if let Some(endpoint) = core_resolve_inbox_endpoint_id(None, Some(hint), None) {
             return Ok(endpoint);
         }
+    }
+    // Fall back to inbox endpoint — same iroh node, but receiver may not accept PRESENCE_PROTOCOL.
+    if let Some(endpoint) = core_resolve_inbox_endpoint_id(
+        ma_fields::ma_current_inbox(document),
+        None,
+        ma_fields::ma_services(document),
+    ) {
+        return Ok(endpoint);
     }
     Err(js_err("recipient DID document has no usable presence transport endpoint"))
 }
 
-/// Generic framed send over an arbitrary ALPN lane using the InboxRequest protocol.
-async fn send_to_lane(alpn: &'static [u8], target_endpoint_id: &str, message_cbor: Vec<u8>) -> Result<InboxResponse, JsValue> {
-    let alpn_label = String::from_utf8_lossy(alpn);
+/// Generic framed send over an arbitrary protocol using the InboxRequest wire format.
+async fn send_on_protocol(protocol: &'static [u8], target_endpoint_id: &str, message_cbor: Vec<u8>) -> Result<InboxResponse, JsValue> {
+    let protocol_label = String::from_utf8_lossy(protocol);
     let target: EndpointId = target_endpoint_id
         .trim()
         .parse()
@@ -76,26 +72,21 @@ async fn send_to_lane(alpn: &'static [u8], target_endpoint_id: &str, message_cbo
         .map_err(|e| js_err(format!("sender endpoint bind failed: {e}")))?;
     let _ = endpoint.online().await;
 
-    let relay_source = core_normalize_relay_url(DEFAULT_WORLD_RELAY_URL);
-    let relay_url: RelayUrl = relay_source
-        .parse()
-        .map_err(|e| js_err(format!("relay URL parse failed for '{}': {}", relay_source, e)))?;
-
-    let endpoint_addr = EndpointAddr::new(target).with_relay_url(relay_url);
+    let endpoint_addr = EndpointAddr::new(target);
     let connection = endpoint
-        .connect(endpoint_addr, alpn)
+        .connect(endpoint_addr, protocol)
         .await
         .map_err(|e| js_err(format!(
-            "send_to_lane connect failed: {} (alpn={})",
-            e, alpn_label
+            "send_on_protocol connect failed: {} (protocol={})",
+            e, protocol_label
         )))?;
 
     let (mut send, mut recv) = connection
         .open_bi()
         .await
         .map_err(|e| js_err(format!(
-            "send_to_lane open_bi failed: {} (alpn={})",
-            e, alpn_label
+            "send_on_protocol open_bi failed: {} (protocol={})",
+            e, protocol_label
         )))?;
 
     let request = InboxRequest::Signed { message_cbor };
@@ -107,7 +98,7 @@ async fn send_to_lane(alpn: &'static [u8], target_endpoint_id: &str, message_cbo
 
     let frame_len = recv.read_u32().await.map_err(js_err)? as usize;
     if frame_len > 256 * 1024 {
-        return Err(js_err(format!("send_to_lane response frame too large: {}", frame_len)));
+        return Err(js_err(format!("send_on_protocol response frame too large: {}", frame_len)));
     }
     let mut bytes = vec![0u8; frame_len];
     recv.read_exact(&mut bytes).await.map_err(js_err)?;
@@ -214,7 +205,7 @@ impl ProtocolHandler for InboxProtocol {
                                 ok: false,
                                 message: format!(
                                     "{} expects content_type={} but got {}",
-                                    String::from_utf8_lossy(self.lane_label),
+                                    String::from_utf8_lossy(self.protocol_label),
                                     expected,
                                     message.content_type
                                 ),
@@ -223,7 +214,7 @@ impl ProtocolHandler for InboxProtocol {
                                 ok: false,
                                 message: format!(
                                     "invalid signed message on {}: {}",
-                                    String::from_utf8_lossy(self.lane_label),
+                                    String::from_utf8_lossy(self.protocol_label),
                                     err
                                 ),
                             },
@@ -279,17 +270,17 @@ async fn ensure_inbox_listener_with_secret(secret_key: SecretKey) -> Result<Stri
     let inbox_protocol = InboxProtocol {
         queue: queue.clone(),
         expected_content_type: None,
-        lane_label: INBOX_ALPN,
+        protocol_label: INBOX_PROTOCOL,
     };
     let presence_protocol = InboxProtocol {
         queue: queue.clone(),
         expected_content_type: None,
-        lane_label: PRESENCE_ALPN,
+        protocol_label: PRESENCE_PROTOCOL,
     };
 
     let router = Router::builder(endpoint.clone())
-        .accept(INBOX_ALPN, inbox_protocol)
-        .accept(PRESENCE_ALPN, presence_protocol)
+        .accept(INBOX_PROTOCOL, inbox_protocol)
+        .accept(PRESENCE_PROTOCOL, presence_protocol)
         .spawn();
 
     let endpoint_id = endpoint.id().to_string();
@@ -302,12 +293,12 @@ async fn ensure_inbox_listener_with_secret(secret_key: SecretKey) -> Result<Stri
     Ok(endpoint_id)
 }
 
-async fn create_stream_cache_on_lane(
+async fn create_stream_cache_on_protocol(
     target_id_str: &str,
     relay_hint: Option<&str>,
-    lane_alpn: &'static [u8],
+    protocol: &'static [u8],
 ) -> Result<WorldConnCache, JsValue> {
-    let requested_alpn = String::from_utf8_lossy(lane_alpn).to_string();
+    let requested_protocol = String::from_utf8_lossy(protocol).to_string();
     let target: EndpointId = target_id_str
         .trim()
         .parse()
@@ -322,29 +313,30 @@ async fn create_stream_cache_on_lane(
     let _ = endpoint.online().await;
 
     let mut endpoint_addr = EndpointAddr::new(target);
-    let relay_source = core_normalize_relay_url(relay_hint.unwrap_or(DEFAULT_WORLD_RELAY_URL));
-
-    match relay_source.parse::<RelayUrl>() {
-        Ok(relay_url) => {
-            endpoint_addr = endpoint_addr.with_relay_url(relay_url);
-        }
-        Err(e) => {
-            return Err(js_err(format!("relay URL parse failed for '{}': {}", relay_source, e)));
+    if let Some(hint) = relay_hint {
+        let relay_source = core_normalize_relay_url(hint);
+        match relay_source.parse::<RelayUrl>() {
+            Ok(relay_url) => {
+                endpoint_addr = endpoint_addr.with_relay_url(relay_url);
+            }
+            Err(e) => {
+                return Err(js_err(format!("relay URL parse failed for '{}': {}", relay_source, e)));
+            }
         }
     }
 
-    let connection = endpoint.connect(endpoint_addr, lane_alpn)
+    let connection = endpoint.connect(endpoint_addr, protocol)
         .await
         .map_err(|e| js_err(format!(
-            "endpoint.connect() failed: {} (requested_alpn={} target={})",
-            e, requested_alpn, target_id_str
+            "endpoint.connect() failed: {} (protocol={} target={})",
+            e, requested_protocol, target_id_str
         )))?;
 
     let (send_stream, recv_stream) = connection.open_bi()
         .await
         .map_err(|e| js_err(format!(
-            "connection.open_bi() failed: {} (requested_alpn={} target={})",
-            e, requested_alpn, target_id_str
+            "connection.open_bi() failed: {} (protocol={} target={})",
+            e, requested_protocol, target_id_str
         )))?;
 
     Ok(WorldConnCache {
@@ -360,7 +352,7 @@ async fn create_stream_cache(
     target_id_str: &str,
     relay_hint: Option<&str>,
 ) -> Result<WorldConnCache, JsValue> {
-    create_stream_cache_on_lane(target_id_str, relay_hint, AVATAR_ALPN).await
+    create_stream_cache_on_protocol(target_id_str, relay_hint, AVATAR_PROTOCOL).await
 }
 
 async fn get_or_create_stream_cache(
@@ -422,7 +414,6 @@ use ma_core::{
     compile_acl,
     CONTENT_TYPE_CHAT,
     CONTENT_TYPE_DOC, CONTENT_TYPE_WORLD, CONTENT_TYPE_WHISPER, CONTENT_TYPE_MESSAGE,
-    DEFAULT_WORLD_RELAY_URL,
     evaluate_compiled_acl_with_owner,
     did_root as core_did_root,
     create_agent_identity,
@@ -441,7 +432,8 @@ use ma_core::{
     resolve_inbox_endpoint_id as core_resolve_inbox_endpoint_id,
     resolve_alias_input as core_resolve_alias_input,
     RoomEvent, WorldCommand, WorldRequest, WorldResponse,
-    AVATAR_ALPN, PRESENCE_ALPN, INBOX_ALPN, IPFS_ALPN,
+    AVATAR_PROTOCOL, PRESENCE_PROTOCOL, INBOX_PROTOCOL, IPFS_PROTOCOL,
+    ma_fields,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -538,7 +530,7 @@ struct InboxResponse {
 struct InboxProtocol {
     queue: Arc<RwLock<VecDeque<InboxMessage>>>,
     expected_content_type: Option<&'static str>,
-    lane_label: &'static [u8],
+    protocol_label: &'static [u8],
 }
 
 #[derive(Debug)]
@@ -933,12 +925,12 @@ async fn send_world_request(endpoint_id: &str, request: WorldRequest) -> Result<
     Err(last_error.unwrap_or_else(|| js_err("world request failed")))
 }
 
-async fn send_world_request_once_on_lane(
+async fn send_world_request_once_on_protocol(
     endpoint_id: &str,
     request: WorldRequest,
-    lane_alpn: &'static [u8],
+    protocol: &'static [u8],
 ) -> Result<WorldResponse, JsValue> {
-    let mut cache = create_stream_cache_on_lane(endpoint_id, None, lane_alpn).await?;
+    let mut cache = create_stream_cache_on_protocol(endpoint_id, None, protocol).await?;
     let result = exchange_on_stream(&mut cache, &request).await;
     cache.connection.close(0u32.into(), b"done");
     cache.endpoint.close().await;
@@ -1223,12 +1215,7 @@ fn build_signed_world_request(
         return Err(js_err("actor_name is required for DID fragment"));
     }
 
-    let contextual_world_did = plain
-        .document
-        .ma
-        .as_ref()
-        .and_then(|ma| ma.world.as_ref())
-        .and_then(|w| w.as_str())
+    let contextual_world_did = ma_fields::ma_world(&plain.document)
         .filter(|did| Did::validate(did).is_ok())
         .map(|s| s.to_string())
         .or_else(cached_world_target_did);
@@ -1566,7 +1553,7 @@ fn initialize_document_lifecycle_metadata(document: &mut Document, bundle_create
     let created = iso_utc_from_unix_secs(bundle_created_at_secs);
     document.set_created(created.clone());
     document.set_updated(created);
-    document.set_ma_version(actor_version_id());
+    ma_fields::set_ma_version(document, &actor_version_id());
 }
 
 fn bump_document_lifecycle_metadata(document: &mut Document, bundle_created_at_secs: u64) {
@@ -1575,7 +1562,7 @@ fn bump_document_lifecycle_metadata(document: &mut Document, bundle_created_at_s
         document.set_created(iso_utc_from_unix_secs(bundle_created_at_secs));
     }
     document.set_updated(now);
-    document.set_ma_version(actor_version_id());
+    ma_fields::set_ma_version(document, &actor_version_id());
 }
 
 // ── Exported WASM functions ────────────────────────────────────────────────────
@@ -1626,7 +1613,7 @@ fn create_identity_internal(
 
     let result = CreateResult {
         encrypted_bundle: serde_json::to_string(&encrypted).map_err(js_err)?,
-        did: generated.root_did.id(),
+        did: generated.subject_did.id(),
         ipns: ipns.to_string(),
         ipns_private_key_b64,
         document_json,
@@ -1830,7 +1817,8 @@ pub fn set_bundle_presence_hint(
     hint: &str,
 ) -> Result<String, JsValue> {
     update_bundle_document(passphrase, encrypted_bundle_json, |document| {
-        document.set_presence_hint(hint).map_err(js_err)
+        ma_fields::set_ma_presence_hint(document, hint);
+        Ok(())
     }, false)
 }
 
@@ -1851,16 +1839,16 @@ pub fn set_bundle_language(
 
     if normalized.is_empty() {
         return update_bundle_document(passphrase, encrypted_bundle_json, |document| {
-            document.clear_language();
-            document.clear_lang();
+            ma_fields::clear_ma_language(document);
+            ma_fields::clear_ma_lang(document);
             Ok(())
         }, false);
     }
 
     update_bundle_document(passphrase, encrypted_bundle_json, move |document| {
-        document.set_language(normalized.clone()).map_err(js_err)?;
+        ma_fields::set_ma_language(document, &normalized);
         // Keep clearing ma.lang until we explicitly support it again.
-        document.clear_lang();
+        ma_fields::clear_ma_lang(document);
         Ok(())
     }, false)
 }
@@ -1874,7 +1862,7 @@ pub fn set_bundle_requested_ttl(
     requested_ttl_seconds: u64,
 ) -> Result<String, JsValue> {
     update_bundle_document(passphrase, encrypted_bundle_json, move |document| {
-        document.set_ma_requested_ttl(requested_ttl_seconds);
+        ma_fields::set_ma_requested_ttl(document, requested_ttl_seconds);
         Ok(())
     }, false)
 }
@@ -1886,27 +1874,27 @@ pub fn clear_bundle_requested_ttl(
     encrypted_bundle_json: &str,
 ) -> Result<String, JsValue> {
     update_bundle_document(passphrase, encrypted_bundle_json, |document| {
-        document.clear_ma_requested_ttl();
+        ma_fields::clear_ma_requested_ttl(document);
         Ok(())
     }, false)
 }
 
-/// Update the `ma:transports` field in the DID document with the agent's live
+/// Update the `ma:services` field in the DID document with the agent's live
 /// iroh inbox endpoint and re-sign it.
 /// Returns JSON: `{ encrypted_bundle, did, ipns, document_json }`
 #[wasm_bindgen]
-pub fn set_bundle_transports(
+pub fn set_bundle_services(
     passphrase: &str,
     encrypted_bundle_json: &str,
     endpoint_id: &str,
 ) -> Result<String, JsValue> {
-    let inbox_hint = format!("/ma-iroh/{}/ma/inbox/1", endpoint_id);
-    let presence_hint = format!("/ma-iroh/{}/ma/presence/1", endpoint_id);
-    let transports = serde_json::json!([inbox_hint.clone(), presence_hint.clone()]);
+    let inbox_hint = format!("/iroh/{}/ma/inbox/0.0.1", endpoint_id);
+    let presence_hint = format!("/iroh/{}/ma/presence/0.0.1", endpoint_id);
+    let services = serde_json::json!([inbox_hint.clone(), presence_hint.clone()]);
     update_bundle_document(passphrase, encrypted_bundle_json, move |document| {
-        document.set_ma_transports(transports);
-        document.set_ma_current_inbox(&inbox_hint);
-        document.set_presence_hint(&presence_hint).map_err(js_err)?;
+        ma_fields::set_ma_services(document, services);
+        ma_fields::set_ma_current_inbox(document, &inbox_hint);
+        ma_fields::set_ma_presence_hint(document, &presence_hint);
         Ok(())
     }, false)
 }
@@ -1919,7 +1907,7 @@ pub fn clear_bundle_presence_hint(
     encrypted_bundle_json: &str,
 ) -> Result<String, JsValue> {
     update_bundle_document(passphrase, encrypted_bundle_json, |document| {
-        document.clear_presence_hint();
+        ma_fields::clear_ma_presence_hint(document);
         Ok(())
     }, false)
 }
@@ -1932,7 +1920,7 @@ pub fn set_bundle_updated_for_send(
     encrypted_bundle_json: &str,
 ) -> Result<String, JsValue> {
     update_bundle_document(passphrase, encrypted_bundle_json, |document| {
-        document.clear_ma_world();
+        ma_fields::clear_ma_world(document);
         Ok(())
     }, true)
 }
@@ -1968,19 +1956,18 @@ async fn send_ipfs_publish_request(
         .map_err(|e| js_err(format!("endpoint bind failed: {e}")))?;
     let _ = endpoint.online().await;
 
-    let relay_base = if relay_url_hint.trim().is_empty() {
-        DEFAULT_WORLD_RELAY_URL
-    } else {
-        relay_url_hint.trim()
-    };
-    let relay_source = core_normalize_relay_url(relay_base);
-    let relay_url: RelayUrl = relay_source
-        .parse()
-        .map_err(|e| js_err(format!("relay URL parse failed for '{}': {}", relay_source, e)))?;
-    let endpoint_addr = EndpointAddr::new(target).with_relay_url(relay_url);
+    let mut endpoint_addr = EndpointAddr::new(target);
+    let relay_hint = relay_url_hint.trim();
+    if !relay_hint.is_empty() {
+        let relay_source = core_normalize_relay_url(relay_hint);
+        let relay_url: RelayUrl = relay_source
+            .parse()
+            .map_err(|e| js_err(format!("relay URL parse failed for '{}': {}", relay_source, e)))?;
+        endpoint_addr = endpoint_addr.with_relay_url(relay_url);
+    }
 
     let connection = endpoint
-        .connect(endpoint_addr, IPFS_ALPN)
+        .connect(endpoint_addr, IPFS_PROTOCOL)
         .await
         .map_err(|e| js_err(format!("ipfs endpoint.connect() failed: {}", e)))?;
 
@@ -2218,7 +2205,7 @@ pub async fn send_world_whisper(
 }
 
 /// Send an E2E-encrypted `application/x-ma-whisper` over the presence lane with explicit TTL.
-/// Requires the recipient to be online (`ma/presence/1`). `ttl_seconds = 0` means no TTL.
+/// Requires the recipient to be online (`ma/presence/0.0.1`). `ttl_seconds = 0` means no TTL.
 #[wasm_bindgen]
 pub async fn send_world_whisper_with_ttl(
     _endpoint_id: &str,
@@ -2257,7 +2244,7 @@ pub async fn send_world_whisper_with_ttl(
         ttl_seconds,
     )?;
 
-    let response = send_to_lane(PRESENCE_ALPN, &recipient_endpoint_id, message.to_cbor().map_err(js_err)?).await?;
+    let response = send_on_protocol(PRESENCE_PROTOCOL, &recipient_endpoint_id, message.to_cbor().map_err(js_err)?).await?;
 
     serde_json::to_string(&WorldActionResult {
         response: WorldResponse {
@@ -2283,7 +2270,7 @@ pub async fn send_world_whisper_with_ttl(
 }
 
 /// Send an E2E-encrypted `application/x-ma-message` over the inbox lane (persistent, queued).
-/// Use this for mail-like messages where the recipient need not be online (`ma/inbox/1`).
+/// Use this for mail-like messages where the recipient need not be online (`ma/inbox/0.0.1`).
 #[wasm_bindgen]
 pub async fn send_direct_message(
     passphrase: &str,
@@ -2342,7 +2329,7 @@ pub async fn send_direct_message_with_ttl(
         ttl_seconds,
     )?;
 
-    let response = send_to_lane(INBOX_ALPN, &recipient_endpoint_id, message.to_cbor().map_err(js_err)?).await?;
+    let response = send_on_protocol(INBOX_PROTOCOL, &recipient_endpoint_id, message.to_cbor().map_err(js_err)?).await?;
 
     serde_json::to_string(&WorldActionResult {
         response: WorldResponse {
@@ -2464,7 +2451,7 @@ pub async fn send_world_message_with_ttl(
     let is_admin_world_command =
         matches!(&envelope, ma_core::MessageEnvelope::ActorCommand { target, .. } if target.eq_ignore_ascii_case("world"));
     if !is_admin_world_command {
-        return Err(js_err("ma/avatar/1 only accepts @world commands for send_world_message"));
+        return Err(js_err("ma/avatar/0.0.1 only accepts @world commands for send_world_message"));
     }
     let request = build_signed_world_request(
         passphrase,
@@ -2479,7 +2466,7 @@ pub async fn send_world_message_with_ttl(
         ttl_seconds,
     )?;
     let response = if is_world_knock {
-        send_world_request_once_on_lane(endpoint_id, request, INBOX_ALPN).await?
+        send_world_request_once_on_protocol(endpoint_id, request, INBOX_PROTOCOL).await?
     } else {
         send_world_request(endpoint_id, request).await?
     };

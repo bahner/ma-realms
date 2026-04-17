@@ -13,7 +13,7 @@ wasm-bindgen-futures = "0.4"
 tokio = { version = "1.37", features = ["io-util", "sync"] }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 
-did-ma = { package = "ma-did", path = "../../did" }
+did-ma = { package = "ma-did", version = "0.3" }
 ma-core = { package = "ma-realms-core", path = "../core" }
 iroh = { version = "0.97.0" }
 iroh-gossip = { version = "0.97.0" }

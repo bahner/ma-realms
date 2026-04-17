@@ -1,8 +1,9 @@
 use did_ma::{Did, Document, EncryptionKey, Result, SigningKey, VerificationMethod};
+use crate::ma_fields;
 
 #[derive(Debug, Clone)]
 pub struct GeneratedAgentIdentity {
-    pub root_did: Did,
+    pub subject_did: Did,
     pub document: Document,
     pub signing_private_key: [u8; 32],
     pub encryption_private_key: [u8; 32],
@@ -14,26 +15,26 @@ pub fn create_agent_identity_from_private_keys(
     signing_private_key: [u8; 32],
     encryption_private_key: [u8; 32],
 ) -> Result<GeneratedAgentIdentity> {
-    let root_did = Did::new(ipns, fragment)?;
-    let sign_did = Did::new_root(ipns)?;
-    let enc_did = Did::new_root(ipns)?;
+    let subject_did = Did::new_url(ipns, Some(fragment))?;
+    let sign_did = Did::new_url(ipns, Option::<String>::None)?;
+    let enc_did = Did::new_url(ipns, Option::<String>::None)?;
 
     let signing_key = SigningKey::from_private_key_bytes(sign_did, signing_private_key)?;
     let encryption_key = EncryptionKey::from_private_key_bytes(enc_did, encryption_private_key)?;
 
-    let mut document = Document::new(&root_did, &root_did);
+    let mut document = Document::new(&subject_did, &subject_did);
 
     let assertion_vm = VerificationMethod::new(
-        root_did.base_id(),
-        root_did.base_id(),
+        subject_did.base_id(),
+        subject_did.base_id(),
         signing_key.key_type.clone(),
         signing_key.did.fragment.as_deref().unwrap_or_default(),
         signing_key.public_key_multibase.clone(),
     )?;
 
     let key_agreement_vm = VerificationMethod::new(
-        root_did.base_id(),
-        root_did.base_id(),
+        subject_did.base_id(),
+        subject_did.base_id(),
         encryption_key.key_type.clone(),
         encryption_key.did.fragment.as_deref().unwrap_or_default(),
         encryption_key.public_key_multibase.clone(),
@@ -44,11 +45,11 @@ pub fn create_agent_identity_from_private_keys(
     document.add_verification_method(key_agreement_vm.clone())?;
     document.assertion_method = vec![assertion_vm_id];
     document.key_agreement = vec![key_agreement_vm.id.clone()];
-    document.set_ma_type("agent")?;
+    ma_fields::set_ma_type(&mut document, "agent");
     document.sign(&signing_key, &assertion_vm)?;
 
     Ok(GeneratedAgentIdentity {
-        root_did,
+        subject_did,
         document,
         signing_private_key,
         encryption_private_key,
@@ -56,8 +57,8 @@ pub fn create_agent_identity_from_private_keys(
 }
 
 pub fn create_agent_identity(ipns: &str, fragment: &str) -> Result<GeneratedAgentIdentity> {
-    let sign_did = Did::new_root(ipns)?;
-    let enc_did = Did::new_root(ipns)?;
+    let sign_did = Did::new_url(ipns, Option::<String>::None)?;
+    let enc_did = Did::new_url(ipns, Option::<String>::None)?;
     let signing_key = SigningKey::generate(sign_did)?;
     let encryption_key = EncryptionKey::generate(enc_did)?;
     create_agent_identity_from_private_keys(

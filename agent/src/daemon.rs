@@ -9,12 +9,13 @@ use axum::{
 };
 use chrono::{SecondsFormat, Utc};
 use did_ma::{DID_PREFIX, Did, Document, SigningKey};
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey, endpoint::presets};
+use ma_core::{Endpoint, EndpointAddr, EndpointId, SecretKey, presets};
 use ma_core::{
-    AVATAR_ALPN, CONTENT_TYPE_WORLD, DEFAULT_WORLD_RELAY_URL, INBOX_ALPN,
+    AVATAR_PROTOCOL, CONTENT_TYPE_WORLD, INBOX_PROTOCOL,
     KuboDidPublisher, MessageEnvelope, WorldCommand, WorldRequest, WorldResponse,
-    create_agent_identity_from_private_keys, default_ma_config_root, normalize_relay_url,
+    create_agent_identity_from_private_keys, default_ma_config_root,
     parse_message, resolve_inbox_endpoint_id,
+    ma_fields,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -47,7 +48,7 @@ pub struct AgentdConfig {
     pub iroh_key_file: String,
     pub enc_key_file: String,
     pub sig_key_file: String,
-    pub world_did_root: String,
+    pub world_did_base: String,
     #[serde(default, alias = "poll_interval")]
     pub poll_ttl: u64,
     #[serde(default)]
@@ -65,7 +66,7 @@ impl Default for AgentdConfig {
             iroh_key_file: AGENT_IROH_KEY_FILE.to_string(),
             enc_key_file: AGENT_ENC_KEY_FILE.to_string(),
             sig_key_file: AGENT_SIG_KEY_FILE.to_string(),
-            world_did_root: String::new(),
+            world_did_base: String::new(),
             poll_ttl: 10,
             lock_ttl: 120,
         }
@@ -117,7 +118,7 @@ impl AgentdConfig {
             self.sig_key_file = AGENT_SIG_KEY_FILE.to_string();
         }
 
-        self.world_did_root = self.world_did_root.trim().to_string();
+        self.world_did_base = self.world_did_base.trim().to_string();
         self.poll_ttl = if self.poll_ttl == 0 { 10 } else { self.poll_ttl };
     }
 }
@@ -206,7 +207,7 @@ struct HealthResponse {
     kubo_api_url: String,
     kubo_key_alias: String,
     kubo_key_alias_found: bool,
-    world_did_root: String,
+    world_did_base: String,
     world_key_file: String,
     iroh_key_file: String,
     enc_key_file: String,
@@ -297,7 +298,7 @@ pub async fn run_daemon(
 
     let startup_state = state.clone();
     tokio::spawn(async move {
-        match ensure_world_root_did_published(&startup_state).await {
+        match ensure_world_base_did_published(&startup_state).await {
             Ok(root) => println!("startup publish: world DID ready at {}", root),
             Err(err) => eprintln!("startup publish: WARN could not ensure world DID: {}", err),
         }
@@ -313,8 +314,8 @@ pub async fn run_daemon(
 async fn alias_monitor_loop(state: AppState) {
     loop {
         let cfg = state.cfg.read().await.clone();
-        if !cfg.world_did_root.trim().is_empty() {
-            println!("alias monitor: world DID root present; stopping Kubo alias polling");
+        if !cfg.world_did_base.trim().is_empty() {
+            println!("alias monitor: world DID base present; stopping Kubo alias polling");
             return;
         }
 
@@ -409,7 +410,7 @@ fn load_or_init_config(
             iroh_key_file: AGENT_IROH_KEY_FILE.to_string(),
             enc_key_file: AGENT_ENC_KEY_FILE.to_string(),
             sig_key_file: AGENT_SIG_KEY_FILE.to_string(),
-            world_did_root: String::new(),
+            world_did_base: String::new(),
         }
     };
 
@@ -577,7 +578,7 @@ fn load_or_default_config() -> Result<AgentdConfig> {
         iroh_key_file: AGENT_IROH_KEY_FILE.to_string(),
         enc_key_file: AGENT_ENC_KEY_FILE.to_string(),
         sig_key_file: AGENT_SIG_KEY_FILE.to_string(),
-        world_did_root: String::new(),
+        world_did_base: String::new(),
     };
     cfg.normalize();
     Ok(cfg)
@@ -743,10 +744,10 @@ async fn kubo_cat_text(publisher: &KuboDidPublisher, path: &str) -> Result<Strin
     ma_core::kubo::cat_text(publisher.kubo_url(), path).await
 }
 
-async fn resolved_root_did_document(
+async fn resolved_base_did_document(
     publisher: &KuboDidPublisher,
     resolved_path: &str,
-    root_did: &str,
+    base_did: &str,
 ) -> Result<Option<Document>> {
     let path = resolved_path.trim();
     if path.is_empty() {
@@ -755,22 +756,22 @@ async fn resolved_root_did_document(
     let raw = kubo_cat_text(publisher, path).await?;
     let doc = Document::unmarshal(&raw)
         .map_err(|e| anyhow!("failed to decode DID document at {}: {}", path, e))?;
-    if doc.id == root_did {
+    if doc.id == base_did {
         Ok(Some(doc))
     } else {
         Ok(None)
     }
 }
 
-fn expected_agent_transports(endpoint_id: &str) -> serde_json::Value {
-    let lanes = [
-        String::from_utf8_lossy(INBOX_ALPN).to_string(),
-        String::from_utf8_lossy(AVATAR_ALPN).to_string(),
+fn expected_agent_services(endpoint_id: &str) -> serde_json::Value {
+    let protocols = [
+        String::from_utf8_lossy(INBOX_PROTOCOL).to_string(),
+        String::from_utf8_lossy(AVATAR_PROTOCOL).to_string(),
     ];
     serde_json::Value::Array(
-        lanes
+        protocols
             .into_iter()
-            .map(|lane| serde_json::Value::String(format!("/ma-iroh/{}/{}", endpoint_id, lane)))
+            .map(|proto| serde_json::Value::String(format!("/iroh/{}/{}", endpoint_id, proto)))
             .collect(),
     )
 }
@@ -795,19 +796,17 @@ fn did_doc_has_required_ma_fields(doc: &Document) -> bool {
         return false;
     };
 
-    let has_transports = ma
-        .transports
-        .as_ref()
+    let has_services = ma_fields::ma_services(doc)
         .and_then(|value| value.as_array())
         .map(|entries| !entries.is_empty())
         .unwrap_or(false);
     let has_created = doc.created.as_ref().map(|v| !v.trim().is_empty()).unwrap_or(false);
     let has_updated = doc.updated.as_ref().map(|v| !v.trim().is_empty()).unwrap_or(false);
 
-    has_transports && has_created && has_updated
+    has_services && has_created && has_updated
 }
 
-async fn ensure_world_root_did_published(state: &AppState) -> Result<String> {
+async fn ensure_world_base_did_published(state: &AppState) -> Result<String> {
     let cfg = state.cfg.read().await.clone();
     let publisher = kubo_publisher(&cfg)?;
 
@@ -834,19 +833,19 @@ async fn ensure_world_root_did_published(state: &AppState) -> Result<String> {
         }
     };
 
-    let root_did = format!("{DID_PREFIX}{}", key_id);
+    let base_did = format!("{DID_PREFIX}{}", key_id);
     let ipns_path = format!("/ipns/{}", key_id);
     let mut existing_created: Option<String> = None;
     if let Ok(resolved) = kubo_name_resolve(&publisher, &ipns_path).await {
-        match resolved_root_did_document(&publisher, &resolved, &root_did).await {
+        match resolved_base_did_document(&publisher, &resolved, &base_did).await {
             Ok(Some(existing)) => {
                 if did_doc_has_required_ma_fields(&existing) {
-                    if cfg.world_did_root != root_did {
+                    if cfg.world_did_base != base_did {
                         let mut next = cfg.clone();
-                        next.world_did_root = root_did.clone();
+                        next.world_did_base = base_did.clone();
                         persist_runtime_config(state, next).await?;
                     }
-                    return Ok(root_did);
+                    return Ok(base_did);
                 }
 
                 existing_created = existing
@@ -855,13 +854,13 @@ async fn ensure_world_root_did_published(state: &AppState) -> Result<String> {
                     .map(|value| value.trim().to_string())
                     .filter(|value| !value.is_empty());
                 eprintln!(
-                    "WARN: existing DID document is missing required ma fields (transports/created/updated); republishing"
+                    "WARN: existing DID document is missing required ma fields (services/created/updated); republishing"
                 );
             }
             Ok(None) => {
                 eprintln!(
                     "WARN: IPNS '{}' resolves to '{}', but document id did not match '{}'; republishing",
-                    ipns_path, resolved, root_did
+                    ipns_path, resolved, base_did
                 );
             }
             Err(err) => {
@@ -894,11 +893,11 @@ async fn ensure_world_root_did_published(state: &AppState) -> Result<String> {
     )?;
     let mut document = generated.document;
     let now = now_zulu();
-    document.set_ma_transports(expected_agent_transports(&iroh_endpoint_id));
     document.set_created(existing_created.unwrap_or_else(|| now.clone()));
     document.set_updated(now);
+    ma_fields::set_ma_services(&mut document, expected_agent_services(&iroh_endpoint_id));
     if let Some(version) = read_agent_version() {
-        document.set_ma_version(version);
+        ma_fields::set_ma_version(&mut document, &version);
     }
     let document_json = document.marshal()
         .map_err(|e| anyhow!("failed to marshal DID document: {}", e))?;
@@ -906,13 +905,13 @@ async fn ensure_world_root_did_published(state: &AppState) -> Result<String> {
         .publish_document(&document_json, "", Some(&world_key_name))
         .await?;
 
-    if cfg.world_did_root != root_did {
+    if cfg.world_did_base != base_did {
         let mut next = cfg.clone();
-        next.world_did_root = root_did.clone();
+        next.world_did_base = base_did.clone();
         persist_runtime_config(state, next).await?;
     }
 
-    Ok(root_did)
+    Ok(base_did)
 }
 
 fn load_agent_meta(state: &AppState, agent_id: &str) -> Result<AgentMeta> {
@@ -954,7 +953,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         kubo_api_url: cfg.kubo_api_url,
         kubo_key_alias: cfg.kubo_key_alias,
         kubo_key_alias_found: alias_found,
-        world_did_root: cfg.world_did_root,
+        world_did_base: cfg.world_did_base,
         world_key_file: cfg.world_key_file,
         iroh_key_file: paths
             .as_ref()
@@ -1145,18 +1144,18 @@ async fn create_agent(
         });
     }
 
-    let world_did_root = match ensure_world_root_did_published(&state).await {
+    let world_did_base = match ensure_world_base_did_published(&state).await {
         Ok(value) => value,
         Err(err) => {
             return Json(CreateAgentResponse {
                 ok: false,
-                message: format!("failed ensuring world root DID publish: {}", err),
+                message: format!("failed ensuring world base DID publish: {}", err),
                 agent: None,
             });
         }
     };
 
-    let did = format!("{}#{}", world_did_root, id);
+    let did = format!("{}#{}", world_did_base, id);
 
     let now = Utc::now().to_rfc3339();
     let meta = AgentMeta {
@@ -1322,32 +1321,32 @@ async fn append_log(
     })
 }
 
-fn world_root_from_did_text(input: &str) -> Option<String> {
+fn world_base_from_did_text(input: &str) -> Option<String> {
     let did = Did::try_from(input.trim()).ok()?;
     Some(did.base_id())
 }
 
-fn build_agent_signing_key(root_did: &str, sig_private: &[u8]) -> Result<SigningKey> {
-    let key_id = root_did
+fn build_agent_signing_key(base_did: &str, sig_private: &[u8]) -> Result<SigningKey> {
+    let key_id = base_did
         .trim()
         .strip_prefix(DID_PREFIX)
-        .ok_or_else(|| anyhow!("invalid world DID root '{}'", root_did))?;
-    let signing_did = Did::new_root(key_id)?;
+        .ok_or_else(|| anyhow!("invalid world DID base '{}'", base_did))?;
+    let signing_did = Did::new_auto(key_id)?;
     let key_bytes: [u8; 32] = sig_private
         .try_into()
         .map_err(|_| anyhow!("invalid signing key length"))?;
     SigningKey::from_private_key_bytes(signing_did, key_bytes).map_err(|e| anyhow!(e.to_string()))
 }
 
-async fn resolve_world_endpoint_id_from_did(kubo_url: &str, world_root_did: &str) -> Result<String> {
+async fn resolve_world_endpoint_id_from_did(kubo_url: &str, world_base_did: &str) -> Result<String> {
     let publisher = KuboDidPublisher::new(kubo_url)?;
-    let root = world_root_from_did_text(world_root_did)
-        .ok_or_else(|| anyhow!("invalid world DID '{}'", world_root_did))?;
+    let root = world_base_from_did_text(world_base_did)
+        .ok_or_else(|| anyhow!("invalid world DID '{}'", world_base_did))?;
     let ipns_id = root
         .strip_prefix(DID_PREFIX)
-        .ok_or_else(|| anyhow!("invalid world DID root '{}'", root))?;
+        .ok_or_else(|| anyhow!("invalid world DID base '{}'", root))?;
     let resolved = kubo_name_resolve(&publisher, &format!("/ipns/{}", ipns_id)).await?;
-    let doc = resolved_root_did_document(&publisher, &resolved, &root)
+    let doc = resolved_base_did_document(&publisher, &resolved, &root)
         .await?
         .ok_or_else(|| anyhow!("resolved DID document mismatch for {}", root))?;
 
@@ -1356,16 +1355,16 @@ async fn resolve_world_endpoint_id_from_did(kubo_url: &str, world_root_did: &str
         .as_ref()
         .and_then(|ma| {
             resolve_inbox_endpoint_id(
-                ma.current_inbox.as_deref(),
-                ma.presence_hint.as_deref(),
-                ma.transports.as_ref(),
+                ma.get("currentInbox").and_then(|v| v.as_str()),
+                ma.get("presenceHint").and_then(|v| v.as_str()),
+                ma.get("services"),
             )
         })
         .ok_or_else(|| anyhow!("world DID '{}' has no inbox endpoint", root))?;
     Ok(endpoint)
 }
 
-async fn send_world_request_over_iroh(endpoint_id: &str, request: WorldRequest, alpn: &'static [u8]) -> Result<WorldResponse> {
+async fn send_world_request_over_iroh(endpoint_id: &str, request: WorldRequest, protocol: &'static [u8]) -> Result<WorldResponse> {
     let target: EndpointId = endpoint_id
         .trim()
         .parse()
@@ -1377,14 +1376,10 @@ async fn send_world_request_over_iroh(endpoint_id: &str, request: WorldRequest, 
         .map_err(|e| anyhow!("endpoint bind failed: {}", e))?;
     let _ = endpoint.online().await;
 
-    let relay_source = normalize_relay_url(DEFAULT_WORLD_RELAY_URL);
-    let relay_url: RelayUrl = relay_source
-        .parse()
-        .map_err(|e| anyhow!("relay URL parse failed for '{}': {}", relay_source, e))?;
-    let endpoint_addr = EndpointAddr::new(target).with_relay_url(relay_url);
+    let endpoint_addr = EndpointAddr::new(target);
 
     let connection = endpoint
-        .connect(endpoint_addr, alpn)
+        .connect(endpoint_addr, protocol)
         .await
         .map_err(|e| anyhow!("endpoint.connect() failed: {}", e))?;
 
@@ -1458,35 +1453,35 @@ async fn send_agent(
     }
 
     let cfg = state.cfg.read().await.clone();
-    let sender_world_root = if !cfg.world_did_root.trim().is_empty() {
-        cfg.world_did_root.trim().to_string()
+    let sender_world_base = if !cfg.world_did_base.trim().is_empty() {
+        cfg.world_did_base.trim().to_string()
     } else {
-        match ensure_world_root_did_published(&state).await {
+        match ensure_world_base_did_published(&state).await {
             Ok(root) => root,
             Err(err) => {
                 return Json(SendAgentResponse {
                     ok: false,
-                    message: format!("failed ensuring world DID root: {}", err),
+                    message: format!("failed ensuring world DID base: {}", err),
                     world_response: None,
                 });
             }
         }
     };
 
-    let sender_did = format!("{}#{}", sender_world_root, id);
+    let sender_did = format!("{}#{}", sender_world_base, id);
     if meta.did != sender_did {
         meta.did = sender_did.clone();
         meta.updated_at = Utc::now().to_rfc3339();
         let _ = save_agent_meta(&state, &meta);
     }
 
-    let target_world_root = req
+    let target_world_base = req
         .to
         .as_deref()
-        .and_then(world_root_from_did_text)
-        .unwrap_or_else(|| sender_world_root.clone());
+        .and_then(world_base_from_did_text)
+        .unwrap_or_else(|| sender_world_base.clone());
 
-    let endpoint_id = match resolve_world_endpoint_id_from_did(&cfg.kubo_api_url, &target_world_root).await {
+    let endpoint_id = match resolve_world_endpoint_id_from_did(&cfg.kubo_api_url, &target_world_base).await {
         Ok(value) => value,
         Err(err) => {
             return Json(SendAgentResponse {
@@ -1547,7 +1542,7 @@ async fn send_agent(
             });
         }
     };
-    let signing_key = match build_agent_signing_key(&sender_world_root, &signing_secret) {
+    let signing_key = match build_agent_signing_key(&sender_world_base, &signing_secret) {
         Ok(key) => key,
         Err(err) => {
             return Json(SendAgentResponse {
@@ -1561,7 +1556,7 @@ async fn send_agent(
     let ttl = req.ttl_seconds.unwrap_or(60);
     let message = match did_ma::Message::new_with_ttl(
         sender_did.clone(),
-        target_world_root.clone(),
+        target_world_base.clone(),
         CONTENT_TYPE_WORLD,
         content,
         ttl,
@@ -1588,7 +1583,7 @@ async fn send_agent(
         }
     };
 
-    match send_world_request_over_iroh(&endpoint_id, request, AVATAR_ALPN).await {
+    match send_world_request_over_iroh(&endpoint_id, request, AVATAR_PROTOCOL).await {
         Ok(world_response) => {
             let _ = append_agent_log_line(
                 &state,
@@ -1596,7 +1591,7 @@ async fn send_agent(
                 &format!(
                     "sent mode={} to={} endpoint={} ok={}",
                     mode,
-                    target_world_root,
+                    target_world_base,
                     endpoint_id,
                     world_response.ok
                 ),

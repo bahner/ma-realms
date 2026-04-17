@@ -13,7 +13,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
-use ma_core::LaneCapability;
+use ma_core::ServiceCapability;
 use tokio::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
@@ -58,7 +58,7 @@ pub struct WorldInfo {
     pub location_hint: String,
     pub entry_acl: String,
     pub started_at: String,
-    pub capabilities: Vec<LaneCapability>,
+    pub capabilities: Vec<ServiceCapability>,
 }
 
 // ── Status HTTP service ──────────────────────────────────────────────

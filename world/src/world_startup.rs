@@ -87,7 +87,7 @@ pub(crate) async fn publish_world_did_runtime_ma(
         .map_err(|e| anyhow!("failed to build world DID from key id '{}': {}", did_identifier, e))?;
     let world_ipns_path = format!("/ipns/{}", world_did.ipns);
 
-    let signing_did = Did::new_root(&did_identifier)
+    let signing_did = Did::new_auto(&did_identifier)
         .map_err(|e| anyhow!("failed to build signing DID: {}", e))?;
     let signing_key = SigningKey::from_private_key_bytes(
         signing_did,
@@ -96,7 +96,7 @@ pub(crate) async fn publish_world_did_runtime_ma(
     .map_err(|e| anyhow!("failed to restore world signing key: {}", e))?;
 
     let mut document = kubo::fetch_did_document(kubo_url, &world_did).await?;
-    document.set_ma_type("world")?;
+    ma_fields::set_ma_type(&mut document, "world");
     set_document_ma_string_field(&mut document, "ipns", &format!("/ipns/{}", world_did.ipns))?;
 
     let world_root: WorldRootIndexDag = dag_get_dag_cbor(kubo_url, root_cid).await
@@ -146,7 +146,7 @@ pub(crate) async fn publish_world_did_runtime_ma(
     // Publish a tailored world projection in ma.world.
     // Keep `root` link for runtime restore compatibility, while exposing a
     // dedicated `public` link and explicit `owner` metadata for traversal.
-    document.set_ma_world(serde_json::Value::Object(ma_world));
+    ma_fields::set_ma_world(&mut document, serde_json::Value::Object(ma_world));
 
     let assertion_id = document.assertion_method.first()
         .ok_or_else(|| anyhow!("world DID has no assertionMethod"))?
@@ -214,7 +214,7 @@ async fn ensure_world_did_document(
         .map_err(|e| anyhow!("failed to build world DID from IPNS key '{}' slug '{}': {}", did_identifier, world_slug, e))?;
     let world_ipns_path = format!("/ipns/{}", did_identifier);
 
-    let signing_did = Did::new_root(&did_identifier)
+    let signing_did = Did::new_auto(&did_identifier)
         .map_err(|e| anyhow!("failed to build signing DID: {}", e))?;
     let signing_key = SigningKey::from_private_key_bytes(
         signing_did,
@@ -222,7 +222,7 @@ async fn ensure_world_did_document(
     )
         .map_err(|e| anyhow!("failed to restore world signing key: {}", e))?;
 
-    let key_agreement_did = Did::new_root(&did_identifier)
+    let key_agreement_did = Did::new_auto(&did_identifier)
         .map_err(|e| anyhow!("failed to build key-agreement DID: {}", e))?;
     let key_agreement_key = EncryptionKey::from_private_key_bytes(
         key_agreement_did,
@@ -256,20 +256,20 @@ async fn ensure_world_did_document(
     document.add_verification_method(key_agreement_vm)?;
     document.assertion_method = vec![assertion_vm_id];
     document.key_agreement = vec![key_agreement_vm_id];
-    document.set_ma_type("world")?;
+    ma_fields::set_ma_type(&mut document, "world");
     set_document_ma_string_field(&mut document, "ipns", &format!("/ipns/{}", did_identifier))?;
     let transport_paths = vec![
-        format!("/ma-iroh/{endpoint_id}/{}", String::from_utf8_lossy(INBOX_ALPN)),
-        format!("/ma-iroh/{endpoint_id}/{}", String::from_utf8_lossy(AVATAR_ALPN)),
-        format!("/ma-iroh/{endpoint_id}/{}", String::from_utf8_lossy(IPFS_ALPN)),
+        format!("/iroh/{endpoint_id}/{}", String::from_utf8_lossy(INBOX_PROTOCOL)),
+        format!("/iroh/{endpoint_id}/{}", String::from_utf8_lossy(AVATAR_PROTOCOL)),
+        format!("/iroh/{endpoint_id}/{}", String::from_utf8_lossy(IPFS_PROTOCOL)),
     ];
-    document.set_ma_transports(serde_json::Value::Array(
+    ma_fields::set_ma_services(&mut document, serde_json::Value::Array(
         transport_paths
             .into_iter()
             .map(serde_json::Value::String)
             .collect(),
     ));
-    document.set_ma_ping_interval_secs(WORLD_PING_INTERVAL_SECS);
+    ma_fields::set_ma_ping_interval_secs(&mut document, WORLD_PING_INTERVAL_SECS as u64);
     document.sign(&signing_key, &assertion_vm)?;
 
     let document_cid = dag_put_dag_cbor(kubo_url, &document).await?;
@@ -366,7 +366,7 @@ pub(crate) async fn run_main() -> Result<()> {
                     .or_else(|| runtime_cfg.iroh_secret.map(PathBuf::from))
                     .unwrap_or_else(|| runtime_iroh_secret_default_path(&normalized_slug));
 
-                generate_iroh_secret_file(&path)?;
+                generate_secret_key_file(&path)?;;
                 println!("generated iroh secret: {}", path.display());
                 return Ok(());
             }
@@ -420,11 +420,11 @@ pub(crate) async fn run_main() -> Result<()> {
 
                 let passphrase = passphrase.unwrap_or_else(|| nanoid!(32));
 
-                generate_iroh_secret_file(&iroh_path)?;
+                generate_secret_key_file(&iroh_path)?;
 
-                let secret_key = load_persisted_iroh_secret_key(&iroh_path)?
+                let secret_bytes = load_secret_key_bytes(&iroh_path)?
                     .ok_or_else(|| anyhow!("failed loading generated iroh secret {}", iroh_path.display()))?;
-                let world_master_key = derive_world_master_key(&secret_key, &normalized_slug);
+                let world_master_key = derive_world_master_key(&secret_bytes, &normalized_slug);
 
                 let world = World::new(
                     EntryAcl {
@@ -505,13 +505,13 @@ pub(crate) async fn run_main() -> Result<()> {
                     .iroh_secret
                     .map(PathBuf::from)
                     .unwrap_or_else(|| runtime_iroh_secret_default_path(&normalized_slug));
-                let secret_key = load_persisted_iroh_secret_key(&iroh_path)?
+                let secret_bytes = load_secret_key_bytes(&iroh_path)?
                     .ok_or_else(|| anyhow!(
                         "missing iroh secret at {}. Create it with: ma-world --gen-iroh-secret --slug {}",
                         iroh_path.display(),
                         normalized_slug
                     ))?;
-                let world_master_key = derive_world_master_key(&secret_key, &normalized_slug);
+                let world_master_key = derive_world_master_key(&secret_bytes, &normalized_slug);
 
                 let world = World::new(
                     EntryAcl {
@@ -1277,13 +1277,13 @@ pub(crate) async fn run_main() -> Result<()> {
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(|| runtime_iroh_secret_default_path(&normalized_slug));
-        let secret_key = load_persisted_iroh_secret_key(&iroh_path)?
+        let secret_bytes = load_secret_key_bytes(&iroh_path)?
             .ok_or_else(|| anyhow!(
                 "missing iroh secret at {}. Create it with: ma-world --gen-iroh-secret --slug {}",
                 iroh_path.display(),
                 normalized_slug
             ))?;
-        let world_master_key = derive_world_master_key(&secret_key, &normalized_slug);
+        let world_master_key = derive_world_master_key(&secret_bytes, &normalized_slug);
         let world_key_name = normalize_world_key_name(&normalized_slug);
         let did_identifier = ensure_kubo_key_id(&kubo_url, &world_key_name).await?;
         let world_did = Did::new(&did_identifier, &normalized_slug)
@@ -1369,13 +1369,13 @@ pub(crate) async fn run_main() -> Result<()> {
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(|| runtime_iroh_secret_default_path(&normalized_slug));
-        let secret_key = load_persisted_iroh_secret_key(&iroh_path)?
+        let secret_bytes = load_secret_key_bytes(&iroh_path)?
             .ok_or_else(|| anyhow!(
                 "missing iroh secret at {}. Create it with: ma-world --gen-iroh-secret --slug {}",
                 iroh_path.display(),
                 normalized_slug
             ))?;
-        let world_master_key = derive_world_master_key(&secret_key, &normalized_slug);
+        let world_master_key = derive_world_master_key(&secret_bytes, &normalized_slug);
         let world_key_name = normalize_world_key_name(&normalized_slug);
         let did_identifier = ensure_kubo_key_id(&kubo_url, &world_key_name).await?;
         let world_did = Did::new(&did_identifier, &normalized_slug)
@@ -1678,7 +1678,7 @@ pub(crate) async fn run_main() -> Result<()> {
         .as_deref()
         .map(PathBuf::from)
         .unwrap_or_else(|| runtime_iroh_secret_default_path(&world_slug));
-    let Some(secret_key) = load_persisted_iroh_secret_key(&key_path)? else {
+    let Some(secret_bytes) = load_secret_key_bytes(&key_path)? else {
         return Err(anyhow!(
             "missing iroh secret at {}. Create it explicitly with: ma-world --gen-iroh-secret {}",
             key_path.display(),
@@ -1686,10 +1686,9 @@ pub(crate) async fn run_main() -> Result<()> {
         ));
     };
     info!("Loaded persistent iroh identity from {}", key_path.display());
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(secret_key)
-        .bind()
-        .await?;
+    let iroh_endpoint = IrohEndpoint::new(secret_bytes).await
+        .map_err(|e| anyhow!("failed to start iroh endpoint: {e}"))?;
+    let endpoint = iroh_endpoint.into_inner();
 
     // Ensure Kubo API is online before DID/IPNS bootstrap.
     wait_for_kubo_api(&kubo_url, 8).await?;
@@ -1706,7 +1705,7 @@ pub(crate) async fn run_main() -> Result<()> {
     }
 
     let run_result: Result<()> = async {
-        let world_master_key = derive_world_master_key(endpoint.secret_key(), &world_slug);
+        let world_master_key = derive_world_master_key(&secret_bytes, &world_slug);
         world.set_world_master_key(world_master_key).await;
         info!("World master key source: derived from iroh identity and world slug");
 
@@ -1866,8 +1865,8 @@ pub(crate) async fn run_main() -> Result<()> {
             entry_acl: world.entry_acl_source().await,
             started_at: Utc::now().to_rfc3339(),
             capabilities: vec![
-                LaneCapability::for_lane(WorldLane::Inbox),
-                LaneCapability::for_lane(WorldLane::Avatar),
+                ServiceCapability::for_service(WorldService::Inbox),
+                ServiceCapability::for_service(WorldService::Avatar),
             ],
         };
 
@@ -1895,10 +1894,10 @@ pub(crate) async fn run_main() -> Result<()> {
         info!("Created default room: {}", DEFAULT_ROOM);
         info!("World endpoint id: {}", world_info.endpoint_id);
         info!("World status page: {}", world_info.status_url);
-        info!("Inbox protocol ALPN: {}", String::from_utf8_lossy(INBOX_ALPN));
-        info!("Avatar protocol ALPN: {}", String::from_utf8_lossy(AVATAR_ALPN));
-        info!("IPFS protocol ALPN (citizenship): {}", String::from_utf8_lossy(IPFS_ALPN));
-        info!("Presence protocol ALPN (outbound push to agents): {}", String::from_utf8_lossy(PRESENCE_ALPN));
+        info!("Inbox protocol: {}", String::from_utf8_lossy(INBOX_PROTOCOL));
+        info!("Avatar protocol: {}", String::from_utf8_lossy(AVATAR_PROTOCOL));
+        info!("IPFS protocol (citizenship): {}", String::from_utf8_lossy(IPFS_PROTOCOL));
+        info!("Presence protocol (outbound push to agents): {}", String::from_utf8_lossy(PRESENCE_PROTOCOL));
         info!("World entry ACL: {}", world_info.entry_acl);
         info!("Optional DID field ma:presenceHint = {}", world_info.location_hint);
         info!("Iroh online readiness: {}", online_status);
@@ -1920,13 +1919,13 @@ pub(crate) async fn run_main() -> Result<()> {
             .await;
 
         // Wait for unlock before accepting protocol connections.
-        // While locked, a gate router responds with "world is locked" on all ALPNs.
+        // While locked, a gate router responds with "world is locked" on all protocols.
         if !world.is_unlocked().await {
             let gate = LockedGateProtocol;
             let gate_router = Router::builder(endpoint.clone())
-                .accept(INBOX_ALPN, gate.clone())
-                .accept(AVATAR_ALPN, gate.clone())
-                .accept(IPFS_ALPN, gate)
+                .accept(INBOX_PROTOCOL, gate.clone())
+                .accept(AVATAR_PROTOCOL, gate.clone())
+                .accept(IPFS_PROTOCOL, gate)
                 .spawn();
             world
                 .record_event("world runtime locked; gate router active — waiting for unlock".to_string())
@@ -1952,7 +1951,7 @@ pub(crate) async fn run_main() -> Result<()> {
             did_cache: did_cache.clone(),
             push_stream_cache: Arc::new(Mutex::new(HashMap::new())),
             push_timeout_cooldown: Arc::new(Mutex::new(HashMap::new())),
-            lane: WorldLane::Inbox,
+            service: WorldService::Inbox,
         };
         let avatar_protocol = WorldProtocol {
             world: world.clone(),
@@ -1961,12 +1960,12 @@ pub(crate) async fn run_main() -> Result<()> {
             did_cache: did_cache.clone(),
             push_stream_cache: inbox_protocol.push_stream_cache.clone(),
             push_timeout_cooldown: inbox_protocol.push_timeout_cooldown.clone(),
-            lane: WorldLane::Avatar,
+            service: WorldService::Avatar,
         };
         let router = Router::builder(endpoint.clone())
-            .accept(INBOX_ALPN, inbox_protocol.clone())
-            .accept(AVATAR_ALPN, avatar_protocol)
-            .accept(IPFS_ALPN, ipfs_protocol)
+            .accept(INBOX_PROTOCOL, inbox_protocol.clone())
+            .accept(AVATAR_PROTOCOL, avatar_protocol)
+            .accept(IPFS_PROTOCOL, ipfs_protocol)
             .spawn();
 
         // Join the ma broadcast channel.
@@ -2094,7 +2093,7 @@ pub(crate) async fn run_main() -> Result<()> {
             .record_event(format!("optional published location hint: {}", world_info.location_hint))
             .await;
         world
-            .record_event(format!("inbox protocol ready on ALPN {}", String::from_utf8_lossy(INBOX_ALPN)))
+            .record_event(format!("inbox protocol ready: {}", String::from_utf8_lossy(INBOX_PROTOCOL)))
             .await;
 
         info!("World initialized. Waiting for connections...");

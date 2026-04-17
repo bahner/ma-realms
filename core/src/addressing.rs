@@ -12,11 +12,11 @@ pub fn did_root(input: &str) -> String {
     }
 }
 
-/// Construct a full DID string from an IPNS key and a fragment.
+/// Construct a DID URL from an IPNS key and a fragment.
 /// Returns `did:ma:<ipns>#<fragment>`.
-pub fn create_world_did(ipns: &str, fragment: &str) -> String {
-    Did::new(ipns, fragment)
-        .expect("create_world_did: invalid ipns or fragment")
+pub fn create_world_url(ipns: &str, fragment: &str) -> String {
+    Did::new_url(ipns, Some(fragment))
+        .expect("create_world_url: invalid ipns or fragment")
         .id()
 }
 
@@ -100,7 +100,7 @@ pub fn endpoint_id_from_transport_value(value: &serde_json::Value) -> Option<Str
 pub fn resolve_inbox_endpoint_id(
     current_inbox: Option<&str>,
     presence_hint: Option<&str>,
-    transports: Option<&serde_json::Value>,
+    services: Option<&serde_json::Value>,
 ) -> Option<String> {
     if let Some(current) = current_inbox {
         if let Some(endpoint) = endpoint_id_from_address(current) {
@@ -114,7 +114,7 @@ pub fn resolve_inbox_endpoint_id(
         }
     }
 
-    if let Some(value) = transports {
+    if let Some(value) = services {
         if let Some(items) = value.as_array() {
             for item in items {
                 if let Some(endpoint) = endpoint_id_from_transport_value(item) {

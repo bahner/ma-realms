@@ -59,16 +59,16 @@ export function extractWorldEndpointFromDidDoc(document) {
 
   const ma = document.ma && typeof document.ma === 'object' ? document.ma : null;
 
-  const transports = ma?.transports;
-  if (Array.isArray(transports)) {
-    for (const entry of transports) {
+  const services = ma?.services;
+  if (Array.isArray(services)) {
+    for (const entry of services) {
       const endpoint = extractEndpointFromTransportEntry(entry);
       if (endpoint) {
         return endpoint;
       }
     }
   } else {
-    const endpoint = extractEndpointFromTransportEntry(transports);
+    const endpoint = extractEndpointFromTransportEntry(services);
     if (endpoint) {
       return endpoint;
     }
@@ -445,7 +445,7 @@ export function createWorldDispatchFlow({
     }
 
     const endpoint = normalizeIrohAddress(target);
-    if (isLikelyIrohAddress(endpoint) || target.startsWith('/ma-iroh/')) {
+    if (isLikelyIrohAddress(endpoint) || target.startsWith('/iroh/') || target.startsWith('/ma-iroh/')) {
       return target;
     }
 
@@ -460,7 +460,7 @@ export function createWorldDispatchFlow({
         return resolved;
       }
       const resolvedEndpoint = normalizeIrohAddress(resolved);
-      if (isLikelyIrohAddress(resolvedEndpoint) || resolved.startsWith('/ma-iroh/')) {
+      if (isLikelyIrohAddress(resolvedEndpoint) || resolved.startsWith('/iroh/') || resolved.startsWith('/ma-iroh/')) {
         return resolved;
       }
     }
@@ -681,7 +681,7 @@ export function createWorldDispatchFlow({
       if (isLikelyIrohAddress(normalizedEndpoint)) {
         return `${prefix}${normalizedEndpoint}${suffix}`;
       }
-      if (resolved.startsWith('/ma-iroh/')) {
+      if (resolved.startsWith('/iroh/') || resolved.startsWith('/ma-iroh/')) {
         return `${prefix}${resolved}${suffix}`;
       }
       return all;

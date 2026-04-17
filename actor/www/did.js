@@ -92,7 +92,7 @@ export async function resolveEndpointWithTypePolicy({
     return localEndpoint;
   }
 
-  // Unknown type: prefer world pointer first (common case), then transports.
+  // Unknown type: prefer world pointer first (common case), then services.
   if (!knownType && worldHintRoot) {
     try {
       const worldDocJson = await fetchDidDocumentJsonByDid(worldHintRoot);

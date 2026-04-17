@@ -121,7 +121,7 @@ impl World {
             .trim()
             .trim_start_matches('@')
             .to_string();
-        let avatar_did = Did::try_from(create_world_did(&world_ipns, &avatar_fragment).as_str())
+        let avatar_did = Did::try_from(create_world_url(&world_ipns, &avatar_fragment).as_str())
             .map_err(|err| anyhow!("invalid derived avatar DID: {}", err))?;
         Ok((avatar_did, avatar_fragment))
     }
@@ -275,7 +275,7 @@ impl World {
             .await
             .clone()
             .ok_or_else(|| anyhow!("world signing key is not unlocked"))?;
-        let signer_did = Did::new_root(&world_did.ipns)
+        let signer_did = Did::new_auto(&world_did.ipns)
             .map_err(|e| anyhow!("failed building world signer DID: {}", e))?;
         let signing_key = SigningKey::from_private_key_bytes(signer_did, world_signing_key_bytes)
             .map_err(|e| anyhow!("failed restoring world signing key: {}", e))?;
@@ -309,35 +309,28 @@ impl World {
             .map_err(|e| anyhow!("failed adding avatar keyAgreement method: {}", e))?;
         document.assertion_method = vec![assertion_vm_id];
         document.key_agreement = vec![key_agreement_vm_id];
-        document.set_ma_type("avatar")?;
+        ma_fields::set_ma_type(&mut document, "avatar");
         if let Some(did_language_order) = normalize_language_for_did_document(&language_order) {
-            if let Err(err) = document.set_language(did_language_order.clone()) {
-                warn!(
-                    "ignoring invalid avatar language '{}' for {}: {}",
-                    did_language_order,
-                    avatar_did.id(),
-                    err
-                );
-            }
+            ma_fields::set_ma_language(&mut document, &did_language_order);
         }
-        document.set_ma_transports(serde_json::Value::Array(
+        ma_fields::set_ma_services(&mut document, serde_json::Value::Array(
             vec![
                 format!(
-                    "/ma-iroh/{}/{}",
+                    "/iroh/{}/{}",
                     avatar.agent_endpoint,
-                    String::from_utf8_lossy(PRESENCE_ALPN)
+                    String::from_utf8_lossy(PRESENCE_PROTOCOL)
                 ),
                 format!(
-                    "/ma-iroh/{}/{}",
+                    "/iroh/{}/{}",
                     avatar.agent_endpoint,
-                    String::from_utf8_lossy(INBOX_ALPN)
+                    String::from_utf8_lossy(INBOX_PROTOCOL)
                 ),
             ]
             .into_iter()
             .map(serde_json::Value::String)
             .collect(),
         ));
-        document.set_ma_ping_interval_secs(WORLD_PING_INTERVAL_SECS);
+        ma_fields::set_ma_ping_interval_secs(&mut document, WORLD_PING_INTERVAL_SECS as u64);
         document
             .sign(&signing_key, &assertion_vm)
             .map_err(|e| anyhow!("failed signing avatar DID document: {}", e))?;
@@ -444,7 +437,7 @@ impl World {
             .trim_start_matches('@')
             .to_string();
         let avatar_did =
-            Did::try_from(create_world_did(&world_ipns, &avatar_fragment).as_str())
+            Did::try_from(create_world_url(&world_ipns, &avatar_fragment).as_str())
                 .map_err(|err| anyhow!("invalid derived avatar DID: {}", err))?;
 
         let signing_key = SigningKey::generate(avatar_did.clone())
@@ -715,7 +708,7 @@ impl World {
                 .iter()
                 .find(|(_, object)| {
                     object.has_receiver_role("world-inbox")
-                        || object.has_receiver_protocol("ma/inbox/1")
+                        || object.has_receiver_protocol("ma/inbox/0.0.1")
                 })
             {
                 return Some((room_id.clone(), object_id.clone()));
@@ -744,7 +737,7 @@ impl World {
 
         let mut out = HashMap::new();
         for object in room_map.values() {
-            let object_did = create_world_did(&ipns, &object.id);
+            let object_did = create_world_url(&ipns, &object.id);
             out.insert(object.id.to_ascii_lowercase(), object_did.clone());
             out.insert(object.name.to_ascii_lowercase(), object_did.clone());
             for alias in &object.aliases {
@@ -797,7 +790,7 @@ impl World {
             return room_map
                 .values()
                 .find(|object| {
-                    object.has_receiver_role("world-inbox") || object.has_receiver_protocol("ma/inbox/1")
+                    object.has_receiver_role("world-inbox") || object.has_receiver_protocol("ma/inbox/0.0.1")
                 })
                 .map(|object| object.id.clone());
         }
@@ -1155,7 +1148,7 @@ impl World {
         {
             let mut rooms = self.rooms.write().await;
             for (room_name, room) in rooms.iter_mut() {
-                room.url = create_world_did(&ipns, room_name);
+                room.url = create_world_url(&ipns, room_name);
             }
         }
 
@@ -1180,7 +1173,7 @@ impl World {
             .local_world_ipns()
             .await
             .unwrap_or_else(|| "unconfigured".to_string());
-        create_world_did(&ipns, room_id)
+        create_world_url(&ipns, room_id)
     }
 
     pub(crate) async fn materialize_room_from_yaml(&self, room_name: &str, room_yaml: &str) -> Result<(Room, bool)> {
@@ -2817,7 +2810,7 @@ impl World {
             .ok_or_else(|| anyhow!("world DID is not configured"))?;
         let world_did = Did::try_from(world_did_str.as_str())
             .map_err(|e| anyhow!("invalid configured world DID '{}': {}", world_did_str, e))?;
-        let signer_did = Did::new_root(&world_did.ipns)
+        let signer_did = Did::new_auto(&world_did.ipns)
             .map_err(|e| anyhow!("failed building state signer DID: {}", e))?;
         let signing_key = SigningKey::from_private_key_bytes(
             signer_did.clone(),
@@ -3205,7 +3198,7 @@ impl World {
             .ok_or_else(|| anyhow!("world DID is not configured"))?;
         let world_did = Did::try_from(world_did_str.as_str())
             .map_err(|e| anyhow!("invalid configured world DID '{}': {}", world_did_str, e))?;
-        let signer_did = Did::new_root(&world_did.ipns)
+        let signer_did = Did::new_auto(&world_did.ipns)
             .map_err(|e| anyhow!("failed building state signer DID: {}", e))?;
         let signing_key = SigningKey::from_private_key_bytes(signer_did, secrets.world_signing_private_key)
             .map_err(|e| anyhow!("failed restoring state signing key: {}", e))?;
@@ -3968,7 +3961,7 @@ impl World {
                 (
                     device.name.clone(),
                     device.kind.clone(),
-                    create_world_did(&world_ipns, &device.id),
+                    create_world_url(&world_ipns, &device.id),
                     device.cid.clone().unwrap_or_else(|| "(builtin)".to_string()),
                     device.holder.clone().unwrap_or_else(|| "(none)".to_string()),
                     device
@@ -4797,7 +4790,7 @@ impl World {
                             .local_world_ipns()
                             .await
                             .unwrap_or_else(|| "unconfigured".to_string());
-                        (object_id.clone(), create_world_did(&world_ipns, &object_id))
+                        (object_id.clone(), create_world_url(&world_ipns, &object_id))
                     };
 
                     let object_exists_here = {
@@ -6200,7 +6193,7 @@ impl World {
                     .unwrap_or_else(|| "unconfigured".to_string());
                 return format!(
                     "did={} source=object room={} object_id={} token={}",
-                    create_world_did(&world_ipns, &object_id),
+                    create_world_url(&world_ipns, &object_id),
                     room_name,
                     object_id,
                     token

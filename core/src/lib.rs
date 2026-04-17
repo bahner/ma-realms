@@ -13,13 +13,10 @@ pub mod command_syntax;
 pub mod document_helpers;
 pub mod domain;
 pub mod identity;
+pub mod ma_fields;
 #[cfg(not(target_arch = "wasm32"))]
 pub use ma_core::ipfs_publish;
 pub mod interfaces;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod gossip;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod iroh;
 pub mod object_runtime;
 pub mod parser;
 pub mod protocol;
@@ -31,7 +28,7 @@ pub mod ttl_cache;
 pub mod util;
 
 pub use addressing::{
-    create_world_did, did_root, find_alias_for_address, find_did_by_endpoint,
+    create_world_url, did_root, find_alias_for_address, find_did_by_endpoint,
     humanize_identifier, humanize_text,
     normalize_endpoint_id, normalize_iroh_address, normalize_relay_url, resolve_alias_input,
     endpoint_id_from_address, endpoint_id_from_transport_value, resolve_inbox_endpoint_id, same_ipns,
@@ -75,9 +72,9 @@ pub use document_helpers::{
 pub use util::{expand_tilde_path, format_system_time, is_valid_nanoid_id, parse_rfc3339_unix};
 pub use secure_fs::{SecureFileKind, ensure_private_dir, write_secure_file};
 #[cfg(not(target_arch = "wasm32"))]
-pub use gossip::{broadcast_topic_id, gossip_send, gossip_send_text, join_broadcast_channel, join_gossip_topic, topic_id_for};
+pub use ma_core::{broadcast_topic_id, gossip_send, gossip_send_text, join_broadcast_channel, join_gossip_topic, topic_id_for};
 #[cfg(not(target_arch = "wasm32"))]
-pub use iroh::{generate_iroh_secret_file, load_persisted_iroh_secret_key, socket_addr_to_multiaddr};
+pub use ma_core::{generate_secret_key_file, load_secret_key_bytes, socket_addr_to_multiaddr};
 pub use object_runtime::{
     MAILBOX_COMMANDS_INLINE,
     ObjectCommandOutput, ObjectCommandResult, ObjectDefinition, ObjectInboxMessage,
@@ -89,10 +86,10 @@ pub use parser::{
     ActorCommand, MessageEnvelope, normalize_spoken_text, parse_actor_command, parse_message,
 };
 pub use protocol::{
-    LaneCapability, PresenceAvatar, RoomEvent, TransportAck, TransportAckCode, WorldCommand,
-    WorldLane, WorldRequest, WorldResponse,
-    AVATAR_ALPN, PRESENCE_ALPN, DEFAULT_WORLD_RELAY_URL, INBOX_ALPN, IPFS_ALPN,
-    BROADCAST_ALPN, BROADCAST_TOPIC,
+    ServiceCapability, PresenceAvatar, RoomEvent, TransportAck, TransportAckCode, WorldCommand,
+    WorldService, WorldRequest, WorldResponse,
+    AVATAR_PROTOCOL, PRESENCE_PROTOCOL, INBOX_PROTOCOL, IPFS_PROTOCOL,
+    BROADCAST_PROTOCOL, BROADCAST_TOPIC,
     DEFAULT_CONTENT_TYPE, CONTENT_TYPE_CHAT, CONTENT_TYPE_PRESENCE,
     CONTENT_TYPE_WORLD, CONTENT_TYPE_EVENT, CONTENT_TYPE_BROADCAST,
     CONTENT_TYPE_WHISPER, CONTENT_TYPE_MESSAGE,

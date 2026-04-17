@@ -3,7 +3,7 @@ import init, {
   unlock_identity,
   ensure_bundle_iroh_secret,
   set_bundle_language,
-  set_bundle_transports,
+  set_bundle_services,
   set_bundle_updated_for_send,
   generate_bip39_phrase,
   normalize_bip39_phrase,
@@ -2925,11 +2925,11 @@ async function prepareIdentityDocumentForSend() {
   }
 
   if (state.inboxEndpointId) {
-    const withTransports = JSON.parse(
-      set_bundle_transports(state.passphrase, state.encryptedBundle, state.inboxEndpointId)
+    const withServices = JSON.parse(
+      set_bundle_services(state.passphrase, state.encryptedBundle, state.inboxEndpointId)
     );
-    state.identity = withTransports;
-    state.encryptedBundle = withTransports.encrypted_bundle;
+    state.identity = withServices;
+    state.encryptedBundle = withServices.encrypted_bundle;
   }
 
   const updated = JSON.parse(
@@ -3238,7 +3238,7 @@ async function autoFollowEnterDirective(message) {
   return await didDocFlow.autoFollowEnterDirective(message);
 }
 
-function syncBundleTransportsFromEndpoint(endpointId) {
+function syncBundleServicesFromEndpoint(endpointId) {
   const inboxEndpointId = String(endpointId || '').trim();
   if (!inboxEndpointId || !state.passphrase || !state.encryptedBundle) {
     return;
@@ -3246,7 +3246,7 @@ function syncBundleTransportsFromEndpoint(endpointId) {
 
   try {
     const updated = JSON.parse(
-      set_bundle_transports(state.passphrase, state.encryptedBundle, inboxEndpointId)
+      set_bundle_services(state.passphrase, state.encryptedBundle, inboxEndpointId)
     );
     state.identity = updated;
     state.encryptedBundle = updated.encrypted_bundle;
@@ -3258,7 +3258,7 @@ function syncBundleTransportsFromEndpoint(endpointId) {
       saveIdentityRecord(state.aliasName, updated.encrypted_bundle);
     }
   } catch (error) {
-    logger.log('did.transports', `failed to sync ma.transports: ${error instanceof Error ? error.message : String(error)}`);
+    logger.log('did.services', `failed to sync ma.services: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -3642,7 +3642,7 @@ async function enterHome(target, preferredRoom = null) {
   if (!isLikelyIrohAddress(endpointId)) {
     if (resolvedDid) {
       throw new Error(
-        `DID ${resolvedDid} did not resolve to a valid iroh endpoint. Ensure its DID document has ma.transports, ma.currentInbox, or ma.presenceHint with /ma-iroh/<endpoint-id>/... or /iroh/<endpoint-id>.`
+        `DID ${resolvedDid} did not resolve to a valid iroh endpoint. Ensure its DID document has ma.services with /iroh/<endpoint-id>/... entries.`
       );
     }
     throw new Error(
@@ -3727,7 +3727,7 @@ async function enterHome(target, preferredRoom = null) {
   updateRoomHeading(state.currentHome.roomTitle, state.currentHome.roomDescription);
 
   const inboxEndpointId = await ensureInboxListener();
-  syncBundleTransportsFromEndpoint(inboxEndpointId);
+  syncBundleServicesFromEndpoint(inboxEndpointId);
   updateIdentityLine();
   scheduleAutoIdentityPublishForConfiguredHomeWorld();
 

@@ -9,7 +9,7 @@ impl WorldProtocol {
         let room_url_parsed = Did::try_from(room_url)
             .map_err(|e| anyhow!("invalid room did '{}': {}", room_url, e))?;
         let room_url_canonical = room_url_parsed.id();
-        let signing_did = Did::new_root(&room_url_parsed.ipns)
+        let signing_did = Did::new_auto(&room_url_parsed.ipns)
             .map_err(|e| anyhow!("invalid signing did for room {}: {}", room_url, e))?;
 
         if let Some(room_key) = {
@@ -69,28 +69,25 @@ impl WorldProtocol {
         ))
     }
 
-    pub(crate) fn push_cache_key(target_endpoint_id: &str, lane_alpn: &'static [u8]) -> String {
-        format!("{}|{}", String::from_utf8_lossy(lane_alpn), target_endpoint_id.trim())
+    pub(crate) fn push_cache_key(target_endpoint_id: &str, protocol: &'static [u8]) -> String {
+        format!("{}|{}", String::from_utf8_lossy(protocol), target_endpoint_id.trim())
     }
 
     pub(crate) async fn create_push_stream_cache(
         &self,
         target_endpoint_id: &str,
-        lane_alpn: &'static [u8],
+        protocol: &'static [u8],
     ) -> Result<PushStreamCache> {
         let target: EndpointId = target_endpoint_id
             .trim()
             .parse()
             .map_err(|e| anyhow!("invalid target endpoint id {}: {}", target_endpoint_id, e))?;
 
-        let relay: RelayUrl = DEFAULT_WORLD_RELAY_URL
-            .parse()
-            .map_err(|e| anyhow!("invalid relay URL {}: {}", DEFAULT_WORLD_RELAY_URL, e))?;
-        let endpoint_addr = EndpointAddr::new(target).with_relay_url(relay);
+        let endpoint_addr = EndpointAddr::new(target);
 
         let connection = self
             .endpoint
-            .connect(endpoint_addr, lane_alpn)
+            .connect(endpoint_addr, protocol)
             .await
             .map_err(|e| anyhow!("push endpoint.connect failed: {}", e))?;
 
@@ -155,22 +152,22 @@ impl WorldProtocol {
         Ok(())
     }
 
-    pub(crate) async fn send_signed_push_to_endpoint_on_lane(
+    pub(crate) async fn send_signed_push_to_endpoint_on_protocol(
         &self,
         target_endpoint_id: &str,
         message_cbor: Vec<u8>,
-        lane_alpn: &'static [u8],
+        protocol: &'static [u8],
     ) -> Result<()> {
-        let cache_key = Self::push_cache_key(target_endpoint_id, lane_alpn);
+        let cache_key = Self::push_cache_key(target_endpoint_id, protocol);
         let now = Instant::now();
         {
             let mut cooldowns = self.push_timeout_cooldown.lock().await;
             cooldowns.retain(|_, until| *until > now);
             if let Some(until) = cooldowns.get(&cache_key) {
                 debug!(
-                    "push endpoint {} on lane {} is in cooldown for {:?}",
+                    "push endpoint {} on protocol {} is in cooldown for {:?}",
                     target_endpoint_id,
-                    String::from_utf8_lossy(lane_alpn),
+                    String::from_utf8_lossy(protocol),
                     until.saturating_duration_since(now)
                 );
                 return Ok(());
@@ -183,7 +180,7 @@ impl WorldProtocol {
                 let mut slots = self.push_stream_cache.lock().await;
                 slots.remove(&cache_key)
             }
-            .unwrap_or(self.create_push_stream_cache(target_endpoint_id, lane_alpn).await?);
+            .unwrap_or(self.create_push_stream_cache(target_endpoint_id, protocol).await?);
 
             match self
                 .exchange_push_on_stream(&mut stream_cache, message_cbor.clone())
@@ -200,9 +197,9 @@ impl WorldProtocol {
                         let mut cooldowns = self.push_timeout_cooldown.lock().await;
                         cooldowns.insert(cache_key.clone(), until);
                         warn!(
-                            "push timeout for endpoint {} on lane {}; cooling down for {}s",
+                            "push timeout for endpoint {} on protocol {}; cooling down for {}s",
                             target_endpoint_id,
-                            String::from_utf8_lossy(lane_alpn),
+                            String::from_utf8_lossy(protocol),
                             PUSH_TIMEOUT_COOLDOWN_SECS
                         );
                         stream_cache.connection.close(0u32.into(), b"push timeout");
@@ -222,7 +219,7 @@ impl WorldProtocol {
         target_endpoint_id: &str,
         message_cbor: Vec<u8>,
     ) -> Result<()> {
-        self.send_signed_push_to_endpoint_on_lane(target_endpoint_id, message_cbor, PRESENCE_ALPN)
+        self.send_signed_push_to_endpoint_on_protocol(target_endpoint_id, message_cbor, PRESENCE_PROTOCOL)
             .await
     }
 
@@ -456,7 +453,7 @@ impl WorldProtocol {
             for endpoint in &endpoints {
                 let cbor_clone = cbor.clone();
                 if let Err(err) = self
-                    .send_signed_push_to_endpoint_on_lane(endpoint, cbor_clone, PRESENCE_ALPN)
+                    .send_signed_push_to_endpoint_on_protocol(endpoint, cbor_clone, PRESENCE_PROTOCOL)
                     .await
                 {
                     warn!("room event push to {} failed: {}", endpoint, err);
@@ -530,7 +527,7 @@ impl WorldProtocol {
         for endpoint in endpoints {
             let cbor_clone = cbor.clone();
             if let Err(err) = self
-                .send_signed_push_to_endpoint_on_lane(&endpoint, cbor_clone, INBOX_ALPN)
+                .send_signed_push_to_endpoint_on_protocol(&endpoint, cbor_clone, INBOX_PROTOCOL)
                 .await
             {
                 warn!("world broadcast push to {} failed: {}", endpoint, err);
@@ -646,7 +643,7 @@ impl WorldProtocol {
         match self.handle_request(request, agent_endpoint).await {
             Ok(resp) => resp,
             Err(err) => {
-                warn!("request error on lane '{}': {}", self.lane.label(), err);
+                warn!("request error on service '{}': {}", self.service.label(), err);
                 let detail = err.to_string();
                 let ack_code = if detail.contains("does not support this request type") {
                     TransportAckCode::UnsupportedRequestType
@@ -672,7 +669,7 @@ impl WorldProtocol {
                     avatars: Vec::new(),
                     room_object_dids: HashMap::new(),
                     transport_ack: Some(TransportAck {
-                        lane: self.lane.label().to_string(),
+                        lane: self.service.label().to_string(),
                         code: ack_code,
                         detail,
                     }),
@@ -731,7 +728,7 @@ impl WorldProtocol {
                 || lowered.contains("did document") && lowered.contains("not found")
             {
                 anyhow!(
-                    "did document is not published yet for {} (submit document via ma/ipfs/1): {}",
+                    "did document is not published yet for {} (submit document via ma/ipfs/0.0.1): {}",
                     sender_did.id(),
                     detail
                 )
@@ -809,29 +806,29 @@ impl WorldProtocol {
     }
 
     pub(crate) async fn handle_request(&self, request: WorldRequest, agent_endpoint: String) -> Result<WorldResponse> {
-        if !self.lane.supports_request(&request) {
+        if !self.service.supports_request(&request) {
             return Err(anyhow!(
-                "lane '{}' does not support this request type",
-                self.lane.label()
+                "service '{}' does not support this request type",
+                self.service.label()
             ));
         }
 
-        // Each ALPN lane has exactly one canonical content type.
+        // Each protocol has exactly one canonical content type.
         let (message, sender_did, sender_document) = self.verify_message(request.message_cbor).await?;
         let expected_ct = CONTENT_TYPE_WORLD;
         if !Self::content_type_matches(&message.content_type, expected_ct, "application/x-ma-command") {
-            return Err(anyhow!("expected {} on this lane, got {}", expected_ct, message.content_type));
+            return Err(anyhow!("expected {} on this service, got {}", expected_ct, message.content_type));
         }
         let command: WorldCommand = serde_json::from_slice(&message.content)
             .map_err(|err| anyhow!("invalid command payload: {}", err))?;
-        if !self.lane.supports_command(&command) {
+        if !self.service.supports_command(&command) {
             return Err(anyhow!(
-                "lane '{}' does not support command on this request type",
-                self.lane.label()
+                "service '{}' does not support command on this request type",
+                self.service.label()
             ));
         }
         if let Some(method) = command.internal_method() {
-            debug!("processing internal method '{}' on lane '{}'", method, self.lane.label());
+            debug!("processing internal method '{}' on service '{}'", method, self.service.label());
         }
         self.handle_command(command, &message, &sender_did, sender_document, agent_endpoint).await
     }
@@ -887,8 +884,8 @@ impl WorldProtocol {
             WorldCommand::RoomEvents { .. } => "room_events",
         };
         debug!(
-            "request lane='{}' kind='{}' from='{}' to='{}'",
-            self.lane.label(),
+            "request service='{}' kind='{}' from='{}' to='{}'",
+            self.service.label(),
             command_kind,
             sender_did.id(),
             message.to,
@@ -979,7 +976,7 @@ impl ProtocolHandler for WorldProtocol {
                     avatars: Vec::new(),
                     room_object_dids: HashMap::new(),
                     transport_ack: Some(TransportAck {
-                        lane: self.lane.label().to_string(),
+                        lane: self.service.label().to_string(),
                         code: TransportAckCode::InvalidRequestJson,
                         detail: format!("invalid request JSON: {}", err),
                     }),
@@ -1039,7 +1036,7 @@ impl IpfsProtocol {
 
         Ok(IpfsPublishDidResponse {
             ok: true,
-            message: "did document published via ma/ipfs/1".to_string(),
+            message: "did document published via ma/ipfs/0.0.1".to_string(),
             did: Some(validated.document_did.id()),
             key_name,
             cid,
@@ -1092,12 +1089,12 @@ impl ProtocolHandler for IpfsProtocol {
     }
 }
 
-pub(crate) fn derive_world_master_key(secret_key: &SecretKey, world_slug: &str) -> [u8; 32] {
+pub(crate) fn derive_world_master_key(secret_bytes: &[u8; 32], world_slug: &str) -> [u8; 32] {
     // Deterministic per-world key derived from machine-local iroh identity.
     let mut hasher = Sha256::new();
     hasher.update(b"ma-world/master-key/v1");
     hasher.update(world_slug.as_bytes());
-    hasher.update(secret_key.to_bytes());
+    hasher.update(secret_bytes);
     let digest = hasher.finalize();
 
     let mut out = [0u8; 32];

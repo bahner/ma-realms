@@ -1,15 +1,13 @@
 use anyhow::{Result, anyhow};
 use did_ma::Document;
 
-use crate::resolve_inbox_endpoint_id;
+use crate::{ma_fields, resolve_inbox_endpoint_id};
 
 pub fn sender_profile_from_document(document: &Document) -> String {
-    if let Some(ma) = document.ma.as_ref() {
-        if let Some(language) = ma.language.as_ref() {
-            let normalized = language.trim();
-            if !normalized.is_empty() {
-                return normalized.to_string();
-            }
+    if let Some(language) = ma_fields::ma_language(document) {
+        let normalized = language.trim();
+        if !normalized.is_empty() {
+            return normalized.to_string();
         }
     }
     "und".to_string()
@@ -30,11 +28,10 @@ pub fn normalize_language_for_did_document(language_order: &str) -> Option<Strin
 }
 
 pub fn sender_push_endpoint_from_document(document: &Document) -> Option<String> {
-    let ma = document.ma.as_ref()?;
     let endpoint = resolve_inbox_endpoint_id(
-        ma.current_inbox.as_deref(),
-        ma.presence_hint.as_deref(),
-        ma.transports.as_ref(),
+        ma_fields::ma_current_inbox(document),
+        ma_fields::ma_presence_hint(document),
+        ma_fields::ma_services(document),
     )?;
     let trimmed = endpoint.trim();
     if trimmed.is_empty() {

@@ -341,7 +341,7 @@ impl ObjectRuntimeState {
             aliases: vec!["mailbox".to_string(), "messaging-device".to_string()],
             receivers: vec![ObjectReceiverListener {
                 transport: "iroh".to_string(),
-                protocol: "ma/inbox/1".to_string(),
+                protocol: "/ma/inbox/0.0.1".to_string(),
                 role: Some("world-inbox".to_string()),
                 address: None,
             }],
