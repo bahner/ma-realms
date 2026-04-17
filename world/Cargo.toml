@@ -15,7 +15,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 anyhow = "1.0"
 thiserror = "1.0"
-did-ma = { package = "ma-did", version = "0.3" }
+did-ma = { package = "ma-did", version = "0.4" }
 ma-core = { package = "ma-realms-core", path = "../core" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart"] }
 attohttpc = { version = "0.30", default-features = false, features = ["tls-rustls-native-roots"] }

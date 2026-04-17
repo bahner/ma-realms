@@ -257,6 +257,7 @@ impl World {
         let owner = avatar.owner.clone();
         let language_order = avatar.language_order.clone();
         let endpoint = avatar.agent_endpoint.clone();
+        let services = avatar.agent_services.clone();
         let acl_summary = avatar.acl.summary();
         let shortcuts = avatar.object_shortcuts.clone();
 
@@ -275,7 +276,7 @@ impl World {
             .await
             .clone()
             .ok_or_else(|| anyhow!("world signing key is not unlocked"))?;
-        let signer_did = Did::new_auto(&world_did.ipns)
+        let signer_did = Did::new_identity(&world_did.ipns)
             .map_err(|e| anyhow!("failed building world signer DID: {}", e))?;
         let signing_key = SigningKey::from_private_key_bytes(signer_did, world_signing_key_bytes)
             .map_err(|e| anyhow!("failed restoring world signing key: {}", e))?;
@@ -309,28 +310,14 @@ impl World {
             .map_err(|e| anyhow!("failed adding avatar keyAgreement method: {}", e))?;
         document.assertion_method = vec![assertion_vm_id];
         document.key_agreement = vec![key_agreement_vm_id];
-        ma_fields::set_ma_type(&mut document, "avatar");
+        ma_core::ma_fields::set_ma_type(&mut document, "avatar");
         if let Some(did_language_order) = normalize_language_for_did_document(&language_order) {
-            ma_fields::set_ma_language(&mut document, &did_language_order);
+            ma_core::ma_fields::set_ma_language(&mut document, &did_language_order);
         }
-        ma_fields::set_ma_services(&mut document, serde_json::Value::Array(
-            vec![
-                format!(
-                    "/iroh/{}/{}",
-                    avatar.agent_endpoint,
-                    String::from_utf8_lossy(PRESENCE_PROTOCOL)
-                ),
-                format!(
-                    "/iroh/{}/{}",
-                    avatar.agent_endpoint,
-                    String::from_utf8_lossy(INBOX_PROTOCOL)
-                ),
-            ]
-            .into_iter()
-            .map(serde_json::Value::String)
-            .collect(),
-        ));
-        ma_fields::set_ma_ping_interval_secs(&mut document, WORLD_PING_INTERVAL_SECS as u64);
+        if let Some(services) = services {
+            ma_core::ma_fields::set_ma_services(&mut document, services);
+        }
+        ma_core::ma_fields::set_ma_ping_interval_secs(&mut document, WORLD_PING_INTERVAL_SECS as u64);
         document
             .sign(&signing_key, &assertion_vm)
             .map_err(|e| anyhow!("failed signing avatar DID document: {}", e))?;
@@ -408,6 +395,7 @@ impl World {
         &self,
         sender_identity: &Did,
         sender_profile: &str,
+        sender_services: Option<did_ma::Ipld>,
         agent_endpoint: &str,
         sender_encryption_pubkey_multibase: &str,
         room: &str,
@@ -448,6 +436,7 @@ impl World {
             identity: sender_identity.id(),
             owner: sender_identity.base_id(),
             agent_endpoint: agent_endpoint.to_string(),
+            agent_services: sender_services,
             language_order,
             signing_secret: signing_key.private_key_bytes(),
             encryption_pubkey_multibase: Some(sender_encryption_pubkey_multibase.to_string()),
@@ -2206,18 +2195,20 @@ impl World {
 
             if let Some(mut avatar) = moved {
                 let endpoint_changed = avatar.agent_endpoint != req.agent_endpoint;
+                let services_changed = avatar.agent_services != req.agent_services;
                 let language_changed = avatar.language_order != req.language_order;
                 let identity_changed = avatar.identity != req.identity;
                 let owner_changed = avatar.owner != req.owner;
                 let encryption_changed = avatar.encryption_pubkey_multibase != req.encryption_pubkey_multibase;
                 avatar.agent_endpoint = req.agent_endpoint.clone();
+                avatar.agent_services = req.agent_services.clone();
                 avatar.language_order = req.language_order.clone();
                 avatar.identity = req.identity.clone();
                 avatar.owner = req.owner.clone();
                 avatar.encryption_pubkey_multibase = req.encryption_pubkey_multibase.clone();
                 avatar.touch_presence();
                 let moved_handle = avatar.inbox.clone();
-                let refresh_registry = endpoint_changed || language_changed || identity_changed || owner_changed || encryption_changed;
+                let refresh_registry = endpoint_changed || services_changed || language_changed || identity_changed || owner_changed || encryption_changed;
 
                 if let Some(room) = rooms.get_mut(room_name) {
                     room.add_avatar(avatar);
@@ -2274,11 +2265,13 @@ impl World {
             .find(|(_, avatar)| avatar.agent_did.id() == did_id)
         {
             let endpoint_changed = existing.agent_endpoint != req.agent_endpoint;
+            let services_changed = existing.agent_services != req.agent_services;
             let language_changed = existing.language_order != req.language_order;
             let identity_changed = existing.identity != req.identity;
             let owner_changed = existing.owner != req.owner;
             let encryption_changed = existing.encryption_pubkey_multibase != req.encryption_pubkey_multibase;
             existing.agent_endpoint = req.agent_endpoint.clone();
+            existing.agent_services = req.agent_services.clone();
             existing.language_order = req.language_order.clone();
             existing.identity = req.identity.clone();
             existing.owner = req.owner.clone();
@@ -2286,7 +2279,7 @@ impl World {
             existing.touch_presence();
             info!("[{}] {} already present ({:?})", room_name, existing_handle, req.did);
             let existing_handle_value = existing_handle.clone();
-            let refresh_registry = endpoint_changed || language_changed || identity_changed || owner_changed || encryption_changed;
+            let refresh_registry = endpoint_changed || services_changed || language_changed || identity_changed || owner_changed || encryption_changed;
             drop(rooms);
             self.rebuild_avatar_room_index().await;
             if refresh_registry {
@@ -2308,6 +2301,7 @@ impl World {
             handle.clone(),
             req.did.clone(),
             req.agent_endpoint.clone(),
+            req.agent_services.clone(),
             req.language_order.clone(),
             req.identity.clone(),
             req.owner.clone(),
@@ -2810,7 +2804,7 @@ impl World {
             .ok_or_else(|| anyhow!("world DID is not configured"))?;
         let world_did = Did::try_from(world_did_str.as_str())
             .map_err(|e| anyhow!("invalid configured world DID '{}': {}", world_did_str, e))?;
-        let signer_did = Did::new_auto(&world_did.ipns)
+        let signer_did = Did::new_identity(&world_did.ipns)
             .map_err(|e| anyhow!("failed building state signer DID: {}", e))?;
         let signing_key = SigningKey::from_private_key_bytes(
             signer_did.clone(),
@@ -2829,6 +2823,7 @@ impl World {
                         inbox: avatar.inbox.clone(),
                         agent_did: avatar.agent_did.id(),
                         agent_endpoint: avatar.agent_endpoint.clone(),
+                        agent_services: avatar.agent_services.clone(),
                         language_order: avatar.language_order.clone(),
                         identity: avatar.identity.clone(),
                         owner: avatar.owner.clone(),
@@ -3198,7 +3193,7 @@ impl World {
             .ok_or_else(|| anyhow!("world DID is not configured"))?;
         let world_did = Did::try_from(world_did_str.as_str())
             .map_err(|e| anyhow!("invalid configured world DID '{}': {}", world_did_str, e))?;
-        let signer_did = Did::new_auto(&world_did.ipns)
+        let signer_did = Did::new_identity(&world_did.ipns)
             .map_err(|e| anyhow!("failed building state signer DID: {}", e))?;
         let signing_key = SigningKey::from_private_key_bytes(signer_did, secrets.world_signing_private_key)
             .map_err(|e| anyhow!("failed restoring state signing key: {}", e))?;
@@ -3283,6 +3278,7 @@ impl World {
                     avatar_doc.inbox.clone(),
                     avatar_did,
                     avatar_doc.agent_endpoint,
+                    avatar_doc.agent_services,
                     avatar_doc.language_order,
                     if avatar_doc.identity.trim().is_empty() {
                         avatar_doc.owner.clone()

@@ -1,0 +1,19 @@
+{
+  "servers": {
+    "ma-agentd": {
+      "type": "stdio",
+      "command": "cargo",
+      "args": [
+        "run",
+        "--manifest-path",
+        "agent/Cargo.toml",
+        "--bin",
+        "ma-agent",
+        "--",
+        "--mcp",
+        "--agentd-url",
+        "http://127.0.0.1:5003"
+      ]
+    }
+  }
+}

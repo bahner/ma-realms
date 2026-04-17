@@ -2,17 +2,14 @@
 
 use std::collections::HashMap;
 
-pub use ma_core::{CONTENT_TYPE_DOC, IpfsPublishDidRequest, IpfsPublishDidResponse};
+pub use ma_core::{IpfsPublishDidRequest, IpfsPublishDidResponse, CONTENT_TYPE_DOC};
 use serde::{Deserialize, Serialize};
 
 // ─── Protocol Identifiers ───────────────────────────────────────────────────
 // Core protocols (inbox, broadcast, ipfs) are re-exported from ma-core.
 // Realms-specific protocols are defined here.
 
-pub use ma_core::{
-    INBOX_PROTOCOL, BROADCAST_PROTOCOL, IPFS_PROTOCOL,
-    BROADCAST_TOPIC,
-};
+pub use ma_core::{BROADCAST_PROTOCOL, BROADCAST_TOPIC, INBOX_PROTOCOL, IPFS_PROTOCOL};
 
 pub const AVATAR_PROTOCOL: &[u8] = b"/ma/avatar/0.0.1";
 pub const PRESENCE_PROTOCOL: &[u8] = b"/ma/presence/0.0.1";
@@ -84,7 +81,8 @@ impl WorldService {
         let crate::parser::MessageEnvelope::ActorCommand {
             target,
             command: crate::parser::ActorCommand::Raw { command },
-        } = envelope else {
+        } = envelope
+        else {
             return false;
         };
         if !target.eq_ignore_ascii_case("world") {

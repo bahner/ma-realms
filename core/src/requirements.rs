@@ -383,9 +383,13 @@ fn validate_legacy_name(name: &str) -> Result<(), String> {
 }
 
 fn is_allowed_symbol(symbol: &str) -> bool {
-    matches!(symbol, "user" | "owner" | "location" | "opened_by" | "world.owner" | "world.slug")
-    || symbol == "inbox"
-    || (symbol.starts_with("room.") && symbol.ends_with(".inbox") && symbol.len() > "room..inbox".len())
+    matches!(
+        symbol,
+        "user" | "owner" | "location" | "opened_by" | "world.owner" | "world.slug"
+    ) || symbol == "inbox"
+        || (symbol.starts_with("room.")
+            && symbol.ends_with(".inbox")
+            && symbol.len() > "room..inbox".len())
         || symbol.starts_with("state.")
 }
 
@@ -447,18 +451,31 @@ fn evaluate_expression<C: RequirementChecker>(expr: &Expr, checker: &C) -> Resul
             .resolve_symbol(symbol)
             .and_then(|value| value.as_bool())
             .unwrap_or(false)),
-        Expr::Eq(left, right) => Ok(resolve_operand_value(left, checker) == resolve_operand_value(right, checker)),
-        Expr::Ne(left, right) => Ok(resolve_operand_value(left, checker) != resolve_operand_value(right, checker)),
-        Expr::And(left, right) => Ok(evaluate_expression(left, checker)? && evaluate_expression(right, checker)?),
-        Expr::Or(left, right) => Ok(evaluate_expression(left, checker)? || evaluate_expression(right, checker)?),
+        Expr::Eq(left, right) => {
+            Ok(resolve_operand_value(left, checker) == resolve_operand_value(right, checker))
+        }
+        Expr::Ne(left, right) => {
+            Ok(resolve_operand_value(left, checker) != resolve_operand_value(right, checker))
+        }
+        Expr::And(left, right) => {
+            Ok(evaluate_expression(left, checker)? && evaluate_expression(right, checker)?)
+        }
+        Expr::Or(left, right) => {
+            Ok(evaluate_expression(left, checker)? || evaluate_expression(right, checker)?)
+        }
         Expr::Not(inner) => Ok(!evaluate_expression(inner, checker)?),
     }
 }
 
-fn resolve_operand_value<C: RequirementChecker>(operand: &Operand, checker: &C) -> RequirementValue {
+fn resolve_operand_value<C: RequirementChecker>(
+    operand: &Operand,
+    checker: &C,
+) -> RequirementValue {
     match operand {
         Operand::Literal(value) => value.clone(),
-        Operand::Symbol(symbol) => checker.resolve_symbol(symbol).unwrap_or(RequirementValue::Null),
+        Operand::Symbol(symbol) => checker
+            .resolve_symbol(symbol)
+            .unwrap_or(RequirementValue::Null),
     }
 }
 

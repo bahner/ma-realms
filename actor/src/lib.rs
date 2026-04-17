@@ -13,18 +13,12 @@ use did_ma::{
     DEFAULT_MESSAGE_TTL_SECS, Did, Document, EncryptionKey, Message, SigningKey,
 };
 use cid::{Cid, multibase::Base, multihash::Multihash};
-use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey,
-    endpoint::{Connection, RecvStream, SendStream, presets},
-    protocol::{AcceptError, ProtocolHandler, Router},
-};
 use js_sys;
 use libp2p_identity::Keypair;
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 fn recipient_inbox_endpoint_id(document: &Document) -> Result<String, JsValue> {
@@ -58,68 +52,9 @@ fn recipient_presence_endpoint_id(document: &Document) -> Result<String, JsValue
     Err(js_err("recipient DID document has no usable presence transport endpoint"))
 }
 
-/// Generic framed send over an arbitrary protocol using the InboxRequest wire format.
-async fn send_on_protocol(protocol: &'static [u8], target_endpoint_id: &str, message_cbor: Vec<u8>) -> Result<InboxResponse, JsValue> {
-    let protocol_label = String::from_utf8_lossy(protocol);
-    let target: EndpointId = target_endpoint_id
-        .trim()
-        .parse()
-        .map_err(|e| js_err(format!("invalid recipient endpoint id: {e}")))?;
 
-    let endpoint = Endpoint::builder(presets::N0)
-        .bind()
-        .await
-        .map_err(|e| js_err(format!("sender endpoint bind failed: {e}")))?;
-    let _ = endpoint.online().await;
-
-    let endpoint_addr = EndpointAddr::new(target);
-    let connection = endpoint
-        .connect(endpoint_addr, protocol)
-        .await
-        .map_err(|e| js_err(format!(
-            "send_on_protocol connect failed: {} (protocol={})",
-            e, protocol_label
-        )))?;
-
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .map_err(|e| js_err(format!(
-            "send_on_protocol open_bi failed: {} (protocol={})",
-            e, protocol_label
-        )))?;
-
-    let request = InboxRequest::Signed { message_cbor };
-    let payload = serde_json::to_vec(&request).map_err(js_err)?;
-
-    send.write_u32(payload.len() as u32).await.map_err(js_err)?;
-    send.write_all(&payload).await.map_err(js_err)?;
-    send.flush().await.map_err(js_err)?;
-
-    let frame_len = recv.read_u32().await.map_err(js_err)? as usize;
-    if frame_len > 256 * 1024 {
-        return Err(js_err(format!("send_on_protocol response frame too large: {}", frame_len)));
-    }
-    let mut bytes = vec![0u8; frame_len];
-    recv.read_exact(&mut bytes).await.map_err(js_err)?;
-
-    let _ = send.finish();
-    connection.close(0u32.into(), b"ok");
-    endpoint.close().await;
-
-    serde_json::from_slice::<InboxResponse>(&bytes).map_err(js_err)
-}
-
-struct WorldConnCache {
-    endpoint: Endpoint,
-    connection: Connection,
-    send_stream: SendStream,
-    recv_stream: RecvStream,
-    target_id: String,
-}
 
 thread_local! {
-    static WORLD_CONN_CACHE: RefCell<Option<WorldConnCache>> = RefCell::new(None);
     static ACL_COMPILED_CACHE: RefCell<HashMap<String, CompiledCapabilityAcl>> = RefCell::new(HashMap::new());
     static ROOM_DID_CACHE: RefCell<HashMap<String, CachedDidEntry>> = RefCell::new(HashMap::new());
     static ROOM_OBJECT_DID_CACHE: RefCell<HashMap<String, CachedDidEntry>> = RefCell::new(HashMap::new());
@@ -134,17 +69,6 @@ struct CachedDidEntry {
 
 const ROOM_DID_CACHE_TTL_MS: f64 = 5.0 * 60.0 * 1000.0;
 
-fn take_conn_cache() -> Option<WorldConnCache> {
-    WORLD_CONN_CACHE.with(|c| c.borrow_mut().take())
-}
-
-fn store_conn_cache(cache: WorldConnCache) {
-    WORLD_CONN_CACHE.with(|c| *c.borrow_mut() = Some(cache))
-}
-
-fn clear_conn_cache() {
-    WORLD_CONN_CACHE.with(|c| *c.borrow_mut() = None)
-}
 
 fn with_inbox_state<T>(f: impl FnOnce(&Option<InboxListenerState>) -> T) -> T {
     INBOX_STATE.with(|slot| {
@@ -159,256 +83,38 @@ fn set_inbox_state(state: InboxListenerState) {
     });
 }
 
-impl ProtocolHandler for InboxProtocol {
-    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        let from_endpoint = connection.remote_id().to_string();
-        let (mut send, mut recv) = connection.accept_bi().await?;
 
-        loop {
-            let frame_len = match recv.read_u32().await {
-                Ok(n) => n as usize,
-                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(err) => return Err(AcceptError::from_err(err)),
-            };
-
-            if frame_len > 256 * 1024 {
-                return Err(AcceptError::from_err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("inbox frame too large: {}", frame_len),
-                )));
-            }
-
-            let mut bytes = vec![0u8; frame_len];
-            recv.read_exact(&mut bytes).await.map_err(AcceptError::from_err)?;
-
-            let response = match serde_json::from_slice::<InboxRequest>(&bytes) {
-                Ok(InboxRequest::Signed { message_cbor }) => {
-                    if let Some(expected) = self.expected_content_type {
-                        match Message::from_cbor(&message_cbor) {
-                            Ok(message) if message.content_type == expected => {
-                                let item = InboxMessage {
-                                    message_cbor_b64: B64.encode(message_cbor),
-                                    from_endpoint: from_endpoint.clone(),
-                                    received_at: now_unix_secs(),
-                                };
-                                let mut queue = self.queue.write().await;
-                                if queue.len() >= MAX_INBOX_EVENTS {
-                                    queue.pop_front();
-                                }
-                                queue.push_back(item);
-                                InboxResponse {
-                                    ok: true,
-                                    message: "queued".to_string(),
-                                }
-                            }
-                            Ok(message) => InboxResponse {
-                                ok: false,
-                                message: format!(
-                                    "{} expects content_type={} but got {}",
-                                    String::from_utf8_lossy(self.protocol_label),
-                                    expected,
-                                    message.content_type
-                                ),
-                            },
-                            Err(err) => InboxResponse {
-                                ok: false,
-                                message: format!(
-                                    "invalid signed message on {}: {}",
-                                    String::from_utf8_lossy(self.protocol_label),
-                                    err
-                                ),
-                            },
-                        }
-                    } else {
-                        let item = InboxMessage {
-                            message_cbor_b64: B64.encode(message_cbor),
-                            from_endpoint: from_endpoint.clone(),
-                            received_at: now_unix_secs(),
-                        };
-                        let mut queue = self.queue.write().await;
-                        if queue.len() >= MAX_INBOX_EVENTS {
-                            queue.pop_front();
-                        }
-                        queue.push_back(item);
-                        InboxResponse {
-                            ok: true,
-                            message: "queued".to_string(),
-                        }
-                    }
-                }
-                Err(err) => InboxResponse {
-                    ok: false,
-                    message: format!("invalid inbox request JSON: {}", err),
-                },
-            };
-
-            let payload = serde_json::to_vec(&response).map_err(AcceptError::from_err)?;
-            send.write_u32(payload.len() as u32)
-                .await
-                .map_err(AcceptError::from_err)?;
-            send.write_all(&payload).await.map_err(AcceptError::from_err)?;
-            send.flush().await.map_err(AcceptError::from_err)?;
-        }
-
-        let _ = send.finish();
-        Ok(())
-    }
-}
 
 async fn ensure_inbox_listener_with_secret(secret_key: SecretKey) -> Result<String, JsValue> {
-    if let Some(existing_id) = with_inbox_state(|state| state.as_ref().map(|s| s.endpoint.id().to_string())) {
+    if let Some(existing_id) = with_inbox_state(|state| state.as_ref().map(|s| s.endpoint_id.clone())) {
         return Ok(existing_id);
     }
 
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(secret_key)
-        .bind()
+    // Create IrohEndpoint using ma-core (handles secret key setup internally)
+    let iroh_endpoint = IrohEndpoint::new(secret_key.to_bytes())
         .await
-        .map_err(|e| js_err(format!("inbox endpoint bind failed: {e}")))?;
+        .map_err(|e| js_err(format!("IrohEndpoint::new failed: {e}")))?;
 
-    let queue = Arc::new(RwLock::new(VecDeque::with_capacity(MAX_INBOX_EVENTS)));
-    let inbox_protocol = InboxProtocol {
-        queue: queue.clone(),
-        expected_content_type: None,
-        protocol_label: INBOX_PROTOCOL,
-    };
-    let presence_protocol = InboxProtocol {
-        queue: queue.clone(),
-        expected_content_type: None,
-        protocol_label: PRESENCE_PROTOCOL,
-    };
+    let endpoint_id = iroh_endpoint.endpoint_id().to_string();
 
-    let router = Router::builder(endpoint.clone())
-        .accept(INBOX_PROTOCOL, inbox_protocol)
-        .accept(PRESENCE_PROTOCOL, presence_protocol)
-        .spawn();
+    // Get separate inboxes for presence and inbox protocols via ma-core services
+    let inbox_service = iroh_endpoint
+        .service(INBOX_PROTOCOL)
+        .map_err(|e| js_err(format!("failed to get inbox service: {e}")))?;
+    let presence_service = iroh_endpoint
+        .service(PRESENCE_PROTOCOL)
+        .map_err(|e| js_err(format!("failed to get presence service: {e}")))?;
 
-    let endpoint_id = endpoint.id().to_string();
     set_inbox_state(InboxListenerState {
-        endpoint,
-        router,
-        queue,
+        endpoint_id,
+        inbox: Arc::new(Mutex::new(inbox_service)),
+        presence: Arc::new(Mutex::new(presence_service)),
     });
 
     Ok(endpoint_id)
 }
 
-async fn create_stream_cache_on_protocol(
-    target_id_str: &str,
-    relay_hint: Option<&str>,
-    protocol: &'static [u8],
-) -> Result<WorldConnCache, JsValue> {
-    let requested_protocol = String::from_utf8_lossy(protocol).to_string();
-    let target: EndpointId = target_id_str
-        .trim()
-        .parse()
-        .map_err(|e| js_err(format!("invalid endpoint id: {e}")))?;
 
-    let endpoint = Endpoint::builder(presets::N0).bind()
-        .await
-        .map_err(js_err)?;
-
-    // Give the endpoint a brief chance to establish its relay/discovery presence
-    // before attempting peer connect by endpoint id.
-    let _ = endpoint.online().await;
-
-    let mut endpoint_addr = EndpointAddr::new(target);
-    if let Some(hint) = relay_hint {
-        let relay_source = core_normalize_relay_url(hint);
-        match relay_source.parse::<RelayUrl>() {
-            Ok(relay_url) => {
-                endpoint_addr = endpoint_addr.with_relay_url(relay_url);
-            }
-            Err(e) => {
-                return Err(js_err(format!("relay URL parse failed for '{}': {}", relay_source, e)));
-            }
-        }
-    }
-
-    let connection = endpoint.connect(endpoint_addr, protocol)
-        .await
-        .map_err(|e| js_err(format!(
-            "endpoint.connect() failed: {} (protocol={} target={})",
-            e, requested_protocol, target_id_str
-        )))?;
-
-    let (send_stream, recv_stream) = connection.open_bi()
-        .await
-        .map_err(|e| js_err(format!(
-            "connection.open_bi() failed: {} (protocol={} target={})",
-            e, requested_protocol, target_id_str
-        )))?;
-
-    Ok(WorldConnCache {
-        endpoint,
-        connection,
-        send_stream,
-        recv_stream,
-        target_id: target_id_str.to_string(),
-    })
-}
-
-async fn create_stream_cache(
-    target_id_str: &str,
-    relay_hint: Option<&str>,
-) -> Result<WorldConnCache, JsValue> {
-    create_stream_cache_on_protocol(target_id_str, relay_hint, AVATAR_PROTOCOL).await
-}
-
-async fn get_or_create_stream_cache(
-    target_id_str: &str,
-) -> Result<WorldConnCache, JsValue> {
-    if let Some(cached) = take_conn_cache() {
-        if cached.target_id == target_id_str {
-            return Ok(cached);
-        }
-        cached.connection.close(0u32.into(), b"switch target");
-        cached.endpoint.close().await;
-    }
-
-    create_stream_cache(target_id_str, None).await
-}
-
-async fn exchange_on_stream(cache: &mut WorldConnCache, request: &WorldRequest) -> Result<WorldResponse, JsValue> {
-    let payload = serde_json::to_vec(request).map_err(js_err)?;
-    if payload.len() > 256 * 1024 {
-        return Err(js_err("request frame too large"));
-    }
-
-    cache
-        .send_stream
-        .write_u32(payload.len() as u32)
-        .await
-        .map_err(|e| js_err(format!("write frame length failed: {e}")))?;
-    cache
-        .send_stream
-        .write_all(&payload)
-        .await
-        .map_err(|e| js_err(format!("iroh send failed: {e}")))?;
-    cache
-        .send_stream
-        .flush()
-        .await
-        .map_err(|e| js_err(format!("iroh flush failed: {e}")))?;
-
-    let response_len = cache
-        .recv_stream
-        .read_u32()
-        .await
-        .map_err(|e| js_err(format!("read frame length failed: {e}")))? as usize;
-    if response_len > 512 * 1024 {
-        return Err(js_err("response frame too large"));
-    }
-
-    let mut response_bytes = vec![0u8; response_len];
-    cache
-        .recv_stream
-        .read_exact(&mut response_bytes)
-        .await
-        .map_err(|e| js_err(format!("iroh read failed: {e}")))?;
-
-    serde_json::from_slice(&response_bytes).map_err(js_err)
-}
 use ma_core::{
     CompiledCapabilityAcl,
     compile_acl,
@@ -434,6 +140,7 @@ use ma_core::{
     RoomEvent, WorldCommand, WorldRequest, WorldResponse,
     AVATAR_PROTOCOL, PRESENCE_PROTOCOL, INBOX_PROTOCOL, IPFS_PROTOCOL,
     ma_fields,
+    Inbox, IrohEndpoint, MaEndpoint, EndpointId, SecretKey, RelayUrl,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -499,45 +206,12 @@ struct WorldActionResult {
     pending_whispers: Vec<RoomEvent>,
 }
 
-const MAX_INBOX_EVENTS: usize = 256;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct InboxMessage {
-    message_cbor_b64: String,
-    from_endpoint: String,
-    received_at: u64,
-}
-
-#[derive(Serialize)]
-struct InboxPollResult {
-    endpoint_id: String,
-    messages: Vec<InboxMessage>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum InboxRequest {
-    Signed { message_cbor: Vec<u8> },
-}
-
-#[derive(Serialize, Deserialize)]
-struct InboxResponse {
-    ok: bool,
-    message: String,
-}
-
-#[derive(Clone, Debug)]
-struct InboxProtocol {
-    queue: Arc<RwLock<VecDeque<InboxMessage>>>,
-    expected_content_type: Option<&'static str>,
-    protocol_label: &'static [u8],
-}
 
 #[derive(Debug)]
 struct InboxListenerState {
-    endpoint: Endpoint,
-    router: Router,
-    queue: Arc<RwLock<VecDeque<InboxMessage>>>,
+    endpoint_id: String,
+    inbox: Arc<Mutex<Inbox<Message>>>,
+    presence: Arc<Mutex<Inbox<Message>>>,
 }
 
 thread_local! {
@@ -904,54 +578,32 @@ fn decrypt_bundle(passphrase: &str, bundle: &EncryptedIdentityBundle) -> Result<
         .map_err(|_| "wrong passphrase or corrupted bundle".to_string())
 }
 
-async fn send_world_request(endpoint_id: &str, request: WorldRequest) -> Result<WorldResponse, JsValue> {
-    let mut last_error: Option<JsValue> = None;
-    for _ in 0..2 {
-        let mut cache = get_or_create_stream_cache(endpoint_id).await?;
-        match exchange_on_stream(&mut cache, &request).await {
-            Ok(response) => {
-                store_conn_cache(cache);
-                return Ok(response);
-            }
-            Err(err) => {
-                last_error = Some(err);
-                cache.connection.close(0u32.into(), b"stream error");
-                cache.endpoint.close().await;
-                clear_conn_cache();
-            }
-        }
-    }
 
-    Err(last_error.unwrap_or_else(|| js_err("world request failed")))
+
+/// Close and drop the inbox listener (call on lock/logout).
+#[wasm_bindgen]
+pub async fn disconnect_world() {
+    let _state = INBOX_STATE.with(|slot| slot.borrow_mut().take());
+    // ma-core manages endpoint lifecycle; inbox is dropped here
+
+    clear_all_room_did_caches();
+}
+
+/// Send a request to world and receive response via ma-core outbox to /ma/avatar/0.0.1
+async fn send_world_request(endpoint_id: &str, request: WorldRequest) -> Result<WorldResponse, JsValue> {
+    // TODO: Implement using ma-core outbox API
+    // For now, return error
+    Err(js_err(format!("send_world_request not yet implemented for endpoint: {}", endpoint_id)))
 }
 
 async fn send_world_request_once_on_protocol(
-    endpoint_id: &str,
-    request: WorldRequest,
-    protocol: &'static [u8],
+    _endpoint_id: &str,
+    _request: WorldRequest,
+    _protocol: &'static [u8],
 ) -> Result<WorldResponse, JsValue> {
-    let mut cache = create_stream_cache_on_protocol(endpoint_id, None, protocol).await?;
-    let result = exchange_on_stream(&mut cache, &request).await;
-    cache.connection.close(0u32.into(), b"done");
-    cache.endpoint.close().await;
-    result
-}
-
-/// Close and drop the cached world connection (call on lock/logout).
-#[wasm_bindgen]
-pub async fn disconnect_world() {
-    if let Some(cached) = take_conn_cache() {
-        cached.connection.close(0u32.into(), b"bye");
-        cached.endpoint.close().await;
-    }
-
-    let state = INBOX_STATE.with(|slot| slot.borrow_mut().take());
-    if let Some(listener) = state {
-        let _ = listener.router.shutdown().await;
-        listener.endpoint.close().await;
-    }
-
-    clear_all_room_did_caches();
+    // TODO: Implement using ma-core outbox API with protocol parameter
+    // For now, return error
+    Err(js_err("send_world_request_once_on_protocol not yet implemented"))
 }
 
 /// Ensure a direct inbox listener is running for this ma-actor session.
@@ -1049,28 +701,60 @@ pub fn rotate_bundle_iroh_secret(
 }
 
 /// Poll and drain direct inbox messages received over iroh.
+/// Returns separate presence and inbox message arrays.
 #[wasm_bindgen]
 pub async fn poll_inbox_messages() -> Result<String, JsValue> {
-    let Some((endpoint_id, queue)) = with_inbox_state(|state| {
+    let Some((endpoint_id, inbox, presence)) = with_inbox_state(|state| {
         state
             .as_ref()
-            .map(|s| (s.endpoint.id().to_string(), s.queue.clone()))
+            .map(|s| (s.endpoint_id.clone(), s.inbox.clone(), s.presence.clone()))
     }) else {
-        return Ok(serde_json::to_string(&InboxPollResult {
-            endpoint_id: String::new(),
-            messages: Vec::new(),
-        })
+        // Return empty result if no inbox listener is active
+        return Ok(serde_json::to_string(&serde_json::json!({
+            "endpoint_id": "",
+            "presence": [],
+            "inbox": []
+        }))
         .map_err(js_err)?);
     };
 
-    let mut guard = queue.write().await;
-    let messages = guard.drain(..).collect::<Vec<_>>();
-    drop(guard);
+    // Get current Unix timestamp
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| js_err(format!("time error: {e}")))?
+        .as_secs();
 
-    serde_json::to_string(&InboxPollResult {
-        endpoint_id,
-        messages,
-    })
+    // Lock and drain both inboxes
+    let mut inbox_guard = inbox.lock().await;
+    let mut presence_guard = presence.lock().await;
+
+    let inbox_msgs = inbox_guard.drain(now);
+    let presence_msgs = presence_guard.drain(now);
+
+    // Convert messages to CBOR base64 format
+    let presence_items: Vec<_> = presence_msgs
+        .into_iter()
+        .map(|msg| serde_json::json!({
+            "message_cbor_b64": B64.encode(
+                msg.to_cbor().unwrap_or_default()
+            )
+        }))
+        .collect();
+
+    let inbox_items: Vec<_> = inbox_msgs
+        .into_iter()
+        .map(|msg| serde_json::json!({
+            "message_cbor_b64": B64.encode(
+                msg.to_cbor().unwrap_or_default()
+            )
+        }))
+        .collect();
+
+    serde_json::to_string(&serde_json::json!({
+        "endpoint_id": endpoint_id,
+        "presence": presence_items,
+        "inbox": inbox_items,
+    }))
     .map_err(js_err)
 }
 
@@ -1925,76 +1609,47 @@ pub fn set_bundle_updated_for_send(
     }, true)
 }
 
-/// Enter a world over iroh using the world protocol.
+/// Connect to a world over iroh. With ma-core, connections are handled on-demand.
 #[wasm_bindgen]
 pub async fn connect_world(endpoint_id: &str) -> Result<(), JsValue> {
-    let cache = get_or_create_stream_cache(endpoint_id).await?;
-    store_conn_cache(cache);
+    if endpoint_id.trim().is_empty() {
+        return Err(js_err("endpoint_id cannot be empty"));
+    }
+    // ma-core handles endpoint lifecycle; just validate ID format
+    let _ = endpoint_id
+        .trim()
+        .parse::<EndpointId>()
+        .map_err(|e| js_err(format!("invalid endpoint id: {e}")))?;
     Ok(())
 }
 
 #[wasm_bindgen]
 pub async fn connect_world_with_relay(endpoint_id: &str, relay_url: &str) -> Result<(), JsValue> {
-    let cache = create_stream_cache(endpoint_id, Some(relay_url)).await?;
-    store_conn_cache(cache);
+    if endpoint_id.trim().is_empty() {
+        return Err(js_err("endpoint_id cannot be empty"));
+    }
+    if relay_url.trim().is_empty() {
+        return Err(js_err("relay_url cannot be empty"));
+    }
+    // ma-core handles relay configuration; just validate inputs
+    let _ = endpoint_id
+        .trim()
+        .parse::<EndpointId>()
+        .map_err(|e| js_err(format!("invalid endpoint id: {e}")))?;
+    let _ = relay_url
+        .trim()
+        .parse::<RelayUrl>()
+        .map_err(|e| js_err(format!("invalid relay url: {e}")))?;
     Ok(())
 }
 
 async fn send_ipfs_publish_request(
-    endpoint_id: &str,
-    relay_url_hint: &str,
-    request: WorldRequest,
+    _endpoint_id: &str,
+    _relay_url_hint: &str,
+    _request: WorldRequest,
 ) -> Result<IpfsPublishDidResponse, JsValue> {
-    let target: EndpointId = endpoint_id
-        .trim()
-        .parse()
-        .map_err(|e| js_err(format!("invalid endpoint id: {e}")))?;
-
-    let endpoint = Endpoint::builder(presets::N0)
-        .bind()
-        .await
-        .map_err(|e| js_err(format!("endpoint bind failed: {e}")))?;
-    let _ = endpoint.online().await;
-
-    let mut endpoint_addr = EndpointAddr::new(target);
-    let relay_hint = relay_url_hint.trim();
-    if !relay_hint.is_empty() {
-        let relay_source = core_normalize_relay_url(relay_hint);
-        let relay_url: RelayUrl = relay_source
-            .parse()
-            .map_err(|e| js_err(format!("relay URL parse failed for '{}': {}", relay_source, e)))?;
-        endpoint_addr = endpoint_addr.with_relay_url(relay_url);
-    }
-
-    let connection = endpoint
-        .connect(endpoint_addr, IPFS_PROTOCOL)
-        .await
-        .map_err(|e| js_err(format!("ipfs endpoint.connect() failed: {}", e)))?;
-
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .map_err(|e| js_err(format!("ipfs connection.open_bi() failed: {}", e)))?;
-
-    let payload = serde_json::to_vec(&request).map_err(js_err)?;
-    send.write_u32(payload.len() as u32).await.map_err(js_err)?;
-    send.write_all(&payload).await.map_err(js_err)?;
-    send.flush().await.map_err(js_err)?;
-
-    let frame_len = recv.read_u32().await.map_err(js_err)? as usize;
-    if frame_len > 512 * 1024 {
-        return Err(js_err(format!("ipfs response frame too large: {}", frame_len)));
-    }
-    let mut bytes = vec![0u8; frame_len];
-    recv.read_exact(&mut bytes).await.map_err(js_err)?;
-
-    let _ = send.finish();
-    drop(recv);
-    drop(send);
-    // Let the one-shot ma/ipfs lane wind down naturally instead of tearing the
-    // entire connection and endpoint down immediately after the response.
-
-    serde_json::from_slice::<IpfsPublishDidResponse>(&bytes).map_err(js_err)
+    // TODO: Implement IPFS publish via ma-core
+    Err(js_err("send_ipfs_publish_request not yet implemented"))
 }
 
 #[wasm_bindgen]
@@ -2244,26 +1899,27 @@ pub async fn send_world_whisper_with_ttl(
         ttl_seconds,
     )?;
 
-    let response = send_on_protocol(PRESENCE_PROTOCOL, &recipient_endpoint_id, message.to_cbor().map_err(js_err)?).await?;
+    // TODO: Send presence message via ma-core outbox to /ma/presence/0.0.1
+    let response = WorldResponse {
+        ok: false,
+        room: String::new(),
+        message: "presence send not yet implemented".to_string(),
+        endpoint_id: recipient_endpoint_id,
+        latest_event_sequence: 0,
+        broadcasted: false,
+        events: Vec::new(),
+        handle: String::new(),
+        room_description: String::new(),
+        room_title: String::new(),
+        room_url: String::new(),
+        world_did: String::new(),
+        avatars: Vec::new(),
+        room_object_dids: HashMap::new(),
+        transport_ack: None,
+    };
 
     serde_json::to_string(&WorldActionResult {
-        response: WorldResponse {
-            ok: response.ok,
-            room: String::new(),
-            message: response.message,
-            endpoint_id: recipient_endpoint_id,
-            latest_event_sequence: 0,
-            broadcasted: false,
-            events: Vec::new(),
-            handle: String::new(),
-            room_description: String::new(),
-            room_title: String::new(),
-            room_url: String::new(),
-            world_did: String::new(),
-            avatars: Vec::new(),
-            room_object_dids: HashMap::new(),
-            transport_ack: None,
-        },
+        response,
         pending_whispers: Vec::new(),
     })
     .map_err(js_err)
@@ -2329,26 +1985,27 @@ pub async fn send_direct_message_with_ttl(
         ttl_seconds,
     )?;
 
-    let response = send_on_protocol(INBOX_PROTOCOL, &recipient_endpoint_id, message.to_cbor().map_err(js_err)?).await?;
+    // TODO: Send inbox message via ma-core outbox to /ma/inbox/0.0.1
+    let response = WorldResponse {
+        ok: false,
+        room: String::new(),
+        message: "inbox send not yet implemented".to_string(),
+        endpoint_id: recipient_endpoint_id,
+        latest_event_sequence: 0,
+        broadcasted: false,
+        events: Vec::new(),
+        handle: String::new(),
+        room_description: String::new(),
+        room_title: String::new(),
+        room_url: String::new(),
+        world_did: String::new(),
+        avatars: Vec::new(),
+        room_object_dids: HashMap::new(),
+        transport_ack: None,
+    };
 
     serde_json::to_string(&WorldActionResult {
-        response: WorldResponse {
-            ok: response.ok,
-            room: String::new(),
-            message: response.message,
-            endpoint_id: recipient_endpoint_id,
-            latest_event_sequence: 0,
-            broadcasted: false,
-            events: Vec::new(),
-            handle: String::new(),
-            room_description: String::new(),
-            room_title: String::new(),
-            room_url: String::new(),
-            world_did: String::new(),
-            avatars: Vec::new(),
-            room_object_dids: HashMap::new(),
-            transport_ack: None,
-        },
+        response,
         pending_whispers: Vec::new(),
     })
     .map_err(js_err)

@@ -7,6 +7,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
+use did_ma::Ipld;
 use ma_core::{ExitData, ObjectProgramRef, ObjectRuntimeState, RoomEvent};
 use serde::{Deserialize, Serialize};
 
@@ -618,6 +619,8 @@ pub(crate) struct AvatarStateDoc {
     pub inbox: String,
     pub agent_did: String,
     pub agent_endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_services: Option<Ipld>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub language_order: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]

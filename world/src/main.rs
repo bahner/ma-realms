@@ -24,49 +24,7 @@ use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 use chrono::Utc;
 use did_ma::{DID_PREFIX, Did, Document, EncryptionKey, Message, SigningKey, VerificationMethod};
 use ma_core::{
-    Endpoint, EndpointAddr, EndpointId, RelayUrl,
-    endpoint::{Connection, RecvStream, SendStream},
-    AcceptError, ProtocolHandler, Router,
-    IrohEndpoint,
-    load_secret_key_bytes,
-};
-#[allow(unused_imports)]
-use ma_core::BROADCAST_PROTOCOL;
-use ma_core::{
     ActorCommand, AVATAR_PROTOCOL, PRESENCE_PROTOCOL,
-    BROADCAST_TOPIC,
-    CONTENT_TYPE_BROADCAST, CONTENT_TYPE_EVENT, CONTENT_TYPE_PRESENCE, CONTENT_TYPE_WORLD, CompiledCapabilityAcl,
-    ExitData, ServiceCapability, MessageEnvelope, ObjectDefinition, ObjectInboxMessage,
-    MAILBOX_COMMANDS_INLINE,
-    IpfsPublishDidResponse,
-    ObjectMessageIntent, ObjectMessageKind, ObjectMessageRetention, ObjectMessageTarget,
-    ObjectRuntimeState, IPFS_PROTOCOL, PresenceAvatar, RoomActorAction, RoomActorContext,
-    RoomEvent, TransportAck, TransportAckCode, INBOX_PROTOCOL, WorldCommand, WorldService, WorldRequest,
-    WorldResponse, compile_acl, create_world_url, evaluate_compiled_acl_with_owner,
-    validate_ipfs_publish_request, publish_did_document_to_kubo,
-    execute_room_actor_command,
-    normalize_spoken_text, parse_capability_acl_text, parse_object_local_capability_acl,
-    parse_property_command, parse_property_command_for_keys,
-    Reply, Scope,
-    LegacyRequirement, RequirementChecker, RequirementSet, RequirementValue,
-    pin_update_add_rm,
-    TtlCache,
-    expand_tilde_path, format_system_time, is_valid_nanoid_id, parse_rfc3339_unix,
-    extract_did_description_from_json, normalize_language_for_did_document,
-    sender_encryption_pubkey_multibase_from_document, sender_profile_from_document,
-    sender_push_endpoint_from_document,
-    generate_secret_key_file, load_secret_key_bytes, socket_addr_to_multiaddr,
-    join_broadcast_channel, gossip_send_text,
-    SecureFileKind, ensure_private_dir, write_secure_file,
-use ma_core::{
-    // iroh transport
-    Endpoint, EndpointAddr, EndpointId, RelayUrl,
-    endpoint::{Connection, RecvStream, SendStream},
-    AcceptError, ProtocolHandler, Router,
-    IrohEndpoint,
-    // service / messaging
-    ActorCommand, AVATAR_PROTOCOL, PRESENCE_PROTOCOL,
-    BROADCAST_PROTOCOL, BROADCAST_TOPIC,
     CONTENT_TYPE_BROADCAST, CONTENT_TYPE_EVENT, CONTENT_TYPE_PRESENCE, CONTENT_TYPE_WORLD,
     CompiledCapabilityAcl, ExitData, ServiceCapability, MessageEnvelope,
     ObjectDefinition, ObjectInboxMessage, MAILBOX_COMMANDS_INLINE,
@@ -87,17 +45,15 @@ use ma_core::{
     extract_did_description_from_json, normalize_language_for_did_document,
     sender_encryption_pubkey_multibase_from_document, sender_profile_from_document,
     sender_push_endpoint_from_document,
-    generate_secret_key_file, load_secret_key_bytes, socket_addr_to_multiaddr,
-    join_broadcast_channel, gossip_send_text,
+    generate_secret_key_file, load_secret_key_bytes,
     SecureFileKind, ensure_private_dir, write_secure_file,
-};
+    IrohEndpoint,
 };
 use moka::sync::Cache;
 use nanoid::nanoid;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::{net::TcpListener, sync::{Mutex, RwLock}};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::prelude::*;
@@ -161,7 +117,6 @@ const IPNS_PUBLISH_INTERVAL_SECS_DEFAULT: u64 = 600;
 const PRESENCE_PROBE_INTERVAL_SECS_DEFAULT: u64 = 5;
 const PRESENCE_STALE_AFTER_SECS_DEFAULT: u64 = 30;
 const WORLD_PING_INTERVAL_SECS: u32 = 5;
-const RELAY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_WORLD_SLUG: &str = "ma";
 const DEFAULT_KUBO_API_URL: &str = "http://127.0.0.1:5001";
 
@@ -198,18 +153,6 @@ struct WorldBroadcastEnvelope {
     message: String,
     ts: String,
 }
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum OutboxRequest {
-    Signed { message_cbor: Vec<u8> },
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct OutboxResponse {
-    ok: bool,
-    message: String,
-}
-
 #[derive(Clone, Debug, Serialize)]
 struct PresenceSnapshotEvent {
     v: u8,
@@ -260,22 +203,14 @@ struct RoomEventEnvelope {
     ts: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct WorldProtocol {
     world: Arc<World>,
-    endpoint: Endpoint,
+    endpoint: Arc<IrohEndpoint>,
     endpoint_id: String,
     did_cache: Arc<RwLock<HashMap<String, CachedDidDocument>>>,
-    push_stream_cache: Arc<Mutex<HashMap<String, PushStreamCache>>>,
     push_timeout_cooldown: Arc<Mutex<HashMap<String, Instant>>>,
     service: WorldService,
-}
-
-#[derive(Debug)]
-struct PushStreamCache {
-    connection: Connection,
-    send: SendStream,
-    recv: RecvStream,
 }
 
 const PUSH_TIMEOUT_COOLDOWN_SECS: u64 = 8;
@@ -286,47 +221,9 @@ struct IpfsProtocol {
     did_cache: Arc<RwLock<HashMap<String, CachedDidDocument>>>,
 }
 
-/// Placeholder protocol handler active while the world is locked.
-///
-/// Reads the first framed request and responds with a "world is locked" error
-/// in the same length-prefixed JSON format the real protocols use, then closes.
-#[derive(Clone, Debug)]
-struct LockedGateProtocol;
-
-impl ProtocolHandler for LockedGateProtocol {
-    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        let (mut send, mut recv) = connection.accept_bi().await?;
-
-        // Read first frame (we still need to consume it to follow the protocol).
-        let frame_len = match recv.read_u32().await {
-            Ok(n) => n as usize,
-            Err(_) => {
-                let _ = send.finish();
-                return Ok(());
-            }
-        };
-        if frame_len > 256 * 1024 {
-            let _ = send.finish();
-            return Ok(());
-        }
-        let mut buf = vec![0u8; frame_len];
-        if recv.read_exact(&mut buf).await.is_err() {
-            let _ = send.finish();
-            return Ok(());
-        }
-
-        let response = serde_json::json!({
-            "ok": false,
-            "message": "world is locked; waiting for unlock"
-        });
-        let payload = serde_json::to_vec(&response).unwrap_or_default();
-        let _ = send.write_u32(payload.len() as u32).await;
-        let _ = send.write_all(&payload).await;
-        let _ = send.flush().await;
-        let _ = send.finish();
-        Ok(())
-    }
-}
+// Locked-gate handling is now done inside WorldProtocol::accept_message:
+// while the world is locked, messages are drained and a "world is locked" response
+// is sent back through the sender's inbox.
 
 #[derive(Clone, Debug, Default)]
 struct ObjectRequirementRuntime {
@@ -763,6 +660,7 @@ mod tests {
             identity: did.id(),
             owner: "did:ma:k51test".to_string(),
             agent_endpoint: "ep-1".to_string(),
+            agent_services: None,
             language_order: "nb_NO:en_UK".to_string(),
             signing_secret: [0u8; 32],
             encryption_pubkey_multibase: None,
@@ -774,6 +672,7 @@ mod tests {
             identity: "did:ma:k51test#pixie".to_string(),
             owner: "did:ma:k51test".to_string(),
             agent_endpoint: "ep-2".to_string(),
+            agent_services: None,
             language_order: "nb_NO:en_UK".to_string(),
             signing_secret: [0u8; 32],
             encryption_pubkey_multibase: None,
@@ -803,6 +702,7 @@ mod tests {
             identity: did.id(),
             owner: "did:ma:k51stale".to_string(),
             agent_endpoint: "ep-stale".to_string(),
+            agent_services: None,
             language_order: "nb_NO:en_UK".to_string(),
             signing_secret: [0u8; 32],
             encryption_pubkey_multibase: None,

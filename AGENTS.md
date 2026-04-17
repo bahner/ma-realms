@@ -91,3 +91,25 @@ Cross-platform hardening policy:
 - Windows files and directories: current-user ACL only
 
 Fail hard if secure permission/ACL hardening fails.
+
+## CRITICAL: ma-core is the only messaging authority
+
+This is absolute and non-negotiable:
+
+- **ma-core owns message construction, validation, serialization/deserialization, and transport semantics.**
+- **ma-realms (world, agent, actor) must only send/receive did:ma messages via ma-core inbox/outbox APIs.**
+- **No local transport wire format is allowed in ma-realms.**
+- **No framing is allowed in ma-realms.**
+- **Do not implement or keep read_u32/write_u32 frame loops in world, agent, or actor.**
+- **Do not open or manage transport streams directly in ma-realms runtime (`connect`, `open_bi`, `accept_bi`).**
+- **Do not implement local request/response transport envelopes in ma-realms when ma-core already provides the behavior.**
+
+If new transport behavior is required, implement it in ma-core and consume it from ma-realms.
+
+PRs that reintroduce framing or duplicate ma-core messaging logic in ma-realms should be rejected.
+
+## CRITICAL: No direct iroh in ma-realms
+
+- **ma-realms must not add or keep direct `iroh` / `iroh-gossip` dependencies.**
+- **ma-realms must not import `iroh::*` directly.**
+- **Any transport capability needed by world/agent/actor must come through ma-core APIs.**

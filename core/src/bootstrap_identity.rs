@@ -5,12 +5,12 @@ use std::{
 };
 
 #[cfg(not(target_arch = "wasm32"))]
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 #[cfg(not(target_arch = "wasm32"))]
 use libp2p_identity::Keypair;
 
 #[cfg(not(target_arch = "wasm32"))]
-use crate::{SecureFileKind, ensure_private_dir, write_secure_file};
+use crate::{ensure_private_dir, write_secure_file, SecureFileKind};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn default_ma_config_root() -> Result<PathBuf> {

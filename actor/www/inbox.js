@@ -343,11 +343,13 @@ export function createInboxTransport({
 
     try {
       const result = JSON.parse(await pollInboxMessages());
-      if (!result || !Array.isArray(result.messages) || result.messages.length === 0) {
+      if (!result) {
         return;
       }
 
-      for (const item of result.messages) {
+      // Process presence events first (high priority, time-sensitive)
+      const presenceMessages = result.presence || [];
+      for (const item of presenceMessages) {
         const meta = JSON.parse(inspectSignedMessage(item.message_cbor_b64));
         if (messageRequiresResponse(meta)) {
           queueMailboxItem(item, meta);
@@ -356,18 +358,44 @@ export function createInboxTransport({
 
         const routeKey = contentTypeToRouteKey(meta.content_type);
         if (!routeKey) {
-          logger.log('inbox.dispatch', `ignoring unsupported inbound content_type=${meta.content_type}`);
+          logger.log('inbox.dispatch', `ignoring unsupported presence content_type=${meta.content_type}`);
+          continue;
+        }
+
+        await dispatchInboundEvent({
+          kind: 'presence',
+          mime_type: routeKey,
+          sender: '',
+          sender_did: meta.from,
+          sender_endpoint: item.from_endpoint || '',
+          message: meta.content_text || '',
+          message_cbor_b64: item.message_cbor_b64,
+          sequence: 0,
+          occurred_at: ''
+        });
+      }
+
+      // Process inbox messages (lower priority, durable)
+      const inboxMessages = result.inbox || [];
+      for (const item of inboxMessages) {
+        const meta = JSON.parse(inspectSignedMessage(item.message_cbor_b64));
+        if (messageRequiresResponse(meta)) {
+          queueMailboxItem(item, meta);
+          continue;
+        }
+
+        const routeKey = contentTypeToRouteKey(meta.content_type);
+        if (!routeKey) {
+          logger.log('inbox.dispatch', `ignoring unsupported inbox content_type=${meta.content_type}`);
           continue;
         }
 
         const kind = routeKey === 'application/x-ma-whisper'
           ? 'whisper'
-          : routeKey === 'application/x-ma-presence'
-            ? 'presence'
-            : routeKey === 'application/x-ma-event'
-              ? 'event'
-              : routeKey === 'application/x-ma-broadcast'
-                ? 'broadcast'
+          : routeKey === 'application/x-ma-event'
+            ? 'event'
+            : routeKey === 'application/x-ma-broadcast'
+              ? 'broadcast'
             : 'chat';
 
         await dispatchInboundEvent({
@@ -376,7 +404,7 @@ export function createInboxTransport({
           sender: '',
           sender_did: meta.from,
           sender_endpoint: item.from_endpoint || '',
-          message: (kind === 'presence' || kind === 'event' || kind === 'broadcast') ? (meta.content_text || '') : '',
+          message: (kind === 'event' || kind === 'broadcast') ? (meta.content_text || '') : '',
           message_cbor_b64: item.message_cbor_b64,
           sequence: 0,
           occurred_at: ''

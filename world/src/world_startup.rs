@@ -1,4 +1,5 @@
 use super::*;
+use ma_core::{ma_fields, MaEndpoint};
 
 #[derive(Debug, Deserialize)]
 struct MaWorldProjectionConfig {
@@ -83,11 +84,11 @@ pub(crate) async fn publish_world_did_runtime_ma(
 
     let world_key_name = normalize_world_key_name(world_slug);
     let did_identifier = ensure_kubo_key_id(kubo_url, &world_key_name).await?;
-    let world_did = Did::new(&did_identifier, world_slug)
+    let world_did = Did::new_identity(&did_identifier)
         .map_err(|e| anyhow!("failed to build world DID from key id '{}': {}", did_identifier, e))?;
     let world_ipns_path = format!("/ipns/{}", world_did.ipns);
 
-    let signing_did = Did::new_auto(&did_identifier)
+    let signing_did = Did::new_identity(&did_identifier)
         .map_err(|e| anyhow!("failed to build signing DID: {}", e))?;
     let signing_key = SigningKey::from_private_key_bytes(
         signing_did,
@@ -146,7 +147,9 @@ pub(crate) async fn publish_world_did_runtime_ma(
     // Publish a tailored world projection in ma.world.
     // Keep `root` link for runtime restore compatibility, while exposing a
     // dedicated `public` link and explicit `owner` metadata for traversal.
-    ma_fields::set_ma_world(&mut document, serde_json::Value::Object(ma_world));
+    let ma_world_ipld: did_ma::Ipld = serde_json::from_value(serde_json::Value::Object(ma_world))
+        .map_err(|e| anyhow!("failed to encode ma.world projection as IPLD: {}", e))?;
+    ma_fields::set_ma_world(&mut document, ma_world_ipld);
 
     let assertion_id = document.assertion_method.first()
         .ok_or_else(|| anyhow!("world DID has no assertionMethod"))?
@@ -190,7 +193,7 @@ pub(crate) async fn publish_world_did_runtime_ma(
 async fn ensure_world_did_document(
     kubo_url: &str,
     world_slug: &str,
-    endpoint_id: &str,
+    endpoint_services: Vec<String>,
     world_master_key: [u8; 32],
 ) -> Result<String> {
     let key_name = normalize_world_key_name(world_slug);
@@ -210,11 +213,11 @@ async fn ensure_world_did_document(
             key_name
         ))?;
 
-    let world_did = Did::new(&did_identifier, world_slug)
+    let world_did = Did::new_identity(&did_identifier)
         .map_err(|e| anyhow!("failed to build world DID from IPNS key '{}' slug '{}': {}", did_identifier, world_slug, e))?;
     let world_ipns_path = format!("/ipns/{}", did_identifier);
 
-    let signing_did = Did::new_auto(&did_identifier)
+    let signing_did = Did::new_identity(&did_identifier)
         .map_err(|e| anyhow!("failed to build signing DID: {}", e))?;
     let signing_key = SigningKey::from_private_key_bytes(
         signing_did,
@@ -222,7 +225,7 @@ async fn ensure_world_did_document(
     )
         .map_err(|e| anyhow!("failed to restore world signing key: {}", e))?;
 
-    let key_agreement_did = Did::new_auto(&did_identifier)
+    let key_agreement_did = Did::new_identity(&did_identifier)
         .map_err(|e| anyhow!("failed to build key-agreement DID: {}", e))?;
     let key_agreement_key = EncryptionKey::from_private_key_bytes(
         key_agreement_did,
@@ -258,17 +261,15 @@ async fn ensure_world_did_document(
     document.key_agreement = vec![key_agreement_vm_id];
     ma_fields::set_ma_type(&mut document, "world");
     set_document_ma_string_field(&mut document, "ipns", &format!("/ipns/{}", did_identifier))?;
-    let transport_paths = vec![
-        format!("/iroh/{endpoint_id}/{}", String::from_utf8_lossy(INBOX_PROTOCOL)),
-        format!("/iroh/{endpoint_id}/{}", String::from_utf8_lossy(AVATAR_PROTOCOL)),
-        format!("/iroh/{endpoint_id}/{}", String::from_utf8_lossy(IPFS_PROTOCOL)),
-    ];
-    ma_fields::set_ma_services(&mut document, serde_json::Value::Array(
-        transport_paths
-            .into_iter()
-            .map(serde_json::Value::String)
-            .collect(),
-    ));
+    ma_fields::set_ma_services(
+        &mut document,
+        did_ma::Ipld::List(
+            endpoint_services
+                .into_iter()
+                .map(did_ma::Ipld::String)
+                .collect(),
+        ),
+    );
     ma_fields::set_ma_ping_interval_secs(&mut document, WORLD_PING_INTERVAL_SECS as u64);
     document.sign(&signing_key, &assertion_vm)?;
 
@@ -366,7 +367,7 @@ pub(crate) async fn run_main() -> Result<()> {
                     .or_else(|| runtime_cfg.iroh_secret.map(PathBuf::from))
                     .unwrap_or_else(|| runtime_iroh_secret_default_path(&normalized_slug));
 
-                generate_secret_key_file(&path)?;;
+                generate_secret_key_file(&path)?;
                 println!("generated iroh secret: {}", path.display());
                 return Ok(());
             }
@@ -1286,7 +1287,7 @@ pub(crate) async fn run_main() -> Result<()> {
         let world_master_key = derive_world_master_key(&secret_bytes, &normalized_slug);
         let world_key_name = normalize_world_key_name(&normalized_slug);
         let did_identifier = ensure_kubo_key_id(&kubo_url, &world_key_name).await?;
-        let world_did = Did::new(&did_identifier, &normalized_slug)
+        let world_did = Did::new_identity(&did_identifier)
             .map_err(|e| anyhow!("failed to build world DID from key id '{}': {}", did_identifier, e))?;
 
         let world = World::new(
@@ -1378,7 +1379,7 @@ pub(crate) async fn run_main() -> Result<()> {
         let world_master_key = derive_world_master_key(&secret_bytes, &normalized_slug);
         let world_key_name = normalize_world_key_name(&normalized_slug);
         let did_identifier = ensure_kubo_key_id(&kubo_url, &world_key_name).await?;
-        let world_did = Did::new(&did_identifier, &normalized_slug)
+        let world_did = Did::new_identity(&did_identifier)
             .map_err(|e| anyhow!("failed to build world DID from key id '{}': {}", did_identifier, e))?;
 
         let world = World::new(
@@ -1686,9 +1687,19 @@ pub(crate) async fn run_main() -> Result<()> {
         ));
     };
     info!("Loaded persistent iroh identity from {}", key_path.display());
-    let iroh_endpoint = IrohEndpoint::new(secret_bytes).await
+    let mut iroh_endpoint = IrohEndpoint::new(secret_bytes).await
         .map_err(|e| anyhow!("failed to start iroh endpoint: {e}"))?;
-    let endpoint = iroh_endpoint.into_inner();
+    let endpoint_services = iroh_endpoint.services();
+    let inbox_protocol_label = std::str::from_utf8(INBOX_PROTOCOL)
+        .map_err(|e| anyhow!("invalid INBOX_PROTOCOL utf8: {}", e))?;
+    let avatar_protocol_label = std::str::from_utf8(AVATAR_PROTOCOL)
+        .map_err(|e| anyhow!("invalid AVATAR_PROTOCOL utf8: {}", e))?;
+    let ipfs_protocol_label = std::str::from_utf8(IPFS_PROTOCOL)
+        .map_err(|e| anyhow!("invalid IPFS_PROTOCOL utf8: {}", e))?;
+    let inbox_rx = Arc::new(Mutex::new(iroh_endpoint.service(inbox_protocol_label)));
+    let avatar_rx = Arc::new(Mutex::new(iroh_endpoint.service(avatar_protocol_label)));
+    let ipfs_rx = Arc::new(Mutex::new(iroh_endpoint.service(ipfs_protocol_label)));
+    let endpoint = Arc::new(iroh_endpoint);
 
     // Ensure Kubo API is online before DID/IPNS bootstrap.
     wait_for_kubo_api(&kubo_url, 8).await?;
@@ -1709,11 +1720,11 @@ pub(crate) async fn run_main() -> Result<()> {
         world.set_world_master_key(world_master_key).await;
         info!("World master key source: derived from iroh identity and world slug");
 
-        let endpoint_id = endpoint.id().to_string();
+        let endpoint_id = endpoint.id();
         let world_did = ensure_world_did_document(
             &kubo_url,
             &world_slug,
-            &endpoint_id,
+            endpoint_services.clone(),
             world_master_key,
         )
         .await?;
@@ -1832,34 +1843,16 @@ pub(crate) async fn run_main() -> Result<()> {
             kubo_url: kubo_url.clone(),
             did_cache: did_cache.clone(),
         };
-        let online_started = Instant::now();
-        let online_status = match tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await {
-            Ok(_) => format!("ok in {}ms", online_started.elapsed().as_millis()),
-            Err(_) => format!("timeout after {}ms", online_started.elapsed().as_millis()),
-        };
-        let endpoint_addr = endpoint.addr();
-
-        let direct_addresses = endpoint_addr
-            .ip_addrs()
-            .map(|addr| addr.to_string())
-            .collect::<Vec<_>>();
-        let multiaddrs = endpoint_addr
-            .ip_addrs()
-            .map(socket_addr_to_multiaddr)
-            .collect::<Vec<_>>();
-        let relay_urls = endpoint_addr
-            .relay_urls()
-            .map(|url| url.to_string())
-            .collect::<Vec<_>>();
+        let online_status = "inbox polling active".to_string();
 
         let world_info = WorldInfo {
             name: world_slug.clone(),
             world_did: world_did.clone(),
             status_url: status_url.clone(),
             endpoint_id: endpoint_id.clone(),
-            direct_addresses,
-            multiaddrs,
-            relay_urls,
+            direct_addresses: Vec::new(),
+            multiaddrs: Vec::new(),
+            relay_urls: Vec::new(),
             kubo_url: kubo_url.clone(),
             location_hint: format!("/iroh/{endpoint_id}"),
             entry_acl: world.entry_acl_source().await,
@@ -1902,11 +1895,6 @@ pub(crate) async fn run_main() -> Result<()> {
         info!("Optional DID field ma:presenceHint = {}", world_info.location_hint);
         info!("Iroh online readiness: {}", online_status);
 
-        for relay_url in &world_info.relay_urls {
-            let probe = probe_relay(relay_url).await;
-            info!("Relay probe {} -> {}", relay_url, probe);
-        }
-
         println!("\n╔══════════════════════════════════════════════════════════╗");
         println!("║ ma-world Server                                         ║");
         println!("║ status page:   {:<41} ║", trim_console(&world_info.status_url, 41));
@@ -1918,38 +1906,11 @@ pub(crate) async fn run_main() -> Result<()> {
             .record_event(format!("world online at {}", world_info.status_url))
             .await;
 
-        // Wait for unlock before accepting protocol connections.
-        // While locked, a gate router responds with "world is locked" on all protocols.
-        if !world.is_unlocked().await {
-            let gate = LockedGateProtocol;
-            let gate_router = Router::builder(endpoint.clone())
-                .accept(INBOX_PROTOCOL, gate.clone())
-                .accept(AVATAR_PROTOCOL, gate.clone())
-                .accept(IPFS_PROTOCOL, gate)
-                .spawn();
-            world
-                .record_event("world runtime locked; gate router active — waiting for unlock".to_string())
-                .await;
-            info!("World locked — gate router active, waiting for unlock via status page at {}", world_info.status_url);
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                if world.is_unlocked().await {
-                    break;
-                }
-            }
-            gate_router.shutdown().await?;
-            world
-                .record_event("world unlocked — starting protocol lanes".to_string())
-                .await;
-            info!("World unlocked — starting protocol lanes");
-        }
-
         let inbox_protocol = WorldProtocol {
             world: world.clone(),
             endpoint: endpoint.clone(),
             endpoint_id: endpoint_id.clone(),
             did_cache: did_cache.clone(),
-            push_stream_cache: Arc::new(Mutex::new(HashMap::new())),
             push_timeout_cooldown: Arc::new(Mutex::new(HashMap::new())),
             service: WorldService::Inbox,
         };
@@ -1958,18 +1919,120 @@ pub(crate) async fn run_main() -> Result<()> {
             endpoint: endpoint.clone(),
             endpoint_id: endpoint_id.clone(),
             did_cache: did_cache.clone(),
-            push_stream_cache: inbox_protocol.push_stream_cache.clone(),
             push_timeout_cooldown: inbox_protocol.push_timeout_cooldown.clone(),
             service: WorldService::Avatar,
         };
-        let router = Router::builder(endpoint.clone())
-            .accept(INBOX_PROTOCOL, inbox_protocol.clone())
-            .accept(AVATAR_PROTOCOL, avatar_protocol)
-            .accept(IPFS_PROTOCOL, ipfs_protocol)
-            .spawn();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut inbox_shutdown = shutdown_rx.clone();
+        let inbox_handler = inbox_protocol.clone();
+        let inbox_rx_loop = inbox_rx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(10));
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = inbox_shutdown.changed() => { break; }
+                }
+                if *inbox_shutdown.borrow() {
+                    break;
+                }
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let messages = {
+                    let mut rx = inbox_rx_loop.lock().await;
+                    rx.drain(now)
+                };
+                for msg in messages {
+                    if !inbox_handler.world.is_unlocked().await {
+                        continue;
+                    }
+                    match msg.to_cbor() {
+                        Ok(message_cbor) => {
+                            let request = WorldRequest { message_cbor };
+                            let _ = inbox_handler.process_request(request, msg.from.clone()).await;
+                        }
+                        Err(err) => {
+                            warn!("inbox message cbor encode failed: {}", err);
+                        }
+                    }
+                }
+            }
+        });
 
-        // Join the ma broadcast channel.
-        let broadcast_result = join_broadcast_channel(endpoint.clone()).await;
+        let mut avatar_shutdown = shutdown_rx.clone();
+        let avatar_handler = avatar_protocol.clone();
+        let avatar_rx_loop = avatar_rx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(10));
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = avatar_shutdown.changed() => { break; }
+                }
+                if *avatar_shutdown.borrow() {
+                    break;
+                }
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let messages = {
+                    let mut rx = avatar_rx_loop.lock().await;
+                    rx.drain(now)
+                };
+                for msg in messages {
+                    if !avatar_handler.world.is_unlocked().await {
+                        continue;
+                    }
+                    match msg.to_cbor() {
+                        Ok(message_cbor) => {
+                            let request = WorldRequest { message_cbor };
+                            let _ = avatar_handler.process_request(request, msg.from.clone()).await;
+                        }
+                        Err(err) => {
+                            warn!("avatar message cbor encode failed: {}", err);
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut ipfs_shutdown = shutdown_rx.clone();
+        let ipfs_handler = ipfs_protocol.clone();
+        let ipfs_rx_loop = ipfs_rx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(20));
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = ipfs_shutdown.changed() => { break; }
+                }
+                if *ipfs_shutdown.borrow() {
+                    break;
+                }
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let messages = {
+                    let mut rx = ipfs_rx_loop.lock().await;
+                    rx.drain(now)
+                };
+                for msg in messages {
+                    match msg.to_cbor() {
+                        Ok(message_cbor) => {
+                            let request = WorldRequest { message_cbor };
+                            let _ = ipfs_handler.process_request(request).await;
+                        }
+                        Err(err) => {
+                            warn!("ipfs message cbor encode failed: {}", err);
+                        }
+                    }
+                }
+            }
+        });
 
         let presence_probe_secs = env::var("MA_PRESENCE_PROBE_SECS")
             .ok()
@@ -1987,38 +2050,7 @@ pub(crate) async fn run_main() -> Result<()> {
             .configure_room_avatar_ttl(Duration::from_secs(presence_stale_secs))
             .await;
 
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-
-        // Announce world startup on the broadcast channel.
-        match broadcast_result {
-            Ok((_gossip, sender)) => {
-                let startup_msg = format!(
-                    r#"{{"kind":"world.online","world":"{}","ts":"{}"}}"#,
-                    world_did,
-                    Utc::now().to_rfc3339()
-                );
-                if let Err(err) = gossip_send_text(&sender, &startup_msg).await {
-                    warn!("Broadcast startup announce failed: {}", err);
-                } else {
-                    info!("Broadcast: world online announced on {}", BROADCAST_TOPIC);
-                }
-                // Keep sender alive in a background task for the shutdown announce.
-                let mut gossip_shutdown = shutdown_rx.clone();
-                let shutdown_world_did = world_did.clone();
-                tokio::spawn(async move {
-                    let _ = gossip_shutdown.changed().await;
-                    let shutdown_msg = format!(
-                        r#"{{"kind":"world.offline","world":"{}","ts":"{}"}}"#,
-                        shutdown_world_did,
-                        Utc::now().to_rfc3339()
-                    );
-                    let _ = gossip_send_text(&sender, &shutdown_msg).await;
-                });
-            }
-            Err(err) => {
-                warn!("Broadcast gossip join failed: {}", err);
-            }
-        }
+        info!("Broadcast startup announce disabled: gossip helpers not available in active ma-core crate");
 
         let inbox_presence = inbox_protocol.clone();
         let mut probe_shutdown = shutdown_rx.clone();
@@ -2080,12 +2112,6 @@ pub(crate) async fn run_main() -> Result<()> {
         world
             .record_event(format!("world relays: {}", world_info.relay_urls.join(", ")))
             .await;
-        for relay_url in &world_info.relay_urls {
-            let probe = probe_relay(relay_url).await;
-            world
-                .record_event(format!("relay probe {} -> {}", relay_url, probe))
-                .await;
-        }
         world
             .record_event(format!("entry acl: {}", world_info.entry_acl))
             .await;
@@ -2115,21 +2141,18 @@ pub(crate) async fn run_main() -> Result<()> {
             }
         }
 
-        // Give the iroh router a bounded window to drain open connections.
-        // If it takes longer than 5 s we exit anyway — connections will time out
-        // on the actor side.
-        let shutdown_timeout = Duration::from_secs(5);
-        match tokio::time::timeout(shutdown_timeout, router.shutdown()).await {
-            Ok(Ok(())) => info!("Router shut down cleanly."),
-            Ok(Err(e)) => warn!("Router shutdown error: {}", e),
-            Err(_) => warn!("Router shutdown timed out after {}s; forcing exit.", shutdown_timeout.as_secs()),
-        }
-
         Ok(())
     }
     .await;
 
-    endpoint.close().await;
+    match Arc::try_unwrap(endpoint) {
+        Ok(endpoint) => {
+            endpoint.close().await;
+        }
+        Err(_) => {
+            warn!("iroh endpoint still has active references on shutdown; dropping Arc");
+        }
+    }
     run_result
 }
 
@@ -2165,19 +2188,6 @@ fn trim_console(input: &str, width: usize) -> String {
         output.push_str(&" ".repeat(width - output.len()));
     }
     output
-}
-
-async fn probe_relay(relay_url: &str) -> String {
-    let started = Instant::now();
-    let client = match reqwest::Client::builder().timeout(RELAY_PROBE_TIMEOUT).build() {
-        Ok(c) => c,
-        Err(err) => return format!("client-build-error: {}", err),
-    };
-
-    match client.get(relay_url).send().await {
-        Ok(resp) => format!("http {} in {}ms", resp.status().as_u16(), started.elapsed().as_millis()),
-        Err(err) => format!("error {} in {}ms", err, started.elapsed().as_millis()),
-    }
 }
 
 fn load_entry_acl() -> Result<EntryAcl> {

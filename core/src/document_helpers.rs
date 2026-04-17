@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use did_ma::Document;
 
 use crate::{ma_fields, resolve_inbox_endpoint_id};
@@ -28,10 +28,12 @@ pub fn normalize_language_for_did_document(language_order: &str) -> Option<Strin
 }
 
 pub fn sender_push_endpoint_from_document(document: &Document) -> Option<String> {
+    let services_json =
+        ma_fields::ma_services(document).and_then(|value| serde_json::to_value(value).ok());
     let endpoint = resolve_inbox_endpoint_id(
         ma_fields::ma_current_inbox(document),
         ma_fields::ma_presence_hint(document),
-        ma_fields::ma_services(document),
+        services_json.as_ref(),
     )?;
     let trimmed = endpoint.trim();
     if trimmed.is_empty() {
@@ -42,14 +44,21 @@ pub fn sender_push_endpoint_from_document(document: &Document) -> Option<String>
 }
 
 pub fn sender_encryption_pubkey_multibase_from_document(document: &Document) -> Result<String> {
-    let ka_id = document.key_agreement.first()
+    let ka_id = document
+        .key_agreement
+        .first()
         .ok_or_else(|| anyhow!("sender DID document has no keyAgreement"))?;
-    let vm = document
-        .get_verification_method_by_id(ka_id)
-        .map_err(|e| anyhow!("sender DID document missing keyAgreement verification method: {}", e))?;
+    let vm = document.get_verification_method_by_id(ka_id).map_err(|e| {
+        anyhow!(
+            "sender DID document missing keyAgreement verification method: {}",
+            e
+        )
+    })?;
     let key = vm.public_key_multibase.trim();
     if key.is_empty() {
-        return Err(anyhow!("sender DID document keyAgreement publicKeyMultibase is empty"));
+        return Err(anyhow!(
+            "sender DID document keyAgreement publicKeyMultibase is empty"
+        ));
     }
     Ok(key.to_string())
 }
@@ -116,19 +125,28 @@ mod tests {
     #[test]
     fn extract_description_from_ma() {
         let json = r#"{"ma":{"description":"Hello world"}}"#;
-        assert_eq!(extract_did_description_from_json(json), Some("Hello world".to_string()));
+        assert_eq!(
+            extract_did_description_from_json(json),
+            Some("Hello world".to_string())
+        );
     }
 
     #[test]
     fn extract_description_from_top() {
         let json = r#"{"description":"Top level"}"#;
-        assert_eq!(extract_did_description_from_json(json), Some("Top level".to_string()));
+        assert_eq!(
+            extract_did_description_from_json(json),
+            Some("Top level".to_string())
+        );
     }
 
     #[test]
     fn extract_description_from_profile() {
         let json = r#"{"profile":{"description":"Profile desc"}}"#;
-        assert_eq!(extract_did_description_from_json(json), Some("Profile desc".to_string()));
+        assert_eq!(
+            extract_did_description_from_json(json),
+            Some("Profile desc".to_string())
+        );
     }
 
     #[test]

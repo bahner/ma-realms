@@ -1,5 +1,5 @@
-use did_ma::{Did, Document, EncryptionKey, Result, SigningKey, VerificationMethod};
 use crate::ma_fields;
+use did_ma::{Did, Document, EncryptionKey, Result, SigningKey, VerificationMethod};
 
 #[derive(Debug, Clone)]
 pub struct GeneratedAgentIdentity {

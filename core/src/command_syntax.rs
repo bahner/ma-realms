@@ -35,7 +35,10 @@ pub fn parse_property_command(input: &str) -> Option<PropertyCommand> {
     Some(PropertyCommand { key, value })
 }
 
-pub fn parse_property_command_for_keys(input: &str, allowed_keys: &[&str]) -> Option<PropertyCommand> {
+pub fn parse_property_command_for_keys(
+    input: &str,
+    allowed_keys: &[&str],
+) -> Option<PropertyCommand> {
     let parsed = parse_property_command(input)?;
 
     if !allowed_keys
@@ -54,8 +57,8 @@ mod tests {
 
     #[test]
     fn parses_generic_payload() {
-        let parsed = parse_property_command("cid bafy...")
-            .expect("generic property command should parse");
+        let parsed =
+            parse_property_command("cid bafy...").expect("generic property command should parse");
         assert_eq!(parsed.key, "cid");
         assert_eq!(parsed.value.as_deref(), Some("bafy..."));
     }

@@ -1,4 +1,4 @@
-use did_ma::Did;
+use did_ma::{Did, Ipld};
 use std::collections::HashMap;
 
 /// 32-byte Ed25519 private key for avatar signing, held by the world.
@@ -11,6 +11,7 @@ pub(crate) struct AvatarRequest {
     pub identity: String,
     pub owner: String,
     pub agent_endpoint: String,
+    pub agent_services: Option<Ipld>,
     pub language_order: String,
     pub signing_secret: AvatarSigningSecret,
     pub encryption_pubkey_multibase: Option<String>,
@@ -59,6 +60,7 @@ pub struct Avatar {
     pub inbox: String,
     pub agent_did: Did,
     pub agent_endpoint: String,
+    pub agent_services: Option<Ipld>,
     pub language_order: String,
     pub identity: String,
     pub owner: String,
@@ -78,6 +80,7 @@ impl Avatar {
         inbox: String,
         agent_did: Did,
         agent_endpoint: String,
+        agent_services: Option<Ipld>,
         language_order: String,
         identity: String,
         owner: String,
@@ -88,6 +91,7 @@ impl Avatar {
             inbox,
             agent_did,
             agent_endpoint,
+            agent_services,
             language_order,
             identity,
             owner,

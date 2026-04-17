@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use did_ma::Did;
 use serde::Deserialize;
 
@@ -113,8 +113,7 @@ pub fn subject_has_capability_with_owner(
     owner_did: Option<&str>,
     capability: &str,
 ) -> bool {
-    let owner_match = owner_did
-        .is_some_and(|owner| owner == subject)
+    let owner_match = owner_did.is_some_and(|owner| owner == subject)
         && acl
             .get("owner")
             .map(|patterns| {
@@ -185,11 +184,7 @@ pub fn compile_acl_from_text(raw: &str, source: &str) -> Result<CompiledCapabili
     compile_acl(&acl, source)
 }
 
-pub fn evaluate_compiled_acl(
-    acl: &CompiledCapabilityAcl,
-    subject: &str,
-    capability: &str,
-) -> bool {
+pub fn evaluate_compiled_acl(acl: &CompiledCapabilityAcl, subject: &str, capability: &str) -> bool {
     let subject_acl = acl.subjects.get(subject).or_else(|| acl.subjects.get("*"));
     let Some(subject_acl) = subject_acl else {
         return false;

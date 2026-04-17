@@ -49,9 +49,16 @@ fn canonical_room_command(command: &str) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MessageEnvelope {
-    Chatter { text: String },
-    RoomCommand { command: String },
-    ActorCommand { target: String, command: ActorCommand },
+    Chatter {
+        text: String,
+    },
+    RoomCommand {
+        command: String,
+    },
+    ActorCommand {
+        target: String,
+        command: ActorCommand,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

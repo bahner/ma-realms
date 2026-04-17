@@ -9,7 +9,7 @@ impl WorldProtocol {
         let room_url_parsed = Did::try_from(room_url)
             .map_err(|e| anyhow!("invalid room did '{}': {}", room_url, e))?;
         let room_url_canonical = room_url_parsed.id();
-        let signing_did = Did::new_auto(&room_url_parsed.ipns)
+        let signing_did = Did::new_identity(&room_url_parsed.ipns)
             .map_err(|e| anyhow!("invalid signing did for room {}: {}", room_url, e))?;
 
         if let Some(room_key) = {
@@ -73,85 +73,6 @@ impl WorldProtocol {
         format!("{}|{}", String::from_utf8_lossy(protocol), target_endpoint_id.trim())
     }
 
-    pub(crate) async fn create_push_stream_cache(
-        &self,
-        target_endpoint_id: &str,
-        protocol: &'static [u8],
-    ) -> Result<PushStreamCache> {
-        let target: EndpointId = target_endpoint_id
-            .trim()
-            .parse()
-            .map_err(|e| anyhow!("invalid target endpoint id {}: {}", target_endpoint_id, e))?;
-
-        let endpoint_addr = EndpointAddr::new(target);
-
-        let connection = self
-            .endpoint
-            .connect(endpoint_addr, protocol)
-            .await
-            .map_err(|e| anyhow!("push endpoint.connect failed: {}", e))?;
-
-        let (send, recv) = connection
-            .open_bi()
-            .await
-            .map_err(|e| anyhow!("push connection.open_bi failed: {}", e))?;
-
-        Ok(PushStreamCache {
-            connection,
-            send,
-            recv,
-        })
-    }
-
-    pub(crate) async fn exchange_push_on_stream(
-        &self,
-        cache: &mut PushStreamCache,
-        message_cbor: Vec<u8>,
-    ) -> Result<()> {
-        let request = OutboxRequest::Signed { message_cbor };
-        let payload = serde_json::to_vec(&request)
-            .map_err(|e| anyhow!("failed to serialize outbox request: {}", e))?;
-
-        cache
-            .send
-            .write_u32(payload.len() as u32)
-            .await
-            .map_err(|e| anyhow!("push write_u32 failed: {}", e))?;
-        cache
-            .send
-            .write_all(&payload)
-            .await
-            .map_err(|e| anyhow!("push write_all failed: {}", e))?;
-        cache
-            .send
-            .flush()
-            .await
-            .map_err(|e| anyhow!("push flush failed: {}", e))?;
-
-        let frame_len = cache
-            .recv
-            .read_u32()
-            .await
-            .map_err(|e| anyhow!("push read_u32 failed: {}", e))? as usize;
-        if frame_len > 256 * 1024 {
-            return Err(anyhow!("push response frame too large: {}", frame_len));
-        }
-
-        let mut bytes = vec![0u8; frame_len];
-        cache
-            .recv
-            .read_exact(&mut bytes)
-            .await
-            .map_err(|e| anyhow!("push read_exact failed: {}", e))?;
-        let response: OutboxResponse = serde_json::from_slice(&bytes)
-            .map_err(|e| anyhow!("push response decode failed: {}", e))?;
-        if !response.ok {
-            return Err(anyhow!("push rejected: {}", response.message));
-        }
-
-        Ok(())
-    }
-
     pub(crate) async fn send_signed_push_to_endpoint_on_protocol(
         &self,
         target_endpoint_id: &str,
@@ -173,45 +94,38 @@ impl WorldProtocol {
                 return Ok(());
             }
         }
-        let mut last_error: Option<anyhow::Error> = None;
+        let protocol_str = std::str::from_utf8(protocol)
+            .map_err(|e| anyhow!("invalid protocol bytes: {}", e))?;
 
-        for _ in 0..2 {
-            let mut stream_cache = {
-                let mut slots = self.push_stream_cache.lock().await;
-                slots.remove(&cache_key)
+        let mut channel = self
+            .endpoint
+            .open(target_endpoint_id.trim(), protocol_str)
+            .await
+            .map_err(|e| anyhow!("push endpoint.open failed: {}", e))?;
+
+        match channel.send(&message_cbor).await {
+            Ok(()) => {
+                channel.close();
+                Ok(())
             }
-            .unwrap_or(self.create_push_stream_cache(target_endpoint_id, protocol).await?);
-
-            match self
-                .exchange_push_on_stream(&mut stream_cache, message_cbor.clone())
-                .await
-            {
-                Ok(()) => {
-                    let mut slots = self.push_stream_cache.lock().await;
-                    slots.insert(cache_key.clone(), stream_cache);
+            Err(err) => {
+                if err.to_string().contains("timed out") {
+                    let until = Instant::now() + Duration::from_secs(PUSH_TIMEOUT_COOLDOWN_SECS);
+                    let mut cooldowns = self.push_timeout_cooldown.lock().await;
+                    cooldowns.insert(cache_key, until);
+                    warn!(
+                        "push timeout for endpoint {} on protocol {}; cooling down for {}s",
+                        target_endpoint_id,
+                        protocol_str,
+                        PUSH_TIMEOUT_COOLDOWN_SECS
+                    );
+                    channel.close();
                     return Ok(());
                 }
-                Err(err) => {
-                    if err.to_string().contains("timed out") {
-                        let until = Instant::now() + Duration::from_secs(PUSH_TIMEOUT_COOLDOWN_SECS);
-                        let mut cooldowns = self.push_timeout_cooldown.lock().await;
-                        cooldowns.insert(cache_key.clone(), until);
-                        warn!(
-                            "push timeout for endpoint {} on protocol {}; cooling down for {}s",
-                            target_endpoint_id,
-                            String::from_utf8_lossy(protocol),
-                            PUSH_TIMEOUT_COOLDOWN_SECS
-                        );
-                        stream_cache.connection.close(0u32.into(), b"push timeout");
-                        return Ok(());
-                    }
-                    last_error = Some(err);
-                    stream_cache.connection.close(0u32.into(), b"stream error");
-                }
+                channel.close();
+                Err(anyhow!("push send failed: {}", err))
             }
         }
-
-        Err(last_error.unwrap_or_else(|| anyhow!("push failed")))
     }
 
     pub(crate) async fn send_signed_push_to_endpoint(
@@ -892,6 +806,7 @@ impl WorldProtocol {
         );
 
         let sender_profile = sender_profile_from_document(&sender_document);
+        let sender_services = ma_core::ma_fields::ma_services(&sender_document).cloned();
         let sender_push_endpoint = sender_push_endpoint_from_document(&sender_document)
             .unwrap_or_else(|| agent_endpoint.clone());
         let sender_encryption_pubkey_multibase =
@@ -910,6 +825,7 @@ impl WorldProtocol {
                 self.handle_enter(
                     sender_did,
                     &sender_profile,
+                    sender_services,
                     &sender_push_endpoint,
                     &sender_encryption_pubkey_multibase,
                     &agent_endpoint,
@@ -933,68 +849,6 @@ impl WorldProtocol {
 
 }
 
-impl ProtocolHandler for WorldProtocol {
-    /// One task runs per connection and serves a single long-lived bi-stream with framed messages.
-    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        let agent_endpoint = connection.remote_id().to_string();
-        self.world
-            .record_event(format!("connection accepted from {}", agent_endpoint))
-            .await;
-        let (mut send, mut recv) = connection.accept_bi().await?;
-
-        loop {
-            let frame_len = match recv.read_u32().await {
-                Ok(n) => n as usize,
-                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(err) => return Err(AcceptError::from_err(err)),
-            };
-            if frame_len > 256 * 1024 {
-                return Err(AcceptError::from_err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("request frame too large: {}", frame_len),
-                )));
-            }
-
-            let mut bytes = vec![0u8; frame_len];
-            recv.read_exact(&mut bytes).await.map_err(AcceptError::from_err)?;
-
-            let response = match serde_json::from_slice::<WorldRequest>(&bytes) {
-                Ok(request) => self.process_request(request, agent_endpoint.clone()).await,
-                Err(err) => WorldResponse {
-                    ok: false,
-                    room: String::new(),
-                    message: format!("invalid request JSON: {}", err),
-                    endpoint_id: self.endpoint_id.clone(),
-                    latest_event_sequence: 0,
-                    broadcasted: false,
-                    events: Vec::new(),
-                    handle: String::new(),
-                    room_description: String::new(),
-                    room_title: String::new(),
-                    room_url: String::new(),
-                    world_did: String::new(),
-                    avatars: Vec::new(),
-                    room_object_dids: HashMap::new(),
-                    transport_ack: Some(TransportAck {
-                        lane: self.service.label().to_string(),
-                        code: TransportAckCode::InvalidRequestJson,
-                        detail: format!("invalid request JSON: {}", err),
-                    }),
-                },
-            };
-            let payload = serde_json::to_vec(&response).map_err(AcceptError::from_err)?;
-
-            send.write_u32(payload.len() as u32)
-                .await
-                .map_err(AcceptError::from_err)?;
-            send.write_all(&payload).await.map_err(AcceptError::from_err)?;
-            send.flush().await.map_err(AcceptError::from_err)?;
-        }
-
-        let _ = send.finish();
-        Ok(())
-    }
-}
 
 impl IpfsProtocol {
     pub(crate) async fn process_request(&self, request: WorldRequest) -> IpfsPublishDidResponse {
@@ -1004,7 +858,6 @@ impl IpfsProtocol {
                 ok: false,
                 message: err.to_string(),
                 did: None,
-                key_name: None,
                 cid: None,
             },
         }
@@ -1026,11 +879,10 @@ impl IpfsProtocol {
             );
         }
 
-        let (key_name, cid) = publish_did_document_to_kubo(
+        let cid = publish_did_document_to_kubo(
             &self.kubo_url,
             &validated.request.did_document_json,
             &validated.request.ipns_private_key_base64,
-            validated.request.desired_fragment.as_deref(),
         )
         .await?;
 
@@ -1038,54 +890,8 @@ impl IpfsProtocol {
             ok: true,
             message: "did document published via ma/ipfs/0.0.1".to_string(),
             did: Some(validated.document_did.id()),
-            key_name,
             cid,
         })
-    }
-}
-
-impl ProtocolHandler for IpfsProtocol {
-    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        let (mut send, mut recv) = connection.accept_bi().await?;
-
-        loop {
-            let frame_len = match recv.read_u32().await {
-                Ok(n) => n as usize,
-                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(err) => return Err(AcceptError::from_err(err)),
-            };
-
-            if frame_len > 1024 * 1024 {
-                return Err(AcceptError::from_err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("ipfs frame too large: {}", frame_len),
-                )));
-            }
-
-            let mut bytes = vec![0u8; frame_len];
-            recv.read_exact(&mut bytes).await.map_err(AcceptError::from_err)?;
-
-            let response = match serde_json::from_slice::<WorldRequest>(&bytes) {
-                Ok(request) => self.process_request(request).await,
-                Err(err) => IpfsPublishDidResponse {
-                    ok: false,
-                    message: format!("invalid ipfs request JSON: {}", err),
-                    did: None,
-                    key_name: None,
-                    cid: None,
-                },
-            };
-
-            let payload = serde_json::to_vec(&response).map_err(AcceptError::from_err)?;
-            send.write_u32(payload.len() as u32)
-                .await
-                .map_err(AcceptError::from_err)?;
-            send.write_all(&payload).await.map_err(AcceptError::from_err)?;
-            send.flush().await.map_err(AcceptError::from_err)?;
-        }
-
-        let _ = send.finish();
-        Ok(())
     }
 }
 
@@ -1142,28 +948,28 @@ pub(crate) async fn resolve_world_root_cid_from_did(kubo_url: &str, world_did: &
     let world = Did::try_from(world_did)
         .map_err(|e| anyhow!("invalid world DID '{}': {}", world_did, e))?;
     let document = kubo::fetch_did_document(kubo_url, &world).await?;
-    let Some(ma) = document.ma.as_ref() else {
+    let Some(did_ma::Ipld::Map(ma)) = document.ma.as_ref() else {
         return Ok(None);
     };
     // ma.world may be either:
     // - direct IPLD link: {"/":"<cid>"}
     // - tailored projection object: { owner: {...}, public: {"/":"<cid>"}, root: {"/":"<cid>"} }
-    let Some(world_val) = ma.world.as_ref() else {
+    let Some(world_val) = ma.get("world") else {
         return Ok(None);
     };
-    let Some(obj) = world_val.as_object() else {
+    let did_ma::Ipld::Map(obj) = world_val else {
         return Ok(None);
     };
 
-    if let Some(cid_str) = obj.get("/").and_then(|v| v.as_str()) {
+    if let Some(did_ma::Ipld::String(cid_str)) = obj.get("/") {
         let trimmed = cid_str.trim();
         if !trimmed.is_empty() {
             return Ok(Some(trimmed.to_string()));
         }
     }
 
-    if let Some(root_obj) = obj.get("root").and_then(|v| v.as_object()) {
-        if let Some(cid_str) = root_obj.get("/").and_then(|v| v.as_str()) {
+    if let Some(did_ma::Ipld::Map(root_obj)) = obj.get("root") {
+        if let Some(did_ma::Ipld::String(cid_str)) = root_obj.get("/") {
             let trimmed = cid_str.trim();
             if !trimmed.is_empty() {
                 return Ok(Some(trimmed.to_string()));

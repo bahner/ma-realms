@@ -38,7 +38,9 @@ impl ExitAcl {
         if self.deny.iter().any(|entry| entry == identity) {
             return false;
         }
-        self.allow.iter().any(|entry| entry == "*" || entry == identity)
+        self.allow
+            .iter()
+            .any(|entry| entry == "*" || entry == identity)
     }
 }
 
@@ -64,11 +66,7 @@ pub struct ExitData {
 }
 
 impl ExitData {
-    pub fn new(
-        id: impl Into<String>,
-        name: impl Into<String>,
-        to: impl Into<String>,
-    ) -> Self {
+    pub fn new(id: impl Into<String>, name: impl Into<String>, to: impl Into<String>) -> Self {
         let canonical_name = name.into();
         let mut names = HashMap::new();
         if !canonical_name.trim().is_empty() {
@@ -158,10 +156,16 @@ impl ExitData {
         if matches_direction_stem(&self.name) {
             return true;
         }
-        if self.names.values().any(|value| matches_direction_stem(value)) {
+        if self
+            .names
+            .values()
+            .any(|value| matches_direction_stem(value))
+        {
             return true;
         }
-        self.aliases.iter().any(|value| matches_direction_stem(value))
+        self.aliases
+            .iter()
+            .any(|value| matches_direction_stem(value))
     }
 
     pub fn can_use(&self, identity: &str) -> bool {
@@ -188,7 +192,6 @@ impl ExitData {
             .cloned()
             .or_else(|| self.travel_texts.values().next().cloned())
     }
-
 }
 
 /// A generic room-local object (item, prop, container, etc.).
@@ -228,7 +231,12 @@ impl WorldActor {
         Self {
             id: id.into(),
             display_name: display_name.into(),
-            commands: vec!["help".to_string(), "who".to_string(), "l".to_string(), "acl".to_string()],
+            commands: vec![
+                "help".to_string(),
+                "who".to_string(),
+                "l".to_string(),
+                "acl".to_string(),
+            ],
         }
     }
 }

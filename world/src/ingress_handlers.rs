@@ -5,6 +5,7 @@ impl WorldProtocol {
         &self,
         sender_identity: &Did,
         sender_profile: &str,
+        sender_services: Option<did_ma::Ipld>,
         sender_push_endpoint: &str,
         sender_encryption_pubkey_multibase: &str,
         agent_endpoint: &str,
@@ -37,6 +38,7 @@ impl WorldProtocol {
             .ensure_avatar(
                 sender_identity,
                 sender_profile,
+                sender_services,
                 sender_push_endpoint,
                 sender_encryption_pubkey_multibase,
                 &pinged_room,

@@ -185,11 +185,13 @@ impl ObjectCommandResult {
     }
 
     pub fn push_inline_text(&mut self, text: impl Into<String>) {
-        self.outputs.push(ObjectCommandOutput::InlineText(text.into()));
+        self.outputs
+            .push(ObjectCommandOutput::InlineText(text.into()));
     }
 
     pub fn push_intent(&mut self, intent: ObjectMessageIntent) {
-        self.outputs.push(ObjectCommandOutput::MessageIntent(intent));
+        self.outputs
+            .push(ObjectCommandOutput::MessageIntent(intent));
     }
 }
 
@@ -268,7 +270,10 @@ const MAILBOX_HELP_NB: &str = "mailbox kommandoer:\n- show/status/look\n- take, 
 const MAILBOX_HELP_EN: &str = "mailbox commands:\n- show/status/look\n- take, drop\n- open, close\n- list, pop, pending\n- ask <target> <text>\n- retry <request_id>\n- reply <request_id> <text>\n- accept <id>, reject <id> [note]\n- invite <did> [note]\n- set cid <cid>\n- set content-b64 <base64-yaml>\n- flush";
 
 fn mailbox_admin_requirements() -> Vec<String> {
-    vec!["user == location".to_string(), "user == world.owner".to_string()]
+    vec![
+        "user == location".to_string(),
+        "user == world.owner".to_string(),
+    ]
 }
 
 fn mailbox_admin_verb(name: &str) -> ObjectVerbDefinition {
@@ -365,7 +370,10 @@ impl ObjectRuntimeState {
 
     fn allocate_request_id(&mut self, now_unix: u64) -> String {
         self.next_ephemeral_request_seq = self.next_ephemeral_request_seq.saturating_add(1);
-        format!("{}-{}-{}", self.id, now_unix, self.next_ephemeral_request_seq)
+        format!(
+            "{}-{}-{}",
+            self.id, now_unix, self.next_ephemeral_request_seq
+        )
     }
 
     pub fn clear_expired_lock(&mut self, now_secs: u64) {
@@ -396,9 +404,13 @@ impl ObjectRuntimeState {
         if needle.is_empty() {
             return false;
         }
-        self.receivers
-            .iter()
-            .any(|listener| listener.role.as_deref().map(|value| value.eq_ignore_ascii_case(needle)).unwrap_or(false))
+        self.receivers.iter().any(|listener| {
+            listener
+                .role
+                .as_deref()
+                .map(|value| value.eq_ignore_ascii_case(needle))
+                .unwrap_or(false)
+        })
     }
 
     pub fn has_receiver_protocol(&self, protocol: &str) -> bool {

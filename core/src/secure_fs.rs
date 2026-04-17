@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 
 #[derive(Clone, Copy, Debug)]
 pub enum SecureFileKind {
@@ -23,8 +23,7 @@ pub fn write_secure_file(path: &Path, bytes: &[u8], kind: SecureFileKind) -> Res
         }
     }
 
-    fs::write(path, bytes)
-        .map_err(|err| anyhow!("failed writing {}: {}", path.display(), err))?;
+    fs::write(path, bytes).map_err(|err| anyhow!("failed writing {}: {}", path.display(), err))?;
 
     apply_secure_permissions(path, kind)
 }
@@ -80,16 +79,21 @@ fn apply_private_dir_permissions(path: &Path) -> Result<()> {
 
 #[cfg(windows)]
 fn apply_windows_current_user_acl(path: &Path) -> Result<()> {
+    use winapi::um::winnt::{FILE_ALL_ACCESS, PSID};
     use windows_acl::acl::ACL;
     use windows_acl::helper::{current_user, name_to_sid, string_to_sid};
-    use winapi::um::winnt::{FILE_ALL_ACCESS, PSID};
 
     let path_str = path
         .to_str()
         .ok_or_else(|| anyhow!("path is not valid Unicode: {}", path.display()))?;
 
-    let mut acl = ACL::from_file_path(path_str, false)
-        .map_err(|code| anyhow!("failed loading ACL for {}: windows error {}", path.display(), code))?;
+    let mut acl = ACL::from_file_path(path_str, false).map_err(|code| {
+        anyhow!(
+            "failed loading ACL for {}: windows error {}",
+            path.display(),
+            code
+        )
+    })?;
 
     let current_user_name = current_user()
         .map_err(|code| anyhow!("failed resolving current user name: windows error {}", code))?;
@@ -103,16 +107,18 @@ fn apply_windows_current_user_acl(path: &Path) -> Result<()> {
 
     // Remove broad group entries before granting current-user full access.
     for sid_text in ["S-1-1-0", "S-1-5-11", "S-1-5-32-545"] {
-        let sid = string_to_sid(sid_text)
-            .map_err(|code| anyhow!("failed converting SID {}: windows error {}", sid_text, code))?;
-        acl.remove(sid.as_ptr() as PSID, None, None).map_err(|code| {
-            anyhow!(
-                "failed removing broad ACL entry {} on {}: windows error {}",
-                sid_text,
-                path.display(),
-                code
-            )
+        let sid = string_to_sid(sid_text).map_err(|code| {
+            anyhow!("failed converting SID {}: windows error {}", sid_text, code)
         })?;
+        acl.remove(sid.as_ptr() as PSID, None, None)
+            .map_err(|code| {
+                anyhow!(
+                    "failed removing broad ACL entry {} on {}: windows error {}",
+                    sid_text,
+                    path.display(),
+                    code
+                )
+            })?;
     }
 
     let current_user_set = acl
@@ -132,9 +138,13 @@ fn apply_windows_current_user_acl(path: &Path) -> Result<()> {
     }
 
     // Fail hard if broad group SIDs still have allow entries on the target object.
-    let entries = acl
-        .all()
-        .map_err(|code| anyhow!("failed re-reading ACL on {}: windows error {}", path.display(), code))?;
+    let entries = acl.all().map_err(|code| {
+        anyhow!(
+            "failed re-reading ACL on {}: windows error {}",
+            path.display(),
+            code
+        )
+    })?;
     for entry in entries {
         let broad_sid = matches!(
             entry.string_sid.as_str(),

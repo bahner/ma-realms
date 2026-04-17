@@ -140,7 +140,10 @@ pub fn resolve_alias_input(input: &str, alias_book: &HashMap<String, String>) ->
         .unwrap_or_else(|| key.to_string())
 }
 
-pub fn find_alias_for_address(address: &str, alias_book: &HashMap<String, String>) -> Option<String> {
+pub fn find_alias_for_address(
+    address: &str,
+    alias_book: &HashMap<String, String>,
+) -> Option<String> {
     let raw = address.trim();
     if raw.is_empty() {
         return None;
@@ -164,7 +167,9 @@ pub fn find_alias_for_address(address: &str, alias_book: &HashMap<String, String
         if !root.is_empty() && (value == root || did_root(value) == root) {
             return Some(name.clone());
         }
-        if let (Some(expected), Some(actual)) = (endpoint.as_deref(), normalize_endpoint_id(value).as_deref()) {
+        if let (Some(expected), Some(actual)) =
+            (endpoint.as_deref(), normalize_endpoint_id(value).as_deref())
+        {
             if expected == actual {
                 return Some(name.clone());
             }
@@ -182,7 +187,10 @@ pub fn humanize_identifier(value: &str, alias_book: &HashMap<String, String>) ->
     find_alias_for_address(trimmed, alias_book).unwrap_or_else(|| trimmed.to_string())
 }
 
-pub fn find_did_by_endpoint(endpoint_like: &str, did_endpoint_map: &HashMap<String, String>) -> Option<String> {
+pub fn find_did_by_endpoint(
+    endpoint_like: &str,
+    did_endpoint_map: &HashMap<String, String>,
+) -> Option<String> {
     let endpoint = normalize_endpoint_id(endpoint_like)?;
     for (did, candidate) in did_endpoint_map {
         if normalize_endpoint_id(candidate).as_deref() == Some(endpoint.as_str()) {
@@ -196,15 +204,19 @@ pub fn humanize_text(text: &str, alias_book: &HashMap<String, String>) -> String
     text.split_whitespace()
         .map(|token| {
             let normalized = token.trim_matches(|ch: char| {
-                !(ch.is_ascii_alphanumeric() || ch == ':' || ch == '#' || ch == '/' || ch == '-' || ch == '_')
+                !(ch.is_ascii_alphanumeric()
+                    || ch == ':'
+                    || ch == '#'
+                    || ch == '/'
+                    || ch == '-'
+                    || ch == '_')
             });
             if normalized.is_empty() {
                 return token.to_string();
             }
 
-            let candidate = normalized.trim_end_matches(|ch: char| {
-                matches!(ch, ':' | '.' | ',' | ';' | '!' | '?' | ')')
-            });
+            let candidate = normalized
+                .trim_end_matches(|ch: char| matches!(ch, ':' | '.' | ',' | ';' | '!' | '?' | ')'));
             if candidate.is_empty() {
                 return token.to_string();
             }

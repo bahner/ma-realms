@@ -30,7 +30,10 @@ where
     K: Eq + Hash + Clone + Send + Sync + 'static,
 {
     #[cfg(not(target_arch = "wasm32"))]
-    fn build_presence_cache(default_max_cache: Duration, capacity: Option<usize>) -> PresenceCache<K, ()> {
+    fn build_presence_cache(
+        default_max_cache: Duration,
+        capacity: Option<usize>,
+    ) -> PresenceCache<K, ()> {
         let mut builder = PresenceCache::builder()
             .time_to_live(default_max_cache)
             .time_to_idle(default_max_cache);
@@ -567,8 +570,14 @@ mod tests {
         let mut cache = TtlCache::new(Duration::from_secs(1));
         cache.insert("a", 1);
         thread::sleep(Duration::from_millis(10));
-        assert_eq!(cache.get_with_max_cache(&"a", Duration::from_millis(5)), None);
-        assert_eq!(cache.get_with_max_cache(&"a", Duration::from_millis(50)), Some(&1));
+        assert_eq!(
+            cache.get_with_max_cache(&"a", Duration::from_millis(5)),
+            None
+        );
+        assert_eq!(
+            cache.get_with_max_cache(&"a", Duration::from_millis(50)),
+            Some(&1)
+        );
     }
 
     #[test]

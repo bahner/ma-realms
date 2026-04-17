@@ -319,14 +319,11 @@ async fn call_tool(state: &AppState, name: &str, args: &Map<String, Value>) -> R
             let method = required_string_arg(args, "method")?.to_uppercase();
             let path = required_string_arg(args, "path")?;
 
-            let query = args
-                .get("query")
-                .and_then(Value::as_object)
-                .map(|obj| {
-                    obj.iter()
-                        .filter_map(|(k, v)| v.as_str().map(|sv| (k.clone(), sv.to_string())))
-                        .collect::<Vec<_>>()
-                });
+            let query = args.get("query").and_then(Value::as_object).map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|sv| (k.clone(), sv.to_string())))
+                    .collect::<Vec<_>>()
+            });
 
             match method.as_str() {
                 "GET" => do_get(state, &path, query).await?,
@@ -489,7 +486,9 @@ fn read_framed_json(reader: &mut impl BufRead) -> Result<Option<Value>> {
 
         if let Some((name, value)) = trimmed.split_once(':') {
             if name.eq_ignore_ascii_case("Content-Length") {
-                let parsed = value.trim().parse::<usize>()
+                let parsed = value
+                    .trim()
+                    .parse::<usize>()
                     .with_context(|| format!("invalid Content-Length header: {}", value.trim()))?;
                 content_length = Some(parsed);
             }

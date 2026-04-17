@@ -11,7 +11,7 @@ chrono = "0.4"
 hex = "0.4"
 libp2p-identity = { version = "0.2", features = ["ed25519", "peerid", "rand"] }
 ma-core = { package = "ma-realms-core", path = "../core" }
-did-ma = { package = "ma-did", version = "0.3" }
+did-ma = { package = "ma-did", version = "0.4" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart"] }
 attohttpc = { version = "0.30", default-features = false, features = ["tls-rustls-native-roots"] }
 nanoid = "0.4"

@@ -2194,8 +2194,6 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "hex",
- "iroh",
- "iroh-gossip",
  "js-sys",
  "libp2p-identity",
  "ma-did",
@@ -2232,7 +2230,9 @@ dependencies = [
 
 [[package]]
 name = "ma-core"
-version = "0.1.0"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b163493dd37235a8148dd88cf791d752f4438d537bccc86775b08902b9c4787"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2253,9 +2253,9 @@ dependencies = [
 
 [[package]]
 name = "ma-did"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a32a5d626ccc322d4ecb63093330d92699156ee89eb275afabab808bc72fcc6d"
+checksum = "bea353cff8257e08d49a0e8e16f50cd29ecc4f6517ec7ed321588afbb34000c1"
 dependencies = [
  "blake3",
  "chacha20poly1305",

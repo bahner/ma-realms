@@ -10,10 +10,10 @@ chrono = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
-did-ma = { package = "ma-did", version = "0.3" }
+did-ma = { package = "ma-did", version = "0.4" }
 blake3 = "1.8"
 bytes = "1"
-ma-core = { path = "../../ma-core" }
+ma-core = "0.5.0"
 rand = "0.8"
 tokio = { version = "1.37", features = ["io-util"] }
 

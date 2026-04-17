@@ -28,90 +28,92 @@ pub mod ttl_cache;
 pub mod util;
 
 pub use addressing::{
-    create_world_url, did_root, find_alias_for_address, find_did_by_endpoint,
-    humanize_identifier, humanize_text,
+    create_world_url, did_root, endpoint_id_from_address, endpoint_id_from_transport_value,
+    find_alias_for_address, find_did_by_endpoint, humanize_identifier, humanize_text,
     normalize_endpoint_id, normalize_iroh_address, normalize_relay_url, resolve_alias_input,
-    endpoint_id_from_address, endpoint_id_from_transport_value, resolve_inbox_endpoint_id, same_ipns,
+    resolve_inbox_endpoint_id, same_ipns,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use bootstrap_identity::{default_ma_config_root, ensure_local_ipns_key_file};
 pub use capability_acl::{
-    CapabilityAcl, CompiledCapabilityAcl, CompiledSubjectAcl,
-    capability_pattern_matches, compile_acl, compile_acl_from_text,
-    evaluate_compiled_acl, evaluate_compiled_acl_with_owner,
-    parse_capability_acl_text, parse_object_local_capability_acl,
+    capability_pattern_matches, compile_acl, compile_acl_from_text, evaluate_compiled_acl,
+    evaluate_compiled_acl_with_owner, parse_capability_acl_text, parse_object_local_capability_acl,
     subject_has_capability, subject_has_capability_with_owner, validate_capability_acl,
+    CapabilityAcl, CompiledCapabilityAcl, CompiledSubjectAcl,
 };
-pub use command_syntax::{parse_property_command, parse_property_command_for_keys, PropertyCommand};
-pub use ma_core::{DidPublisher, IpfsPublisher};
-pub use ma_core::{PinUpdateOutcome, pin_update_add_rm};
-#[cfg(not(target_arch = "wasm32"))]
-pub use ma_core::KuboKey;
-#[cfg(not(target_arch = "wasm32"))]
-pub use ma_core::KuboDidPublisher;
-pub use ttl_cache::TtlCache;
-pub use domain::{ActorType, AvatarActor, ExitData, Object, RoomActor, WorldActor};
-pub use identity::{
-    GeneratedAgentIdentity,
-    create_agent_identity,
-    create_agent_identity_from_private_keys,
+pub use command_syntax::{
+    parse_property_command, parse_property_command_for_keys, PropertyCommand,
 };
-pub use interfaces::AclRuntime;
-pub use ma_core::{
-    CONTENT_TYPE_DOC, IpfsPublishDidRequest, IpfsPublishDidResponse,
-    ValidatedIpfsPublish, validate_ipfs_publish_request,
-};
-#[cfg(not(target_arch = "wasm32"))]
-pub use ma_core::{handle_ipfs_publish, publish_did_document_to_kubo};
-pub use reply::{Reply, Scope};
 pub use document_helpers::{
     extract_did_description_from_json, normalize_language_for_did_document,
     sender_encryption_pubkey_multibase_from_document, sender_profile_from_document,
     sender_push_endpoint_from_document,
 };
-pub use util::{expand_tilde_path, format_system_time, is_valid_nanoid_id, parse_rfc3339_unix};
-pub use secure_fs::{SecureFileKind, ensure_private_dir, write_secure_file};
+pub use domain::{ActorType, AvatarActor, ExitData, Object, RoomActor, WorldActor};
+pub use identity::{
+    create_agent_identity, create_agent_identity_from_private_keys, GeneratedAgentIdentity,
+};
+pub use interfaces::AclRuntime;
 #[cfg(not(target_arch = "wasm32"))]
-pub use ma_core::{broadcast_topic_id, gossip_send, gossip_send_text, join_broadcast_channel, join_gossip_topic, topic_id_for};
+pub use ma_core::KuboDidPublisher;
+#[cfg(not(target_arch = "wasm32"))]
+pub use ma_core::KuboKey;
 #[cfg(not(target_arch = "wasm32"))]
 pub use ma_core::{generate_secret_key_file, load_secret_key_bytes, socket_addr_to_multiaddr};
+#[cfg(not(target_arch = "wasm32"))]
+pub use ma_core::{handle_ipfs_publish, publish_did_document_to_kubo};
+pub use ma_core::{pin_update_add_rm, PinUpdateOutcome};
+pub use ma_core::{
+    validate_ipfs_publish_request, IpfsPublishDidRequest, IpfsPublishDidResponse,
+    ValidatedIpfsPublish, CONTENT_TYPE_DOC,
+};
+pub use ma_core::{DidPublisher, IpfsPublisher, MaEndpoint};
+#[cfg(not(target_arch = "wasm32"))]
+pub use ma_core::{Channel, IrohEndpoint};
+#[cfg(not(target_arch = "wasm32"))]
+pub use ma_core::{
+    presets, AcceptError, Connection, Endpoint, EndpointAddr, EndpointId, ProtocolHandler,
+    RecvStream, RelayUrl, Router, SecretKey, SendStream,
+};
+pub use ma_core::Inbox;
 pub use object_runtime::{
-    MAILBOX_COMMANDS_INLINE,
     ObjectCommandOutput, ObjectCommandResult, ObjectDefinition, ObjectInboxMessage,
-    ObjectMessageIntent, ObjectMessageKind, ObjectMessageRetention, ObjectMessageTarget, ObjectPersistencePolicy,
-    ObjectProgramRef, ObjectReceiverListener, ObjectRuntimeState, PendingEphemeralRequest,
-    ObjectVerbDefinition, ObjectVerbEvaluator,
+    ObjectMessageIntent, ObjectMessageKind, ObjectMessageRetention, ObjectMessageTarget,
+    ObjectPersistencePolicy, ObjectProgramRef, ObjectReceiverListener, ObjectRuntimeState,
+    ObjectVerbDefinition, ObjectVerbEvaluator, PendingEphemeralRequest, MAILBOX_COMMANDS_INLINE,
 };
 pub use parser::{
-    ActorCommand, MessageEnvelope, normalize_spoken_text, parse_actor_command, parse_message,
+    normalize_spoken_text, parse_actor_command, parse_message, ActorCommand, MessageEnvelope,
 };
 pub use protocol::{
-    ServiceCapability, PresenceAvatar, RoomEvent, TransportAck, TransportAckCode, WorldCommand,
-    WorldService, WorldRequest, WorldResponse,
-    AVATAR_PROTOCOL, PRESENCE_PROTOCOL, INBOX_PROTOCOL, IPFS_PROTOCOL,
-    BROADCAST_PROTOCOL, BROADCAST_TOPIC,
-    DEFAULT_CONTENT_TYPE, CONTENT_TYPE_CHAT, CONTENT_TYPE_PRESENCE,
-    CONTENT_TYPE_WORLD, CONTENT_TYPE_EVENT, CONTENT_TYPE_BROADCAST,
-    CONTENT_TYPE_WHISPER, CONTENT_TYPE_MESSAGE,
+    PresenceAvatar, RoomEvent, ServiceCapability, TransportAck, TransportAckCode, WorldCommand,
+    WorldRequest, WorldResponse, WorldService, AVATAR_PROTOCOL, BROADCAST_PROTOCOL,
+    BROADCAST_TOPIC, CONTENT_TYPE_BROADCAST, CONTENT_TYPE_CHAT, CONTENT_TYPE_EVENT,
+    CONTENT_TYPE_MESSAGE, CONTENT_TYPE_PRESENCE, CONTENT_TYPE_WHISPER, CONTENT_TYPE_WORLD,
+    DEFAULT_CONTENT_TYPE, INBOX_PROTOCOL, IPFS_PROTOCOL, PRESENCE_PROTOCOL,
     ROOM_METHOD_BROADCAST_SEND, ROOM_METHOD_EVENTS_POLL, ROOM_METHOD_PRESENCE_LIST,
 };
+pub use reply::{Reply, Scope};
 pub use requirements::{
-    LegacyRequirement, RequirementArgArity, RequirementChecker, RequirementEvaluation,
-    RequirementValue,
-    RequirementSet, RequirementSignature, RequirementSpec,
-    RequirementValidationIssue, RequirementValidationIssueKind, RequirementValidationReport,
-    REQUIREMENT_SIGNATURES, evaluate_requirements, requirement_catalog, validate_requirements,
+    evaluate_requirements, requirement_catalog, validate_requirements, LegacyRequirement,
+    RequirementArgArity, RequirementChecker, RequirementEvaluation, RequirementSet,
+    RequirementSignature, RequirementSpec, RequirementValidationIssue,
+    RequirementValidationIssueKind, RequirementValidationReport, RequirementValue,
+    REQUIREMENT_SIGNATURES,
 };
 pub use room_actor::{
     execute_room_actor_command, RoomActorAction, RoomActorContext, RoomActorResult,
 };
+pub use secure_fs::{ensure_private_dir, write_secure_file, SecureFileKind};
+pub use ttl_cache::TtlCache;
+pub use util::{expand_tilde_path, format_system_time, is_valid_nanoid_id, parse_rfc3339_unix};
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ActorCommand, MessageEnvelope, did_root,
-        find_alias_for_address, find_did_by_endpoint, humanize_identifier, humanize_text,
+        did_root, find_alias_for_address, find_did_by_endpoint, humanize_identifier, humanize_text,
         normalize_endpoint_id, normalize_spoken_text, parse_message, resolve_alias_input,
+        ActorCommand, MessageEnvelope,
     };
     use std::collections::HashMap;
 
@@ -260,7 +262,10 @@ mod tests {
     #[test]
     fn normalizes_endpoint_id() {
         let endpoint = "a".repeat(64);
-        assert_eq!(normalize_endpoint_id(&format!("/iroh/{endpoint}")), Some(endpoint));
+        assert_eq!(
+            normalize_endpoint_id(&format!("/iroh/{endpoint}")),
+            Some(endpoint)
+        );
     }
 
     #[test]
@@ -274,7 +279,10 @@ mod tests {
     fn finds_alias_for_did_address() {
         let mut aliases = HashMap::new();
         aliases.insert("dancer".to_string(), "did:ma:k51example".to_string());
-        assert_eq!(find_alias_for_address("did:ma:k51example#sig", &aliases), Some("dancer".to_string()));
+        assert_eq!(
+            find_alias_for_address("did:ma:k51example#sig", &aliases),
+            Some("dancer".to_string())
+        );
     }
 
     #[test]
@@ -285,7 +293,10 @@ mod tests {
             "/iroh/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
         );
         assert_eq!(
-            humanize_identifier("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &aliases),
+            humanize_identifier(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &aliases
+            ),
             "world-home"
         );
     }
@@ -298,7 +309,10 @@ mod tests {
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
         );
         assert_eq!(
-            find_did_by_endpoint("/iroh/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", &map),
+            find_did_by_endpoint(
+                "/iroh/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                &map
+            ),
             Some("did:ma:k51example".to_string())
         );
     }
@@ -307,6 +321,9 @@ mod tests {
     fn humanizes_text_tokens() {
         let mut aliases = HashMap::new();
         aliases.insert("dancer".to_string(), "did:ma:k51example".to_string());
-        assert_eq!(humanize_text("did:ma:k51example: hello", &aliases), "dancer: hello");
+        assert_eq!(
+            humanize_text("did:ma:k51example: hello", &aliases),
+            "dancer: hello"
+        );
     }
 }

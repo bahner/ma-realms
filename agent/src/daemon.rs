@@ -1,28 +1,30 @@
-use std::{env, fs, path::{Path as FsPath, PathBuf}, sync::Arc};
+use std::{
+    env, fs,
+    path::{Path as FsPath, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{anyhow, Context, Result};
 use axum::{
-    Json, Router,
     extract::{Path, Query, State},
     response::{Html, IntoResponse},
     routing::{delete, get, post},
+    Json, Router,
 };
 use chrono::{SecondsFormat, Utc};
-use did_ma::{DID_PREFIX, Did, Document, SigningKey};
-use ma_core::{Endpoint, EndpointAddr, EndpointId, SecretKey, presets};
+use did_ma::{Did, Document, SigningKey, DID_PREFIX};
 use ma_core::{
-    AVATAR_PROTOCOL, CONTENT_TYPE_WORLD, INBOX_PROTOCOL,
-    KuboDidPublisher, MessageEnvelope, WorldCommand, WorldRequest, WorldResponse,
-    create_agent_identity_from_private_keys, default_ma_config_root,
-    parse_message, resolve_inbox_endpoint_id,
-    ma_fields,
+    create_agent_identity_from_private_keys, default_ma_config_root, ma_fields, parse_message,
+    resolve_inbox_endpoint_id, KuboDidPublisher, MessageEnvelope, WorldCommand, WorldRequest,
+    WorldResponse, AVATAR_PROTOCOL, CONTENT_TYPE_WORLD,
 };
+use ma_core::{presets, Endpoint, EndpointAddr, EndpointId};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 
 const AGENT_VERSION_FILE: &str = ".generated/agent-version.txt";
 const AGENT_IROH_KEY_FILE: &str = "agent_iroh.bin";
@@ -119,7 +121,11 @@ impl AgentdConfig {
         }
 
         self.world_did_base = self.world_did_base.trim().to_string();
-        self.poll_ttl = if self.poll_ttl == 0 { 10 } else { self.poll_ttl };
+        self.poll_ttl = if self.poll_ttl == 0 {
+            10
+        } else {
+            self.poll_ttl
+        };
     }
 }
 
@@ -293,7 +299,12 @@ pub async fn run_daemon(
     println!("data:   {}", state.data_root.display());
     println!("alias monitor: every {}s", cfg_now.poll_ttl);
     if let Ok(paths) = ensure_daemon_secret_files_for(&cfg_now, &state.config_path) {
-        println!("keys:   iroh={} enc={} sig={}", paths.iroh_path.display(), paths.enc_path.display(), paths.sig_path.display());
+        println!(
+            "keys:   iroh={} enc={} sig={}",
+            paths.iroh_path.display(),
+            paths.enc_path.display(),
+            paths.sig_path.display()
+        );
     }
 
     let startup_state = state.clone();
@@ -356,7 +367,7 @@ async fn alias_monitor_loop(state: AppState) {
 
 #[cfg(unix)]
 async fn sighup_reload_loop(state: AppState) {
-    use tokio::signal::unix::{SignalKind, signal};
+    use tokio::signal::unix::{signal, SignalKind};
 
     let Ok(mut stream) = signal(SignalKind::hangup()) else {
         eprintln!("WARN: failed to subscribe to SIGHUP");
@@ -367,8 +378,7 @@ async fn sighup_reload_loop(state: AppState) {
         match reload_runtime_config(&state).await {
             Ok(cfg) => println!(
                 "SIGHUP: reloaded config (alias='{}', poll_ttl={}s)",
-                cfg.kubo_key_alias,
-                cfg.poll_ttl
+                cfg.kubo_key_alias, cfg.poll_ttl
             ),
             Err(err) => eprintln!("WARN: SIGHUP reload failed: {}", err),
         }
@@ -516,14 +526,20 @@ fn ensure_secret_file(path: &FsPath, expected_len: usize, label: &str) -> Result
 
 fn config_root_from_config_path(config_path: &FsPath) -> Result<PathBuf> {
     let Some(parent) = config_path.parent() else {
-        return Err(anyhow!("config path has no parent: {}", config_path.display()));
+        return Err(anyhow!(
+            "config path has no parent: {}",
+            config_path.display()
+        ));
     };
     fs::create_dir_all(parent)
         .with_context(|| format!("failed to create config dir {}", parent.display()))?;
     Ok(parent.to_path_buf())
 }
 
-fn ensure_daemon_secret_files_for(cfg: &AgentdConfig, config_path: &FsPath) -> Result<DaemonSecretPaths> {
+fn ensure_daemon_secret_files_for(
+    cfg: &AgentdConfig,
+    config_path: &FsPath,
+) -> Result<DaemonSecretPaths> {
     let config_root = config_root_from_config_path(config_path)?;
     let paths = daemon_secret_paths_for_cfg(&config_root, cfg);
     ensure_secret_file(&paths.iroh_path, 32, "agent iroh secret")?;
@@ -617,7 +633,11 @@ fn data_root_global() -> Result<PathBuf> {
     Ok(data_root_base()?.join("agentd"))
 }
 
-fn migrate_legacy_agent_data(data_root: &FsPath, agents_dir: &FsPath, logs_dir: &FsPath) -> Result<()> {
+fn migrate_legacy_agent_data(
+    data_root: &FsPath,
+    agents_dir: &FsPath,
+    logs_dir: &FsPath,
+) -> Result<()> {
     let ma_root = data_root
         .parent()
         .ok_or_else(|| anyhow!("invalid data root {}", data_root.display()))?;
@@ -763,47 +783,15 @@ async fn resolved_base_did_document(
     }
 }
 
-fn expected_agent_services(endpoint_id: &str) -> serde_json::Value {
-    let protocols = [
-        String::from_utf8_lossy(INBOX_PROTOCOL).to_string(),
-        String::from_utf8_lossy(AVATAR_PROTOCOL).to_string(),
-    ];
-    serde_json::Value::Array(
-        protocols
-            .into_iter()
-            .map(|proto| serde_json::Value::String(format!("/iroh/{}/{}", endpoint_id, proto)))
-            .collect(),
-    )
-}
-
 fn now_zulu() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-fn iroh_endpoint_id_from_secret_file(path: &FsPath) -> Result<String> {
-    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let key_bytes: [u8; 32] = bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("invalid iroh secret key length in {}", path.display()))?;
-    let secret = SecretKey::from_bytes(&key_bytes);
-    let endpoint_id = EndpointId::from(secret.public());
-    Ok(endpoint_id.to_string())
-}
-
 fn did_doc_has_required_ma_fields(doc: &Document) -> bool {
-    let Some(ma) = doc.ma.as_ref() else {
-        return false;
-    };
+    let has_created = !doc.created_at.trim().is_empty();
+    let has_updated = !doc.updated_at.trim().is_empty();
 
-    let has_services = ma_fields::ma_services(doc)
-        .and_then(|value| value.as_array())
-        .map(|entries| !entries.is_empty())
-        .unwrap_or(false);
-    let has_created = doc.created.as_ref().map(|v| !v.trim().is_empty()).unwrap_or(false);
-    let has_updated = doc.updated.as_ref().map(|v| !v.trim().is_empty()).unwrap_or(false);
-
-    has_services && has_created && has_updated
+    has_created && has_updated
 }
 
 async fn ensure_world_base_did_published(state: &AppState) -> Result<String> {
@@ -848,10 +836,7 @@ async fn ensure_world_base_did_published(state: &AppState) -> Result<String> {
                     return Ok(base_did);
                 }
 
-                existing_created = existing
-                    .created
-                    .as_ref()
-                    .map(|value| value.trim().to_string())
+                existing_created = Some(existing.created_at.trim().to_string())
                     .filter(|value| !value.is_empty());
                 eprintln!(
                     "WARN: existing DID document is missing required ma fields (services/created/updated); republishing"
@@ -873,18 +858,22 @@ async fn ensure_world_base_did_published(state: &AppState) -> Result<String> {
     }
 
     let secret_paths = ensure_daemon_secret_files_for(&cfg, &state.config_path)?;
-    let iroh_endpoint_id = iroh_endpoint_id_from_secret_file(&secret_paths.iroh_path)?;
     let signing_bytes = ensure_secret_file(&secret_paths.sig_path, 32, "agent signing secret")?;
-    let encryption_bytes = ensure_secret_file(&secret_paths.enc_path, 32, "agent encryption secret")?;
+    let encryption_bytes =
+        ensure_secret_file(&secret_paths.enc_path, 32, "agent encryption secret")?;
 
-    let signing_private_key = signing_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("invalid signing key length in {}", secret_paths.sig_path.display()))?;
-    let encryption_private_key = encryption_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("invalid encryption key length in {}", secret_paths.enc_path.display()))?;
+    let signing_private_key = signing_bytes.as_slice().try_into().map_err(|_| {
+        anyhow!(
+            "invalid signing key length in {}",
+            secret_paths.sig_path.display()
+        )
+    })?;
+    let encryption_private_key = encryption_bytes.as_slice().try_into().map_err(|_| {
+        anyhow!(
+            "invalid encryption key length in {}",
+            secret_paths.enc_path.display()
+        )
+    })?;
     let generated = create_agent_identity_from_private_keys(
         &key_id,
         "agent",
@@ -893,16 +882,16 @@ async fn ensure_world_base_did_published(state: &AppState) -> Result<String> {
     )?;
     let mut document = generated.document;
     let now = now_zulu();
-    document.set_created(existing_created.unwrap_or_else(|| now.clone()));
-    document.set_updated(now);
-    ma_fields::set_ma_services(&mut document, expected_agent_services(&iroh_endpoint_id));
+    document.created_at = existing_created.unwrap_or_else(|| now.clone());
+    document.updated_at = now;
     if let Some(version) = read_agent_version() {
         ma_fields::set_ma_version(&mut document, &version);
     }
-    let document_json = document.marshal()
+    let document_json = document
+        .marshal()
         .map_err(|e| anyhow!("failed to marshal DID document: {}", e))?;
     let _ = publisher
-        .publish_document(&document_json, "", Some(&world_key_name))
+        .publish_document(&document_json, "")
         .await?;
 
     if cfg.world_did_base != base_did {
@@ -916,8 +905,8 @@ async fn ensure_world_base_did_published(state: &AppState) -> Result<String> {
 
 fn load_agent_meta(state: &AppState, agent_id: &str) -> Result<AgentMeta> {
     let path = agent_meta_path(state, agent_id);
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let meta = serde_json::from_str::<AgentMeta>(&raw)
         .with_context(|| format!("invalid agent metadata {}", path.display()))?;
     Ok(meta)
@@ -1331,14 +1320,17 @@ fn build_agent_signing_key(base_did: &str, sig_private: &[u8]) -> Result<Signing
         .trim()
         .strip_prefix(DID_PREFIX)
         .ok_or_else(|| anyhow!("invalid world DID base '{}'", base_did))?;
-    let signing_did = Did::new_auto(key_id)?;
+    let signing_did = Did::new_url(key_id, None::<String>)?;
     let key_bytes: [u8; 32] = sig_private
         .try_into()
         .map_err(|_| anyhow!("invalid signing key length"))?;
     SigningKey::from_private_key_bytes(signing_did, key_bytes).map_err(|e| anyhow!(e.to_string()))
 }
 
-async fn resolve_world_endpoint_id_from_did(kubo_url: &str, world_base_did: &str) -> Result<String> {
+async fn resolve_world_endpoint_id_from_did(
+    kubo_url: &str,
+    world_base_did: &str,
+) -> Result<String> {
     let publisher = KuboDidPublisher::new(kubo_url)?;
     let root = world_base_from_did_text(world_base_did)
         .ok_or_else(|| anyhow!("invalid world DID '{}'", world_base_did))?;
@@ -1350,21 +1342,22 @@ async fn resolve_world_endpoint_id_from_did(kubo_url: &str, world_base_did: &str
         .await?
         .ok_or_else(|| anyhow!("resolved DID document mismatch for {}", root))?;
 
-    let endpoint = doc
-        .ma
-        .as_ref()
-        .and_then(|ma| {
-            resolve_inbox_endpoint_id(
-                ma.get("currentInbox").and_then(|v| v.as_str()),
-                ma.get("presenceHint").and_then(|v| v.as_str()),
-                ma.get("services"),
-            )
-        })
+    let services_json = ma_fields::ma_services(&doc)
+        .and_then(|value| serde_json::to_value(value).ok());
+    let endpoint = resolve_inbox_endpoint_id(
+        ma_fields::ma_current_inbox(&doc),
+        ma_fields::ma_presence_hint(&doc),
+        services_json.as_ref(),
+    )
         .ok_or_else(|| anyhow!("world DID '{}' has no inbox endpoint", root))?;
     Ok(endpoint)
 }
 
-async fn send_world_request_over_iroh(endpoint_id: &str, request: WorldRequest, protocol: &'static [u8]) -> Result<WorldResponse> {
+async fn send_world_request_over_iroh(
+    endpoint_id: &str,
+    request: WorldRequest,
+    protocol: &'static [u8],
+) -> Result<WorldResponse> {
     let target: EndpointId = endpoint_id
         .trim()
         .parse()
@@ -1389,18 +1382,15 @@ async fn send_world_request_over_iroh(endpoint_id: &str, request: WorldRequest, 
         .map_err(|e| anyhow!("connection.open_bi() failed: {}", e))?;
 
     let payload = serde_json::to_vec(&request)?;
-    send.write_u32(payload.len() as u32).await?;
     send.write_all(&payload).await?;
     send.flush().await?;
-
-    let frame_len = recv.read_u32().await? as usize;
-    if frame_len > 1024 * 1024 {
-        return Err(anyhow!("world response frame too large: {}", frame_len));
-    }
-    let mut bytes = vec![0u8; frame_len];
-    recv.read_exact(&mut bytes).await?;
-
     let _ = send.finish();
+
+    let bytes = recv.read_to_end(1024 * 1024).await?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(anyhow!("world response too large: {}", bytes.len()));
+    }
+
     connection.close(0u32.into(), b"ok");
     endpoint.close().await;
 
@@ -1443,7 +1433,12 @@ async fn send_agent(
         });
     }
 
-    let mode = req.mode.as_deref().unwrap_or("command").trim().to_ascii_lowercase();
+    let mode = req
+        .mode
+        .as_deref()
+        .unwrap_or("command")
+        .trim()
+        .to_ascii_lowercase();
     if mode != "command" && mode != "chat" {
         return Json(SendAgentResponse {
             ok: false,
@@ -1481,18 +1476,23 @@ async fn send_agent(
         .and_then(world_base_from_did_text)
         .unwrap_or_else(|| sender_world_base.clone());
 
-    let endpoint_id = match resolve_world_endpoint_id_from_did(&cfg.kubo_api_url, &target_world_base).await {
-        Ok(value) => value,
-        Err(err) => {
-            return Json(SendAgentResponse {
-                ok: false,
-                message: format!("failed resolving world endpoint: {}", err),
-                world_response: None,
-            });
-        }
-    };
+    let endpoint_id =
+        match resolve_world_endpoint_id_from_did(&cfg.kubo_api_url, &target_world_base).await {
+            Ok(value) => value,
+            Err(err) => {
+                return Json(SendAgentResponse {
+                    ok: false,
+                    message: format!("failed resolving world endpoint: {}", err),
+                    world_response: None,
+                });
+            }
+        };
 
-    let room = req.room.unwrap_or_else(|| "lobby".to_string()).trim().to_string();
+    let room = req
+        .room
+        .unwrap_or_else(|| "lobby".to_string())
+        .trim()
+        .to_string();
     let envelope = if mode == "chat" {
         MessageEnvelope::Chatter {
             text: body.to_string(),
@@ -1508,10 +1508,7 @@ async fn send_agent(
         parse_message(&command_text)
     };
 
-    let content = match serde_json::to_vec(&WorldCommand::Message {
-        room,
-        envelope,
-    }) {
+    let content = match serde_json::to_vec(&WorldCommand::Message { room, envelope }) {
         Ok(bytes) => bytes,
         Err(err) => {
             return Json(SendAgentResponse {
@@ -1532,16 +1529,17 @@ async fn send_agent(
             });
         }
     };
-    let signing_secret = match ensure_secret_file(&secret_paths.sig_path, 32, "agent signing secret") {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            return Json(SendAgentResponse {
-                ok: false,
-                message: format!("failed reading signing secret: {}", err),
-                world_response: None,
-            });
-        }
-    };
+    let signing_secret =
+        match ensure_secret_file(&secret_paths.sig_path, 32, "agent signing secret") {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return Json(SendAgentResponse {
+                    ok: false,
+                    message: format!("failed reading signing secret: {}", err),
+                    world_response: None,
+                });
+            }
+        };
     let signing_key = match build_agent_signing_key(&sender_world_base, &signing_secret) {
         Ok(key) => key,
         Err(err) => {
@@ -1590,10 +1588,7 @@ async fn send_agent(
                 &id,
                 &format!(
                     "sent mode={} to={} endpoint={} ok={}",
-                    mode,
-                    target_world_base,
-                    endpoint_id,
-                    world_response.ok
+                    mode, target_world_base, endpoint_id, world_response.ok
                 ),
             );
             Json(SendAgentResponse {

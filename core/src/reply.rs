@@ -37,11 +37,19 @@ pub struct Reply {
 
 impl Reply {
     pub fn new(scope: Scope, message: impl Into<String>) -> Self {
-        Self { scope, attribute: None, message: message.into() }
+        Self {
+            scope,
+            attribute: None,
+            message: message.into(),
+        }
     }
 
     pub fn with_attr(scope: Scope, attr: impl Into<String>, message: impl Into<String>) -> Self {
-        Self { scope, attribute: Some(attr.into()), message: message.into() }
+        Self {
+            scope,
+            attribute: Some(attr.into()),
+            message: message.into(),
+        }
     }
 
     pub fn here(message: impl Into<String>) -> Self {
@@ -62,7 +70,11 @@ impl Reply {
 
     /// Join multiple replies into a single newline-separated string.
     pub fn join(replies: &[Reply]) -> String {
-        replies.iter().map(|r| r.to_string()).collect::<Vec<_>>().join("\n")
+        replies
+            .iter()
+            .map(|r| r.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Build a list of `@scope.attr value` lines from key-value pairs.
@@ -97,7 +109,10 @@ mod tests {
     #[test]
     fn here_with_attribute() {
         let r = Reply::here_attr("avatars", "in 'lobby': aurora(did:ma:k51abc)");
-        assert_eq!(r.to_string(), "@here.avatars in 'lobby': aurora(did:ma:k51abc)");
+        assert_eq!(
+            r.to_string(),
+            "@here.avatars in 'lobby': aurora(did:ma:k51abc)"
+        );
     }
 
     #[test]
